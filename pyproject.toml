@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eloquy-agent"
+version = "0.1.0"
+description = "Local 24/7 listening agent for Eloquy — captures real conversations the user participates in for downstream English-coaching analysis."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "sounddevice>=0.4.6",
+    "soundcard>=0.4.3",
+    "silero-vad>=5.1",
+    "faster-whisper>=1.0.3",
+    # resemblyzer: install separately with --no-deps because it pins the
+    # source-only `webrtcvad`. See README. Order:
+    #   pip install webrtcvad-wheels librosa
+    #   pip install resemblyzer --no-deps
+    "webrtcvad-wheels>=2.0.14",
+    "librosa>=0.10",
+    # llama-cpp-python: install separately from the prebuilt wheel index, e.g.
+    #   pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+    # Left out of `dependencies` so `pip install -e .` doesn't try to compile it.
+    "av>=12.0",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    "huggingface-hub>=0.24",
+    "click>=8.1",
+    "rich>=13.7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+eloquy-agent = "eloquy_agent.__main__:cli"
+
+[tool.setuptools.packages.find]
+include = ["eloquy_agent*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
