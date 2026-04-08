@@ -266,6 +266,46 @@ def evaluate_user_turn_gate(buffers: SessionBuffers, cfg: ConversationConfig) ->
     )
 
 
+def merge_close_segments(
+    segments: list[SpeechSegment],
+    gap_secs: float,
+) -> list[SpeechSegment]:
+    """Merge time ranges whose inter-segment gap is shorter than `gap_secs`.
+
+    Used by the final-audio trimmer to preserve conversational pauses
+    (thinking beats, response latency) as real audio while still removing
+    true dead air. Ignores `source` — two segments from different sources
+    are merged if their timestamps are close enough, and the resulting
+    merged segment is tagged as "mic" purely so the SpeechSegment dataclass
+    is satisfied (build_windowed_pcm doesn't look at the source field).
+
+    Pure / unit-testable. Returns a new sorted list; input is not mutated.
+    `gap_secs <= 0` disables merging and just sorts the input.
+    """
+    if not segments:
+        return []
+    ordered = sorted(segments, key=lambda s: s.start_ts)
+    if gap_secs <= 0:
+        return ordered
+    merged: list[SpeechSegment] = [
+        SpeechSegment(source=ordered[0].source, start_ts=ordered[0].start_ts, end_ts=ordered[0].end_ts)
+    ]
+    for s in ordered[1:]:
+        last = merged[-1]
+        if s.start_ts - last.end_ts <= gap_secs:
+            if s.end_ts > last.end_ts:
+                merged[-1] = SpeechSegment(
+                    source=last.source,
+                    start_ts=last.start_ts,
+                    end_ts=s.end_ts,
+                )
+        else:
+            merged.append(
+                SpeechSegment(source=s.source, start_ts=s.start_ts, end_ts=s.end_ts)
+            )
+    return merged
+
+
 def build_windowed_pcm(
     pcm: bytes,
     keep_segments: list[SpeechSegment],

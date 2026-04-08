@@ -20,7 +20,7 @@ def encode_opus_stereo(
     sys_pcm16: bytes,
     out_path: Path,
     sample_rate: int = 16000,
-    bitrate: int = 24000,
+    bitrate: int = 64000,
 ) -> None:
     """Encode mic (L) + system (R) as a single stereo Opus file via PyAV."""
     import av  # lazy
@@ -104,26 +104,23 @@ class CaptureSink:
         rec_dir = self.captures_dir / rec_id
         rec_dir.mkdir(parents=True, exist_ok=True)
 
-        # Crop PCM to relevant span before encoding
+        # Save the FULL session audio and transcript. We deliberately do NOT
+        # crop to `relevant_span` here — small local LLMs routinely
+        # under-estimate how much context a conversation needs, and once
+        # cropped from the on-disk file that audio is gone forever. Keep
+        # everything, store the LLM's span as metadata, let downstream
+        # analysis decide whether to trust it.
         start_s, end_s = relevant_span
-        a = max(0, int(start_s * sample_rate)) * 2  # *2 = bytes per int16
-        b = max(a, int(end_s * sample_rate)) * 2
-        mic_cropped = bytes(mic_pcm16[a:b])
-        sys_cropped = bytes(sys_pcm16[a:b])
-
         audio_rel = "audio.opus"
-        encode_opus_stereo(mic_cropped, sys_cropped, rec_dir / audio_rel, sample_rate=sample_rate)
-
-        # Crop transcript to span as well
-        cropped_transcript = [
-            t for t in transcript if t.end >= start_s and t.start <= end_s
-        ]
+        encode_opus_stereo(
+            bytes(mic_pcm16), bytes(sys_pcm16), rec_dir / audio_rel, sample_rate=sample_rate
+        )
 
         record = ConversationRecord(
             id=rec_id,
             started_at=started_at,
             ended_at=ended_at,
-            transcript=cropped_transcript,
+            transcript=list(transcript),
             title=title,
             summary=summary,
             audio_path=audio_rel,

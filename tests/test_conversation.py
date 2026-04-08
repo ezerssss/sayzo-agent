@@ -12,6 +12,7 @@ from eloquy_agent.conversation import (
     SessionState,
     build_windowed_pcm,
     evaluate_user_turn_gate,
+    merge_close_segments,
 )
 from eloquy_agent.models import SessionCloseReason, SpeechSegment
 
@@ -27,6 +28,68 @@ def _cfg(**overrides) -> ConversationConfig:
     )
     base.update(overrides)
     return ConversationConfig(**base)
+
+
+def test_merge_close_segments_preserves_short_gaps():
+    """Two segments within the gap threshold are merged into one range."""
+    segs = [
+        SpeechSegment("mic", 0.0, 3.0),
+        SpeechSegment("mic", 5.0, 8.0),  # 2s gap
+    ]
+    merged = merge_close_segments(segs, gap_secs=5.0)
+    assert len(merged) == 1
+    assert merged[0].start_ts == 0.0
+    assert merged[0].end_ts == 8.0
+
+
+def test_merge_close_segments_respects_long_gaps():
+    """Segments further apart than the threshold are kept separate."""
+    segs = [
+        SpeechSegment("mic", 0.0, 3.0),
+        SpeechSegment("mic", 15.0, 18.0),  # 12s gap
+    ]
+    merged = merge_close_segments(segs, gap_secs=5.0)
+    assert len(merged) == 2
+
+
+def test_merge_close_segments_ignores_source():
+    """A mic segment followed by a nearby sys segment should merge — the
+    helper is purely timestamp-based because build_windowed_pcm is too."""
+    segs = [
+        SpeechSegment("mic", 0.0, 3.0),
+        SpeechSegment("system", 5.0, 8.0),  # 2s gap, different source
+    ]
+    merged = merge_close_segments(segs, gap_secs=5.0)
+    assert len(merged) == 1
+    assert merged[0].start_ts == 0.0
+    assert merged[0].end_ts == 8.0
+
+
+def test_merge_close_segments_disabled_when_gap_zero():
+    """gap_secs <= 0 should just return the input sorted, no merging."""
+    segs = [
+        SpeechSegment("mic", 5.0, 8.0),
+        SpeechSegment("mic", 0.0, 3.0),
+    ]
+    merged = merge_close_segments(segs, gap_secs=0.0)
+    assert len(merged) == 2
+    assert merged[0].start_ts == 0.0
+    assert merged[1].start_ts == 5.0
+
+
+def test_merge_close_segments_chains_multiple():
+    """A, B, C each within gap of the previous all merge into one range."""
+    segs = [
+        SpeechSegment("mic", 0.0, 2.0),
+        SpeechSegment("system", 3.0, 5.0),
+        SpeechSegment("mic", 6.0, 9.0),
+        SpeechSegment("mic", 20.0, 22.0),  # far away
+    ]
+    merged = merge_close_segments(segs, gap_secs=2.0)
+    assert len(merged) == 2
+    assert merged[0].start_ts == 0.0
+    assert merged[0].end_ts == 9.0
+    assert merged[1].start_ts == 20.0
 
 
 def _frame(seconds: float, sr: int = 16000, amplitude: float = 0.1) -> np.ndarray:

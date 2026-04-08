@@ -18,6 +18,7 @@ from .conversation import (
     SessionState,
     build_windowed_pcm,
     evaluate_user_turn_gate,
+    merge_close_segments,
 )
 from .models import SessionBuffers, SpeechSegment, TranscriptLine
 from .relevance import RelevanceLLM, RelevanceVerdict
@@ -146,7 +147,32 @@ class Agent:
 
         loop = asyncio.get_running_loop()
 
-        # 2. Transcribe both sources in the heavy worker.
+        # 2a. Language probe on the mic stream. Eloquy is English-only, so if
+        # the user was confidently speaking another language we bail now
+        # rather than burn CPU transcribing nonsense (Whisper forced to
+        # English on e.g. Tagalog produces hallucinated English). Set
+        # STTConfig.non_english_discard_prob=1.0 to disable.
+        mic_bytes = bytes(buffers.mic_pcm)
+        if mic_bytes:
+            mic_lang, mic_lang_prob = await loop.run_in_executor(
+                self._executor, self.stt.detect_language, mic_bytes
+            )
+            log.info(
+                "[stt] mic language probe: %s (prob=%.2f)", mic_lang, mic_lang_prob
+            )
+            if (
+                mic_lang != "en"
+                and mic_lang_prob >= self.cfg.stt.non_english_discard_prob
+            ):
+                log.info(
+                    "[session] DISCARDED (mic confidently non-English: %s @ %.2f)",
+                    mic_lang,
+                    mic_lang_prob,
+                )
+                self._captures_discarded += 1
+                return
+
+        # 2b. Transcribe both sources in the heavy worker.
         # Density branch: when the user was barely present (e.g. passive media
         # + occasional comment), transcribe system audio only in ±pad windows
         # around mic VAD segments. Cuts STT cost dramatically without changing
@@ -175,7 +201,7 @@ class Agent:
             len(sys_pcm_full) / 2 / sr,
         )
         mic_segs, sys_segs = await loop.run_in_executor(
-            self._executor, self._transcribe_both, bytes(buffers.mic_pcm), sys_pcm_for_stt, sr
+            self._executor, self._transcribe_both, mic_bytes, sys_pcm_for_stt, sr
         )
 
         # 3. Speaker tagging + transcript merge
@@ -215,7 +241,43 @@ class Agent:
             self._captures_discarded += 1
             return
 
-        # 5. Sink + upload
+        # 5. Trim dead air from the final audio. Zero-fill both channels
+        # outside the union of mic + system VAD segments so the on-disk
+        # capture doesn't carry minutes of hissing system audio during
+        # silence, and Opus can compress the silent regions to near-zero
+        # bits. Timestamps are preserved 1:1 — `relevant_span` and
+        # transcript offsets still line up with the saved file.
+        #
+        # Before zeroing, we merge any two speech segments whose gap is
+        # shorter than `final_audio_merge_gap_secs`. This preserves
+        # conversational pauses (response latency, thinking beats, intra-
+        # turn hesitation) as real audio — those pauses are coachable
+        # signal for speech analysis. True dead air longer than the merge
+        # gap still gets removed.
+        raw_speech_segs = list(buffers.mic_segments) + list(buffers.sys_segments)
+        speech_segs = merge_close_segments(
+            raw_speech_segs, gap_secs=self.cfg.conversation.final_audio_merge_gap_secs
+        )
+        pad = self.cfg.conversation.final_audio_speech_pad_secs
+        mic_final = build_windowed_pcm(
+            bytes(buffers.mic_pcm), speech_segs, pad_secs=pad, sample_rate=sr
+        )
+        sys_final = build_windowed_pcm(
+            bytes(buffers.sys_pcm), speech_segs, pad_secs=pad, sample_rate=sr
+        )
+        full_secs = len(buffers.mic_pcm) / 2 / sr
+        kept_secs = sum(
+            min(s.end_ts + pad, full_secs) - max(0.0, s.start_ts - pad)
+            for s in speech_segs
+            if s.end_ts > s.start_ts
+        )
+        log.info(
+            "[sink] trimming dead air: %.1fs of speech regions out of %.1fs total",
+            min(kept_secs, full_secs),
+            full_secs,
+        )
+
+        # 6. Sink + upload
         ended_at = buffers.started_at + timedelta(seconds=buffers.elapsed())
         record = await loop.run_in_executor(
             self._executor,
@@ -226,8 +288,8 @@ class Agent:
             verdict.relevant_span,
             buffers.started_at,
             ended_at,
-            bytes(buffers.mic_pcm),
-            bytes(buffers.sys_pcm),
+            mic_final,
+            sys_final,
             sr,
             {"close_reason": buffers.close_reason.value if buffers.close_reason else None},
         )

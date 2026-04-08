@@ -28,7 +28,7 @@ class VADConfig(BaseSettings):
 
 
 class ConversationConfig(BaseSettings):
-    joint_silence_close_secs: float = 90.0
+    joint_silence_close_secs: float = 45.0
     max_session_secs: float = 3600.0
     min_user_turn_secs: float = 8.0
     min_user_total_secs: float = 15.0
@@ -40,6 +40,18 @@ class ConversationConfig(BaseSettings):
     # without changing any discard logic (LLM still judges).
     stt_full_density: float = 0.05
     stt_context_pad_secs: float = 60.0
+    # Pad around each VAD segment (mic or system) when building the final
+    # saved audio. Regions outside any padded segment are zero-filled so
+    # dead air + static artifacts don't end up in the on-disk capture. Small
+    # pad keeps speech starts/ends from being clipped.
+    final_audio_speech_pad_secs: float = 0.5
+    # Before zero-filling dead air, merge any two VAD segments whose gap is
+    # shorter than this. Preserves conversational pauses (response latency,
+    # thinking beats, intra-turn hesitation) as real audio — those pauses
+    # are coachable signal for speech analysis. True dead air longer than
+    # this threshold still gets zeroed. Set to 0 to disable merging and fall
+    # back to strict per-segment trimming.
+    final_audio_merge_gap_secs: float = 5.0
     # Pre-session rolling PCM buffer. Silero only yields a SpeechSegment after
     # the speech *ends* (hangover_ms of trailing silence), so by the time
     # on_segment fires and opens a session, the actual voiced audio happened
@@ -54,7 +66,18 @@ class STTConfig(BaseSettings):
     model: str = "small"
     compute_type: str = "int8"
     device: str = "cpu"
-    language: str | None = None  # auto-detect
+    # Force English transcription. Eloquy is an English coaching platform, so
+    # auto-detection is both unnecessary and actively harmful — Whisper-small
+    # frequently misidentifies accented-but-correct English as Tagalog/Malay/
+    # Indonesian and then "transcribes" nonsense. Set to None to re-enable
+    # auto-detect if you ever need multilingual support.
+    language: str | None = "en"
+    # If the mic stream's detected language is confidently non-English
+    # (prob >= this threshold), discard the whole session before STT. Guards
+    # against spending CPU on sessions where the user was clearly speaking
+    # another language (and Whisper would hallucinate English for). Set to
+    # 1.0 to disable the discard path. Default 0.85 = "really sure" only.
+    non_english_discard_prob: float = 0.85
 
 
 class SpeakerConfig(BaseSettings):

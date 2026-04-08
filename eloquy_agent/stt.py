@@ -46,6 +46,24 @@ class WhisperSTT:
             download_root=self.models_dir,
         )
 
+    def detect_language(self, pcm16: bytes, sample_rate: int = 16000) -> tuple[str, float]:
+        """Return (language_code, probability) for a PCM16 buffer.
+
+        Cheap compared to transcription — Whisper's language detection only
+        looks at the first ~30 s of audio. Used by the pipeline to discard
+        confidently non-English sessions before paying the full STT cost.
+        Returns ("", 0.0) on empty input.
+        """
+        if not pcm16:
+            return ("", 0.0)
+        self._ensure_loaded()
+        if sample_rate != 16000:
+            raise ValueError("Whisper requires 16 kHz input")
+        audio = np.frombuffer(pcm16, dtype=np.int16).astype(np.float32) / 32768.0
+        assert self._model is not None
+        lang, prob, _ = self._model.detect_language(audio)
+        return (lang, float(prob))
+
     def transcribe_pcm16(self, pcm16: bytes, sample_rate: int = 16000) -> list[TranscribedSegment]:
         if not pcm16:
             return []
