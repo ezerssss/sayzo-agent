@@ -360,13 +360,24 @@ def run() -> None:
 
     from .auth.store import TokenStore
 
+    upload_client = None
     store = TokenStore(cfg.auth_path)
     if not store.has_tokens():
         log.warning("Not authenticated. Run `eloquy-agent login` to enable uploads.")
+    elif cfg.auth.effective_server_url:
+        from .auth.client import AuthenticatedClient
+        from .auth.server import HttpAuthServer
+        from .upload import AuthenticatedUploadClient
+
+        auth_server = HttpAuthServer(cfg.auth.auth_url, cfg.auth.client_id, cfg.auth.scopes)
+        store = TokenStore(cfg.auth_path, auth_server=auth_server)
+        client = AuthenticatedClient(cfg.auth.effective_server_url, store)
+        upload_client = AuthenticatedUploadClient(client, cfg.captures_dir)
+        log.info("Uploads enabled → %s", cfg.auth.effective_server_url)
 
     from .app import Agent
 
-    agent = Agent(cfg)
+    agent = Agent(cfg, upload_client=upload_client)
 
     async def _main() -> None:
         loop = asyncio.get_running_loop()

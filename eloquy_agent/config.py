@@ -94,11 +94,24 @@ class LLMConfig(BaseSettings):
 
 
 class AuthConfig(BaseSettings):
-    auth_url: str = ""  # e.g. "https://auth.eloquy.com"
+    auth_url: str = ""  # e.g. "https://eloquy.com/api/auth"
     client_id: str = ""  # Public OAuth client ID (no secret — PKCE)
+    server_url: str = ""  # e.g. "https://eloquy.com" — base for all API calls
     scopes: str = "offline_access upload"
     redirect_port: int = 17223  # Preferred port for PKCE localhost redirect
     login_timeout_secs: int = 120
+
+    @property
+    def effective_server_url(self) -> str:
+        """Base URL for API calls. Falls back to deriving from auth_url."""
+        if self.server_url:
+            return self.server_url.rstrip("/")
+        if self.auth_url:
+            # "http://localhost:3000/api/auth" -> "http://localhost:3000"
+            from urllib.parse import urlparse
+            parsed = urlparse(self.auth_url)
+            return f"{parsed.scheme}://{parsed.netloc}"
+        return ""
 
 
 class Config(BaseSettings):
