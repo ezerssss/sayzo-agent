@@ -1,39 +1,40 @@
-"""System audio (loopback) capture via the `soundcard` library.
+"""System audio (loopback) capture via PyAudioWPatch (WASAPI loopback).
 
-On Windows this uses WASAPI loopback on the default output device.
-On macOS/Linux a virtual loopback device (e.g. BlackHole, PulseAudio monitor)
-must be selected by name.
+Uses the WASAPI loopback device corresponding to the default output speaker.
+Captures at the device's native sample rate (typically 48 kHz) and resamples
+to the pipeline's target rate (16 kHz) via scipy to avoid quality loss.
+
+To eliminate frame-boundary artifacts, we accumulate a larger chunk of audio
+at native rate (multiple pipeline frames worth), resample the whole chunk in
+one call, then slice the result into pipeline-sized frames. This avoids the
+discontinuities that per-frame resample_poly would produce.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import threading
-import warnings
+from math import gcd
 
 import numpy as np
+import pyaudiowpatch as pyaudio
+from scipy.signal import resample_poly
 
-# soundcard 0.4.x calls numpy.fromstring on a binary buffer, which raises in
-# numpy 2.x ("binary mode of fromstring is removed"). Unconditionally replace
-# it with frombuffer (same semantics for the byte-buffer use case).
-np.fromstring = np.frombuffer  # type: ignore[attr-defined]
-
-import soundcard as sc
-from soundcard import SoundcardRuntimeWarning
-
-# soundcard fires this every time WASAPI reports a timestamp gap. Under
-# steady-state load (heavy worker running STT/LLM) it can fire many times per
-# second; we already tolerate small loopback gaps, so silence the noise.
-warnings.filterwarnings("ignore", category=SoundcardRuntimeWarning)
+from . import normalize_rms
 
 log = logging.getLogger(__name__)
+
+# How many pipeline frames worth of audio to accumulate before resampling.
+# Larger = fewer boundary artifacts, but adds latency. 25 frames at 20 ms
+# = 500 ms chunks — good tradeoff between quality and responsiveness.
+_RESAMPLE_BATCH_FRAMES = 25
 
 
 class SystemCapture:
     """Captures mono PCM frames from the system output (loopback).
 
-    Runs the blocking soundcard recorder in a background thread and forwards
-    frames into an asyncio.Queue on the main loop.
+    Runs the blocking PyAudio stream in a background thread and forwards
+    resampled frames into an asyncio.Queue on the main loop.
     """
 
     def __init__(
@@ -51,49 +52,124 @@ class SystemCapture:
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
 
-    def _resolve_device(self):
+    def _find_loopback_device(self, pa: pyaudio.PyAudio) -> dict:
+        """Find the WASAPI loopback device for the default speakers."""
+        wasapi_info = pa.get_host_api_info_by_type(pyaudio.paWASAPI)
+        default_speakers = pa.get_device_info_by_index(
+            wasapi_info["defaultOutputDevice"]
+        )
+
         if self.device_name:
-            return sc.get_microphone(self.device_name, include_loopback=True)
-        # Default speaker's loopback companion mic
-        speaker = sc.default_speaker()
-        return sc.get_microphone(speaker.name, include_loopback=True)
+            target_name = self.device_name
+        else:
+            target_name = default_speakers["name"]
+
+        for i in range(pa.get_device_count()):
+            dev = pa.get_device_info_by_index(i)
+            if (
+                dev.get("isLoopbackDevice")
+                and target_name in dev["name"]
+            ):
+                return dev
+
+        raise RuntimeError(
+            f"No WASAPI loopback device found for '{target_name}'. "
+            f"Available devices: {[pa.get_device_info_by_index(i)['name'] for i in range(pa.get_device_count())]}"
+        )
 
     def _run(self) -> None:
+        pa = pyaudio.PyAudio()
         try:
-            mic = self._resolve_device()
+            loopback = self._find_loopback_device(pa)
         except Exception:
-            log.exception("failed to open system loopback device")
+            log.exception("failed to find system loopback device")
+            pa.terminate()
             return
-        log.info("system capture started: device=%s sr=%d", mic.name, self.sample_rate)
+
+        native_rate = int(loopback["defaultSampleRate"])
+        channels = max(1, int(loopback["maxInputChannels"]))
+
+        # Resampling parameters
+        g = gcd(native_rate, self.sample_rate)
+        up = self.sample_rate // g
+        down = native_rate // g
+        need_resample = native_rate != self.sample_rate
+
+        # We read a large chunk at native rate (multiple pipeline frames),
+        # resample the whole chunk once, then slice into pipeline frames.
+        # This eliminates the discontinuity artifacts that per-frame
+        # resample_poly would produce at every 20 ms boundary.
+        native_samples_per_frame = self.frame_samples * down // up
+        batch_native_samples = native_samples_per_frame * _RESAMPLE_BATCH_FRAMES
+
+        log.info(
+            "system capture started: device=%s native_sr=%d target_sr=%d channels=%d "
+            "(resample %d/%d, batch=%d frames)",
+            loopback["name"],
+            native_rate,
+            self.sample_rate,
+            channels,
+            up,
+            down,
+            _RESAMPLE_BATCH_FRAMES,
+        )
+
+        stream = None
         try:
-            # NOTE: do NOT pass blocksize=self.frame_samples here. Forcing a
-            # 20 ms WASAPI block size makes the loopback ring buffer tiny, so
-            # any jitter on this thread (e.g. when the heavy worker starts
-            # Whisper/Qwen) causes the OS to drop samples and spam
-            # SoundcardRuntimeWarning("data discontinuity in recording"). Let
-            # soundcard pick its default (much larger) block size; rec.record
-            # still returns exactly numframes samples regardless.
-            with mic.recorder(samplerate=self.sample_rate, channels=1) as rec:
-                while not self._stop.is_set():
-                    data = rec.record(numframes=self.frame_samples)
-                    if data.ndim == 2:
-                        data = data[:, 0]
-                    frame = data.astype(np.float32, copy=False).copy()
-                    if self._loop is None:
-                        continue
+            stream = pa.open(
+                format=pyaudio.paFloat32,
+                channels=channels,
+                rate=native_rate,
+                input=True,
+                input_device_index=loopback["index"],
+                frames_per_buffer=batch_native_samples,
+            )
+
+            while not self._stop.is_set():
+                raw = stream.read(batch_native_samples, exception_on_overflow=False)
+                samples = np.frombuffer(raw, dtype=np.float32)
+
+                # Downmix to mono
+                if channels > 1:
+                    samples = samples.reshape(-1, channels).mean(axis=1)
+
+                # Resample the whole batch at once — no boundary artifacts
+                if need_resample:
+                    samples = resample_poly(samples, up, down).astype(np.float32)
+
+                # Normalize the batch to a consistent RMS level so the
+                # transcriber sees uniform volume regardless of system volume.
+                samples = normalize_rms(samples)
+
+                # Slice into pipeline-sized frames and enqueue
+                if self._loop is None:
+                    continue
+                pos = 0
+                while pos + self.frame_samples <= len(samples):
+                    frame = samples[pos : pos + self.frame_samples]
+                    pos += self.frame_samples
                     try:
-                        self._loop.call_soon_threadsafe(self.queue.put_nowait, frame)
+                        self._loop.call_soon_threadsafe(
+                            self.queue.put_nowait, frame
+                        )
                     except asyncio.QueueFull:
                         log.warning("system queue full, dropping frame")
+
         except Exception:
             log.exception("system capture loop crashed")
         finally:
+            if stream is not None:
+                stream.stop_stream()
+                stream.close()
+            pa.terminate()
             log.info("system capture stopped")
 
     async def start(self) -> None:
         self._loop = asyncio.get_running_loop()
         self._stop.clear()
-        self._thread = threading.Thread(target=self._run, name="system-capture", daemon=True)
+        self._thread = threading.Thread(
+            target=self._run, name="system-capture", daemon=True
+        )
         self._thread.start()
 
     async def stop(self) -> None:

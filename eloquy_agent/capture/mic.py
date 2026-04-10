@@ -7,6 +7,8 @@ import logging
 import numpy as np
 import sounddevice as sd
 
+from . import normalize_rms
+
 log = logging.getLogger(__name__)
 
 
@@ -36,6 +38,7 @@ class MicCapture:
             log.debug("mic status: %s", status)
         # indata: (frames, channels) float32. We always use mono.
         mono = indata[:, 0].copy() if indata.ndim == 2 else indata.copy()
+        mono = normalize_rms(mono)
         if self._loop is None:
             return
         try:

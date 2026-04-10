@@ -15,3 +15,5 @@ eloquy-data/
 *.opus
 *.wav
 *.npy
+
+test_data/

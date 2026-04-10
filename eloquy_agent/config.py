@@ -93,6 +93,14 @@ class LLMConfig(BaseSettings):
     idle_unload_secs: float = 300.0
 
 
+class AuthConfig(BaseSettings):
+    auth_url: str = ""  # e.g. "https://auth.eloquy.com"
+    client_id: str = ""  # Public OAuth client ID (no secret — PKCE)
+    scopes: str = "offline_access upload"
+    redirect_port: int = 17223  # Preferred port for PKCE localhost redirect
+    login_timeout_secs: int = 120
+
+
 class Config(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="ELOQUY_",
@@ -114,6 +122,7 @@ class Config(BaseSettings):
     stt: STTConfig = Field(default_factory=STTConfig)
     speaker: SpeakerConfig = Field(default_factory=SpeakerConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
+    auth: AuthConfig = Field(default_factory=AuthConfig)
 
     @property
     def models_dir(self) -> Path:
@@ -126,6 +135,10 @@ class Config(BaseSettings):
     @property
     def voiceprint_path(self) -> Path:
         return self.data_dir / "voiceprint.npy"
+
+    @property
+    def auth_path(self) -> Path:
+        return self.data_dir / "auth.json"
 
     def ensure_dirs(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)

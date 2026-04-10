@@ -103,6 +103,47 @@ class RelevanceLLM:
             out.append(f"[{ln.start:7.2f}-{ln.end:7.2f}] {ln.speaker}: {ln.text}")
         return "\n".join(out)
 
+    # Reserve tokens for: system prompt, user prompt framing, and LLM output.
+    _RESERVED_TOKENS = 1200
+
+    def _truncate_transcript(
+        self, lines: list[TranscriptLine], max_tokens: int
+    ) -> tuple[list[TranscriptLine], bool]:
+        """Truncate transcript to fit within max_tokens, keeping start + end.
+
+        Returns (lines, was_truncated). When truncated, removes lines from
+        the middle so the LLM still sees how the conversation opened and
+        closed.
+        """
+        assert self._llm is not None
+        full_text = self._format_transcript(lines)
+        n_tokens = len(self._llm.tokenize(full_text.encode(), add_bos=False))
+        if n_tokens <= max_tokens:
+            return lines, False
+
+        # Binary search: keep first K and last K lines such that total fits.
+        lo, hi = 1, len(lines) // 2
+        best_k = 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            head = lines[:mid]
+            tail = lines[-mid:]
+            text = self._format_transcript(head) + "\n[... transcript trimmed ...]\n" + self._format_transcript(tail)
+            if len(self._llm.tokenize(text.encode(), add_bos=False)) <= max_tokens:
+                best_k = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+
+        head = lines[:best_k]
+        tail = lines[-best_k:]
+        trimmed = len(lines) - 2 * best_k
+        log.info(
+            "[llm] transcript truncated: %d lines -> %d+%d kept, %d removed from middle",
+            len(lines), best_k, best_k, trimmed,
+        )
+        return head + tail, True
+
     def judge(self, lines: list[TranscriptLine], total_duration: float) -> RelevanceVerdict:
         self._ensure_loaded()
         assert self._llm is not None
@@ -114,7 +155,16 @@ class RelevanceLLM:
         # very next session. Keep both.
         self._last_used = time.monotonic()
 
-        transcript_text = self._format_transcript(lines)
+        max_transcript_tokens = self.cfg.n_ctx - self._RESERVED_TOKENS
+        lines_for_llm, was_truncated = self._truncate_transcript(lines, max_transcript_tokens)
+        transcript_text = self._format_transcript(lines_for_llm)
+        if was_truncated:
+            # Insert marker so the LLM knows the middle was cut
+            head_end = len(lines_for_llm) // 2
+            head_text = self._format_transcript(lines_for_llm[:head_end])
+            tail_text = self._format_transcript(lines_for_llm[head_end:])
+            transcript_text = head_text + "\n[... middle of transcript trimmed for length ...]\n" + tail_text
+
         user_prompt = (
             f"Total duration: {total_duration:.1f}s\n\n"
             f"Transcript:\n{transcript_text}\n\n"

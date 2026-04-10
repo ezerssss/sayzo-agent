@@ -32,14 +32,20 @@ log = logging.getLogger(__name__)
 
 
 class Agent:
-    def __init__(self, config: Config, upload_client: Optional[UploadClient] = None) -> None:
+    def __init__(
+        self,
+        config: Config,
+        upload_client: Optional[UploadClient] = None,
+        mic_capture=None,
+        sys_capture=None,
+    ) -> None:
         self.cfg = config
-        self.mic = MicCapture(
+        self.mic = mic_capture or MicCapture(
             sample_rate=config.capture.sample_rate,
             frame_ms=config.capture.frame_ms,
             device=config.capture.mic_device,
         )
-        self.sys = SystemCapture(
+        self.sys = sys_capture or SystemCapture(
             sample_rate=config.capture.sample_rate,
             frame_ms=config.capture.frame_ms,
             device=config.capture.sys_device,
@@ -65,6 +71,7 @@ class Agent:
 
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="eloquy-heavy")
         self._stop = asyncio.Event()
+        self._processing_tasks: set[asyncio.Task] = set()
         self._heartbeat_last: float = 0.0
         self._captures_kept: int = 0
         self._captures_discarded: int = 0
@@ -88,7 +95,9 @@ class Agent:
             self._maybe_heartbeat(now)
             buffers = self.detector.take_closed_session()
             while buffers is not None:
-                asyncio.create_task(self._process_session(buffers))
+                task = asyncio.create_task(self._process_session(buffers))
+                self._processing_tasks.add(task)
+                task.add_done_callback(self._processing_tasks.discard)
                 buffers = self.detector.take_closed_session()
 
     def _maybe_heartbeat(self, now: float) -> None:
@@ -265,15 +274,23 @@ class Agent:
         sys_final = build_windowed_pcm(
             bytes(buffers.sys_pcm), speech_segs, pad_secs=pad, sample_rate=sr
         )
+
+        # Truncate trailing silence: cut both channels at the end of the
+        # last speech segment + pad. The session buffer includes up to
+        # joint_silence_close_secs of dead air at the tail — no reason to
+        # keep it on disk.
         full_secs = len(buffers.mic_pcm) / 2 / sr
-        kept_secs = sum(
-            min(s.end_ts + pad, full_secs) - max(0.0, s.start_ts - pad)
-            for s in speech_segs
-            if s.end_ts > s.start_ts
-        )
+        if speech_segs:
+            last_end = max(s.end_ts for s in speech_segs)
+            cut_sample = min(int((last_end + pad) * sr), len(mic_final) // 2)
+            cut_byte = cut_sample * 2
+            mic_final = mic_final[:cut_byte]
+            sys_final = sys_final[:cut_byte]
+
+        kept_secs = len(mic_final) / 2 / sr
         log.info(
-            "[sink] trimming dead air: %.1fs of speech regions out of %.1fs total",
-            min(kept_secs, full_secs),
+            "[sink] trimmed: %.1fs kept out of %.1fs total",
+            kept_secs,
             full_secs,
         )
 
@@ -397,6 +414,10 @@ class Agent:
             buffers = self.detector.take_closed_session()
             if buffers is not None:
                 await self._process_session(buffers)
+            # Wait for any in-flight _process_session tasks to finish
+            if self._processing_tasks:
+                log.info("[agent] waiting for %d in-flight session(s)...", len(self._processing_tasks))
+                await asyncio.gather(*self._processing_tasks, return_exceptions=True)
             self._executor.shutdown(wait=True)
             log.info("[agent] stopped")
 

@@ -107,14 +107,13 @@ These are the rules the conversation detector and gate logic encode. Several wer
 - **`conversation.py`** — Pure (no I/O, no models). State machine + gate. Unit-tested with synthetic VAD events. The most behavior-critical file in the project; treat changes here with care.
 - **`app.py`** — Async orchestrator. Wires capture → VAD → detector → heavy-worker pool → sink. All STT/embedding/LLM work runs on a single-worker `ThreadPoolExecutor` so heavy stages never run in parallel and starve the CPU. Capture + VAD run on the asyncio loop.
 - **`relevance.py`** — Loads Qwen lazily on first use, unloads after `idle_unload_secs` (default 5 min) to free ~2 GB of RAM during idle periods. The system prompt is the contract — modifying it changes the JSON shape downstream.
-- **`capture/system.py`** — Contains a numpy 2.x compatibility shim (`np.fromstring = np.frombuffer`) for the unmaintained `soundcard` package. Must be applied **before** `import soundcard`. Don't move the shim.
+- **`capture/system.py`** — Uses PyAudioWPatch for WASAPI loopback capture. Captures at the device's native sample rate (typically 48 kHz) and resamples to 16 kHz via scipy to avoid quality loss.
 - **`speaker.py`** — Greedy cosine clustering for other-speaker labels (avoids a sklearn dependency). Heavy imports (`resemblyzer`) are lazy so unit tests don't need them.
 
 ## Distribution caveats (future work)
 
 The current install is fragile by design — it's a dev install, not a distributable. If/when shipping to non-dev users:
 
-- `soundcard` is unmaintained and broken on numpy 2.x → replace with `pyaudiowpatch` (Windows) or platform-specific loopback.
 - `resemblyzer` forces source-build of `webrtcvad` → replace with a directly-loaded ONNX speaker encoder.
 - `llama-cpp-python` wheels are Python-version-fragile → bundle via PyInstaller/Nuitka instead of relying on pip.
 - Models are downloaded post-install via `huggingface_hub` (cached, idempotent) — this part is fine to keep.
