@@ -52,6 +52,7 @@ class _CallbackHandler(BaseHTTPRequestHandler):
 
     # Set by the outer flow before the server starts.
     auth_code: str | None = None
+    returned_state: str | None = None
     error: str | None = None
     _ready = threading.Event()
 
@@ -59,6 +60,7 @@ class _CallbackHandler(BaseHTTPRequestHandler):
         qs = parse_qs(urlparse(self.path).query)
         if "code" in qs:
             _CallbackHandler.auth_code = qs["code"][0]
+            _CallbackHandler.returned_state = qs.get("state", [None])[0]
         elif "error" in qs:
             _CallbackHandler.error = qs["error"][0]
         else:
@@ -94,6 +96,7 @@ async def pkce_flow(
     """
     # Reset handler state.
     _CallbackHandler.auth_code = None
+    _CallbackHandler.returned_state = None
     _CallbackHandler.error = None
     _CallbackHandler._ready.clear()
 
@@ -105,6 +108,7 @@ async def pkce_flow(
     port = httpd.server_address[1]
     redirect_uri = f"http://127.0.0.1:{port}/callback"
     verifier, challenge = _generate_verifier()
+    state = secrets.token_urlsafe(32)
 
     authorize_url = (
         f"{auth_url.rstrip('/')}/authorize"
@@ -114,6 +118,7 @@ async def pkce_flow(
         f"&code_challenge={challenge}"
         f"&code_challenge_method=S256"
         f"&scope={scopes}"
+        f"&state={state}"
     )
 
     # Start the callback server in a background thread.
@@ -136,6 +141,10 @@ async def pkce_flow(
         if _CallbackHandler.error:
             raise AuthenticationFailed(
                 f"Login failed: {_CallbackHandler.error}"
+            )
+        if _CallbackHandler.returned_state != state:
+            raise AuthenticationFailed(
+                "State mismatch in callback — possible CSRF attack"
             )
         code = _CallbackHandler.auth_code
         if not code:
