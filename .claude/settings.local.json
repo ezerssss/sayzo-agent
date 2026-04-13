@@ -1,8 +1,11 @@
 {
-    "permissions": {
-        "allow": ["Bash(.venv/Scripts/python -m pytest tests/ -q)"]
-    },
-    "env": {
-        "CLAUDE_CODE_USE_POWERSHELL_TOOL": "1"
-    }
+  "env": {
+    "CLAUDE_CODE_USE_POWERSHELL_TOOL": "1"
+  },
+  "permissions": {
+    "allow": [
+      "Bash(.venv/Scripts/python -m pytest tests/ -q)",
+      "WebSearch"
+    ]
+  }
 }

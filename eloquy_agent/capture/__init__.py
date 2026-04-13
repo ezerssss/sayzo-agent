@@ -25,3 +25,16 @@ def normalize_rms(audio: np.ndarray) -> np.ndarray:
     if 0.95 <= gain <= 1.05:
         return audio  # already at target, skip the multiply
     return np.clip(audio * gain, -1.0, 1.0).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Platform dispatch: export the right SystemCapture for the current OS.
+# ---------------------------------------------------------------------------
+import sys as _sys
+
+if _sys.platform == "darwin":
+    from .system_mac import SystemCapture as SystemCapture
+elif _sys.platform == "win32":
+    from .system_win import SystemCapture as SystemCapture
+else:
+    SystemCapture = None  # type: ignore[assignment]

@@ -11,7 +11,7 @@ from typing import Optional
 import numpy as np
 
 from .capture.mic import MicCapture
-from .capture.system import SystemCapture
+from .capture import SystemCapture
 from .config import Config
 from .conversation import (
     ConversationDetector,
@@ -333,19 +333,10 @@ class Agent:
 
         lines: list[TranscriptLine] = []
 
-        # Mic segments → user (or "other" if voiceprint mismatch)
+        # Mic segments → always "user". The mic is the user's own device;
+        # whatever it picks up is treated as the user's speech.
         for s in mic_segs:
-            speaker_tag = "user"
-            if self.speaker._voiceprint is not None:
-                pcm_slice = self._slice_pcm_float(mic_pcm, s.start, s.end, sr)
-                if pcm_slice.size > 0:
-                    try:
-                        emb = self.speaker.embed(pcm_slice)
-                        if not self.speaker.is_user(emb):
-                            speaker_tag = "other_unmic"
-                    except Exception:
-                        log.exception("speaker embed failed")
-            lines.append(TranscriptLine(speaker=speaker_tag, start=s.start, end=s.end, text=s.text))
+            lines.append(TranscriptLine(speaker="user", start=s.start, end=s.end, text=s.text))
 
         # System segments → other_N via greedy clustering on embeddings
         sys_embeds: list[np.ndarray] = []

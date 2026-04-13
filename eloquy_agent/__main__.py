@@ -136,25 +136,31 @@ def devices() -> None:
     _setup_logging(cfg.log_level, cfg.debug)
 
     import sounddevice as sd
-    import pyaudiowpatch as pyaudio
 
     click.echo("--- sounddevice (input) ---")
     for i, d in enumerate(sd.query_devices()):
         if d.get("max_input_channels", 0) > 0:
             click.echo(f"  [{i}] {d['name']} (in={d['max_input_channels']})")
 
-    click.echo("\n--- WASAPI loopback devices ---")
-    pa = pyaudio.PyAudio()
-    try:
-        for i in range(pa.get_device_count()):
-            dev = pa.get_device_info_by_index(i)
-            if dev.get("isLoopbackDevice"):
-                click.echo(f"  [{i}] {dev['name']} (sr={int(dev['defaultSampleRate'])} ch={dev['maxInputChannels']})")
-        wasapi_info = pa.get_host_api_info_by_type(pyaudio.paWASAPI)
-        default_out = pa.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
-        click.echo(f"\nDefault output: {default_out['name']}")
-    finally:
-        pa.terminate()
+    if sys.platform == "win32":
+        import pyaudiowpatch as pyaudio
+
+        click.echo("\n--- WASAPI loopback devices ---")
+        pa = pyaudio.PyAudio()
+        try:
+            for i in range(pa.get_device_count()):
+                dev = pa.get_device_info_by_index(i)
+                if dev.get("isLoopbackDevice"):
+                    click.echo(f"  [{i}] {dev['name']} (sr={int(dev['defaultSampleRate'])} ch={dev['maxInputChannels']})")
+            wasapi_info = pa.get_host_api_info_by_type(pyaudio.paWASAPI)
+            default_out = pa.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
+            click.echo(f"\nDefault output: {default_out['name']}")
+        finally:
+            pa.terminate()
+    elif sys.platform == "darwin":
+        click.echo("\n--- macOS system audio ---")
+        click.echo("  ScreenCaptureKit captures all system audio output.")
+        click.echo("  No device selection needed (all apps' audio is mixed).")
 
 
 @cli.command("test-capture")
@@ -167,7 +173,7 @@ def test_capture(seconds: int, dump_wav: bool) -> None:
 
     async def _run() -> None:
         from .capture.mic import MicCapture
-        from .capture.system import SystemCapture
+        from .capture import SystemCapture
 
         mic = MicCapture(cfg.capture.sample_rate, cfg.capture.frame_ms, cfg.capture.mic_device)
         sys_ = SystemCapture(cfg.capture.sample_rate, cfg.capture.frame_ms, cfg.capture.sys_device)
