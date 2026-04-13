@@ -1,8 +1,6 @@
 """Tests for cosine helper and greedy other-speaker clustering."""
 from __future__ import annotations
 
-from pathlib import Path
-
 import numpy as np
 
 from eloquy_agent.config import SpeakerConfig
@@ -18,20 +16,8 @@ def test_cosine_basics():
     assert _cosine(np.zeros(3), a) == 0.0
 
 
-def test_is_user_without_voiceprint_trusts_mic(tmp_path: Path):
-    sp = SpeakerIdentifier(SpeakerConfig(), tmp_path / "vp.npy")
-    assert sp.is_user(np.random.rand(256)) is True
-
-
-def test_is_user_threshold(tmp_path: Path):
-    sp = SpeakerIdentifier(SpeakerConfig(threshold=0.7), tmp_path / "vp.npy")
-    sp._voiceprint = np.array([1.0, 0.0, 0.0])
-    assert sp.is_user(np.array([1.0, 0.0, 0.0])) is True
-    assert sp.is_user(np.array([0.0, 1.0, 0.0])) is False
-
-
-def test_cluster_others_groups_similar(tmp_path: Path):
-    sp = SpeakerIdentifier(SpeakerConfig(max_other_speakers=4), tmp_path / "vp.npy")
+def test_cluster_others_groups_similar():
+    sp = SpeakerIdentifier(SpeakerConfig(max_other_speakers=4))
     a1 = np.array([1.0, 0.0, 0.0])
     a2 = np.array([0.99, 0.01, 0.0])
     b1 = np.array([0.0, 1.0, 0.0])
@@ -42,8 +28,8 @@ def test_cluster_others_groups_similar(tmp_path: Path):
     assert labels[0] != labels[1]
 
 
-def test_cluster_others_caps_at_max(tmp_path: Path):
-    sp = SpeakerIdentifier(SpeakerConfig(max_other_speakers=2), tmp_path / "vp.npy")
+def test_cluster_others_caps_at_max():
+    sp = SpeakerIdentifier(SpeakerConfig(max_other_speakers=2))
     embeds = [np.eye(4)[i] for i in range(4)]
     labels = sp.cluster_others(embeds, merge_threshold=0.99)
     assert max(labels) <= 1

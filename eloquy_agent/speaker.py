@@ -1,9 +1,7 @@
-"""Speaker enrollment, user-vs-other tagging, and other-side clustering."""
+"""Speaker embedding and other-side clustering."""
 from __future__ import annotations
 
 import logging
-from pathlib import Path
-from typing import Optional
 
 import numpy as np
 
@@ -21,11 +19,9 @@ def _cosine(a: np.ndarray, b: np.ndarray) -> float:
 
 
 class SpeakerIdentifier:
-    def __init__(self, cfg: SpeakerConfig, voiceprint_path: Path) -> None:
+    def __init__(self, cfg: SpeakerConfig) -> None:
         self.cfg = cfg
-        self.voiceprint_path = voiceprint_path
         self._encoder = None
-        self._voiceprint: Optional[np.ndarray] = None
 
     def _ensure_encoder(self):
         if self._encoder is not None:
@@ -34,34 +30,11 @@ class SpeakerIdentifier:
         self._encoder = VoiceEncoder()
         return self._encoder
 
-    def load_voiceprint(self) -> bool:
-        if self.voiceprint_path.exists():
-            self._voiceprint = np.load(self.voiceprint_path)
-            log.info("loaded voiceprint from %s", self.voiceprint_path)
-            return True
-        return False
-
-    def enroll(self, pcm_float32: np.ndarray) -> None:
-        encoder = self._ensure_encoder()
-        from resemblyzer import preprocess_wav  # lazy
-        wav = preprocess_wav(pcm_float32, source_sr=16000)
-        embed = encoder.embed_utterance(wav)
-        self.voiceprint_path.parent.mkdir(parents=True, exist_ok=True)
-        np.save(self.voiceprint_path, embed)
-        self._voiceprint = embed
-        log.info("voiceprint enrolled and saved to %s", self.voiceprint_path)
-
     def embed(self, pcm_float32: np.ndarray) -> np.ndarray:
         encoder = self._ensure_encoder()
         from resemblyzer import preprocess_wav
         wav = preprocess_wav(pcm_float32, source_sr=16000)
         return encoder.embed_utterance(wav)
-
-    def is_user(self, embed: np.ndarray) -> bool:
-        if self._voiceprint is None:
-            return True  # without enrollment, trust mic = user
-        sim = _cosine(embed, self._voiceprint)
-        return sim >= self.cfg.threshold
 
     def cluster_others(self, embeds: list[np.ndarray], merge_threshold: float = 0.75) -> list[int]:
         """Greedy online clustering by cosine similarity.

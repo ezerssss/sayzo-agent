@@ -1,0 +1,136 @@
+name: Build Installers
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # -----------------------------------------------------------------------
+  # Windows
+  # -----------------------------------------------------------------------
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          pip install llama-cpp-python \
+            --only-binary=llama-cpp-python \
+            --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+          pip install webrtcvad-wheels librosa
+          pip install resemblyzer --no-deps
+          pip install -e .
+          pip install pyinstaller
+
+      - name: Build with PyInstaller
+        run: pyinstaller eloquy-agent.spec
+
+      - name: Build NSIS installer
+        uses: joncloud/makensis-action@v4
+        with:
+          script-file: installer/windows/eloquy-agent.nsi
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: installer/windows/eloquy-agent-setup-*.exe
+
+      - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: installer/windows/eloquy-agent-setup-*.exe
+
+  # -----------------------------------------------------------------------
+  # macOS
+  # -----------------------------------------------------------------------
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile sck-tap Swift binary
+        run: |
+          cd eloquy_agent/capture/sck-tap
+          swiftc -O -o sck-tap main.swift \
+            -framework ScreenCaptureKit \
+            -framework CoreMedia \
+            -framework AVFoundation
+
+      - name: Install dependencies
+        run: |
+          pip install llama-cpp-python \
+            --only-binary=llama-cpp-python \
+            --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+          pip install webrtcvad-wheels librosa
+          pip install resemblyzer --no-deps
+          pip install -e .
+          pip install pyinstaller
+
+      - name: Build with PyInstaller
+        run: pyinstaller eloquy-agent.spec
+
+      - name: Sign app bundle
+        if: env.APPLE_DEVELOPER_ID != ''
+        env:
+          APPLE_DEVELOPER_ID: ${{ secrets.APPLE_DEVELOPER_ID }}
+        run: |
+          codesign --deep --force --options runtime \
+            --sign "$APPLE_DEVELOPER_ID" \
+            "dist/Eloquy Agent.app"
+
+      - name: Create DMG
+        run: |
+          VERSION=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          hdiutil create -volname "Eloquy Agent" \
+            -srcfolder "dist/Eloquy Agent.app" \
+            -ov -format UDZO \
+            "dist/Eloquy-Agent-${VERSION}.dmg"
+
+      - name: Sign DMG
+        if: env.APPLE_DEVELOPER_ID != ''
+        env:
+          APPLE_DEVELOPER_ID: ${{ secrets.APPLE_DEVELOPER_ID }}
+        run: |
+          codesign --sign "$APPLE_DEVELOPER_ID" dist/Eloquy-Agent-*.dmg
+
+      - name: Notarize
+        if: env.APPLE_ID != ''
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          xcrun notarytool submit dist/Eloquy-Agent-*.dmg \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --wait
+          xcrun stapler staple dist/Eloquy-Agent-*.dmg
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-installer
+          path: dist/Eloquy-Agent-*.dmg
+
+      - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/Eloquy-Agent-*.dmg

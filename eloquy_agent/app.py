@@ -64,13 +64,14 @@ class Agent:
         )
         self.detector = ConversationDetector(config.conversation, sample_rate=config.capture.sample_rate)
         self.stt = WhisperSTT(config.stt, models_dir=str(config.models_dir))
-        self.speaker = SpeakerIdentifier(config.speaker, voiceprint_path=config.voiceprint_path)
+        self.speaker = SpeakerIdentifier(config.speaker)
         self.llm = RelevanceLLM(config.llm, models_dir=config.models_dir)
         self.sink = CaptureSink(config.captures_dir)
         self.upload = upload_client or NoopUploadClient()
 
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="eloquy-heavy")
         self._stop = asyncio.Event()
+        self._paused = asyncio.Event()  # clear = running, set = paused
         self._processing_tasks: set[asyncio.Task] = set()
         self._heartbeat_last: float = 0.0
         self._captures_kept: int = 0
@@ -80,6 +81,9 @@ class Agent:
 
     async def _consume(self, source: str, queue: asyncio.Queue, vad: SileroVAD) -> None:
         while not self._stop.is_set():
+            if self._paused.is_set():
+                await asyncio.sleep(0.5)
+                continue
             frame: np.ndarray = await queue.get()
             now = time.monotonic()
             self.detector.on_frame(source, frame, now)
@@ -328,9 +332,6 @@ class Agent:
         sys_pcm: bytes,
         sr: int,
     ) -> list[TranscriptLine]:
-        # Load voiceprint if present
-        self.speaker.load_voiceprint()
-
         lines: list[TranscriptLine] = []
 
         # Mic segments → always "user". The mic is the user's own device;
@@ -351,9 +352,6 @@ class Agent:
                 emb = self.speaker.embed(pcm_slice)
             except Exception:
                 emb = np.zeros(256, dtype=np.float32)
-            # If user voice loops back through speakers, drop as duplicate
-            if self.speaker._voiceprint is not None and self.speaker.is_user(emb):
-                continue
             sys_embeds.append(emb)
             sys_keep_idx.append(i)
 
@@ -411,6 +409,14 @@ class Agent:
                 await asyncio.gather(*self._processing_tasks, return_exceptions=True)
             self._executor.shutdown(wait=True)
             log.info("[agent] stopped")
+
+    def pause(self) -> None:
+        self._paused.set()
+        log.info("[agent] paused")
+
+    def resume(self) -> None:
+        self._paused.clear()
+        log.info("[agent] resumed")
 
     def stop(self) -> None:
         self._stop.set()

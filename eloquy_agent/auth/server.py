@@ -46,7 +46,13 @@ class HttpAuthServer:
     """Concrete auth server client that calls HTTP endpoints."""
 
     def __init__(self, auth_url: str, client_id: str, scopes: str) -> None:
-        self._auth_url = auth_url.rstrip("/")
+        # Normalize: strip trailing slash, collapse any double slashes in path.
+        from urllib.parse import urlparse, urlunparse
+        parsed = urlparse(auth_url)
+        clean_path = "/".join(p for p in parsed.path.split("/") if p)
+        if clean_path:
+            clean_path = "/" + clean_path
+        self._auth_url = urlunparse(parsed._replace(path=clean_path))
         self._client_id = client_id
         self._scopes = scopes
 

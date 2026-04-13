@@ -9,9 +9,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 def default_data_dir() -> Path:
-    # Project-local directory in the current working directory.
+    # User-level directory under the home folder.  A background service has no
+    # meaningful cwd, so home-based is the only sane default.
     # Override with ELOQUY_DATA_DIR for a different location.
-    return Path.cwd() / "eloquy-data"
+    return Path.home() / ".eloquy" / "agent"
 
 
 class CaptureConfig(BaseSettings):
@@ -94,9 +95,9 @@ class LLMConfig(BaseSettings):
 
 
 class AuthConfig(BaseSettings):
-    auth_url: str = ""  # e.g. "https://eloquy.com/api/auth"
-    client_id: str = ""  # Public OAuth client ID (no secret — PKCE)
-    server_url: str = ""  # e.g. "https://eloquy.com" — base for all API calls
+    auth_url: str = "https://eloquy.threadlify.io/api/auth"
+    client_id: str = "eloquy-desktop"  # Public OAuth client ID (no secret — PKCE)
+    server_url: str = "https://eloquy.threadlify.io"
     scopes: str = "offline_access upload"
     redirect_port: int = 17223  # Preferred port for PKCE localhost redirect
     login_timeout_secs: int = 120
@@ -148,17 +149,22 @@ class Config(BaseSettings):
         return self.data_dir / "captures"
 
     @property
-    def voiceprint_path(self) -> Path:
-        return self.data_dir / "voiceprint.npy"
+    def logs_dir(self) -> Path:
+        return self.data_dir / "logs"
 
     @property
     def auth_path(self) -> Path:
         return self.data_dir / "auth.json"
 
+    @property
+    def pid_path(self) -> Path:
+        return self.data_dir / "agent.pid"
+
     def ensure_dirs(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.models_dir.mkdir(parents=True, exist_ok=True)
         self.captures_dir.mkdir(parents=True, exist_ok=True)
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
 
 
 def load_config() -> Config:

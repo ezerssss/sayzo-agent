@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import logging.handlers
+import os
 import signal
 import sys
 import time
@@ -21,7 +23,22 @@ def _setup_logging(level: str, debug: bool) -> None:
     )
 
 
-async def _do_login(cfg, no_browser: bool = False) -> None:
+def _setup_file_logging(logs_dir) -> None:
+    """Configure rotating file-based logging for the background service."""
+    log_file = logs_dir / "agent.log"
+    handler = logging.handlers.RotatingFileHandler(
+        log_file, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8",
+    )
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s.%(msecs)03d %(levelname)-5s %(name)s  %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    root = logging.getLogger()
+    root.setLevel(logging.WARNING)
+    root.addHandler(handler)
+
+
+async def _do_login(cfg, no_browser: bool = False, quiet: bool = False) -> None:
     """Run the login flow (PKCE primary, device code fallback)."""
     from .auth.device import device_code_flow
     from .auth.pkce import pkce_flow
@@ -45,11 +62,13 @@ async def _do_login(cfg, no_browser: bool = False) -> None:
                 timeout_secs=cfg.auth.login_timeout_secs,
             )
         except PKCEUnavailable:
-            click.echo("Browser login unavailable, falling back to device code...")
+            if not quiet:
+                click.echo("Browser login unavailable, falling back to device code...")
             tokens = await device_code_flow(server, timeout_secs=cfg.auth.login_timeout_secs)
 
     store.save(tokens)
-    click.echo("Login successful.")
+    if not quiet:
+        click.echo("Login successful.")
 
 
 @click.group()
@@ -57,79 +76,7 @@ def cli() -> None:
     """Eloquy local listening agent."""
 
 
-@cli.command()
-def setup() -> None:
-    """Download all required model weights (idempotent)."""
-    cfg = load_config()
-    _setup_logging(cfg.log_level, cfg.debug)
-    log = logging.getLogger("setup")
-
-    from huggingface_hub import hf_hub_download
-
-    # Whisper — faster-whisper downloads on first transcribe, but we can pre-warm
-    log.info("Whisper model %s will be fetched lazily on first transcription.", cfg.stt.model)
-
-    # Qwen GGUF
-    log.info("Downloading LLM weights: %s / %s", cfg.llm.repo_id, cfg.llm.filename)
-    path = hf_hub_download(
-        repo_id=cfg.llm.repo_id,
-        filename=cfg.llm.filename,
-        local_dir=str(cfg.models_dir),
-        local_dir_use_symlinks=False,
-    )
-    log.info("LLM ready at %s", path)
-
-    # First-run wizard: if not authenticated yet, run login → enroll.
-    from .auth.store import TokenStore
-
-    store = TokenStore(cfg.auth_path)
-    if not store.has_tokens():
-        click.echo()
-        click.echo("Welcome to Eloquy! Let's get you set up.")
-        click.echo()
-        if cfg.auth.auth_url and cfg.auth.client_id:
-            click.echo("Step 1/2: Log in to your Eloquy account.")
-            asyncio.run(_do_login(cfg))
-        else:
-            click.echo("Auth not configured — skipping login. Set ELOQUY_AUTH__AUTH_URL and ELOQUY_AUTH__CLIENT_ID.")
-
-        if not cfg.voiceprint_path.exists():
-            click.echo()
-            click.echo("Step 2/2: Record a voice sample so we can identify you.")
-            ctx = click.get_current_context()
-            ctx.invoke(enroll)
-        click.echo()
-
-    log.info("Setup complete.")
-
-
-@cli.command()
-@click.option("--seconds", default=10, help="Recording duration for enrollment.")
-def enroll(seconds: int) -> None:
-    """Record a voice sample to build the user's voiceprint."""
-    cfg = load_config()
-    _setup_logging(cfg.log_level, cfg.debug)
-    log = logging.getLogger("enroll")
-
-    import numpy as np
-    import sounddevice as sd
-
-    log.info("Recording %d seconds — please speak naturally...", seconds)
-    audio = sd.rec(
-        int(seconds * cfg.capture.sample_rate),
-        samplerate=cfg.capture.sample_rate,
-        channels=1,
-        dtype="float32",
-    )
-    sd.wait()
-    log.info("Recording done. Computing embedding...")
-    from .speaker import SpeakerIdentifier
-    sp = SpeakerIdentifier(cfg.speaker, cfg.voiceprint_path)
-    sp.enroll(audio[:, 0] if audio.ndim == 2 else audio)
-    log.info("Enrollment complete.")
-
-
-@cli.command()
+@cli.command(hidden=True)
 def devices() -> None:
     """List available mic and loopback devices."""
     cfg = load_config()
@@ -163,7 +110,7 @@ def devices() -> None:
         click.echo("  No device selection needed (all apps' audio is mixed).")
 
 
-@cli.command("test-capture")
+@cli.command("test-capture", hidden=True)
 @click.option("--seconds", default=10)
 @click.option("--dump-wav", is_flag=True, help="Save captured mic/system audio as WAV files for inspection.")
 def test_capture(seconds: int, dump_wav: bool) -> None:
@@ -216,7 +163,7 @@ def test_capture(seconds: int, dump_wav: bool) -> None:
     asyncio.run(_run())
 
 
-@cli.command()
+@cli.command(hidden=True)
 @click.argument("audio_file", type=click.Path(exists=True))
 @click.option("--speed", default=1.0, help="Playback speed multiplier. 0 = as fast as possible.")
 @click.option(
@@ -357,6 +304,110 @@ def logout() -> None:
     click.echo("Logged out.")
 
 
+@cli.command("first-run")
+@click.pass_context
+def first_run(ctx: click.Context) -> None:
+    """One-time setup: download models and log in."""
+    from rich.console import Console
+    from huggingface_hub import hf_hub_download
+
+    cfg = load_config()
+    _setup_logging(cfg.log_level, cfg.debug)
+    console = Console()
+
+    # Let Ctrl+C kill the process immediately.
+    ctx.resilient_parsing = True
+    signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
+
+    console.print()
+    console.print("[bold cyan]  Eloquy Agent Setup[/]")
+    console.print("[cyan]  ==================[/]")
+    console.print()
+
+    # Step 1: Download model
+    # Suppress noisy HTTP and huggingface_hub logs during download.
+    import warnings
+    warnings.filterwarnings("ignore", message=".*unauthenticated.*")
+    for noisy in ("httpx", "httpcore", "huggingface_hub", "filelock"):
+        logging.getLogger(noisy).setLevel(logging.ERROR)
+
+    model_path = cfg.models_dir / cfg.llm.filename
+    if model_path.exists():
+        console.print("  [green]Language model already downloaded.[/]")
+    else:
+        console.print("  Downloading language model...")
+        try:
+            hf_hub_download(
+                repo_id=cfg.llm.repo_id,
+                filename=cfg.llm.filename,
+                local_dir=str(cfg.models_dir),
+            )
+            console.print("  [green]Language model ready.[/]")
+        except KeyboardInterrupt:
+            console.print("\n  [yellow]Cancelled.[/]")
+            sys.exit(130)
+        except Exception as e:
+            console.print(f"  [red]Download failed: {e}[/]")
+            console.print("  Run [bold]eloquy-agent first-run[/] again to retry.")
+            sys.exit(1)
+
+    console.print()
+
+    # Step 2: Login
+    from .auth.store import TokenStore
+
+    store = TokenStore(cfg.auth_path)
+    if store.has_tokens():
+        console.print("  [green]Already logged in.[/]")
+    elif cfg.auth.auth_url and cfg.auth.client_id:
+        console.print("  Your browser will open to log in to Eloquy.")
+        console.print()
+        for i in range(3, 0, -1):
+            console.print(f"  Opening browser in [bold]{i}[/]...", end="\r")
+            time.sleep(1)
+        console.print("  Opening browser...           ")
+        console.print()
+
+        # Suppress noisy HTTP/auth logs during login.
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
+        logging.getLogger("eloquy_agent.auth").setLevel(logging.WARNING)
+
+        try:
+            asyncio.run(_do_login(cfg, quiet=True))
+            console.print("  [green]Login successful.[/]")
+        except KeyboardInterrupt:
+            console.print("\n  [yellow]Cancelled.[/]")
+            sys.exit(130)
+        except Exception as e:
+            console.print(f"  [yellow]Login skipped: {e}[/]")
+            console.print("  You can log in later with: [bold]eloquy-agent login[/]")
+    else:
+        console.print("  [dim]Auth not configured — skipping login.[/]")
+
+    # Step 3: Start the service in the background (if not already running)
+    from .pidfile import is_running
+
+    console.print()
+    if is_running(cfg.pid_path):
+        console.print("  [green]Eloquy Agent is already running.[/]")
+    else:
+        console.print("  Starting Eloquy Agent...")
+        import subprocess
+        exe = sys.executable
+        if getattr(sys, "frozen", False):
+            subprocess.Popen([exe, "service"], creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+        else:
+            flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            subprocess.Popen([exe, "-m", "eloquy_agent", "service"], creationflags=flags)
+        console.print("  [green]Eloquy Agent is now running in the background.[/]")
+
+    console.print()
+    console.print("  [bold green]Setup complete![/]")
+    console.print("  The agent will start automatically on login.")
+    console.print()
+
+
 @cli.command()
 def run() -> None:
     """Run the listening agent (foreground, verbose terminal output)."""
@@ -405,6 +456,93 @@ def run() -> None:
         asyncio.run(_main())
     except KeyboardInterrupt:
         pass
+
+
+@cli.command()
+def service() -> None:
+    """Run the agent as a background service (no terminal output, file logging)."""
+    cfg = load_config()
+    _setup_file_logging(cfg.logs_dir)
+    log = logging.getLogger("service")
+
+    from .pidfile import is_running, write_pid, remove_pid
+
+    if is_running(cfg.pid_path):
+        log.warning("service already running, exiting")
+        return
+
+    write_pid(cfg.pid_path)
+    log.warning("eloquy-agent service starting (pid=%d)", os.getpid())
+
+    from .auth.store import TokenStore
+    from .gui.tray import TrayIcon, TrayState, Status
+
+    upload_client = None
+    store = TokenStore(cfg.auth_path)
+    if store.has_tokens() and cfg.auth.effective_server_url:
+        from .auth.client import AuthenticatedClient
+        from .auth.server import HttpAuthServer
+        from .upload import AuthenticatedUploadClient
+
+        auth_server = HttpAuthServer(cfg.auth.auth_url, cfg.auth.client_id, cfg.auth.scopes)
+        store = TokenStore(cfg.auth_path, auth_server=auth_server)
+        client = AuthenticatedClient(cfg.auth.effective_server_url, store)
+        upload_client = AuthenticatedUploadClient(client, cfg.captures_dir)
+        log.warning("uploads enabled → %s", cfg.auth.effective_server_url)
+
+    from .app import Agent
+
+    tray_state = TrayState()
+    tray = TrayIcon(tray_state, cfg.captures_dir)
+    tray.start()
+
+    agent = Agent(cfg, upload_client=upload_client)
+
+    async def _main() -> None:
+        loop = asyncio.get_running_loop()
+
+        def _handle_stop() -> None:
+            log.warning("shutdown requested")
+            tray.stop()
+            agent.stop()
+
+        try:
+            loop.add_signal_handler(signal.SIGINT, _handle_stop)
+            loop.add_signal_handler(signal.SIGTERM, _handle_stop)
+        except NotImplementedError:
+            pass
+
+        # Windows: Task Scheduler sends SIGBREAK (Ctrl+Break) on stop.
+        if sys.platform == "win32":
+            signal.signal(signal.SIGBREAK, lambda *_: _handle_stop())
+
+        # Poll the tray thread for pause/resume/quit signals.
+        async def _tray_bridge() -> None:
+            was_paused = False
+            while not agent._stop.is_set():
+                await asyncio.sleep(0.5)
+                if tray_state.quit_event.is_set():
+                    _handle_stop()
+                    return
+                paused = tray_state.pause_event.is_set()
+                if paused and not was_paused:
+                    agent.pause()
+                elif not paused and was_paused:
+                    agent.resume()
+                was_paused = paused
+                tray.update()
+
+        asyncio.create_task(_tray_bridge())
+        await agent.run()
+
+    try:
+        asyncio.run(_main())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        tray.stop()
+        remove_pid(cfg.pid_path)
+        log.warning("eloquy-agent service stopped")
 
 
 if __name__ == "__main__":

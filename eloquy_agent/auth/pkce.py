@@ -128,12 +128,18 @@ async def pkce_flow(
     try:
         opened = webbrowser.open(authorize_url)
         if opened:
-            click.echo("Opening browser for login...")
+            log.info("browser opened for login")
         else:
             click.echo(f"Open this URL in your browser to log in:\n\n  {authorize_url}\n")
 
-        # Wait for the callback.
-        got_response = _CallbackHandler._ready.wait(timeout=timeout_secs)
+        # Wait for the callback.  Poll in short intervals so Ctrl+C
+        # actually interrupts on Windows (Event.wait swallows KeyboardInterrupt).
+        deadline = __import__("time").monotonic() + timeout_secs
+        got_response = False
+        while __import__("time").monotonic() < deadline:
+            if _CallbackHandler._ready.wait(timeout=0.5):
+                got_response = True
+                break
         if not got_response:
             raise AuthenticationFailed(
                 f"Login timed out after {timeout_secs}s. Try again."
