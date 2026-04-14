@@ -17,3 +17,5 @@ eloquy-data/
 *.npy
 
 test_data/
+installer/**/*.exe
+installer/**/*.dmg

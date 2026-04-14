@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Eloquy Agent — macOS one-liner installer
-# Usage: curl -fsSL https://eloquy.com/install.sh | bash
+# Usage: curl -fsSL https://eloquy.threadlify.io/releases/macos/install.sh | bash
 #
 # Downloads the DMG, installs the .app, sets up launchd auto-start,
 # and launches first-run setup.
@@ -10,7 +10,7 @@ set -euo pipefail
 VERSION="0.1.0"
 ARCH=$(uname -m)  # x86_64 or arm64
 DMG_NAME="Eloquy-Agent-${VERSION}.dmg"
-DOWNLOAD_URL="https://github.com/eloquy/agent/releases/download/v${VERSION}/${DMG_NAME}"
+DOWNLOAD_URL="https://eloquy.threadlify.io/releases/macos/${DMG_NAME}"
 APP_NAME="Eloquy Agent"
 APP_PATH="/Applications/${APP_NAME}.app"
 PLIST_NAME="com.eloquy.agent.plist"

@@ -4,6 +4,8 @@
 
 !include "MUI2.nsh"
 !include "nsDialogs.nsh"
+!include "WinMessages.nsh"
+!include "WordFunc.nsh"
 
 ; ---------------------------------------------------------------------------
 ; Configuration
@@ -13,7 +15,7 @@
 !define PRODUCT_PUBLISHER "Eloquy"
 !define PRODUCT_VERSION "0.1.0"
 !define PRODUCT_EXE "eloquy-agent.exe"
-!define INSTALL_DIR "$PROGRAMFILES\Eloquy\Agent"
+!define INSTALL_DIR "$PROGRAMFILES64\Eloquy\Agent"
 !define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}"
 
 Name "${PRODUCT_NAME} ${PRODUCT_VERSION}"
@@ -41,10 +43,12 @@ Section "Install"
 
     ; Copy the entire PyInstaller bundle directory.
     ; The NSIS script must be invoked from the repo root where dist/eloquy-agent/ exists.
-    File /r "dist\eloquy-agent\*.*"
+    File /r "..\..\dist\eloquy-agent\*.*"
 
     ; Add install dir to user PATH so `eloquy-agent` works from any terminal.
-    EnVar::AddValue "PATH" "$INSTDIR"
+    ReadRegStr $0 HKCU "Environment" "Path"
+    WriteRegStr HKCU "Environment" "Path" "$0;$INSTDIR"
+    SendMessage ${HWND_BROADCAST} ${WM_WININICHANGE} 0 "STR:Environment" /TIMEOUT=5000
 
     ; Create Task Scheduler entry: run at login, hidden, restart on failure.
     ; /SC ONLOGON: trigger at user login
@@ -80,7 +84,11 @@ Section "Uninstall"
     nsExec::ExecToLog 'schtasks /Delete /TN "Eloquy Agent" /F'
 
     ; Remove PATH entry.
-    EnVar::DeleteValue "PATH" "$INSTDIR"
+    ReadRegStr $0 HKCU "Environment" "Path"
+    ${WordReplace} $0 ";$INSTDIR" "" "+*" $0
+    ${WordReplace} $0 "$INSTDIR" "" "+*" $0
+    WriteRegStr HKCU "Environment" "Path" "$0"
+    SendMessage ${HWND_BROADCAST} ${WM_WININICHANGE} 0 "STR:Environment" /TIMEOUT=5000
 
     ; Remove Start Menu shortcuts.
     RMDir /r "$SMPROGRAMS\${PRODUCT_NAME}"

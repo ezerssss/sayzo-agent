@@ -1,5 +1,5 @@
 # Eloquy Agent — Windows one-liner installer
-# Usage: irm https://eloquy.com/install.ps1 | iex
+# Usage: irm https://eloquy.threadlify.io/releases/windows/install.ps1 | iex
 #
 # Downloads the NSIS installer, runs it silently, then launches first-run setup.
 
@@ -8,7 +8,7 @@ $ErrorActionPreference = "Stop"
 $version = "0.1.0"
 $arch = if ([System.Environment]::Is64BitOperatingSystem) { "x64" } else { "x86" }
 $installerName = "eloquy-agent-setup-${version}.exe"
-$downloadUrl = "https://github.com/eloquy/agent/releases/download/v${version}/${installerName}"
+$downloadUrl = "https://eloquy.threadlify.io/releases/windows/${installerName}"
 $tempDir = Join-Path $env:TEMP "eloquy-install"
 $installerPath = Join-Path $tempDir $installerName
 
@@ -50,7 +50,7 @@ $exePath = Join-Path $env:ProgramFiles "Eloquy\Agent\eloquy-agent.exe"
 if (Test-Path $exePath) {
     Write-Host ""
     Write-Host "  Launching first-time setup..." -ForegroundColor Cyan
-    Start-Process -FilePath $exePath -ArgumentList "first-run"
+    & $exePath first-run
 } else {
     Write-Host "  Warning: Could not find $exePath" -ForegroundColor Yellow
     Write-Host "  Run 'eloquy-agent first-run' manually to complete setup." -ForegroundColor Yellow
