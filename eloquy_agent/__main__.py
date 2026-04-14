@@ -394,12 +394,24 @@ def first_run(ctx: click.Context) -> None:
     else:
         console.print("  Starting Eloquy Agent...")
         import subprocess
+        from pathlib import Path
         exe = sys.executable
-        if getattr(sys, "frozen", False):
-            subprocess.Popen([exe, "service"], creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+        popen_kwargs = {}
+        if sys.platform == "win32":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
         else:
-            flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-            subprocess.Popen([exe, "-m", "eloquy_agent", "service"], creationflags=flags)
+            # Detach from the installer shell so closing Terminal doesn't SIGHUP the service.
+            popen_kwargs["start_new_session"] = True
+        if getattr(sys, "frozen", False):
+            # On Windows, prefer the sibling windowless service exe so no
+            # console window appears in the background.
+            if sys.platform == "win32":
+                service_exe = Path(exe).parent / "eloquy-agent-service.exe"
+                if service_exe.exists():
+                    exe = str(service_exe)
+            subprocess.Popen([exe, "service"], **popen_kwargs)
+        else:
+            subprocess.Popen([exe, "-m", "eloquy_agent", "service"], **popen_kwargs)
         console.print("  [green]Eloquy Agent is now running in the background.[/]")
 
     console.print()

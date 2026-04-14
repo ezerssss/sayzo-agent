@@ -15,6 +15,7 @@
 !define PRODUCT_PUBLISHER "Eloquy"
 !define PRODUCT_VERSION "0.1.0"
 !define PRODUCT_EXE "eloquy-agent.exe"
+!define SERVICE_EXE "eloquy-agent-service.exe"
 !define INSTALL_DIR "$PROGRAMFILES64\Eloquy\Agent"
 !define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}"
 
@@ -51,14 +52,16 @@ Section "Install"
     SendMessage ${HWND_BROADCAST} ${WM_WININICHANGE} 0 "STR:Environment" /TIMEOUT=5000
 
     ; Create Task Scheduler entry: run at login, hidden, restart on failure.
+    ; Points at the windowless service exe so no console window pops up.
     ; /SC ONLOGON: trigger at user login
     ; /RL HIGHEST: run with highest privileges (needed for WASAPI on some systems)
     ; /F: force overwrite if exists
-    nsExec::ExecToLog 'schtasks /Create /TN "Eloquy Agent" /TR "\"$INSTDIR\${PRODUCT_EXE}\" service" /SC ONLOGON /RL HIGHEST /F'
+    nsExec::ExecToLog 'schtasks /Create /TN "Eloquy Agent" /TR "\"$INSTDIR\${SERVICE_EXE}\" service" /SC ONLOGON /RL HIGHEST /F'
 
-    ; Start Menu shortcut
+    ; Start Menu shortcut — also uses the windowless exe so clicking it doesn't
+    ; pop a terminal. The console exe stays available on PATH for CLI use.
     CreateDirectory "$SMPROGRAMS\${PRODUCT_NAME}"
-    CreateShortCut "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME}.lnk" "$INSTDIR\${PRODUCT_EXE}" "service"
+    CreateShortCut "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME}.lnk" "$INSTDIR\${SERVICE_EXE}" "service"
     CreateShortCut "$SMPROGRAMS\${PRODUCT_NAME}\Uninstall.lnk" "$INSTDIR\uninstall.exe"
 
     ; Write uninstall information to registry.

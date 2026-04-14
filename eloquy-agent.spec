@@ -131,14 +131,36 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    console=True,  # Needs console for first-run, login, --help. Service hides via Task Scheduler.
+    console=True,  # CLI: needs a console for first-run, login, --help.
     disable_windowed_traceback=False,
     argv_emulation=False,
     icon=None,  # TODO: add app icon
 )
 
+# Windows: build a second, windowless exe for the background service so Task
+# Scheduler can launch it at login without popping a console window. The CLI
+# exe above is still needed for interactive commands (first-run, login, etc.).
+collect_targets = [exe]
+if sys.platform == "win32":
+    exe_service = EXE(
+        pyz,
+        a.scripts,
+        [],
+        exclude_binaries=True,
+        name="eloquy-agent-service",
+        debug=False,
+        bootloader_ignore_signals=False,
+        strip=False,
+        upx=True,
+        console=False,
+        disable_windowed_traceback=False,
+        argv_emulation=False,
+        icon=None,
+    )
+    collect_targets.append(exe_service)
+
 coll = COLLECT(
-    exe,
+    *collect_targets,
     a.binaries,
     a.zipfiles,
     a.datas,
