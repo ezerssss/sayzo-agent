@@ -6,15 +6,15 @@ from __future__ import annotations
 
 import numpy as np
 
-from eloquy_agent.config import ConversationConfig
-from eloquy_agent.conversation import (
+from sayzo_agent.config import ConversationConfig
+from sayzo_agent.conversation import (
     ConversationDetector,
     SessionState,
     build_windowed_pcm,
     evaluate_user_turn_gate,
     merge_close_segments,
 )
-from eloquy_agent.models import SessionCloseReason, SpeechSegment
+from sayzo_agent.models import SessionCloseReason, SpeechSegment
 
 
 def _cfg(**overrides) -> ConversationConfig:

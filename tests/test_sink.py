@@ -3,8 +3,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from eloquy_agent.models import ConversationRecord, TranscriptLine
-from eloquy_agent.sink import deserialize_record, serialize_record
+from sayzo_agent.models import ConversationRecord, TranscriptLine
+from sayzo_agent.sink import deserialize_record, serialize_record
 
 
 def test_record_roundtrip():

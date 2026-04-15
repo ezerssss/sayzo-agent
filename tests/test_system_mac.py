@@ -14,7 +14,7 @@ import pytest
 
 # Import the module directly (not via __init__ dispatch) so we can test it on
 # any platform without triggering the platform guard.
-from eloquy_agent.capture.system_mac import (
+from sayzo_agent.capture.system_mac import (
     SystemCapture,
     _EXIT_PERMISSION_DENIED,
     _NATIVE_RATE,
@@ -118,11 +118,11 @@ def cap() -> SystemCapture:
 class TestFindBinary:
     def test_raises_when_not_found(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
-            "eloquy_agent.capture.system_mac.Path",
+            "sayzo_agent.capture.system_mac.Path",
             lambda *a: tmp_path / "nonexistent",
         )
         monkeypatch.setattr(
-            "eloquy_agent.capture.system_mac.shutil.which",
+            "sayzo_agent.capture.system_mac.shutil.which",
             lambda _: None,
         )
         with pytest.raises(FileNotFoundError, match="sck-tap binary not found"):
@@ -135,7 +135,7 @@ class TestStartPermissionDenied:
         proc = FastExitProc(exit_code=_EXIT_PERMISSION_DENIED)
 
         with patch(
-            "eloquy_agent.capture.system_mac._find_sck_tap", return_value="/fake/sck-tap"
+            "sayzo_agent.capture.system_mac._find_sck_tap", return_value="/fake/sck-tap"
         ), patch(
             "asyncio.create_subprocess_exec", return_value=proc
         ):
@@ -147,7 +147,7 @@ class TestStartPermissionDenied:
         proc = FastExitProc(exit_code=1)
 
         with patch(
-            "eloquy_agent.capture.system_mac._find_sck_tap", return_value="/fake/sck-tap"
+            "sayzo_agent.capture.system_mac._find_sck_tap", return_value="/fake/sck-tap"
         ), patch(
             "asyncio.create_subprocess_exec", return_value=proc
         ):
@@ -163,7 +163,7 @@ class TestReader:
         proc = FakeProc(stdout_data=pcm)
 
         with patch(
-            "eloquy_agent.capture.system_mac._find_sck_tap", return_value="/fake/sck-tap"
+            "sayzo_agent.capture.system_mac._find_sck_tap", return_value="/fake/sck-tap"
         ), patch(
             "asyncio.create_subprocess_exec", return_value=proc
         ):
@@ -190,7 +190,7 @@ class TestReader:
         proc = FakeProc(stdout_data=pcm)
 
         with patch(
-            "eloquy_agent.capture.system_mac._find_sck_tap", return_value="/fake/sck-tap"
+            "sayzo_agent.capture.system_mac._find_sck_tap", return_value="/fake/sck-tap"
         ), patch(
             "asyncio.create_subprocess_exec", return_value=proc
         ):
@@ -213,7 +213,7 @@ class TestReader:
         proc = FakeProc(stdout_data=pcm)
 
         with patch(
-            "eloquy_agent.capture.system_mac._find_sck_tap", return_value="/fake/sck-tap"
+            "sayzo_agent.capture.system_mac._find_sck_tap", return_value="/fake/sck-tap"
         ), patch(
             "asyncio.create_subprocess_exec", return_value=proc
         ):
@@ -235,7 +235,7 @@ class TestStop:
         proc = FakeProc(stdout_data=pcm)
 
         with patch(
-            "eloquy_agent.capture.system_mac._find_sck_tap", return_value="/fake/sck-tap"
+            "sayzo_agent.capture.system_mac._find_sck_tap", return_value="/fake/sck-tap"
         ), patch(
             "asyncio.create_subprocess_exec", return_value=proc
         ):

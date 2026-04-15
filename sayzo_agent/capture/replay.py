@@ -5,9 +5,9 @@ Stereo files: channel 0 → mic, channel 1 → system.
 Mono files: same audio feeds both mic and system queues.
 
 Usage:
-    eloquy-agent replay conversation.wav
-    eloquy-agent replay conversation.wav --speed 4
-    eloquy-agent replay conversation.wav --speed 0   # as fast as possible
+    sayzo-agent replay conversation.wav
+    sayzo-agent replay conversation.wav --speed 4
+    sayzo-agent replay conversation.wav --speed 0   # as fast as possible
 """
 from __future__ import annotations
 

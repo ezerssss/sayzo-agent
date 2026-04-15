@@ -73,7 +73,7 @@ class TokenStore:
             tokens = self._load()
             if tokens is None:
                 raise AuthenticationRequired(
-                    "Not authenticated. Run `eloquy-agent login`."
+                    "Not authenticated. Run `sayzo-agent login`."
                 )
             if not tokens.is_expired:
                 return tokens.access_token
@@ -81,7 +81,7 @@ class TokenStore:
             # Try refreshing.
             if self._server is None:
                 raise AuthenticationRequired(
-                    "Token expired. Run `eloquy-agent login`."
+                    "Token expired. Run `sayzo-agent login`."
                 )
             try:
                 new_tokens = await self._server.refresh_token(tokens.refresh_token)
@@ -90,5 +90,5 @@ class TokenStore:
             except Exception:
                 log.warning("token refresh failed")
                 raise AuthenticationRequired(
-                    "Session expired. Run `eloquy-agent login`."
+                    "Session expired. Run `sayzo-agent login`."
                 )

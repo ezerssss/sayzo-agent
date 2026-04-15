@@ -11,7 +11,7 @@ venv/
 .mypy_cache/
 .ruff_cache/
 captures/
-eloquy-data/
+sayzo-data/
 *.opus
 *.wav
 *.npy

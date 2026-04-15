@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "eloquy-agent"
+name = "sayzo-agent"
 version = "0.1.0"
-description = "Local 24/7 listening agent for Eloquy — captures real conversations the user participates in for downstream English-coaching analysis."
+description = "Local 24/7 listening agent for Sayzo — captures real conversations the user participates in for downstream English-coaching analysis."
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.26",
@@ -41,10 +41,10 @@ dev = [
 ]
 
 [project.scripts]
-eloquy-agent = "eloquy_agent.__main__:cli"
+sayzo-agent = "sayzo_agent.__main__:cli"
 
 [tool.setuptools.packages.find]
-include = ["eloquy_agent*"]
+include = ["sayzo_agent*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

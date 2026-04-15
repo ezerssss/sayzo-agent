@@ -69,7 +69,7 @@ class Agent:
         self.sink = CaptureSink(config.captures_dir)
         self.upload = upload_client or NoopUploadClient()
 
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="eloquy-heavy")
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sayzo-heavy")
         self._stop = asyncio.Event()
         self._paused = asyncio.Event()  # clear = running, set = paused
         self._processing_tasks: set[asyncio.Task] = set()
@@ -160,7 +160,7 @@ class Agent:
 
         loop = asyncio.get_running_loop()
 
-        # 2a. Language probe on the mic stream. Eloquy is English-only, so if
+        # 2a. Language probe on the mic stream. Sayzo is English-only, so if
         # the user was confidently speaking another language we bail now
         # rather than burn CPU transcribing nonsense (Whisper forced to
         # English on e.g. Tagalog produces hallucinated English). Set

@@ -1,10 +1,10 @@
-# Eloquy Server Captures Spec — Context for Implementation
+# Sayzo Server Captures Spec — Context for Implementation
 
-> **What this is:** A spec for the capture upload and processing pipeline that the Eloquy desktop agent expects. Drop this into the Claude session working on your Next.js app so it implements the correct server-side routes and processing.
+> **What this is:** A spec for the capture upload and processing pipeline that the Sayzo desktop agent expects. Drop this into the Claude session working on your Next.js app so it implements the correct server-side routes and processing.
 
 ## Background
 
-Eloquy has a **local Python agent** that runs 24/7 on the user's machine. It captures real English conversations the user participates in (meetings, calls, etc.), transcribes them locally, filters out noise (YouTube, music, monologues), and uploads the kept captures to the server. The server's job is to:
+Sayzo has a **local Python agent** that runs 24/7 on the user's machine. It captures real English conversations the user participates in (meetings, calls, etc.), transcribes them locally, filters out noise (YouTube, music, monologues), and uploads the kept captures to the server. The server's job is to:
 
 1. Receive and store the raw capture (audio + transcript)
 2. Re-transcribe with a better model (the agent uses Whisper small on CPU — good enough for filtering, not for coaching)
@@ -103,7 +103,7 @@ The agent sends a JSON-serialized `ConversationRecord` with this exact shape:
 
 | Label | Meaning |
 |---|---|
-| `"user"` | Audio from the microphone that matched the user's enrolled voiceprint. This is the Eloquy user — the person being coached. |
+| `"user"` | Audio from the microphone that matched the user's enrolled voiceprint. This is the Sayzo user — the person being coached. |
 | `"other_unmic"` | Audio from the microphone that did NOT match the user's voiceprint. This means someone else was physically near the mic (e.g., in-person meeting). |
 | `"other_1"`, `"other_2"`, ... | Audio from the system stream (other side of a call). Speakers are clustered by voice similarity, up to 4 distinct speakers. |
 
@@ -546,12 +546,12 @@ At 5 captures/day per user: ~$0.50 - $2.25/day = ~$15 - $68/month per active use
 1. Start your Next.js dev server
 2. On the agent side, ensure `.env` has:
    ```
-   ELOQUY_AUTH__AUTH_URL=http://localhost:3000/api/auth
-   ELOQUY_AUTH__CLIENT_ID=eloquy-desktop
-   ELOQUY_AUTH__SERVER_URL=http://localhost:3000
+   SAYZO_AUTH__AUTH_URL=http://localhost:3000/api/auth
+   SAYZO_AUTH__CLIENT_ID=sayzo-desktop
+   SAYZO_AUTH__SERVER_URL=http://localhost:3000
    ```
-3. Run `eloquy-agent login` (or the setup wizard)
-4. Run `eloquy-agent run` and trigger a conversation (or use `eloquy-agent replay some_audio.wav`)
+3. Run `sayzo-agent login` (or the setup wizard)
+4. Run `sayzo-agent run` and trigger a conversation (or use `sayzo-agent replay some_audio.wav`)
 5. The agent should POST to `/api/captures/upload` after the conversation closes
 6. Check Firestore: a document should appear in `users/{uid}/captures/` with `status: "queued"`
 7. Check Cloud Storage: `captures/{uid}/{capture_id}/audio.opus` should exist

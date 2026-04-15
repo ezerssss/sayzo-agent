@@ -4,11 +4,11 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.eloquy.agent</string>
+    <string>com.sayzo.agent</string>
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Applications/Eloquy Agent.app/Contents/MacOS/eloquy-agent</string>
+        <string>/Applications/Sayzo Agent.app/Contents/MacOS/sayzo-agent</string>
         <string>service</string>
     </array>
 
@@ -19,10 +19,10 @@
     <true/>
 
     <key>StandardOutPath</key>
-    <string>/tmp/eloquy-agent-stdout.log</string>
+    <string>/tmp/sayzo-agent-stdout.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/tmp/eloquy-agent-stderr.log</string>
+    <string>/tmp/sayzo-agent-stderr.log</string>
 
     <key>ProcessType</key>
     <string>Background</string>

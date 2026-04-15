@@ -118,9 +118,9 @@ class TrayIcon:
         self._current_status = status
         self._icon.icon = _make_icon(status)
         if status == Status.ERROR and error_msg:
-            self._icon.title = f"Eloquy Agent — {error_msg}"
+            self._icon.title = f"Sayzo Agent — {error_msg}"
         else:
-            self._icon.title = f"Eloquy Agent — {status.value.replace('_', ' ').title()}"
+            self._icon.title = f"Sayzo Agent — {status.value.replace('_', ' ').title()}"
 
     def stop(self) -> None:
         """Stop the tray icon."""
@@ -171,9 +171,9 @@ class TrayIcon:
         )
 
         self._icon = pystray.Icon(
-            name="eloquy-agent",
+            name="sayzo-agent",
             icon=_make_icon(status),
-            title=f"Eloquy Agent — {status.value.replace('_', ' ').title()}",
+            title=f"Sayzo Agent — {status.value.replace('_', ' ').title()}",
             menu=menu,
         )
 

@@ -37,7 +37,7 @@ async def device_code_flow(
             f"[bold]Open this URL and enter the code:[/bold]\n\n"
             f"  [link={url}]{url}[/link]\n\n"
             f"  Code: [bold cyan]{resp.user_code}[/bold cyan]",
-            title="Eloquy Login",
+            title="Sayzo Login",
             expand=False,
         )
     )

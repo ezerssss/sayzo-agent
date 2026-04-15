@@ -1,10 +1,10 @@
-# Eloquy Server Auth Spec — Context for Implementation
+# Sayzo Server Auth Spec — Context for Implementation
 
-> **What this is:** A spec for the auth endpoints that the Eloquy desktop agent (Python CLI) expects. Drop this into the Claude session working on your Next.js app so it implements the correct server-side routes.
+> **What this is:** A spec for the auth endpoints that the Sayzo desktop agent (Python CLI) expects. Drop this into the Claude session working on your Next.js app so it implements the correct server-side routes.
 
 ## Background
 
-Eloquy has a **local Python agent** that runs on the user's machine, captures English conversations, and uploads transcripts + audio to the server. The agent authenticates via **OAuth 2.0 PKCE** (browser-based login). The server needs to act as a thin OAuth layer backed by **Firebase Auth with Google provider**.
+Sayzo has a **local Python agent** that runs on the user's machine, captures English conversations, and uploads transcripts + audio to the server. The agent authenticates via **OAuth 2.0 PKCE** (browser-based login). The server needs to act as a thin OAuth layer backed by **Firebase Auth with Google provider**.
 
 The agent is already implemented. The server endpoints below are what the agent calls. Do not change the endpoint contracts — implement them exactly as specified.
 
@@ -239,8 +239,8 @@ lib/
 
 Once implemented, the Python agent is configured with:
 ```
-ELOQUY_AUTH__AUTH_URL=https://your-domain.com/api/auth
-ELOQUY_AUTH__CLIENT_ID=eloquy-desktop
+SAYZO_AUTH__AUTH_URL=https://your-domain.com/api/auth
+SAYZO_AUTH__CLIENT_ID=sayzo-desktop
 ```
 
 The CLI appends `/authorize` and `/token` to `AUTH_URL`. So if your routes are at `/api/auth/authorize` and `/api/auth/token`, set AUTH_URL to `https://your-domain.com/api/auth`.
@@ -262,9 +262,9 @@ To test end-to-end:
 1. Start your Next.js dev server
 2. On the Python agent side, set:
    ```
-   ELOQUY_AUTH__AUTH_URL=http://localhost:3000/api/auth
-   ELOQUY_AUTH__CLIENT_ID=eloquy-desktop
+   SAYZO_AUTH__AUTH_URL=http://localhost:3000/api/auth
+   SAYZO_AUTH__CLIENT_ID=sayzo-desktop
    ```
-3. Run `eloquy-agent login`
+3. Run `sayzo-agent login`
 4. Browser should open, you sign in with Google, browser redirects to localhost, CLI prints "Login successful."
-5. Check `eloquy-data/auth.json` — should contain access_token, refresh_token, expires_at.
+5. Check `sayzo-data/auth.json` — should contain access_token, refresh_token, expires_at.

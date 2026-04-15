@@ -47,7 +47,7 @@ class AuthenticatedClient:
                 resp = await client.request(method, path, headers=headers, **kwargs)
             if resp.status_code == 401:
                 raise AuthenticationRequired(
-                    "Server rejected credentials. Run `eloquy-agent login`."
+                    "Server rejected credentials. Run `sayzo-agent login`."
                 )
 
         return resp

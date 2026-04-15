@@ -1,10 +1,10 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller spec for Eloquy Agent.
+"""PyInstaller spec for Sayzo Agent.
 
 Build:
-    pyinstaller eloquy-agent.spec
+    pyinstaller sayzo-agent.spec
 
-This produces a one-directory bundle under dist/eloquy-agent/ containing the
+This produces a one-directory bundle under dist/sayzo-agent/ containing the
 main executable plus all dependencies.  The platform installer (NSIS on Windows,
 DMG on macOS) wraps this directory for end-user distribution.
 """
@@ -12,6 +12,19 @@ import sys
 from pathlib import Path
 
 block_cipher = None
+
+# ---------------------------------------------------------------------------
+# App icon — Sayzo logo. .ico on Windows, .icns on macOS.
+# The .icns is generated at build time in the macOS CI job from logo.png
+# (see .github/workflows/build.yml) so it does not need to live in git.
+# ---------------------------------------------------------------------------
+
+if sys.platform == "win32":
+    app_icon = "installer/assets/logo.ico"
+elif sys.platform == "darwin":
+    app_icon = "installer/assets/logo.icns"
+else:
+    app_icon = None
 
 # ---------------------------------------------------------------------------
 # Data files to bundle
@@ -28,9 +41,9 @@ if silero_onnx.exists():
 
 # macOS: bundle the pre-compiled sck-tap binary.
 if sys.platform == "darwin":
-    sck_tap = Path("eloquy_agent/capture/sck-tap/sck-tap")
+    sck_tap = Path("sayzo_agent/capture/sck-tap/sck-tap")
     if sck_tap.exists():
-        datas.append((str(sck_tap), "eloquy_agent/capture/sck-tap"))
+        datas.append((str(sck_tap), "sayzo_agent/capture/sck-tap"))
 
 # ---------------------------------------------------------------------------
 # Hidden imports — modules loaded lazily or via importlib that PyInstaller
@@ -126,7 +139,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="eloquy-agent",
+    name="sayzo-agent",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -134,7 +147,7 @@ exe = EXE(
     console=True,  # CLI: needs a console for first-run, login, --help.
     disable_windowed_traceback=False,
     argv_emulation=False,
-    icon=None,  # TODO: add app icon
+    icon=app_icon,
 )
 
 # Windows: build a second, windowless exe for the background service so Task
@@ -147,7 +160,7 @@ if sys.platform == "win32":
         a.scripts,
         [],
         exclude_binaries=True,
-        name="eloquy-agent-service",
+        name="sayzo-agent-service",
         debug=False,
         bootloader_ignore_signals=False,
         strip=False,
@@ -155,7 +168,7 @@ if sys.platform == "win32":
         console=False,
         disable_windowed_traceback=False,
         argv_emulation=False,
-        icon=None,
+        icon=app_icon,
     )
     collect_targets.append(exe_service)
 
@@ -167,7 +180,7 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name="eloquy-agent",
+    name="sayzo-agent",
 )
 
 # ---------------------------------------------------------------------------
@@ -177,18 +190,18 @@ coll = COLLECT(
 if sys.platform == "darwin":
     app = BUNDLE(
         coll,
-        name="Eloquy Agent.app",
-        icon=None,  # TODO: installer/macos/icon.icns
-        bundle_identifier="com.eloquy.agent",
+        name="Sayzo Agent.app",
+        icon=app_icon,
+        bundle_identifier="com.sayzo.agent",
         info_plist={
             "CFBundleShortVersionString": "0.1.0",
             "LSUIElement": True,  # hide from Dock (tray-only background app)
             "NSMicrophoneUsageDescription": (
-                "Eloquy needs microphone access to capture your "
+                "Sayzo needs microphone access to capture your "
                 "conversations for English coaching."
             ),
             "NSAppleEventsUsageDescription": (
-                "Eloquy needs Screen Recording access to capture system audio."
+                "Sayzo needs Screen Recording access to capture system audio."
             ),
         },
     )

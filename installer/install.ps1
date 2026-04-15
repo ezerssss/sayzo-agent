@@ -1,5 +1,5 @@
-# Eloquy Agent — Windows one-liner installer
-# Usage: irm https://eloquy.threadlify.io/releases/windows/install.ps1 | iex
+# Sayzo Agent — Windows one-liner installer
+# Usage: irm https://sayzo.app/releases/windows/install.ps1 | iex
 #
 # Downloads the NSIS installer, runs it silently, then launches first-run setup.
 
@@ -7,14 +7,14 @@ $ErrorActionPreference = "Stop"
 
 $version = "0.1.0"
 $arch = if ([System.Environment]::Is64BitOperatingSystem) { "x64" } else { "x86" }
-$installerName = "eloquy-agent-setup-${version}.exe"
-$downloadUrl = "https://eloquy.threadlify.io/releases/windows/${installerName}"
-$tempDir = Join-Path $env:TEMP "eloquy-install"
+$installerName = "sayzo-agent-setup-${version}.exe"
+$downloadUrl = "https://sayzo.app/releases/windows/${installerName}"
+$tempDir = Join-Path $env:TEMP "sayzo-install"
 $installerPath = Join-Path $tempDir $installerName
 
 Write-Host ""
-Write-Host "  Eloquy Agent Installer" -ForegroundColor Cyan
-Write-Host "  ======================" -ForegroundColor Cyan
+Write-Host "  Sayzo Agent Installer" -ForegroundColor Cyan
+Write-Host "  =====================" -ForegroundColor Cyan
 Write-Host ""
 
 # Create temp directory.
@@ -23,7 +23,7 @@ if (-not (Test-Path $tempDir)) {
 }
 
 # Download installer.
-Write-Host "  Downloading Eloquy Agent v${version}..." -ForegroundColor White
+Write-Host "  Downloading Sayzo Agent v${version}..." -ForegroundColor White
 try {
     Invoke-WebRequest -Uri $downloadUrl -OutFile $installerPath -UseBasicParsing
 } catch {
@@ -46,16 +46,16 @@ Write-Host "  Installed successfully." -ForegroundColor Green
 Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
 
 # Launch first-run setup.
-$exePath = Join-Path $env:ProgramFiles "Eloquy\Agent\eloquy-agent.exe"
+$exePath = Join-Path $env:ProgramFiles "Sayzo\Agent\sayzo-agent.exe"
 if (Test-Path $exePath) {
     Write-Host ""
     Write-Host "  Launching first-time setup..." -ForegroundColor Cyan
     & $exePath first-run
 } else {
     Write-Host "  Warning: Could not find $exePath" -ForegroundColor Yellow
-    Write-Host "  Run 'eloquy-agent first-run' manually to complete setup." -ForegroundColor Yellow
+    Write-Host "  Run 'sayzo-agent first-run' manually to complete setup." -ForegroundColor Yellow
 }
 
 Write-Host ""
-Write-Host "  Done! Eloquy Agent will start automatically on login." -ForegroundColor Green
+Write-Host "  Done! Sayzo Agent will start automatically on login." -ForegroundColor Green
 Write-Host ""

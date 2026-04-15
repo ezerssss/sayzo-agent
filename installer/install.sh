@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Eloquy Agent — macOS one-liner installer
-# Usage: curl -fsSL https://eloquy.threadlify.io/releases/macos/install.sh | bash
+# Sayzo Agent — macOS one-liner installer
+# Usage: curl -fsSL https://sayzo.app/releases/macos/install.sh | bash
 #
 # Downloads the DMG, installs the .app, sets up launchd auto-start,
 # and launches first-run setup.
@@ -9,12 +9,12 @@ set -euo pipefail
 
 VERSION="0.1.0"
 ARCH=$(uname -m)  # x86_64 or arm64
-DMG_NAME="Eloquy-Agent-${VERSION}.dmg"
-DOWNLOAD_URL="https://eloquy.threadlify.io/releases/macos/${DMG_NAME}"
-APP_NAME="Eloquy Agent"
+DMG_NAME="Sayzo-Agent-${VERSION}.dmg"
+DOWNLOAD_URL="https://sayzo.app/releases/macos/${DMG_NAME}"
+APP_NAME="Sayzo Agent"
 APP_PATH="/Applications/${APP_NAME}.app"
-PLIST_NAME="com.eloquy.agent.plist"
-PLIST_SRC_URL="https://raw.githubusercontent.com/eloquy/agent/main/installer/macos/${PLIST_NAME}"
+PLIST_NAME="com.sayzo.agent.plist"
+PLIST_SRC_URL="https://raw.githubusercontent.com/ezerssss/sayzo-agent/main/installer/macos/${PLIST_NAME}"
 LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
 TMPDIR_INSTALL=$(mktemp -d)
 
@@ -28,14 +28,14 @@ cleanup() {
 trap cleanup EXIT
 
 echo ""
-echo "  Eloquy Agent Installer"
-echo "  ======================"
+echo "  Sayzo Agent Installer"
+echo "  ====================="
 echo ""
 
 # -----------------------------------------------------------------------
 # Download DMG
 # -----------------------------------------------------------------------
-echo "  Downloading Eloquy Agent v${VERSION} (${ARCH})..."
+echo "  Downloading Sayzo Agent v${VERSION} (${ARCH})..."
 DMG_PATH="${TMPDIR_INSTALL}/${DMG_NAME}"
 if ! curl -fSL -o "$DMG_PATH" "$DOWNLOAD_URL"; then
     echo "  Download failed." >&2
@@ -79,10 +79,10 @@ cat > "$PLIST_PATH" << 'PLIST_EOF'
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.eloquy.agent</string>
+    <string>com.sayzo.agent</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Applications/Eloquy Agent.app/Contents/MacOS/eloquy-agent</string>
+        <string>/Applications/Sayzo Agent.app/Contents/MacOS/sayzo-agent</string>
         <string>service</string>
     </array>
     <key>RunAtLoad</key>
@@ -90,9 +90,9 @@ cat > "$PLIST_PATH" << 'PLIST_EOF'
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/tmp/eloquy-agent-stdout.log</string>
+    <string>/tmp/sayzo-agent-stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/eloquy-agent-stderr.log</string>
+    <string>/tmp/sayzo-agent-stderr.log</string>
     <key>ProcessType</key>
     <string>Background</string>
 </dict>
@@ -106,7 +106,7 @@ echo "  Launchd plist installed at ${PLIST_PATH}"
 # -----------------------------------------------------------------------
 echo ""
 echo "  Launching first-time setup..."
-"${APP_PATH}/Contents/MacOS/eloquy-agent" first-run
+"${APP_PATH}/Contents/MacOS/sayzo-agent" first-run
 
 # -----------------------------------------------------------------------
 # Load the launchd service
@@ -114,5 +114,5 @@ echo "  Launching first-time setup..."
 launchctl load "$PLIST_PATH"
 
 echo ""
-echo "  Done! Eloquy Agent will start automatically on login."
+echo "  Done! Sayzo Agent will start automatically on login."
 echo ""

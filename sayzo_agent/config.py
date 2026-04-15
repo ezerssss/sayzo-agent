@@ -1,4 +1,4 @@
-"""Configuration loaded from ~/.eloquy/agent/config.toml with env overrides."""
+"""Configuration loaded from ~/.sayzo/agent/config.toml with env overrides."""
 from __future__ import annotations
 
 import os
@@ -11,8 +11,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 def default_data_dir() -> Path:
     # User-level directory under the home folder.  A background service has no
     # meaningful cwd, so home-based is the only sane default.
-    # Override with ELOQUY_DATA_DIR for a different location.
-    return Path.home() / ".eloquy" / "agent"
+    # Override with SAYZO_DATA_DIR for a different location.
+    return Path.home() / ".sayzo" / "agent"
 
 
 class CaptureConfig(BaseSettings):
@@ -67,7 +67,7 @@ class STTConfig(BaseSettings):
     model: str = "small"
     compute_type: str = "int8"
     device: str = "cpu"
-    # Force English transcription. Eloquy is an English coaching platform, so
+    # Force English transcription. Sayzo is an English coaching platform, so
     # auto-detection is both unnecessary and actively harmful — Whisper-small
     # frequently misidentifies accented-but-correct English as Tagalog/Malay/
     # Indonesian and then "transcribes" nonsense. Set to None to re-enable
@@ -95,9 +95,9 @@ class LLMConfig(BaseSettings):
 
 
 class AuthConfig(BaseSettings):
-    auth_url: str = "https://eloquy.threadlify.io/api/auth"
-    client_id: str = "eloquy-desktop"  # Public OAuth client ID (no secret — PKCE)
-    server_url: str = "https://eloquy.threadlify.io"
+    auth_url: str = "https://sayzo.app/api/auth"
+    client_id: str = "sayzo-desktop"  # Public OAuth client ID (no secret — PKCE)
+    server_url: str = "https://sayzo.app"
     scopes: str = "offline_access upload"
     redirect_port: int = 17223  # Preferred port for PKCE localhost redirect
     login_timeout_secs: int = 120
@@ -117,7 +117,7 @@ class AuthConfig(BaseSettings):
 
 class Config(BaseSettings):
     model_config = SettingsConfigDict(
-        env_prefix="ELOQUY_",
+        env_prefix="SAYZO_",
         env_nested_delimiter="__",
         env_file=".env",
         env_file_encoding="utf-8",
@@ -129,7 +129,7 @@ class Config(BaseSettings):
     debug: bool = False
     # Periodic "still alive" status line emitted by the main loop so the user
     # can see at a glance whether the agent is idle, in a session, etc. Set
-    # to 0 to disable. Override via ELOQUY_HEARTBEAT_SECS.
+    # to 0 to disable. Override via SAYZO_HEARTBEAT_SECS.
     heartbeat_secs: float = 30.0
 
     capture: CaptureConfig = Field(default_factory=CaptureConfig)

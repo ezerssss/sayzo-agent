@@ -18,9 +18,9 @@ from .models import TranscriptLine
 log = logging.getLogger(__name__)
 
 
-SYSTEM_PROMPT = """You are a strict JSON classifier for the Eloquy English coaching platform.
+SYSTEM_PROMPT = """You are a strict JSON classifier for the Sayzo English coaching platform.
 
-You receive a transcript of a conversation captured from a user's machine. The transcript has speaker tags ("user" = the Eloquy user being coached; "other_1", "other_2", ... = other participants).
+You receive a transcript of a conversation captured from a user's machine. The transcript has speaker tags ("user" = the Sayzo user being coached; "other_1", "other_2", ... = other participants).
 
 Your job: decide whether this conversation contains learnable data about the *user's* professional spoken English.
 
@@ -80,7 +80,7 @@ class RelevanceLLM:
         path = self._model_path()
         if not path.exists():
             raise FileNotFoundError(
-                f"LLM weights not found at {path}. Run `eloquy-agent setup` first."
+                f"LLM weights not found at {path}. Run `sayzo-agent setup` first."
             )
         log.info("loading LLM %s (n_ctx=%d)", path.name, self.cfg.n_ctx)
         self._llm = Llama(

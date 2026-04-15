@@ -8,7 +8,7 @@ same asyncio queue interface that :class:`system_win.SystemCapture` provides.
 
 The Swift binary must be compiled separately on a Mac::
 
-    cd eloquy_agent/capture/sck-tap
+    cd sayzo_agent/capture/sck-tap
     swiftc -O -o sck-tap main.swift \\
         -framework ScreenCaptureKit -framework CoreMedia -framework AVFoundation
 
@@ -58,7 +58,7 @@ def _find_sck_tap() -> str:
 
     raise FileNotFoundError(
         "sck-tap binary not found.  Compile it on macOS with:\n"
-        "  cd eloquy_agent/capture/sck-tap\n"
+        "  cd sayzo_agent/capture/sck-tap\n"
         "  swiftc -O -o sck-tap main.swift "
         "-framework ScreenCaptureKit -framework CoreMedia "
         "-framework AVFoundation"

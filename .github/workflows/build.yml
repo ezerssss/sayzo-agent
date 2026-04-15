@@ -33,7 +33,7 @@ jobs:
           pip install pyinstaller
 
       - name: Build with PyInstaller
-        run: pyinstaller eloquy-agent.spec
+        run: pyinstaller sayzo-agent.spec
 
       - name: Install NSIS
         run: choco install nsis -y
@@ -41,19 +41,19 @@ jobs:
       - name: Build NSIS installer
         run: |
           $env:PATH += ";C:\Program Files (x86)\NSIS"
-          makensis installer\windows\eloquy-agent.nsi
+          makensis installer\windows\sayzo-agent.nsi
 
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
         with:
           name: windows-installer
-          path: installer/windows/eloquy-agent-setup-*.exe
+          path: installer/windows/sayzo-agent-setup-*.exe
 
       - name: Upload to release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: installer/windows/eloquy-agent-setup-*.exe
+          files: installer/windows/sayzo-agent-setup-*.exe
 
   # -----------------------------------------------------------------------
   # macOS
@@ -69,11 +69,23 @@ jobs:
 
       - name: Compile sck-tap Swift binary
         run: |
-          cd eloquy_agent/capture/sck-tap
+          cd sayzo_agent/capture/sck-tap
           swiftc -O -o sck-tap main.swift \
             -framework ScreenCaptureKit \
             -framework CoreMedia \
             -framework AVFoundation
+
+      - name: Generate logo.icns from logo.png
+        run: |
+          cd installer/assets
+          mkdir -p logo.iconset
+          for size in 16 32 64 128 256 512; do
+            sips -z $size $size logo.png --out "logo.iconset/icon_${size}x${size}.png"
+            double=$((size * 2))
+            sips -z $double $double logo.png --out "logo.iconset/icon_${size}x${size}@2x.png"
+          done
+          iconutil -c icns logo.iconset -o logo.icns
+          rm -rf logo.iconset
 
       - name: Install dependencies
         run: |
@@ -86,7 +98,7 @@ jobs:
           pip install pyinstaller
 
       - name: Build with PyInstaller
-        run: pyinstaller eloquy-agent.spec
+        run: pyinstaller sayzo-agent.spec
 
       - name: Sign app bundle
         if: env.APPLE_DEVELOPER_ID != ''
@@ -95,22 +107,22 @@ jobs:
         run: |
           codesign --deep --force --options runtime \
             --sign "$APPLE_DEVELOPER_ID" \
-            "dist/Eloquy Agent.app"
+            "dist/Sayzo Agent.app"
 
       - name: Create DMG
         run: |
           VERSION=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
-          hdiutil create -volname "Eloquy Agent" \
-            -srcfolder "dist/Eloquy Agent.app" \
+          hdiutil create -volname "Sayzo Agent" \
+            -srcfolder "dist/Sayzo Agent.app" \
             -ov -format UDZO \
-            "dist/Eloquy-Agent-${VERSION}.dmg"
+            "dist/Sayzo-Agent-${VERSION}.dmg"
 
       - name: Sign DMG
         if: env.APPLE_DEVELOPER_ID != ''
         env:
           APPLE_DEVELOPER_ID: ${{ secrets.APPLE_DEVELOPER_ID }}
         run: |
-          codesign --sign "$APPLE_DEVELOPER_ID" dist/Eloquy-Agent-*.dmg
+          codesign --sign "$APPLE_DEVELOPER_ID" dist/Sayzo-Agent-*.dmg
 
       - name: Notarize
         if: env.APPLE_ID != ''
@@ -119,21 +131,21 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         run: |
-          xcrun notarytool submit dist/Eloquy-Agent-*.dmg \
+          xcrun notarytool submit dist/Sayzo-Agent-*.dmg \
             --apple-id "$APPLE_ID" \
             --team-id "$APPLE_TEAM_ID" \
             --password "$APPLE_APP_PASSWORD" \
             --wait
-          xcrun stapler staple dist/Eloquy-Agent-*.dmg
+          xcrun stapler staple dist/Sayzo-Agent-*.dmg
 
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v4
         with:
           name: macos-installer
-          path: dist/Eloquy-Agent-*.dmg
+          path: dist/Sayzo-Agent-*.dmg
 
       - name: Upload to release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/Eloquy-Agent-*.dmg
+          files: dist/Sayzo-Agent-*.dmg

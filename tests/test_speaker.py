@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from eloquy_agent.config import SpeakerConfig
-from eloquy_agent.speaker import SpeakerIdentifier, _cosine
+from sayzo_agent.config import SpeakerConfig
+from sayzo_agent.speaker import SpeakerIdentifier, _cosine
 
 
 def test_cosine_basics():

@@ -1,4 +1,4 @@
-"""CLI entrypoint for the Eloquy local listening agent."""
+"""CLI entrypoint for the Sayzo local listening agent."""
 from __future__ import annotations
 
 import asyncio
@@ -73,7 +73,7 @@ async def _do_login(cfg, no_browser: bool = False, quiet: bool = False) -> None:
 
 @click.group()
 def cli() -> None:
-    """Eloquy local listening agent."""
+    """Sayzo local listening agent."""
 
 
 @cli.command(hidden=True)
@@ -184,10 +184,10 @@ def replay(audio_file: str, speed: float, channel: str, dump_wav: bool) -> None:
     Mono files: routed by --channel (default: both).
 
     Examples:\b
-        eloquy-agent replay conversation.wav
-        eloquy-agent replay conversation.wav --speed 4
-        eloquy-agent replay conversation.wav --channel mic
-        eloquy-agent replay call.mp3 --channel system --speed 0
+        sayzo-agent replay conversation.wav
+        sayzo-agent replay conversation.wav --speed 4
+        sayzo-agent replay conversation.wav --channel mic
+        sayzo-agent replay call.mp3 --channel system --speed 0
     """
     cfg = load_config()
     _setup_logging(cfg.log_level, cfg.debug)
@@ -282,12 +282,12 @@ def replay(audio_file: str, speed: float, channel: str, dump_wav: bool) -> None:
 @cli.command()
 @click.option("--no-browser", is_flag=True, help="Use device code flow instead of browser redirect.")
 def login(no_browser: bool) -> None:
-    """Authenticate with the Eloquy server."""
+    """Authenticate with the Sayzo server."""
     cfg = load_config()
     _setup_logging(cfg.log_level, cfg.debug)
 
     if not cfg.auth.auth_url or not cfg.auth.client_id:
-        click.echo("Auth not configured. Set ELOQUY_AUTH__AUTH_URL and ELOQUY_AUTH__CLIENT_ID.")
+        click.echo("Auth not configured. Set SAYZO_AUTH__AUTH_URL and SAYZO_AUTH__CLIENT_ID.")
         sys.exit(1)
 
     asyncio.run(_do_login(cfg, no_browser))
@@ -320,8 +320,8 @@ def first_run(ctx: click.Context) -> None:
     signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
 
     console.print()
-    console.print("[bold cyan]  Eloquy Agent Setup[/]")
-    console.print("[cyan]  ==================[/]")
+    console.print("[bold cyan]  Sayzo Agent Setup[/]")
+    console.print("[cyan]  =================[/]")
     console.print()
 
     # Step 1: Download model
@@ -348,7 +348,7 @@ def first_run(ctx: click.Context) -> None:
             sys.exit(130)
         except Exception as e:
             console.print(f"  [red]Download failed: {e}[/]")
-            console.print("  Run [bold]eloquy-agent first-run[/] again to retry.")
+            console.print("  Run [bold]sayzo-agent first-run[/] again to retry.")
             sys.exit(1)
 
     console.print()
@@ -360,7 +360,7 @@ def first_run(ctx: click.Context) -> None:
     if store.has_tokens():
         console.print("  [green]Already logged in.[/]")
     elif cfg.auth.auth_url and cfg.auth.client_id:
-        console.print("  Your browser will open to log in to Eloquy.")
+        console.print("  Your browser will open to log in to Sayzo.")
         console.print()
         for i in range(3, 0, -1):
             console.print(f"  Opening browser in [bold]{i}[/]...", end="\r")
@@ -371,7 +371,7 @@ def first_run(ctx: click.Context) -> None:
         # Suppress noisy HTTP/auth logs during login.
         logging.getLogger("httpx").setLevel(logging.WARNING)
         logging.getLogger("httpcore").setLevel(logging.WARNING)
-        logging.getLogger("eloquy_agent.auth").setLevel(logging.WARNING)
+        logging.getLogger("sayzo_agent.auth").setLevel(logging.WARNING)
 
         try:
             asyncio.run(_do_login(cfg, quiet=True))
@@ -381,7 +381,7 @@ def first_run(ctx: click.Context) -> None:
             sys.exit(130)
         except Exception as e:
             console.print(f"  [yellow]Login skipped: {e}[/]")
-            console.print("  You can log in later with: [bold]eloquy-agent login[/]")
+            console.print("  You can log in later with: [bold]sayzo-agent login[/]")
     else:
         console.print("  [dim]Auth not configured — skipping login.[/]")
 
@@ -390,9 +390,9 @@ def first_run(ctx: click.Context) -> None:
 
     console.print()
     if is_running(cfg.pid_path):
-        console.print("  [green]Eloquy Agent is already running.[/]")
+        console.print("  [green]Sayzo Agent is already running.[/]")
     else:
-        console.print("  Starting Eloquy Agent...")
+        console.print("  Starting Sayzo Agent...")
         import subprocess
         from pathlib import Path
         exe = sys.executable
@@ -406,13 +406,13 @@ def first_run(ctx: click.Context) -> None:
             # On Windows, prefer the sibling windowless service exe so no
             # console window appears in the background.
             if sys.platform == "win32":
-                service_exe = Path(exe).parent / "eloquy-agent-service.exe"
+                service_exe = Path(exe).parent / "sayzo-agent-service.exe"
                 if service_exe.exists():
                     exe = str(service_exe)
             subprocess.Popen([exe, "service"], **popen_kwargs)
         else:
-            subprocess.Popen([exe, "-m", "eloquy_agent", "service"], **popen_kwargs)
-        console.print("  [green]Eloquy Agent is now running in the background.[/]")
+            subprocess.Popen([exe, "-m", "sayzo_agent", "service"], **popen_kwargs)
+        console.print("  [green]Sayzo Agent is now running in the background.[/]")
 
     console.print()
     console.print("  [bold green]Setup complete![/]")
@@ -432,7 +432,7 @@ def run() -> None:
     upload_client = None
     store = TokenStore(cfg.auth_path)
     if not store.has_tokens():
-        log.warning("Not authenticated. Run `eloquy-agent login` to enable uploads.")
+        log.warning("Not authenticated. Run `sayzo-agent login` to enable uploads.")
     elif cfg.auth.effective_server_url:
         from .auth.client import AuthenticatedClient
         from .auth.server import HttpAuthServer
@@ -484,7 +484,7 @@ def service() -> None:
         return
 
     write_pid(cfg.pid_path)
-    log.warning("eloquy-agent service starting (pid=%d)", os.getpid())
+    log.warning("sayzo-agent service starting (pid=%d)", os.getpid())
 
     from .auth.store import TokenStore
     from .gui.tray import TrayIcon, TrayState, Status
@@ -554,7 +554,7 @@ def service() -> None:
     finally:
         tray.stop()
         remove_pid(cfg.pid_path)
-        log.warning("eloquy-agent service stopped")
+        log.warning("sayzo-agent service stopped")
 
 
 if __name__ == "__main__":

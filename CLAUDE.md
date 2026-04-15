@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A local Python agent that runs 24/7 on a user's machine, listens to mic + system audio, detects when the user is **actively participating** in a real conversation, and writes a transcript + compressed audio file to disk. It is the data-collection arm of Eloquy, an English coaching platform — the captured conversations feed server-side analysis that drives personalized speaking drills. Server upload is currently a no-op stub (`NoopUploadClient`).
+A local Python agent that runs 24/7 on a user's machine, listens to mic + system audio, detects when the user is **actively participating** in a real conversation, and writes a transcript + compressed audio file to disk. It is the data-collection arm of Sayzo, an English coaching platform — the captured conversations feed server-side analysis that drives personalized speaking drills. Server upload is currently a no-op stub (`NoopUploadClient`).
 
 Everything must run locally (no paid APIs in the hot path) and must be cheap enough to run 24/7 in the background.
 
@@ -45,14 +45,14 @@ pytest tests/
 pytest tests/test_conversation.py::test_gate_passes_late_substantive_user_turn -v
 
 # CLI commands (all under one entrypoint)
-eloquy-agent setup         # one-time: download Qwen GGUF (~2 GB) into ~/.eloquy/agent/models/
-eloquy-agent enroll        # one-time: record voiceprint to ~/.eloquy/agent/voiceprint.npy
-eloquy-agent devices       # list mic + loopback devices
-eloquy-agent test-capture  # 10-second capture sanity check
-eloquy-agent run           # main 24/7 loop with verbose terminal output
+sayzo-agent setup         # one-time: download Qwen GGUF (~2 GB) into ~/.sayzo/agent/models/
+sayzo-agent enroll        # one-time: record voiceprint to ~/.sayzo/agent/voiceprint.npy
+sayzo-agent devices       # list mic + loopback devices
+sayzo-agent test-capture  # 10-second capture sanity check
+sayzo-agent run           # main 24/7 loop with verbose terminal output
 ```
 
-Captures land in `./eloquy-data/captures/<id>/` (project-local by default, override with `ELOQUY_DATA_DIR`) as `record.json` + `audio.opus`.
+Captures land in `./sayzo-data/captures/<id>/` (project-local by default, override with `SAYZO_DATA_DIR`) as `record.json` + `audio.opus`.
 
 ### Persistence vs. upload (don't get these confused)
 
@@ -60,7 +60,7 @@ Captures land in `./eloquy-data/captures/<id>/` (project-local by default, overr
 
 ### Heartbeat log
 
-The main loop emits a `[heartbeat]` line every `Config.heartbeat_secs` seconds (default 30, override via `ELOQUY_HEARTBEAT_SECS`, set to 0 to disable). It shows current state (`IDLE` / `OPEN`), pre-buffer fill or in-session voiced time, LLM loaded/unloaded, and running kept/discarded counters. This exists so a user watching the terminal for hours can tell at a glance that the agent is alive and what it's doing, instead of assuming it crashed during long silent periods.
+The main loop emits a `[heartbeat]` line every `Config.heartbeat_secs` seconds (default 30, override via `SAYZO_HEARTBEAT_SECS`, set to 0 to disable). It shows current state (`IDLE` / `OPEN`), pre-buffer fill or in-session voiced time, LLM loaded/unloaded, and running kept/discarded counters. This exists so a user watching the terminal for hours can tell at a glance that the agent is alive and what it's doing, instead of assuming it crashed during long silent periods.
 
 ## Architecture
 
