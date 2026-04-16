@@ -104,18 +104,39 @@ class TrayIcon:
         self._current_status: Status | None = None
 
     def start(self) -> None:
-        """Start the tray icon on a daemon thread."""
+        """Start the tray icon on a daemon thread.
+
+        Safe on Windows/Linux. On macOS pystray requires the main thread
+        (AppKit instantiates NSStatusItem/NSWindow) — use :meth:`run_main`
+        there instead.
+        """
         self._thread = threading.Thread(target=self._run, daemon=True, name="tray")
         self._thread.start()
 
+    def run_main(self) -> None:
+        """Run the tray icon on the calling (main) thread — blocks until stop().
+
+        Required on macOS. Caller must have moved the asyncio loop to a
+        background thread first.
+        """
+        self._run()
+
     def update(self) -> None:
-        """Refresh the icon/tooltip if the status changed. Call from any thread."""
+        """Refresh the icon/tooltip if the status changed. Call from any thread.
+
+        On macOS, icon/title mutation touches AppKit objects which is only
+        safe on the main thread. We skip cross-thread mutation there; the
+        menu text callbacks still re-evaluate dynamically when the menu is
+        opened, so pause/resume labels stay correct.
+        """
         if self._icon is None:
             return
         status, error_msg = self.state.get_status()
         if status == self._current_status:
             return
         self._current_status = status
+        if sys.platform == "darwin":
+            return
         self._icon.icon = _make_icon(status)
         if status == Status.ERROR and error_msg:
             self._icon.title = f"Sayzo Agent — {error_msg}"
@@ -123,9 +144,12 @@ class TrayIcon:
             self._icon.title = f"Sayzo Agent — {status.value.replace('_', ' ').title()}"
 
     def stop(self) -> None:
-        """Stop the tray icon."""
+        """Stop the tray icon. Safe to call from any thread."""
         if self._icon is not None:
-            self._icon.stop()
+            try:
+                self._icon.stop()
+            except Exception:
+                log.exception("tray stop failed")
 
     # -- internal ----------------------------------------------------------
 

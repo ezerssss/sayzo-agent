@@ -506,7 +506,6 @@ def service() -> None:
 
     tray_state = TrayState()
     tray = TrayIcon(tray_state, cfg.captures_dir)
-    tray.start()
 
     agent = Agent(cfg, upload_client=upload_client)
 
@@ -548,7 +547,34 @@ def service() -> None:
         await agent.run()
 
     try:
-        asyncio.run(_main())
+        if sys.platform == "darwin":
+            # macOS: pystray uses AppKit, which requires NSStatusItem to be
+            # instantiated on the main thread. Run asyncio on a worker thread
+            # and hand the main thread to pystray.
+            import threading
+
+            asyncio_exc: list[BaseException] = []
+
+            def _asyncio_runner() -> None:
+                try:
+                    asyncio.run(_main())
+                except BaseException as e:
+                    asyncio_exc.append(e)
+                finally:
+                    tray.stop()
+
+            worker = threading.Thread(target=_asyncio_runner, name="asyncio", daemon=False)
+            worker.start()
+            try:
+                tray.run_main()
+            finally:
+                agent.stop()
+                worker.join(timeout=30)
+            if asyncio_exc and not isinstance(asyncio_exc[0], KeyboardInterrupt):
+                raise asyncio_exc[0]
+        else:
+            tray.start()
+            asyncio.run(_main())
     except KeyboardInterrupt:
         pass
     finally:
