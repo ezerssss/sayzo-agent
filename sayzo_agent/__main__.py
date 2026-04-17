@@ -421,6 +421,51 @@ def first_run(ctx: click.Context) -> None:
 
 
 @cli.command()
+@click.option("-n", "--lines", default=50, help="Number of lines to show initially.")
+@click.option("-f", "--follow", is_flag=True, default=True, help="Stream new lines as they appear (default).")
+@click.option("--no-follow", is_flag=True, help="Print last N lines and exit.")
+def logs(lines: int, follow: bool, no_follow: bool) -> None:
+    """Tail the agent log file (like tail -f)."""
+    cfg = load_config()
+    log_file = cfg.logs_dir / "agent.log"
+    if not log_file.exists():
+        click.echo(f"No log file found at {log_file}")
+        click.echo("The agent service hasn't run yet, or logs were cleared.")
+        raise SystemExit(1)
+
+    # Print last N lines
+    with open(log_file, "r", encoding="utf-8", errors="replace") as f:
+        all_lines = f.readlines()
+        tail = all_lines[-lines:] if len(all_lines) > lines else all_lines
+        for line in tail:
+            click.echo(line, nl=False)
+
+    if no_follow:
+        return
+
+    # Stream new lines
+    click.echo(f"\n--- following {log_file} (Ctrl+C to stop) ---\n")
+    try:
+        with open(log_file, "r", encoding="utf-8", errors="replace") as f:
+            # Seek to end
+            f.seek(0, 2)
+            while True:
+                line = f.readline()
+                if line:
+                    click.echo(line, nl=False)
+                else:
+                    # Check if file was rotated (size shrank)
+                    try:
+                        if f.tell() > log_file.stat().st_size:
+                            f.seek(0)
+                    except OSError:
+                        pass
+                    time.sleep(0.3)
+    except KeyboardInterrupt:
+        pass
+
+
+@cli.command()
 def run() -> None:
     """Run the listening agent (foreground, verbose terminal output)."""
     cfg = load_config()
