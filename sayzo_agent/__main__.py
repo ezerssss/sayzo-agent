@@ -520,7 +520,7 @@ def service() -> None:
         try:
             loop.add_signal_handler(signal.SIGINT, _handle_stop)
             loop.add_signal_handler(signal.SIGTERM, _handle_stop)
-        except NotImplementedError:
+        except (NotImplementedError, RuntimeError):
             pass
 
         # Windows: Task Scheduler sends SIGBREAK (Ctrl+Break) on stop.
