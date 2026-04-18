@@ -397,17 +397,29 @@ def first_run(ctx: click.Context) -> None:
         console.print("  [dim]Auth not configured — skipping login.[/]")
 
     # Step 3: Start the service in the background (if not already running)
+    from pathlib import Path
+
     from .pidfile import is_running
+
+    mac_plist = Path.home() / "Library/LaunchAgents/com.sayzo.agent.plist"
 
     console.print()
     if is_running(cfg.pid_path):
         console.print("  [green]Sayzo Agent is already running.[/]")
+    elif sys.platform == "darwin" and mac_plist.exists():
+        # launchd owns the service on installed macOS; the installer script
+        # runs `launchctl load` immediately after first-run returns. Spawning
+        # our own subprocess here would race it for the pidfile and leak the
+        # detached service's stderr to the installer terminal.
+        console.print("  [green]Sayzo Agent is configured to start automatically.[/]")
     else:
         console.print("  Starting Sayzo Agent...")
         import subprocess
-        from pathlib import Path
         exe = sys.executable
-        popen_kwargs = {}
+        popen_kwargs = {
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+        }
         if sys.platform == "win32":
             popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
         else:

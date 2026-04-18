@@ -36,15 +36,20 @@ class MicCapture:
     def _callback(self, indata, frames, time_info, status) -> None:  # noqa: ANN001
         if status:
             log.debug("mic status: %s", status)
+        # PortAudio can fire one more callback between stream.stop() and the
+        # audio thread actually joining. If asyncio.run() has already closed
+        # the loop by then, call_soon_threadsafe raises RuntimeError. Check
+        # up front and catch as a backstop.
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
         # indata: (frames, channels) float32. We always use mono.
         mono = indata[:, 0].copy() if indata.ndim == 2 else indata.copy()
         mono = normalize_rms(mono)
-        if self._loop is None:
-            return
         try:
-            self._loop.call_soon_threadsafe(self.queue.put_nowait, mono)
-        except asyncio.QueueFull:
-            log.warning("mic queue full, dropping frame")
+            loop.call_soon_threadsafe(self.queue.put_nowait, mono)
+        except RuntimeError:
+            pass
 
     async def start(self) -> None:
         self._loop = asyncio.get_running_loop()
