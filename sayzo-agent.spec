@@ -39,6 +39,16 @@ silero_onnx = silero_pkg / "data" / "silero_vad.onnx"
 if silero_onnx.exists():
     datas.append((str(silero_onnx), "silero_vad/data"))
 
+# faster-whisper's internal VAD ONNX — different file from silero_vad above.
+# Loaded lazily by faster_whisper.vad when transcribe(vad_filter=True) is used
+# (see sayzo_agent/stt.py), and PyInstaller doesn't pick up non-Python package
+# data without an explicit entry.
+import faster_whisper
+fw_pkg = Path(faster_whisper.__file__).parent
+fw_vad_onnx = fw_pkg / "assets" / "silero_vad_v6.onnx"
+if fw_vad_onnx.exists():
+    datas.append((str(fw_vad_onnx), "faster_whisper/assets"))
+
 # macOS: bundle the pre-compiled sck-tap binary.
 if sys.platform == "darwin":
     sck_tap = Path("sayzo_agent/capture/sck-tap/sck-tap")

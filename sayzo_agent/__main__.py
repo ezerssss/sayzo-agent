@@ -23,6 +23,14 @@ def _setup_logging(level: str, debug: bool) -> None:
     )
 
 
+class _DropHeartbeat(logging.Filter):
+    # Heartbeats exist for the `run` terminal view (live "is it alive?" signal).
+    # In the 24/7 service log they'd be ~2880 lines/day of low-value chatter and
+    # would dominate the file, so filter them out of the file handler only.
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "[heartbeat]" not in record.getMessage()
+
+
 def _setup_file_logging(logs_dir) -> None:
     """Configure rotating file-based logging for the background service."""
     log_file = logs_dir / "agent.log"
@@ -33,9 +41,12 @@ def _setup_file_logging(logs_dir) -> None:
         "%(asctime)s.%(msecs)03d %(levelname)-5s %(name)s  %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     ))
+    handler.addFilter(_DropHeartbeat())
     root = logging.getLogger()
-    root.setLevel(logging.WARNING)
+    root.setLevel(logging.INFO)
     root.addHandler(handler)
+    for noisy in ("httpx", "httpcore", "huggingface_hub", "filelock", "faster_whisper"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 async def _do_login(cfg, no_browser: bool = False, quiet: bool = False) -> None:
