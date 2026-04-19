@@ -32,7 +32,7 @@ export function Welcome({ onSignedIn, onCancel }: Props) {
     <Layout
       step="01"
       title="Welcome to Sayzo"
-      subtitle="A two-minute setup so the agent can listen, transcribe locally, and back up your conversations to your account."
+      subtitle="A two-minute setup so the agent can listen, transcribe on your machine, and sync coachable moments to your account for the web app."
       footer={
         <>
           <Button variant="ghost" onClick={onCancel} disabled={busy}>
@@ -45,8 +45,8 @@ export function Welcome({ onSignedIn, onCancel }: Props) {
       }
     >
       <p className="text-sm leading-relaxed text-ink-muted">
-        Signing in opens your browser to sayzo.app. Audio always stays on this
-        machine — only metadata about each captured session is uploaded.
+        Signing in opens your browser to sayzo.app so Sayzo can link this
+        machine to your account and surface coachable moments in the web app.
       </p>
       {error && (
         <Alert className="mt-6">

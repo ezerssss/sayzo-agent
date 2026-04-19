@@ -1,24 +1,21 @@
-import { useEffect } from "react";
 import { CheckCircle2 } from "lucide-react";
 import { Button } from "../components/ui/Button";
 import { Layout } from "../components/Layout";
 import { bridge } from "../lib/bridge";
 
+// The Done screen is the last thing the user sees before the setup window
+// closes and the agent runs silently in the background. We intentionally do
+// NOT auto-dismiss — the user deserves a moment to see the success state and
+// click through on their own timing. The "Start listening" button fires
+// bridge.finish() which closes the window and hands control back to the
+// service, which then boots the tray + capture pipeline.
 export function Done() {
-  // Auto-dismiss after a short pause so the user sees the success state.
-  useEffect(() => {
-    const t = window.setTimeout(() => {
-      void bridge.finish();
-    }, 1500);
-    return () => window.clearTimeout(t);
-  }, []);
-
   return (
     <Layout
-      title="You're set"
-      subtitle="Sayzo is listening in the background. Check your menu bar / system tray."
+      title="You're all set"
+      subtitle="Sayzo will run quietly in the background and pick up conversations as they happen. Check the menu bar / system tray any time to pause or quit."
       footer={
-        <Button onClick={() => bridge.finish()}>Close</Button>
+        <Button onClick={() => bridge.finish()}>Got it</Button>
       }
     >
       <div className="flex items-center gap-3 text-accent">

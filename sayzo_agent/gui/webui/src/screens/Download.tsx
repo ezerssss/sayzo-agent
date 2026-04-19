@@ -64,8 +64,8 @@ export function Download({ onDone, onCancel }: Props) {
   return (
     <Layout
       step="02"
-      title="Downloading the model"
-      subtitle="Qwen 2.5 3B (~2 GB). This runs locally so your conversations never leave your machine."
+      title="Setting things up"
+      subtitle="Downloading what Sayzo needs to listen and help you improve your English. This lives on your computer once it's done — about 2 GB, a one-time setup."
       footer={
         <>
           <Button variant="ghost" onClick={onCancel}>

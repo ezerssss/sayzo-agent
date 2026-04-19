@@ -5,11 +5,11 @@ export default {
     extend: {
       colors: {
         // Mirrors the Sayzo marketing site palette: white background,
-        // near-black body text, teal accent on CTAs.
+        // near-black body text, blue accent on CTAs.
         accent: {
-          DEFAULT: "#0d9488", // teal-600
-          hover: "#0f766e",   // teal-700
-          ring: "#5eead4",    // teal-300 — focus ring
+          DEFAULT: "#2563eb", // blue-600
+          hover: "#1d4ed8",   // blue-700
+          ring: "#93c5fd",    // blue-300 — focus ring
         },
         ink: {
           DEFAULT: "#1a1a1a",
