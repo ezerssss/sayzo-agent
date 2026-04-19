@@ -541,7 +541,15 @@ def run() -> None:
 
 
 @cli.command()
-def service() -> None:
+@click.option(
+    "--force-setup",
+    is_flag=True,
+    hidden=True,
+    help="Always open the first-run GUI even if setup looks complete. "
+    "Used by the NSIS finish-page-launch on Windows so users get visual "
+    "confirmation right after install.",
+)
+def service(force_setup: bool) -> None:
     """Run the agent as a background service (no terminal output, file logging)."""
     cfg = load_config()
     _setup_file_logging(cfg.logs_dir)
@@ -557,21 +565,35 @@ def service() -> None:
     log.warning("sayzo-agent service starting (pid=%d)", os.getpid())
 
     # First-run gate. Detect missing setup signals (auth token, LLM weights,
-    # macOS mic permission) and open the GUI setup window if any is missing.
-    # The window blocks the main thread until the user completes setup or
+    # macOS mic permission) and open the GUI setup window if any is missing
+    # — or if the caller forced it via --force-setup (NSIS finish-page), or
+    # if this is the very first .app launch on macOS (no marker file). The
+    # window blocks the main thread until the user completes setup or
     # cancels. On cancel, exit cleanly without starting the tray + agent.
     from .gui.setup.detect import detect_setup
+    from .gui.setup.marker import is_first_launch, mark_setup_seen
+
     setup_status = detect_setup(cfg)
-    if not setup_status.is_complete:
+    mac_first_launch = sys.platform == "darwin" and is_first_launch(cfg)
+    should_show_gui = (
+        force_setup or mac_first_launch or not setup_status.is_complete
+    )
+    log.warning(
+        "first-run gate: force_setup=%s mac_first_launch=%s is_complete=%s "
+        "(token=%s model=%s mic=%s) → show_gui=%s",
+        force_setup,
+        mac_first_launch,
+        setup_status.is_complete,
+        setup_status.has_token,
+        setup_status.has_model,
+        setup_status.has_mic_permission,
+        should_show_gui,
+    )
+
+    if should_show_gui:
         from .gui.setup.window import SetupWindow
         from .gui.setup.bridge import SetupResult
 
-        log.warning(
-            "setup incomplete (token=%s model=%s mic=%s) — opening setup window",
-            setup_status.has_token,
-            setup_status.has_model,
-            setup_status.has_mic_permission,
-        )
         try:
             setup_result = SetupWindow(cfg).run_blocking()
         except Exception:
@@ -582,8 +604,10 @@ def service() -> None:
             log.warning("user cancelled setup — exiting")
             remove_pid(cfg.pid_path)
             return
-        # COMPLETED: register the macOS launchd LaunchAgent so the service
-        # auto-starts on login. No-op on other platforms. Wired in Step 6.
+        # COMPLETED: persist the first-launch marker so subsequent launchd /
+        # Task Scheduler restarts don't re-open the GUI unnecessarily, then
+        # register the macOS launchd LaunchAgent for auto-start on login.
+        mark_setup_seen(cfg)
         if sys.platform == "darwin":
             try:
                 from .gui.setup.launchd import ensure_launchd_registered

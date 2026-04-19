@@ -47,7 +47,10 @@ UninstallIcon "..\..\installer\assets\logo.ico"
 ; the whole point of the GUI installer path. See ~/.claude/plans/i-created-a-memory-quizzical-cosmos.md.
 ; The MUI_FINISHPAGE_RUN_* defines must come BEFORE MUI_PAGE_FINISH.
 !define MUI_FINISHPAGE_RUN "$INSTDIR\${SERVICE_EXE}"
-!define MUI_FINISHPAGE_RUN_PARAMETERS "service"
+; --force-setup makes the service open the GUI regardless of detect_setup's
+; verdict — users get visual confirmation right after install even if they
+; had prior-install state from a previous CLI run.
+!define MUI_FINISHPAGE_RUN_PARAMETERS "service --force-setup"
 !define MUI_FINISHPAGE_RUN_TEXT "Launch Sayzo Agent"
 !insertmacro MUI_PAGE_FINISH
 
