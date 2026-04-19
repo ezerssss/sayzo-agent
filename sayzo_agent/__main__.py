@@ -701,7 +701,22 @@ def service(force_setup: bool) -> None:
                 tray.run_main()
             finally:
                 agent.stop()
-                worker.join(timeout=30)
+                worker.join(timeout=5)
+                # macOS: the asyncio worker can take a long time to unwind
+                # (audio-tap subprocess shutdown, pending coroutines, etc.).
+                # Meanwhile the user has clicked Quit on the tray and expects
+                # the process to be gone — the launchd plist is already
+                # unloaded (see tray._mac_unload_launchd_agent), so nothing
+                # is going to revive us. If the worker is still alive after
+                # the short grace period, force-exit the process. A clean
+                # shutdown is a nice-to-have; the user-visible promise of
+                # "quit means gone" is not.
+                if worker.is_alive():
+                    log.warning(
+                        "asyncio worker still alive after 5s — forcing exit"
+                    )
+                    remove_pid(cfg.pid_path)
+                    os._exit(0)
             if asyncio_exc and not isinstance(asyncio_exc[0], KeyboardInterrupt):
                 raise asyncio_exc[0]
         else:
