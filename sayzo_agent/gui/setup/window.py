@@ -69,7 +69,7 @@ class SetupWindow:
             background_color="#FFFFFF",
             text_select=False,
         )
-        self._bridge.attach_window(window)
+        self._bridge._attach_window(window)
 
         # webview.start() blocks until the window is destroyed. debug=True
         # opens the devtools panel — gated on Config.debug for ad-hoc UI work.

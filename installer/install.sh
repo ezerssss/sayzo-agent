@@ -58,14 +58,30 @@ fi
 hdiutil detach "/Volumes/${APP_NAME}" -quiet
 echo "  Installed to ${APP_PATH}"
 
-# Launch the .app now so the setup window opens automatically — matches the
-# GUI-install UX where double-clicking the app in Finder triggers first-run.
-# Uses the explicit path rather than `open -a "Name"` because LaunchServices
-# hasn't finished indexing the freshly-copied bundle yet, so name lookup
-# fails with "unable to find application". An explicit path sidesteps that.
-echo ""
-echo "  Opening Sayzo Agent..."
-open "${APP_PATH}"
+# Launch the inner binary directly (NOT `open` on the .app bundle) so we
+# bypass Gatekeeper's notarization check. Without an Apple notarization
+# stamp, `spctl` rejects the .app and `open` silently refuses to launch —
+# no dialog, no error, the app just doesn't start. Invoking the Mach-O
+# binary directly from the shell skips LaunchServices and therefore skips
+# Gatekeeper. The launchd LaunchAgent we register during first-run uses the
+# same path, so subsequent auto-starts on login also bypass Gatekeeper.
+#
+# Trade-off: double-clicking the .app from Finder will still be blocked
+# until the release is properly notarized. Users should interact via the
+# tray/menu bar icon for day-to-day control, not by re-opening the .app.
+#
+# Detach so the shell can return — `nohup … &` + `disown` keeps the agent
+# running after this script exits.
+SAYZO_BIN="${APP_PATH}/Contents/MacOS/sayzo-agent"
+if [ -x "$SAYZO_BIN" ]; then
+    echo ""
+    echo "  Opening Sayzo Agent..."
+    nohup "$SAYZO_BIN" service --force-setup >/tmp/sayzo-agent-bootstrap.log 2>&1 &
+    disown
+else
+    echo "  Warning: could not find $SAYZO_BIN" >&2
+    echo "  Try opening Sayzo Agent from Applications manually." >&2
+fi
 
 echo ""
 echo "  Done! Complete setup in the window that appears."

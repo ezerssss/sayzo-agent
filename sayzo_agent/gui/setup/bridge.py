@@ -48,10 +48,14 @@ class Bridge:
         self._event_listeners: list[Callable[[dict[str, Any]], None]] = []
 
     # ------------------------------------------------------------------
-    # Lifecycle (called from SetupWindow, not from JS)
+    # Lifecycle (called from SetupWindow, not from JS). The setter is
+    # underscore-prefixed so pywebview's method discovery doesn't expose
+    # it as window.pywebview.api.attach_window — keeps the JS surface clean
+    # and sidesteps a macOS Cocoa-backend readiness edge case. `result` is
+    # a @property descriptor which pywebview skips anyway.
     # ------------------------------------------------------------------
 
-    def attach_window(self, window: "webview.Window") -> None:
+    def _attach_window(self, window: "webview.Window") -> None:
         self._window = window
 
     @property

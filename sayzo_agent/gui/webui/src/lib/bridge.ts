@@ -32,15 +32,50 @@ declare global {
   }
 }
 
-// pywebview fires a `pywebviewready` event on window once the JS API is
-// usable. Resolves immediately if it already fired.
+// Wait until the pywebview JS bridge is fully populated. On macOS's cocoa
+// backend, `window.pywebview.api` can exist as an empty object before the
+// individual Python methods are bound — so we poll for a specific method
+// (`get_status`) rather than trusting the object's mere existence. We also
+// listen for the `pywebviewready` event as a secondary trigger, and bail
+// with a hard error after 10s so a truly broken bridge surfaces instead of
+// hanging the UI forever.
 export function whenReady(): Promise<void> {
-  return new Promise((resolve) => {
-    if (window.pywebview?.api) {
+  return new Promise((resolve, reject) => {
+    const deadline = Date.now() + 10_000;
+
+    const isReady = () =>
+      typeof window.pywebview?.api?.get_status === "function";
+
+    if (isReady()) {
       resolve();
       return;
     }
-    window.addEventListener("pywebviewready", () => resolve(), { once: true });
+
+    const tick = () => {
+      if (isReady()) {
+        resolve();
+      } else if (Date.now() > deadline) {
+        reject(
+          new Error(
+            "pywebview JS API never became available. " +
+              "If you're on macOS, the Cocoa backend may have failed to bind " +
+              "the Python bridge — check the agent log.",
+          ),
+        );
+      } else {
+        setTimeout(tick, 20);
+      }
+    };
+
+    window.addEventListener(
+      "pywebviewready",
+      () => {
+        if (isReady()) resolve();
+      },
+      { once: true },
+    );
+
+    setTimeout(tick, 20);
   });
 }
 
