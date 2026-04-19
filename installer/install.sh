@@ -60,11 +60,12 @@ echo "  Installed to ${APP_PATH}"
 
 # Launch the .app now so the setup window opens automatically — matches the
 # GUI-install UX where double-clicking the app in Finder triggers first-run.
-# The macOS first-launch marker file under ~/.sayzo/agent/ drives whether
-# the setup GUI shows; it will on a first install.
+# Uses the explicit path rather than `open -a "Name"` because LaunchServices
+# hasn't finished indexing the freshly-copied bundle yet, so name lookup
+# fails with "unable to find application". An explicit path sidesteps that.
 echo ""
 echo "  Opening Sayzo Agent..."
-open -a "${APP_NAME}"
+open "${APP_PATH}"
 
 echo ""
 echo "  Done! Complete setup in the window that appears."

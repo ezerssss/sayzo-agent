@@ -195,26 +195,31 @@ a = Analysis(
 )
 
 # ---------------------------------------------------------------------------
-# Strip MSVC C++ runtime DLLs from the top-level bundle.
+# Strip MSVC C++ runtime DLLs from anywhere in the bundle.
 #
 # Multiple Python packages (numpy, sklearn, llvmlite, winrt, pythonnet) ship
-# their own copies of msvcp140.dll / vcruntime140.dll pairs, each from a
-# different MSVC release. PyInstaller deduplicates across packages and
-# picks whichever it saw first, which can mate a 14.40 msvcp140.dll with a
-# 14.44 msvcp140_1.dll — an incompatible combination. When torch imports
-# and loads c10.dll, its DllMain fails at runtime with WinError 1114
-# because msvcp140/_1 expect matched versions.
+# their own copies of msvcp140.dll / vcruntime140.dll, each from a different
+# MSVC release. On load order, whichever runs its import first (winrt via
+# desktop-notifier, in our case) anchors the process to its version of
+# MSVCP140.dll. When torch later loads c10.dll — compiled against a newer
+# MSVCP140 — Windows returns the already-loaded older module instead of
+# the newer system copy. c10.dll's DllMain calls a function that doesn't
+# exist in the older DLL → access violation (0xC0000005) → WinError 1114.
 #
-# Instead, drop these DLLs from the bundle entirely. The NSIS installer
+# Observed in the wild: winrt ships 14.29 (from VS 2019). torch's c10.dll
+# wants 14.40+. Load order: winrt first (at import), torch second (via
+# silero_vad → torch), boom.
+#
+# Fix: remove every bare copy from the bundle. The NSIS installer
 # bootstraps the VC++ Redistributable onto the target machine (see the
-# Redist bootstrapper section in installer/windows/sayzo-agent.nsi), which
-# deploys a matched set of DLLs into C:\Windows\System32 — Windows' normal
-# DLL resolution then finds them and torch initializes cleanly. This
-# matches how a non-frozen Python installation behaves.
+# Redist bootstrapper in installer/windows/sayzo-agent.nsi), which puts a
+# matched set of DLLs in C:\Windows\System32. Windows' normal search path
+# resolves them from there — the same way a non-frozen Python install
+# behaves. Torch initializes cleanly.
 #
-# Only the top-level copies are removed; the ones under package subfolders
-# (numpy.libs/, sklearn/.libs/, winrt/) are left alone because those
-# packages reference them via explicit paths and os.add_dll_directory.
+# Hash-suffixed copies (numpy.libs\msvcp140-<hash>.dll etc.) are left
+# alone — those packages import them via delvewheel's explicit
+# hashed-name mechanism, and removing them would break numpy.
 if sys.platform == "win32":
     _MSVC_RUNTIME_NAMES = {
         "msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll",
@@ -222,18 +227,19 @@ if sys.platform == "win32":
         "concrt140.dll",
     }
 
-    def _is_top_level_msvc_runtime(entry):
-        dest = entry[0]
-        # Top-level entries have no path separator in dest.
-        if "\\" in dest or "/" in dest:
-            return False
-        return dest.lower() in _MSVC_RUNTIME_NAMES
+    def _is_msvc_runtime(entry):
+        # Match by basename regardless of subdir so the copy inside
+        # winrt/ and similar package subfolders also gets stripped. The
+        # case-insensitive comparison handles winrt/MSVCP140.dll as well
+        # as top-level msvcp140.dll.
+        return Path(entry[0]).name.lower() in _MSVC_RUNTIME_NAMES
 
     _before = len(a.binaries)
-    a.binaries = [b for b in a.binaries if not _is_top_level_msvc_runtime(b)]
+    _stripped = [b[0] for b in a.binaries if _is_msvc_runtime(b)]
+    a.binaries = [b for b in a.binaries if not _is_msvc_runtime(b)]
     print(
-        f"sayzo-agent.spec: stripped {_before - len(a.binaries)} top-level "
-        f"MSVC runtime DLLs; Windows will resolve them from system VC++ Redist."
+        f"sayzo-agent.spec: stripped {_before - len(a.binaries)} MSVC runtime "
+        f"DLLs (system VC++ Redist supplies them): {_stripped}"
     )
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
