@@ -48,6 +48,19 @@ Write-Host "  Installed successfully." -ForegroundColor Green
 # Clean up installer.
 Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
 
+# NSIS silent install (/S) skips the finish page, so MUI_FINISHPAGE_RUN
+# doesn't fire — we have to launch the service ourselves. --force-setup
+# tells it to open the setup GUI even if prior-install state looks complete,
+# giving terminal-install users the same UX as the GUI-install path.
+$servicePath = Join-Path $env:ProgramFiles "Sayzo\Agent\sayzo-agent-service.exe"
+if (Test-Path $servicePath) {
+    Write-Host "  Opening setup window..." -ForegroundColor Cyan
+    Start-Process -FilePath $servicePath -ArgumentList "service", "--force-setup"
+} else {
+    Write-Host "  Warning: could not find $servicePath" -ForegroundColor Yellow
+    Write-Host "  Launch Sayzo Agent from the Start Menu to complete setup." -ForegroundColor Yellow
+}
+
 Write-Host ""
 Write-Host "  Done! Complete setup in the window that appears." -ForegroundColor Green
 Write-Host "  Sayzo Agent will then start automatically on every login." -ForegroundColor Green

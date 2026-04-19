@@ -58,7 +58,14 @@ fi
 hdiutil detach "/Volumes/${APP_NAME}" -quiet
 echo "  Installed to ${APP_PATH}"
 
+# Launch the .app now so the setup window opens automatically — matches the
+# GUI-install UX where double-clicking the app in Finder triggers first-run.
+# The macOS first-launch marker file under ~/.sayzo/agent/ drives whether
+# the setup GUI shows; it will on a first install.
 echo ""
-echo "  Done! Open Sayzo Agent from Applications to finish setup."
-echo "  (The first launch opens a setup window — login, model download, mic permission.)"
+echo "  Opening Sayzo Agent..."
+open -a "${APP_NAME}"
+
+echo ""
+echo "  Done! Complete setup in the window that appears."
 echo ""
