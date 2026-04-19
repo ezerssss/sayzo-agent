@@ -24,3 +24,6 @@ installer/**/*.dmg
 !installer/windows/MicrosoftEdgeWebview2Setup.exe
 # Vendored NSIS plugin DLLs are build inputs too.
 !installer/windows/nsis-plugins/**
+# Visual C++ Redist downloaded by CI before makensis runs (also allowed
+# committed for local NSIS builds when CI isn't available).
+!installer/windows/VC_redist.x64.exe

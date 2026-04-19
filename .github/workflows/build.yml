@@ -51,6 +51,15 @@ jobs:
       - name: Install NSIS
         run: choco install nsis -y
 
+      - name: Download Visual C++ Redistributable
+        # Bundled into the installer so target machines get a matched set of
+        # msvcp140/vcruntime140 DLLs installed system-wide. We strip those
+        # DLLs from the PyInstaller bundle in sayzo-agent.spec because mixing
+        # versions across numpy/sklearn/pythonnet blows up torch's DllMain.
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://aka.ms/vs/17/release/vc_redist.x64.exe" -OutFile "installer\windows\VC_redist.x64.exe"
+
       - name: Build NSIS installer
         run: |
           $env:PATH += ";C:\Program Files (x86)\NSIS"

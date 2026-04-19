@@ -90,6 +90,18 @@ Section "Install"
         webview2_skip:
     !endif
 
+    ; Bootstrap Microsoft Visual C++ Redistributable (2015–2022, x64). torch's
+    ; c10.dll depends on msvcp140/vcruntime140 and we strip those from the
+    ; PyInstaller bundle (see sayzo-agent.spec) so Windows loads matched
+    ; versions from the Redist instead of PyInstaller's mismatched copies.
+    ; /install /quiet /norestart is idempotent — skips fast if up to date.
+    !if /FileExists "VC_redist.x64.exe"
+        DetailPrint "Installing Visual C++ Redistributable..."
+        File "VC_redist.x64.exe"
+        ExecWait '"$INSTDIR\VC_redist.x64.exe" /install /quiet /norestart'
+        Delete "$INSTDIR\VC_redist.x64.exe"
+    !endif
+
     ; Add install dir to user PATH so `sayzo-agent` works from any terminal.
     ReadRegStr $0 HKCU "Environment" "Path"
     WriteRegStr HKCU "Environment" "Path" "$0;$INSTDIR"

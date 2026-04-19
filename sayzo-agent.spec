@@ -194,6 +194,48 @@ a = Analysis(
     noarchive=False,
 )
 
+# ---------------------------------------------------------------------------
+# Strip MSVC C++ runtime DLLs from the top-level bundle.
+#
+# Multiple Python packages (numpy, sklearn, llvmlite, winrt, pythonnet) ship
+# their own copies of msvcp140.dll / vcruntime140.dll pairs, each from a
+# different MSVC release. PyInstaller deduplicates across packages and
+# picks whichever it saw first, which can mate a 14.40 msvcp140.dll with a
+# 14.44 msvcp140_1.dll — an incompatible combination. When torch imports
+# and loads c10.dll, its DllMain fails at runtime with WinError 1114
+# because msvcp140/_1 expect matched versions.
+#
+# Instead, drop these DLLs from the bundle entirely. The NSIS installer
+# bootstraps the VC++ Redistributable onto the target machine (see the
+# Redist bootstrapper section in installer/windows/sayzo-agent.nsi), which
+# deploys a matched set of DLLs into C:\Windows\System32 — Windows' normal
+# DLL resolution then finds them and torch initializes cleanly. This
+# matches how a non-frozen Python installation behaves.
+#
+# Only the top-level copies are removed; the ones under package subfolders
+# (numpy.libs/, sklearn/.libs/, winrt/) are left alone because those
+# packages reference them via explicit paths and os.add_dll_directory.
+if sys.platform == "win32":
+    _MSVC_RUNTIME_NAMES = {
+        "msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll",
+        "vcruntime140.dll", "vcruntime140_1.dll",
+        "concrt140.dll",
+    }
+
+    def _is_top_level_msvc_runtime(entry):
+        dest = entry[0]
+        # Top-level entries have no path separator in dest.
+        if "\\" in dest or "/" in dest:
+            return False
+        return dest.lower() in _MSVC_RUNTIME_NAMES
+
+    _before = len(a.binaries)
+    a.binaries = [b for b in a.binaries if not _is_top_level_msvc_runtime(b)]
+    print(
+        f"sayzo-agent.spec: stripped {_before - len(a.binaries)} top-level "
+        f"MSVC runtime DLLs; Windows will resolve them from system VC++ Redist."
+    )
+
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
 exe = EXE(
