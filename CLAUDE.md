@@ -56,7 +56,16 @@ Captures land in `./sayzo-data/captures/<id>/` (project-local by default, overri
 
 ### Persistence vs. upload (don't get these confused)
 
-`CaptureSink.write` in `sink.py` is what persists a kept session to disk. It runs **before** `UploadClient.upload`. `NoopUploadClient` is a no-op — it only logs `"[upload] (noop) …"`. So even though server upload is a stub, every session that survives the pipeline is already saved locally and survives restarts. The sink logs absolute paths of the written `record.json` and `audio.opus` so you can see exactly where they landed. If you ever wire up a real `UploadClient`, do not delete the local files on upload success — the sink write is the source of truth.
+`CaptureSink.write` in `sink.py` persists a kept session to disk. It runs **before** `UploadClient.upload`. Two upload clients exist:
+
+- `AuthenticatedUploadClient` (`upload.py`) — real multipart POST to `/api/captures/upload`. Active when the user is logged in and `cfg.auth.effective_server_url` is set. Failures are caught and logged; they do not raise back to the pipeline and they do not delete the local files.
+- `NoopUploadClient` — fallback when the user is unauthenticated. Only logs `"[upload] (noop) …"`.
+
+Either way, every session that survives the pipeline is saved locally first and survives restarts. The sink logs absolute paths of `record.json` + `audio.opus` so you can see where they landed. Do not delete local files on upload success — the sink write is the source of truth.
+
+### Desktop notifications
+
+After each kept session the agent fires a native toast (`"Conversation saved" / "<title> · <duration>"`) via `sayzo_agent/notify.py` → the `desktop-notifier` PyPI package. Dispatched on the heavy-worker executor so `send_sync` never blocks the asyncio loop. Discards and failures are silent. Toggle with `SAYZO_NOTIFICATIONS_ENABLED=0`. Windows 10 requires the Start Menu shortcut to carry an AUMID (`"Sayzo.Agent"`, set in `installer/windows/sayzo-agent.nsi`) for WinRT toasts to appear; the same string must be passed as `app_name` to `DesktopNotifier`. macOS requires a signed bundle with `CFBundleIdentifier = com.sayzo.agent` — already set in `sayzo-agent.spec`.
 
 ### Heartbeat log
 

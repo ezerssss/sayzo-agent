@@ -25,10 +25,17 @@ from .relevance import RelevanceLLM, RelevanceVerdict
 from .sink import CaptureSink
 from .speaker import SpeakerIdentifier
 from .stt import WhisperSTT, TranscribedSegment
+from .notify import NoopNotifier, Notifier
 from .upload import NoopUploadClient, UploadClient
 from .vad import SileroVAD
 
 log = logging.getLogger(__name__)
+
+
+def _format_duration(secs: float) -> str:
+    if secs >= 60:
+        return f"{int(round(secs / 60))} min"
+    return f"{int(round(secs))}s"
 
 
 class Agent:
@@ -38,6 +45,7 @@ class Agent:
         upload_client: Optional[UploadClient] = None,
         mic_capture=None,
         sys_capture=None,
+        notifier: Optional[Notifier] = None,
     ) -> None:
         self.cfg = config
         self.mic = mic_capture or MicCapture(
@@ -68,6 +76,7 @@ class Agent:
         self.llm = RelevanceLLM(config.llm, models_dir=config.models_dir)
         self.sink = CaptureSink(config.captures_dir)
         self.upload = upload_client or NoopUploadClient()
+        self.notifier: Notifier = notifier or NoopNotifier()
 
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sayzo-heavy")
         self._stop = asyncio.Event()
@@ -316,6 +325,12 @@ class Agent:
         )
         await self.upload.upload(record)
         self._captures_kept += 1
+
+        duration_s = (ended_at - buffers.started_at).total_seconds()
+        body = f"{verdict.title} \u00b7 {_format_duration(duration_s)}"
+        await loop.run_in_executor(
+            self._executor, self.notifier.notify, "Conversation saved", body
+        )
 
     def _transcribe_both(
         self, mic_pcm: bytes, sys_pcm: bytes, sr: int

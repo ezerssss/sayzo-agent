@@ -93,6 +93,43 @@ def _open_folder(path: Path) -> None:
         subprocess.Popen(["xdg-open", p])
 
 
+def _mac_unload_launchd_agent() -> None:
+    """Ask launchd to stop supervising the agent before we exit.
+
+    Without this, launchd's ``KeepAlive`` resurrects the process seconds
+    after a menu-bar Quit — the user sees the app close and instantly
+    reopen. ``bootout`` removes the job from launchd's registry for the
+    current user session; the plist stays on disk and re-loads on next
+    login, so auto-start still works tomorrow.
+
+    Falls back to the legacy ``launchctl unload`` form on older macOS.
+    Best-effort: any failure is logged and swallowed so Quit still exits.
+    """
+    if sys.platform != "darwin":
+        return
+    plist = Path.home() / "Library" / "LaunchAgents" / "com.sayzo.agent.plist"
+    if not plist.exists():
+        return
+    try:
+        uid = os.getuid()
+    except AttributeError:
+        return
+    try:
+        r = subprocess.run(
+            ["launchctl", "bootout", f"gui/{uid}", str(plist)],
+            capture_output=True,
+            timeout=5,
+        )
+        if r.returncode != 0:
+            subprocess.run(
+                ["launchctl", "unload", str(plist)],
+                capture_output=True,
+                timeout=5,
+            )
+    except Exception:
+        log.exception("launchctl unload failed")
+
+
 class TrayIcon:
     """Manages the system tray icon lifecycle on a background thread."""
 
@@ -173,6 +210,7 @@ class TrayIcon:
             _open_folder(self.captures_dir)
 
         def on_quit(icon, item):
+            _mac_unload_launchd_agent()
             self.state.quit_event.set()
             icon.stop()
 

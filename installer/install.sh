@@ -87,8 +87,12 @@ cat > "$PLIST_PATH" << 'PLIST_EOF'
     </array>
     <key>RunAtLoad</key>
     <true/>
+    <!-- Respawn on crashes only; a clean quit from the tray must stay dead. -->
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
     <key>StandardOutPath</key>
     <string>/tmp/sayzo-agent-stdout.log</string>
     <key>StandardErrorPath</key>

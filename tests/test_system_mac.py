@@ -1,6 +1,6 @@
 """Unit tests for the macOS system-capture Python wrapper.
 
-These tests run on any platform — they mock the ``sck-tap`` subprocess so no
+These tests run on any platform — they mock the ``audio-tap`` subprocess so no
 Mac or Swift binary is needed.
 """
 from __future__ import annotations
@@ -18,7 +18,7 @@ from sayzo_agent.capture.system_mac import (
     SystemCapture,
     _EXIT_PERMISSION_DENIED,
     _NATIVE_RATE,
-    _find_sck_tap,
+    _find_audio_tap,
 )
 
 
@@ -125,8 +125,8 @@ class TestFindBinary:
             "sayzo_agent.capture.system_mac.shutil.which",
             lambda _: None,
         )
-        with pytest.raises(FileNotFoundError, match="sck-tap binary not found"):
-            _find_sck_tap()
+        with pytest.raises(FileNotFoundError, match="audio-tap binary not found"):
+            _find_audio_tap()
 
 
 class TestStartPermissionDenied:
@@ -135,11 +135,11 @@ class TestStartPermissionDenied:
         proc = FastExitProc(exit_code=_EXIT_PERMISSION_DENIED)
 
         with patch(
-            "sayzo_agent.capture.system_mac._find_sck_tap", return_value="/fake/sck-tap"
+            "sayzo_agent.capture.system_mac._find_audio_tap", return_value="/fake/audio-tap"
         ), patch(
             "asyncio.create_subprocess_exec", return_value=proc
         ):
-            with pytest.raises(PermissionError, match="Screen Recording"):
+            with pytest.raises(PermissionError, match="Audio Capture"):
                 await cap.start()
 
     @pytest.mark.asyncio
@@ -147,11 +147,11 @@ class TestStartPermissionDenied:
         proc = FastExitProc(exit_code=1)
 
         with patch(
-            "sayzo_agent.capture.system_mac._find_sck_tap", return_value="/fake/sck-tap"
+            "sayzo_agent.capture.system_mac._find_audio_tap", return_value="/fake/audio-tap"
         ), patch(
             "asyncio.create_subprocess_exec", return_value=proc
         ):
-            with pytest.raises(RuntimeError, match="sck-tap exited immediately"):
+            with pytest.raises(RuntimeError, match="audio-tap exited immediately"):
                 await cap.start()
 
 
@@ -163,7 +163,7 @@ class TestReader:
         proc = FakeProc(stdout_data=pcm)
 
         with patch(
-            "sayzo_agent.capture.system_mac._find_sck_tap", return_value="/fake/sck-tap"
+            "sayzo_agent.capture.system_mac._find_audio_tap", return_value="/fake/audio-tap"
         ), patch(
             "asyncio.create_subprocess_exec", return_value=proc
         ):
@@ -190,7 +190,7 @@ class TestReader:
         proc = FakeProc(stdout_data=pcm)
 
         with patch(
-            "sayzo_agent.capture.system_mac._find_sck_tap", return_value="/fake/sck-tap"
+            "sayzo_agent.capture.system_mac._find_audio_tap", return_value="/fake/audio-tap"
         ), patch(
             "asyncio.create_subprocess_exec", return_value=proc
         ):
@@ -213,7 +213,7 @@ class TestReader:
         proc = FakeProc(stdout_data=pcm)
 
         with patch(
-            "sayzo_agent.capture.system_mac._find_sck_tap", return_value="/fake/sck-tap"
+            "sayzo_agent.capture.system_mac._find_audio_tap", return_value="/fake/audio-tap"
         ), patch(
             "asyncio.create_subprocess_exec", return_value=proc
         ):
@@ -235,7 +235,7 @@ class TestStop:
         proc = FakeProc(stdout_data=pcm)
 
         with patch(
-            "sayzo_agent.capture.system_mac._find_sck_tap", return_value="/fake/sck-tap"
+            "sayzo_agent.capture.system_mac._find_audio_tap", return_value="/fake/audio-tap"
         ), patch(
             "asyncio.create_subprocess_exec", return_value=proc
         ):

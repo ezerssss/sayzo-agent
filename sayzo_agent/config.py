@@ -131,6 +131,8 @@ class Config(BaseSettings):
     # can see at a glance whether the agent is idle, in a session, etc. Set
     # to 0 to disable. Override via SAYZO_HEARTBEAT_SECS.
     heartbeat_secs: float = 30.0
+    # Native desktop toast after each kept session. SAYZO_NOTIFICATIONS_ENABLED=0 to disable.
+    notifications_enabled: bool = True
 
     capture: CaptureConfig = Field(default_factory=CaptureConfig)
     vad: VADConfig = Field(default_factory=VADConfig)

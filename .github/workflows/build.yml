@@ -67,12 +67,12 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Compile sck-tap Swift binary
+      - name: Compile audio-tap Swift binary
         run: |
-          cd sayzo_agent/capture/sck-tap
-          swiftc -O -o sck-tap main.swift \
-            -framework ScreenCaptureKit \
-            -framework CoreMedia \
+          cd sayzo_agent/capture/audio-tap
+          swiftc -O -o audio-tap main.swift \
+            -framework CoreAudio \
+            -framework AudioToolbox \
             -framework AVFoundation
 
       - name: Generate logo.icns from logo.png

@@ -15,8 +15,15 @@
     <key>RunAtLoad</key>
     <true/>
 
+    <!-- Respawn on crashes only. A clean exit (exit code 0) from the tray
+         "Quit" action must NOT trigger a relaunch — otherwise quitting from
+         the menu bar does nothing visible, since launchd revives the
+         process within seconds. -->
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
 
     <key>StandardOutPath</key>
     <string>/tmp/sayzo-agent-stdout.log</string>

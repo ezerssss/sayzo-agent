@@ -68,6 +68,15 @@ Section "Install"
     CreateShortCut "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME}.lnk" "$INSTDIR\${SERVICE_EXE}" "service"
     CreateShortCut "$SMPROGRAMS\${PRODUCT_NAME}\Uninstall.lnk" "$INSTDIR\uninstall.exe"
 
+    ; Set AppUserModelID (AUMID) on the Start Menu shortcut. Windows 10 silently
+    ; drops WinRT toasts from apps without a registered AUMID-on-shortcut, so
+    ; this is required for desktop-notifier to show anything on Win10. Must
+    ; match the `app_name` passed to DesktopNotifier() in sayzo_agent/__main__.py.
+    ; Requires the ApplicationID NSIS plugin (ships with many NSIS builds; if
+    ; missing, install it or use a registry-based fallback).
+    ApplicationID::Set "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME}.lnk" "Sayzo.Agent"
+    Pop $0
+
     ; Write uninstall information to registry.
     WriteRegStr HKLM "${UNINSTALL_KEY}" "DisplayName" "${PRODUCT_NAME}"
     WriteRegStr HKLM "${UNINSTALL_KEY}" "UninstallString" '"$INSTDIR\uninstall.exe"'

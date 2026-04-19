@@ -32,6 +32,7 @@ dependencies = [
     "rich>=13.7",
     "pystray>=0.19",
     "Pillow>=10.0",
+    "desktop-notifier>=6.2",
 ]
 
 [project.optional-dependencies]

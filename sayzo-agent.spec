@@ -67,11 +67,11 @@ resemblyzer_pt = resemblyzer_pkg / "pretrained.pt"
 if resemblyzer_pt.exists():
     datas.append((str(resemblyzer_pt), "resemblyzer"))
 
-# macOS: bundle the pre-compiled sck-tap binary.
+# macOS: bundle the pre-compiled audio-tap binary (CoreAudio Process Taps helper).
 if sys.platform == "darwin":
-    sck_tap = Path("sayzo_agent/capture/sck-tap/sck-tap")
-    if sck_tap.exists():
-        datas.append((str(sck_tap), "sayzo_agent/capture/sck-tap"))
+    audio_tap = Path("sayzo_agent/capture/audio-tap/audio-tap")
+    if audio_tap.exists():
+        datas.append((str(audio_tap), "sayzo_agent/capture/audio-tap"))
 
 # ---------------------------------------------------------------------------
 # Hidden imports — modules loaded lazily or via importlib that PyInstaller
@@ -110,6 +110,8 @@ hiddenimports = [
     "httpx",
     # torch — required by Silero VAD feed()
     "torch",
+    # Native toast notifications
+    "desktop_notifier",
 ]
 
 # Windows-specific
@@ -117,12 +119,18 @@ if sys.platform == "win32":
     hiddenimports += [
         "pyaudiowpatch",
         "pystray._win32",
+        # desktop-notifier → WinRT backend
+        "winrt",
+        "winsdk",
     ]
 
 # macOS-specific
 if sys.platform == "darwin":
     hiddenimports += [
         "pystray._darwin",
+        # desktop-notifier → UNUserNotificationCenter backend
+        "rubicon",
+        "rubicon.objc",
     ]
 
 # ---------------------------------------------------------------------------
@@ -228,8 +236,12 @@ if sys.platform == "darwin":
                 "Sayzo needs microphone access to capture your "
                 "conversations for English coaching."
             ),
-            "NSAppleEventsUsageDescription": (
-                "Sayzo needs Screen Recording access to capture system audio."
+            "NSAudioCaptureUsageDescription": (
+                "Sayzo records audio from other apps (e.g. Zoom, FaceTime, "
+                "Meet) so it can transcribe conversations you're part of."
             ),
+            # macOS 14.4 is the floor — CoreAudio Process Taps API is unavailable
+            # on earlier releases.
+            "LSMinimumSystemVersion": "14.4",
         },
     )

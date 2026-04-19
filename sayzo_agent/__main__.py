@@ -117,7 +117,7 @@ def devices() -> None:
             pa.terminate()
     elif sys.platform == "darwin":
         click.echo("\n--- macOS system audio ---")
-        click.echo("  ScreenCaptureKit captures all system audio output.")
+        click.echo("  CoreAudio Process Taps capture all system audio output.")
         click.echo("  No device selection needed (all apps' audio is mixed).")
 
 
@@ -513,8 +513,10 @@ def run() -> None:
         log.info("Uploads enabled → %s", cfg.auth.effective_server_url)
 
     from .app import Agent
+    from .notify import DesktopNotifier, NoopNotifier
 
-    agent = Agent(cfg, upload_client=upload_client)
+    notifier = DesktopNotifier(app_name="Sayzo.Agent") if cfg.notifications_enabled else NoopNotifier()
+    agent = Agent(cfg, upload_client=upload_client, notifier=notifier)
 
     async def _main() -> None:
         loop = asyncio.get_running_loop()
@@ -571,11 +573,13 @@ def service() -> None:
         log.warning("uploads enabled → %s", cfg.auth.effective_server_url)
 
     from .app import Agent
+    from .notify import DesktopNotifier, NoopNotifier
 
     tray_state = TrayState()
     tray = TrayIcon(tray_state, cfg.captures_dir)
 
-    agent = Agent(cfg, upload_client=upload_client)
+    notifier = DesktopNotifier(app_name="Sayzo.Agent") if cfg.notifications_enabled else NoopNotifier()
+    agent = Agent(cfg, upload_client=upload_client, notifier=notifier)
 
     async def _main() -> None:
         loop = asyncio.get_running_loop()

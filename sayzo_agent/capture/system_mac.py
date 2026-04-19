@@ -1,20 +1,21 @@
-"""System audio (loopback) capture via a ScreenCaptureKit Swift helper.
+"""System audio (loopback) capture via a CoreAudio Process Taps Swift helper.
 
-macOS has no WASAPI-style loopback API.  Instead we spawn a small Swift binary
-(``sck-tap``) that uses ScreenCaptureKit to capture *all* system audio and
-pipes raw mono float32 PCM at 48 kHz to stdout.  This module reads that pipe,
-resamples to the pipeline target rate, and pushes normalised frames into the
-same asyncio queue interface that :class:`system_win.SystemCapture` provides.
+macOS has no WASAPI-style loopback API.  We spawn a small Swift binary
+(``audio-tap``) that uses the CoreAudio Process Taps API (macOS 14.4+) to
+capture all system audio and pipes raw mono float32 PCM at 48 kHz to stdout.
+This module reads that pipe, resamples to the pipeline target rate, and
+pushes normalised frames into the same asyncio queue interface that
+:class:`system_win.SystemCapture` provides.
 
 The Swift binary must be compiled separately on a Mac::
 
-    cd sayzo_agent/capture/sck-tap
-    swiftc -O -o sck-tap main.swift \\
-        -framework ScreenCaptureKit -framework CoreMedia -framework AVFoundation
+    cd sayzo_agent/capture/audio-tap
+    swiftc -O -o audio-tap main.swift \\
+        -framework CoreAudio -framework AudioToolbox -framework AVFoundation
 
 Binary lookup order:
 1. Same directory as this file (package-data install).
-2. ``sck-tap`` anywhere on ``PATH``.
+2. ``audio-tap`` anywhere on ``PATH``.
 """
 from __future__ import annotations
 
@@ -33,42 +34,42 @@ from . import normalize_rms
 
 log = logging.getLogger(__name__)
 
-# sck-tap emits mono float32 PCM at this rate.
+# audio-tap emits mono float32 PCM at this rate.
 _NATIVE_RATE = 48_000
 
 # Match the batch size used by the Windows implementation so behaviour
 # (latency, resampling quality) is consistent across platforms.
 _RESAMPLE_BATCH_FRAMES = 25
 
-# Exit code the Swift binary uses when Screen Recording permission is denied.
+# Exit code the Swift binary uses when Audio Capture permission is denied.
 _EXIT_PERMISSION_DENIED = 77
 
 
-def _find_sck_tap() -> str:
-    """Locate the ``sck-tap`` binary, raising FileNotFoundError if absent."""
+def _find_audio_tap() -> str:
+    """Locate the ``audio-tap`` binary, raising FileNotFoundError if absent."""
     # 1. Next to this file (package_data install / dev checkout).
-    here = Path(__file__).resolve().parent / "sck-tap" / "sck-tap"
+    here = Path(__file__).resolve().parent / "audio-tap" / "audio-tap"
     if here.is_file() and os.access(here, os.X_OK):
         return str(here)
 
     # 2. On PATH.
-    on_path = shutil.which("sck-tap")
+    on_path = shutil.which("audio-tap")
     if on_path is not None:
         return on_path
 
     raise FileNotFoundError(
-        "sck-tap binary not found.  Compile it on macOS with:\n"
-        "  cd sayzo_agent/capture/sck-tap\n"
-        "  swiftc -O -o sck-tap main.swift "
-        "-framework ScreenCaptureKit -framework CoreMedia "
+        "audio-tap binary not found.  Compile it on macOS with:\n"
+        "  cd sayzo_agent/capture/audio-tap\n"
+        "  swiftc -O -o audio-tap main.swift "
+        "-framework CoreAudio -framework AudioToolbox "
         "-framework AVFoundation"
     )
 
 
 class SystemCapture:
-    """Captures mono PCM frames from all system audio via ScreenCaptureKit.
+    """Captures mono PCM frames from all system audio via CoreAudio Process Taps.
 
-    Spawns the ``sck-tap`` Swift helper as an async subprocess and reads raw
+    Spawns the ``audio-tap`` Swift helper as an async subprocess and reads raw
     PCM from its stdout.  Resampled frames are pushed into ``self.queue``
     exactly like the Windows :class:`system_win.SystemCapture`.
     """
@@ -86,7 +87,7 @@ class SystemCapture:
 
         if device is not None:
             log.warning(
-                "device=%r ignored on macOS — ScreenCaptureKit captures "
+                "device=%r ignored on macOS — CoreAudio Process Taps capture "
                 "all system audio, no per-device selection",
                 device,
             )
@@ -109,8 +110,8 @@ class SystemCapture:
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
-        binary = _find_sck_tap()
-        log.info("starting sck-tap: %s", binary)
+        binary = _find_audio_tap()
+        log.info("starting audio-tap: %s", binary)
 
         self._proc = await asyncio.create_subprocess_exec(
             binary,
@@ -134,12 +135,12 @@ class SystemCapture:
             stderr_text = stderr_bytes.decode(errors="replace").strip()
             if code == _EXIT_PERMISSION_DENIED:
                 raise PermissionError(
-                    "Screen Recording permission denied.  Grant it in:\n"
-                    "  System Settings → Privacy & Security → Screen Recording\n"
+                    "Audio Capture permission denied.  Grant it in:\n"
+                    "  System Settings → Privacy & Security → Audio Capture\n"
                     "Then restart the agent."
                 )
             raise RuntimeError(
-                f"sck-tap exited immediately with code {code}: {stderr_text}"
+                f"audio-tap exited immediately with code {code}: {stderr_text}"
             )
 
         self._reader_task = asyncio.create_task(self._reader())
@@ -163,7 +164,7 @@ class SystemCapture:
             except asyncio.TimeoutError:
                 self._proc.kill()
                 await self._proc.wait()
-            log.info("sck-tap stopped (code %d)", self._proc.returncode)
+            log.info("audio-tap stopped (code %d)", self._proc.returncode)
 
         for task in (self._reader_task, self._stderr_task):
             if task is not None and not task.done():
@@ -182,7 +183,7 @@ class SystemCapture:
     # ------------------------------------------------------------------
 
     async def _reader(self) -> None:
-        """Read raw float32 PCM from sck-tap stdout, resample, enqueue."""
+        """Read raw float32 PCM from audio-tap stdout, resample, enqueue."""
         assert self._proc is not None and self._proc.stdout is not None
         stdout = self._proc.stdout
 
@@ -211,14 +212,14 @@ class SystemCapture:
                         log.warning("system queue full, dropping frame")
 
         except asyncio.IncompleteReadError:
-            log.info("sck-tap stdout closed (process ended)")
+            log.info("audio-tap stdout closed (process ended)")
         except asyncio.CancelledError:
             raise
         except Exception:
             log.exception("system capture reader crashed")
 
     async def _stderr_reader(self) -> None:
-        """Forward sck-tap stderr to the Python logger."""
+        """Forward audio-tap stderr to the Python logger."""
         assert self._proc is not None and self._proc.stderr is not None
         stderr = self._proc.stderr
 
@@ -227,7 +228,7 @@ class SystemCapture:
                 line = await stderr.readline()
                 if not line:
                     break
-                log.warning("[sck-tap] %s", line.decode(errors="replace").rstrip())
+                log.warning("[audio-tap] %s", line.decode(errors="replace").rstrip())
         except asyncio.CancelledError:
             raise
         except Exception:
