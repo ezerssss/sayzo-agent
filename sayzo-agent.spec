@@ -73,6 +73,13 @@ if sys.platform == "darwin":
     if audio_tap.exists():
         datas.append((str(audio_tap), "sayzo_agent/capture/audio-tap"))
 
+# First-run GUI assets — built HTML/JS/CSS bundle that the pywebview window
+# loads. The dev path resolves these via Path(__file__).parent in
+# sayzo_agent/gui/setup/window.py; the frozen path uses sys._MEIPASS.
+webui_dist = Path("sayzo_agent/gui/webui/dist")
+if webui_dist.exists():
+    datas.append((str(webui_dist), "sayzo_agent/gui/webui/dist"))
+
 # ---------------------------------------------------------------------------
 # Hidden imports — modules loaded lazily or via importlib that PyInstaller
 # cannot detect through static analysis.
@@ -112,6 +119,8 @@ hiddenimports = [
     "torch",
     # Native toast notifications
     "desktop_notifier",
+    # First-run GUI window
+    "webview",
 ]
 
 # Windows-specific
@@ -122,6 +131,11 @@ if sys.platform == "win32":
         # desktop-notifier → WinRT backend
         "winrt",
         "winsdk",
+        # pywebview → EdgeChromium / WinForms backend (uses .NET via pythonnet)
+        "webview.platforms.edgechromium",
+        "webview.platforms.winforms",
+        "clr_loader",
+        "pythonnet",
     ]
 
 # macOS-specific
@@ -131,6 +145,11 @@ if sys.platform == "darwin":
         # desktop-notifier → UNUserNotificationCenter backend
         "rubicon",
         "rubicon.objc",
+        # pywebview → Cocoa / WKWebView backend (via pyobjc)
+        "webview.platforms.cocoa",
+        "Foundation",
+        "AppKit",
+        "WebKit",
     ]
 
 # ---------------------------------------------------------------------------
@@ -243,5 +262,11 @@ if sys.platform == "darwin":
             # macOS 14.4 is the floor — CoreAudio Process Taps API is unavailable
             # on earlier releases.
             "LSMinimumSystemVersion": "14.4",
+            # First-run GUI uses Apple Events to deep-link into System Settings
+            # for granting microphone permission.
+            "NSAppleEventsUsageDescription": (
+                "Sayzo opens System Settings to help you grant microphone access."
+            ),
+            "LSApplicationCategoryType": "public.app-category.productivity",
         },
     )

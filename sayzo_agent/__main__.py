@@ -556,6 +556,42 @@ def service() -> None:
     write_pid(cfg.pid_path)
     log.warning("sayzo-agent service starting (pid=%d)", os.getpid())
 
+    # First-run gate. Detect missing setup signals (auth token, LLM weights,
+    # macOS mic permission) and open the GUI setup window if any is missing.
+    # The window blocks the main thread until the user completes setup or
+    # cancels. On cancel, exit cleanly without starting the tray + agent.
+    from .gui.setup.detect import detect_setup
+    setup_status = detect_setup(cfg)
+    if not setup_status.is_complete:
+        from .gui.setup.window import SetupWindow
+        from .gui.setup.bridge import SetupResult
+
+        log.warning(
+            "setup incomplete (token=%s model=%s mic=%s) — opening setup window",
+            setup_status.has_token,
+            setup_status.has_model,
+            setup_status.has_mic_permission,
+        )
+        try:
+            setup_result = SetupWindow(cfg).run_blocking()
+        except Exception:
+            log.exception("setup window crashed — exiting")
+            remove_pid(cfg.pid_path)
+            return
+        if setup_result == SetupResult.QUIT:
+            log.warning("user cancelled setup — exiting")
+            remove_pid(cfg.pid_path)
+            return
+        # COMPLETED: register the macOS launchd LaunchAgent so the service
+        # auto-starts on login. No-op on other platforms. Wired in Step 6.
+        if sys.platform == "darwin":
+            try:
+                from .gui.setup.launchd import ensure_launchd_registered
+
+                ensure_launchd_registered()
+            except Exception:
+                log.warning("launchd registration failed (non-fatal)", exc_info=True)
+
     from .auth.store import TokenStore
     from .gui.tray import TrayIcon, TrayState, Status
 

@@ -1,7 +1,10 @@
-# Sayzo Agent — Windows one-liner installer
+# Sayzo Agent — Windows one-liner installer (dev / power-user path)
 # Usage: irm https://sayzo.app/releases/windows/install.ps1 | iex
 #
-# Downloads the NSIS installer, runs it silently, then launches first-run setup.
+# Downloads the NSIS installer and runs it silently. The NSIS finish page
+# auto-launches sayzo-agent-service.exe, which detects missing setup signals
+# and opens its own GUI setup window — so this script no longer needs to
+# invoke `first-run` itself.
 
 $ErrorActionPreference = "Stop"
 
@@ -45,17 +48,7 @@ Write-Host "  Installed successfully." -ForegroundColor Green
 # Clean up installer.
 Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
 
-# Launch first-run setup.
-$exePath = Join-Path $env:ProgramFiles "Sayzo\Agent\sayzo-agent.exe"
-if (Test-Path $exePath) {
-    Write-Host ""
-    Write-Host "  Launching first-time setup..." -ForegroundColor Cyan
-    & $exePath first-run
-} else {
-    Write-Host "  Warning: Could not find $exePath" -ForegroundColor Yellow
-    Write-Host "  Run 'sayzo-agent first-run' manually to complete setup." -ForegroundColor Yellow
-}
-
 Write-Host ""
-Write-Host "  Done! Sayzo Agent will start automatically on login." -ForegroundColor Green
+Write-Host "  Done! Complete setup in the window that appears." -ForegroundColor Green
+Write-Host "  Sayzo Agent will then start automatically on every login." -ForegroundColor Green
 Write-Host ""

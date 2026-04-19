@@ -35,6 +35,17 @@ UninstallIcon "..\..\installer\assets\logo.ico"
 !define MUI_ICON "..\..\installer\assets\logo.ico"
 !define MUI_UNICON "..\..\installer\assets\logo.ico"
 !insertmacro MUI_PAGE_INSTFILES
+
+; Finish page with a "Launch Sayzo Agent" checkbox that runs the windowless
+; service exe (console=False per sayzo-agent.spec). The service detects
+; missing setup signals and opens its own first-run GUI if needed — that's
+; the whole point of the GUI installer path. See ~/.claude/plans/i-created-a-memory-quizzical-cosmos.md.
+; The MUI_FINISHPAGE_RUN_* defines must come BEFORE MUI_PAGE_FINISH.
+!define MUI_FINISHPAGE_RUN "$INSTDIR\${SERVICE_EXE}"
+!define MUI_FINISHPAGE_RUN_PARAMETERS "service"
+!define MUI_FINISHPAGE_RUN_TEXT "Launch Sayzo Agent"
+!insertmacro MUI_PAGE_FINISH
+
 !insertmacro MUI_UNPAGE_CONFIRM
 !insertmacro MUI_UNPAGE_INSTFILES
 !insertmacro MUI_LANGUAGE "English"
@@ -49,6 +60,27 @@ Section "Install"
     ; Copy the entire PyInstaller bundle directory.
     ; The NSIS script must be invoked from the repo root where dist/sayzo-agent/ exists.
     File /r "..\..\dist\sayzo-agent\*.*"
+
+    ; Bootstrap WebView2 Evergreen Runtime when missing. pywebview's
+    ; edgechromium backend (used by the first-run GUI) needs it. Win10 21H2+
+    ; and all Win11 ship it preinstalled; older Win10 doesn't.
+    ;
+    ; Drop MicrosoftEdgeWebview2Setup.exe (~120 KB, downloads from MS CDN at
+    ; install time) into installer/windows/ to enable bundling. Get it from:
+    ;   https://go.microsoft.com/fwlink/p/?LinkId=2124703
+    ; The !ifexist guard makes the bootstrapper optional — if the file isn't
+    ; there at compile time the installer skips this whole block and assumes
+    ; the target machine already has the runtime.
+    !ifexist "MicrosoftEdgeWebview2Setup.exe"
+        ReadRegStr $1 HKLM "SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}" "pv"
+        StrCmp $1 "" webview2_install webview2_skip
+        webview2_install:
+            DetailPrint "Installing WebView2 Runtime..."
+            File "MicrosoftEdgeWebview2Setup.exe"
+            ExecWait '"$INSTDIR\MicrosoftEdgeWebview2Setup.exe" /silent /install'
+            Delete "$INSTDIR\MicrosoftEdgeWebview2Setup.exe"
+        webview2_skip:
+    !endif
 
     ; Add install dir to user PATH so `sayzo-agent` works from any terminal.
     ReadRegStr $0 HKCU "Environment" "Path"
