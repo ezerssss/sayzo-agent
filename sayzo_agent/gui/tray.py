@@ -15,12 +15,13 @@ import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from PIL import Image, ImageDraw
+from PIL import Image
 
 log = logging.getLogger(__name__)
 
-# Tray icon size (pixels).
-_ICON_SIZE = 64
+# Tray icon size (pixels). pystray rescales as needed for the host OS, so we
+# pass a reasonably high-resolution PIL image and let it figure out the rest.
+_ICON_SIZE = 128
 
 
 # ---------------------------------------------------------------------------
@@ -55,27 +56,47 @@ class TrayState:
 
 
 # ---------------------------------------------------------------------------
-# Icon generation — simple colored circles, no external assets needed
+# Tray icon — loads the Sayzo logo from the bundled assets directory. Status
+# indication lives in the tooltip title + menu labels (no more colored
+# circles, per user request — the green dot felt unsettling).
 # ---------------------------------------------------------------------------
 
-_COLORS = {
-    Status.LISTENING: "#22c55e",   # green
-    Status.PAUSED: "#9ca3af",      # grey
-    Status.SETTING_UP: "#eab308",  # yellow
-    Status.ERROR: "#ef4444",       # red
-}
+
+def _logo_path() -> Path:
+    """Resolve the bundled logo image path for dev and frozen builds."""
+    if getattr(sys, "frozen", False):
+        base = Path(sys._MEIPASS) / "installer" / "assets"  # type: ignore[attr-defined]
+    else:
+        # tray.py is sayzo_agent/gui/tray.py — climb to repo root.
+        base = Path(__file__).resolve().parent.parent.parent / "installer" / "assets"
+    return base / "logo.png"
+
+
+_cached_icon: Image.Image | None = None
 
 
 def _make_icon(status: Status) -> Image.Image:
-    """Generate a solid-circle icon for the given status."""
-    img = Image.new("RGBA", (_ICON_SIZE, _ICON_SIZE), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    margin = 4
-    draw.ellipse(
-        [margin, margin, _ICON_SIZE - margin, _ICON_SIZE - margin],
-        fill=_COLORS[status],
-    )
-    return img
+    """Return the Sayzo logo as a PIL image, cached on first load.
+
+    ``status`` is accepted for signature compatibility — the visual doesn't
+    change per status anymore. Users get status info via tooltip + menu.
+    """
+    global _cached_icon
+    if _cached_icon is not None:
+        return _cached_icon
+
+    path = _logo_path()
+    try:
+        img = Image.open(path).convert("RGBA")
+        # pystray on macOS expects reasonably small/square icons; scale down
+        # big PNGs to _ICON_SIZE so we don't bloat memory.
+        if max(img.size) > _ICON_SIZE:
+            img.thumbnail((_ICON_SIZE, _ICON_SIZE), Image.Resampling.LANCZOS)
+        _cached_icon = img
+    except (OSError, FileNotFoundError):
+        log.warning("could not load tray logo at %s; using blank fallback", path)
+        _cached_icon = Image.new("RGBA", (_ICON_SIZE, _ICON_SIZE), (0, 0, 0, 0))
+    return _cached_icon
 
 
 # ---------------------------------------------------------------------------

@@ -6,6 +6,7 @@ import logging
 import logging.handlers
 import os
 import signal
+import subprocess
 import sys
 import time
 
@@ -700,23 +701,41 @@ def service(force_setup: bool) -> None:
             try:
                 tray.run_main()
             finally:
+                # After the tray closes on macOS, force-exit unconditionally.
+                # Several things can keep the Python process alive past the
+                # main thread even when the asyncio worker exits cleanly:
+                #
+                #   - pyobjc / pywebview leave non-daemon threads bound to
+                #     AppKit internals after the setup webview is destroyed.
+                #   - pythonnet / clr_loader initialize the CoreCLR runtime
+                #     which runs a background GC thread.
+                #   - launchd-spawned XPC helpers (WebKit Networking, GPU)
+                #     can land outside our process group.
+                #
+                # The user clicked Quit and expects "process gone". The
+                # launchd plist is already unloaded via the tray's quit
+                # handler, so nothing will revive us. SIGKILL the process
+                # group first to take down direct children (audio-tap, etc.),
+                # then os._exit as a safety net in case killpg raised.
                 agent.stop()
                 worker.join(timeout=5)
-                # macOS: the asyncio worker can take a long time to unwind
-                # (audio-tap subprocess shutdown, pending coroutines, etc.).
-                # Meanwhile the user has clicked Quit on the tray and expects
-                # the process to be gone — the launchd plist is already
-                # unloaded (see tray._mac_unload_launchd_agent), so nothing
-                # is going to revive us. If the worker is still alive after
-                # the short grace period, force-exit the process. A clean
-                # shutdown is a nice-to-have; the user-visible promise of
-                # "quit means gone" is not.
-                if worker.is_alive():
-                    log.warning(
-                        "asyncio worker still alive after 5s — forcing exit"
+                log.warning("tray quit — killing process group and exiting")
+                remove_pid(cfg.pid_path)
+                # Best-effort: pkill any remaining direct children that may
+                # have escaped the process group (WebKit XPC helpers).
+                try:
+                    subprocess.run(
+                        ["pkill", "-P", str(os.getpid())],
+                        timeout=2,
+                        capture_output=True,
                     )
-                    remove_pid(cfg.pid_path)
-                    os._exit(0)
+                except (OSError, subprocess.SubprocessError):
+                    pass
+                try:
+                    os.killpg(os.getpgrp(), signal.SIGKILL)
+                except OSError:
+                    pass
+                os._exit(0)
             if asyncio_exc and not isinstance(asyncio_exc[0], KeyboardInterrupt):
                 raise asyncio_exc[0]
         else:

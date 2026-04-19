@@ -87,6 +87,13 @@ if not (webui_dist / "index.html").exists():
     )
 datas.append((str(webui_dist), "sayzo_agent/gui/webui/dist"))
 
+# Tray icon — sayzo_agent/gui/tray.py loads this from the bundled assets
+# directory at runtime. Same source file also supplies the .ico/.icns used
+# for the Windows exe / macOS .app bundle icon below.
+tray_logo = Path("installer/assets/logo.png")
+if tray_logo.exists():
+    datas.append((str(tray_logo), "installer/assets"))
+
 # ---------------------------------------------------------------------------
 # Hidden imports — modules loaded lazily or via importlib that PyInstaller
 # cannot detect through static analysis.
