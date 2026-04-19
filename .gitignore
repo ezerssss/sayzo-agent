@@ -19,3 +19,6 @@ sayzo-data/
 test_data/
 installer/**/*.exe
 installer/**/*.dmg
+# Exception: the WebView2 Evergreen Bootstrapper is a committed build input,
+# not a build output — NSIS bundles it to cover Win10 pre-21H2 machines.
+!installer/windows/MicrosoftEdgeWebview2Setup.exe

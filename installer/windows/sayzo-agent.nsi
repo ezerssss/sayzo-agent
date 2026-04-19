@@ -68,10 +68,10 @@ Section "Install"
     ; Drop MicrosoftEdgeWebview2Setup.exe (~120 KB, downloads from MS CDN at
     ; install time) into installer/windows/ to enable bundling. Get it from:
     ;   https://go.microsoft.com/fwlink/p/?LinkId=2124703
-    ; The !ifexist guard makes the bootstrapper optional — if the file isn't
-    ; there at compile time the installer skips this whole block and assumes
-    ; the target machine already has the runtime.
-    !ifexist "MicrosoftEdgeWebview2Setup.exe"
+    ; The !if /FileExists guard makes the bootstrapper optional — if the
+    ; file isn't there at compile time the installer skips this whole block
+    ; and assumes the target machine already has the runtime.
+    !if /FileExists "MicrosoftEdgeWebview2Setup.exe"
         ReadRegStr $1 HKLM "SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}" "pv"
         StrCmp $1 "" webview2_install webview2_skip
         webview2_install:
