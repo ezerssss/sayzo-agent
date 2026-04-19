@@ -7,6 +7,11 @@
 !include "WinMessages.nsh"
 !include "WordFunc.nsh"
 
+; Vendored NSIS plugins (see installer/windows/nsis-plugins/README.md).
+; We ship ApplicationID.dll so toast notifications work on Win10 — the
+; chocolatey `nsis` package on CI doesn't bundle third-party plugins.
+!addplugindir /x86-unicode "nsis-plugins\x86-unicode"
+
 ; ---------------------------------------------------------------------------
 ; Configuration
 ; ---------------------------------------------------------------------------
@@ -100,12 +105,11 @@ Section "Install"
     CreateShortCut "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME}.lnk" "$INSTDIR\${SERVICE_EXE}" "service"
     CreateShortCut "$SMPROGRAMS\${PRODUCT_NAME}\Uninstall.lnk" "$INSTDIR\uninstall.exe"
 
-    ; Set AppUserModelID (AUMID) on the Start Menu shortcut. Windows 10 silently
-    ; drops WinRT toasts from apps without a registered AUMID-on-shortcut, so
-    ; this is required for desktop-notifier to show anything on Win10. Must
-    ; match the `app_name` passed to DesktopNotifier() in sayzo_agent/__main__.py.
-    ; Requires the ApplicationID NSIS plugin (ships with many NSIS builds; if
-    ; missing, install it or use a registry-based fallback).
+    ; Set AppUserModelID (AUMID) on the Start Menu shortcut. Windows 10
+    ; silently drops WinRT toasts from apps without a registered AUMID-on-
+    ; shortcut, so this is required for desktop-notifier to show anything on
+    ; Win10. Must match the `app_name` passed to DesktopNotifier() in
+    ; sayzo_agent/__main__.py. Plugin is vendored under nsis-plugins/.
     ApplicationID::Set "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME}.lnk" "Sayzo.Agent"
     Pop $0
 
