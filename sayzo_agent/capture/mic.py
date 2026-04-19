@@ -2,16 +2,28 @@
 
 Each frame is enqueued as a ``(capture_mono_ts, pcm)`` tuple where
 ``capture_mono_ts`` is the ``time.monotonic()`` value corresponding to the
-first sample in the frame. We derive it from PortAudio's hardware-stamped
-``time_info.inputBufferAdcTime`` (the ADC time of the first sample),
-correlated against ``time.monotonic()`` at stream open. This removes the
-callback-scheduling jitter that would otherwise make cross-source alignment
-unreliable.
+first sample in the frame.
 
-Fallback: if ``inputBufferAdcTime`` is zero or non-monotonic (some drivers
-don't populate it), stamp with ``time.monotonic()`` at callback entry,
-minus the device's reported ``inputLatency``. The fallback is lossier (up
-to ~50 ms bias) but still prevents drift.
+Stamping strategy: ``time.monotonic()`` at callback entry, minus the
+reported input latency and one frame duration. Two platform quirks we have
+to handle:
+
+1. **WASAPI's ``inputBufferAdcTime`` is broken**: PortAudio's WASAPI
+   backend populates it with tiny values (e.g. 0.02) on a clock that
+   doesn't match ``stream.time``. Correlating the two produces garbage
+   timestamps. So we don't use ``inputBufferAdcTime`` at all — callback-
+   time stamping is ~10-20 ms of constant bias, which the system side
+   also has (batch end time), so cross-source alignment stays tight.
+
+2. **WASAPI fires callbacks in pairs**: sounddevice sometimes delivers
+   two 20 ms callbacks back-to-back with identical ``time.monotonic()``
+   readings, then a ~40 ms gap to the next pair. Without handling this,
+   adjacent frames get the same timestamp, the detector appears to see
+   all frames arriving late in bursts, and cross-source alignment drifts
+   by the pair delta (~40 ms). We enforce a strict per-frame spacing:
+   each frame's timestamp is ``max(wall_clock_ts, last_ts +
+   frame_duration)``. That de-aliases paired callbacks while still
+   trusting wall-clock when it's ahead (real drops / queue backup).
 """
 from __future__ import annotations
 
@@ -49,16 +61,14 @@ class MicCapture:
         self.queue: asyncio.Queue[tuple[float, np.ndarray]] = asyncio.Queue(maxsize=queue_maxsize)
         self._stream: sd.InputStream | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
-        # Stream-time → monotonic correlation. Captured at stream start, used
-        # every callback to convert PortAudio's `inputBufferAdcTime` into
-        # `time.monotonic()` seconds.
-        self._stream_time_ref: float | None = None
-        self._mono_time_ref: float | None = None
-        # Fallback: input latency reported by the stream, used when ADC-time
-        # isn't available.
-        self._input_latency: float = 0.0
-        # Whether we logged the clock-source choice yet.
-        self._stamping_mode: str = "unknown"
+        # Offset between "callback fires" and "first sample in indata was
+        # captured". Combines the driver's reported input latency with one
+        # frame duration (since the buffer was filled over the last
+        # ``frame_duration`` seconds before the callback fired).
+        self._capture_offset: float = 0.0
+        # Last emitted capture_mono_ts. Used to de-alias WASAPI's paired
+        # callbacks (two callbacks with the same wall-clock time.monotonic()).
+        self._last_emitted_ts: float | None = None
 
     def _callback(self, indata, frames, time_info, status) -> None:  # noqa: ANN001
         if status:
@@ -71,14 +81,24 @@ class MicCapture:
         if loop is None or loop.is_closed():
             return
 
-        # Stamp capture time at the hardware boundary. Primary: PortAudio's
-        # inputBufferAdcTime (ADC time of first sample in indata). Fallback:
-        # monotonic() at callback entry minus the reported input latency.
-        adc_time = getattr(time_info, "inputBufferAdcTime", 0.0) or 0.0
-        if self._stream_time_ref is not None and adc_time > 0.0:
-            capture_mono_ts = self._mono_time_ref + (adc_time - self._stream_time_ref)
+        # Monotonic-at-callback minus the capture offset gives the mono
+        # time of the FIRST sample in indata. This is what the detector's
+        # gap-fill invariant expects.
+        wall_clock_ts = time.monotonic() - self._capture_offset
+
+        # De-alias WASAPI's paired callbacks: when two callbacks fire with
+        # the same ``time.monotonic()``, the raw stamp would be identical
+        # for adjacent frames, corrupting the detector's timeline. Enforce
+        # strict spacing of at least one frame_duration between frames. If
+        # wall-clock is ahead of extrapolation (real drop / queue backup),
+        # trust wall-clock so the detector's gap-fill can kick in.
+        if self._last_emitted_ts is not None:
+            capture_mono_ts = max(
+                wall_clock_ts, self._last_emitted_ts + self.frame_duration
+            )
         else:
-            capture_mono_ts = time.monotonic() - self._input_latency
+            capture_mono_ts = wall_clock_ts
+        self._last_emitted_ts = capture_mono_ts
 
         # indata: (frames, channels) float32. We always use mono.
         mono = indata[:, 0].copy() if indata.ndim == 2 else indata.copy()
@@ -100,39 +120,29 @@ class MicCapture:
         )
         self._stream.start()
 
-        # Grab stream-time / monotonic correlation once, as soon as the
-        # stream is running. Some drivers need the first few callbacks to
-        # populate `inputBufferAdcTime`; we'll simply detect non-zero ADC
-        # time per callback and fall back if absent.
+        # `Stream.latency` returns either a float (InputStream) or a tuple
+        # (Stream with both input+output) depending on the sounddevice
+        # version. Handle both without risking a TypeError that would leave
+        # `_capture_offset` at zero.
+        reported_latency = 0.0
         try:
-            mono_ref = time.monotonic()
-            stream_ref = float(self._stream.time)
-            self._mono_time_ref = mono_ref
-            self._stream_time_ref = stream_ref
-            self._stamping_mode = "adc-time"
+            lat = self._stream.latency
+            if isinstance(lat, (tuple, list)):
+                reported_latency = float(lat[0])
+            else:
+                reported_latency = float(lat)
         except Exception:
-            self._mono_time_ref = None
-            self._stream_time_ref = None
-            self._stamping_mode = "fallback-monotonic"
+            reported_latency = 0.0
 
-        try:
-            self._input_latency = float(self._stream.latency[0])
-        except Exception:
-            self._input_latency = 0.0
+        self._capture_offset = reported_latency + self.frame_duration
 
         log.info(
-            "mic capture started: device=%s sr=%d mode=%s latency=%.3fs",
+            "mic capture started: device=%s sr=%d latency=%.3fs capture_offset=%.3fs",
             self.device or "default",
             self.sample_rate,
-            self._stamping_mode,
-            self._input_latency,
+            reported_latency,
+            self._capture_offset,
         )
-        if self._stamping_mode != "adc-time":
-            log.warning(
-                "mic capture: hardware ADC timestamps unavailable — falling "
-                "back to callback-time stamping. Cross-source alignment will "
-                "be wider (~50 ms bias)."
-            )
 
     async def stop(self) -> None:
         if self._stream is not None:

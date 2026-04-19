@@ -38,6 +38,18 @@ class DesktopNotifier:
 
     def __init__(self, app_name: str = "Sayzo") -> None:
         self._impl = None
+        # On Windows the desktop-notifier backend activates winrt notification
+        # APIs, which load Windows Runtime DLLs that subsequently break torch's
+        # own DLL initialization (c10.dll) — any later `import torch` via
+        # silero_vad dies with WinError 1114. Preloading torch first pins its
+        # DLLs so the winrt load can't clobber them. The PyInstaller bundle
+        # sidesteps this by shipping DLLs next to the exe; dev installs don't.
+        import sys
+        if sys.platform == "win32":
+            try:
+                import torch  # noqa: F401
+            except Exception:
+                pass
         try:
             from desktop_notifier import DesktopNotifier as _Backend
             self._impl = _Backend(app_name=app_name)
