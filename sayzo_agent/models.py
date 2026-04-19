@@ -32,7 +32,15 @@ class SpeechSegment:
 
 @dataclass
 class SessionBuffers:
-    """Per-source PCM buffers and VAD timelines for one open session."""
+    """Per-source PCM buffers and VAD timelines for one open session.
+
+    After the detector closes a session, `mic_pcm` and `sys_pcm` are the same
+    length and both start at `session_t0_mono` in `time.monotonic()` seconds:
+    `mic_pcm[sample_N]` and `sys_pcm[sample_N]` correspond to the same
+    wall-clock moment. All `SpeechSegment.start_ts` / `end_ts` and all
+    Whisper-derived timestamps after STT are in session seconds (= seconds
+    from `session_t0_mono`) so they index either PCM buffer directly.
+    """
 
     mic_pcm: bytearray = field(default_factory=bytearray)
     sys_pcm: bytearray = field(default_factory=bytearray)
@@ -41,6 +49,12 @@ class SessionBuffers:
     started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     started_monotonic: float = 0.0
     ended_monotonic: float = 0.0
+    # Monotonic time of mic_pcm[0] = sys_pcm[0]. Set when the session opens
+    # and the backfill alignment lands both channels at the same wall-clock
+    # moment. Differs from `started_monotonic` (which is the "_open_session
+    # was called" moment) because backfill extends the audio earlier.
+    session_t0_mono: float = 0.0
+    session_end_mono: float = 0.0
     close_reason: Optional[SessionCloseReason] = None
 
     def mic_total_voiced(self) -> float:
@@ -57,6 +71,11 @@ class SessionBuffers:
 
     def elapsed(self) -> float:
         return self.ended_monotonic - self.started_monotonic
+
+    def pcm_duration(self, sample_rate: int = 16000) -> float:
+        """Duration of the saved audio in seconds. After close, this equals
+        `session_end_mono - session_t0_mono` modulo rounding."""
+        return max(len(self.mic_pcm), len(self.sys_pcm)) / 2 / sample_rate
 
 
 @dataclass

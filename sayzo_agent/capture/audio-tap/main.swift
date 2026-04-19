@@ -1,7 +1,20 @@
 // audio-tap — Capture all system audio via CoreAudio Process Taps (macOS 14.4+),
-// pipe raw PCM to stdout.
+// pipe timestamp-framed PCM to stdout.
 //
-// Output format: mono float32 PCM at 48 kHz, written to stdout unbuffered.
+// Wire protocol (new in protocol version 1): each capture block is written as
+//
+//     [4 bytes magic "SAYZ"][8 bytes Float64 timestamp][4 bytes UInt32 byte count][N bytes Float32 PCM]
+//
+// - Magic is ASCII "SAYZ" (0x53 0x41 0x59 0x5A) so Python can detect a stale
+//   binary (which wrote raw PCM) and warn.
+// - Timestamp is CACurrentMediaTime-equivalent seconds (mach-timebase-derived
+//   from CoreAudio's `inInputTime->mHostTime`), matching Python's
+//   `time.monotonic()` on macOS since both resolve to `mach_absolute_time()`
+//   converted to seconds.
+// - Byte count is the PCM payload size in bytes (always a multiple of 4 —
+//   Float32 mono at 48 kHz).
+// - PCM is mono float32 at 48 kHz, one CoreAudio ioProc block per header.
+//
 // On permission denied: prints message to stderr and exits with code 77.
 //
 // Compile (macOS 14.4+):
@@ -9,7 +22,13 @@
 //       -framework CoreAudio -framework AudioToolbox -framework AVFoundation
 //
 // Test:
-//   ./audio-tap | ffplay -f f32le -ar 48000 -ac 1 -
+//   ./audio-tap | python3 -c 'import sys, struct
+//       while True:
+//           h = sys.stdin.buffer.read(16)
+//           if len(h) < 16: break
+//           magic, ts, n = h[:4], struct.unpack("<d", h[4:12])[0], struct.unpack("<I", h[12:16])[0]
+//           pcm = sys.stdin.buffer.read(n)
+//           print(magic, ts, n, len(pcm))'
 //
 // Why CoreAudio taps (not ScreenCaptureKit): the tap permission prompt is
 // audio-only ("Audio Capture") instead of the alarming "Screen Recording"
@@ -19,6 +38,7 @@
 import AudioToolbox
 import AVFoundation
 import CoreAudio
+import Darwin
 import Foundation
 
 // ---------------------------------------------------------------------------
@@ -29,8 +49,29 @@ let kSampleRate: Double = 48_000
 let kChannelCount: AVAudioChannelCount = 1
 let kExitPermissionDenied: Int32 = 77
 
+// Magic bytes "SAYZ" so Python can distinguish new-protocol output from a
+// stale binary that emitted raw PCM.
+let kMagicBytes: [UInt8] = [0x53, 0x41, 0x59, 0x5A]
+
 // Unbuffer stdout so PCM bytes reach the Python reader immediately.
 setbuf(stdout, nil)
+
+// ---------------------------------------------------------------------------
+// Mach timebase for converting AudioTimeStamp.mHostTime → seconds.
+// `mach_absolute_time()` units × (numer/denom) = nanoseconds.
+// ---------------------------------------------------------------------------
+
+var gMachTimebase = mach_timebase_info_data_t()
+mach_timebase_info(&gMachTimebase)
+
+@inline(__always)
+func hostTimeToSeconds(_ hostTime: UInt64) -> Double {
+    // Convert mach host time to nanoseconds, then to seconds. The same math
+    // Python's time.monotonic() and CACurrentMediaTime() use, so the result
+    // is directly comparable to a Python-side time.monotonic() value.
+    let nanos = Double(hostTime) * Double(gMachTimebase.numer) / Double(gMachTimebase.denom)
+    return nanos / 1_000_000_000
+}
 
 // ---------------------------------------------------------------------------
 // Global state
@@ -53,10 +94,11 @@ var gRunLoop = true
 
 // ---------------------------------------------------------------------------
 // IO proc — called on a real-time audio thread for each input block.
-// Converts incoming samples to mono float32 @ 48 kHz, writes to stdout.
+// Converts incoming samples to mono float32 @ 48 kHz, writes a framed record
+// (header + PCM) to stdout.
 // ---------------------------------------------------------------------------
 
-let ioProc: AudioDeviceIOProc = { _, _, inInputData, _, _, _, _ in
+let ioProc: AudioDeviceIOProc = { _, _, inInputData, inInputTime, _, _, _ in
     guard let converter = gState.converter,
           let outBuf = gState.outputBuffer,
           let inputFormat = gState.inputFormat else {
@@ -90,9 +132,36 @@ let ioProc: AudioDeviceIOProc = { _, _, inInputData, _, _, _, _ in
         return noErr
     }
 
-    if let floatPtr = outBuf.floatChannelData?[0] {
-        fwrite(floatPtr, MemoryLayout<Float>.size, Int(outBuf.frameLength), stdout)
+    guard let floatPtr = outBuf.floatChannelData?[0] else {
+        return noErr
     }
+
+    let frameCount = Int(outBuf.frameLength)
+    if frameCount == 0 {
+        return noErr
+    }
+
+    // Timestamp of the first sample in this input block, derived from
+    // CoreAudio's hardware-grounded timestamp. Converted to mach-seconds so
+    // Python's `time.monotonic()` matches directly.
+    let hostTime = inInputTime.pointee.mHostTime
+    var timestampSeconds = hostTimeToSeconds(hostTime)
+    var pcmByteCount = UInt32(frameCount * MemoryLayout<Float>.size)
+
+    // Emit framing header. Byte order is native little-endian on all macOS
+    // platforms (Apple Silicon + Intel), matching Python's struct "<" format.
+    _ = kMagicBytes.withUnsafeBufferPointer { ptr in
+        fwrite(ptr.baseAddress, 1, 4, stdout)
+    }
+    withUnsafePointer(to: &timestampSeconds) { ptr in
+        _ = fwrite(ptr, MemoryLayout<Double>.size, 1, stdout)
+    }
+    withUnsafePointer(to: &pcmByteCount) { ptr in
+        _ = fwrite(ptr, MemoryLayout<UInt32>.size, 1, stdout)
+    }
+
+    // PCM payload.
+    fwrite(floatPtr, MemoryLayout<Float>.size, frameCount, stdout)
     return noErr
 }
 
@@ -241,7 +310,7 @@ func run() {
     fputs(
         "audio-tap: capturing system audio "
             + "(native \(Int(nativeFmt.sampleRate)) Hz ch=\(nativeFmt.channelCount), "
-            + "emitting \(Int(kSampleRate)) Hz mono float32)\n",
+            + "emitting \(Int(kSampleRate)) Hz mono float32, protocol=SAYZ/v1)\n",
         stderr
     )
 

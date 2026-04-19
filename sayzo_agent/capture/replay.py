@@ -134,7 +134,19 @@ def save_wav(audio: np.ndarray, sample_rate: int, path: str | Path) -> None:
 
 class ReplayCapture:
     """Drop-in replacement for MicCapture/SystemCapture that feeds frames
-    from a pre-loaded float32 array."""
+    from a pre-loaded float32 array.
+
+    Each enqueued item is a ``(capture_mono_ts, frame)`` tuple. The
+    timestamp is derived from a **synthetic monotonic clock** that advances
+    by ``frame_samples / sample_rate`` per frame regardless of playback
+    speed. At speed=0 (as-fast-as-possible), real ``time.monotonic()``
+    would fire the gap-fill path on every frame; using a synthetic
+    audio-rate clock keeps the detector's mono-clock invariant intact.
+
+    For cross-source alignment in tests, the mic and sys ``ReplayCapture``
+    instances must share the same ``t0`` (default 0.0) so their synthetic
+    clocks are coherent.
+    """
 
     def __init__(
         self,
@@ -143,12 +155,15 @@ class ReplayCapture:
         frame_ms: int = 20,
         speed: float = 1.0,
         queue_maxsize: int = 200,
+        t0: float = 0.0,
     ) -> None:
         self.sample_rate = sample_rate
         self.frame_samples = int(sample_rate * frame_ms / 1000)
-        self.queue: asyncio.Queue[np.ndarray] = asyncio.Queue(maxsize=queue_maxsize)
+        self.frame_duration = self.frame_samples / sample_rate
+        self.queue: asyncio.Queue[tuple[float, np.ndarray]] = asyncio.Queue(maxsize=queue_maxsize)
         self._audio = audio
         self._speed = speed
+        self._t0 = t0
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
@@ -161,8 +176,7 @@ class ReplayCapture:
 
     def _run(self) -> None:
         n_samples = len(self._audio)
-        frame_dur = self.frame_samples / self.sample_rate
-        sleep_dur = frame_dur / self._speed if self._speed > 0 else 0.0
+        sleep_dur = self.frame_duration / self._speed if self._speed > 0 else 0.0
         pos = 0
         frames_fed = 0
 
@@ -172,20 +186,25 @@ class ReplayCapture:
             if len(chunk) < self.frame_samples:
                 # Pad final frame with silence
                 chunk = np.pad(chunk, (0, self.frame_samples - len(chunk)))
+            # Synthetic timestamp: ``t0 + sample_position / sample_rate`` so
+            # it advances in lockstep with audio content, decoupled from
+            # wall-clock replay speed.
+            capture_mono_ts = self._t0 + pos / self.sample_rate
             pos = end
             frames_fed += 1
 
             if self._loop is None:
                 continue
+            payload = (capture_mono_ts, chunk)
             try:
-                self._loop.call_soon_threadsafe(self.queue.put_nowait, chunk)
+                self._loop.call_soon_threadsafe(self.queue.put_nowait, payload)
             except asyncio.QueueFull:
                 # Back-pressure: wait a bit and retry
                 import time
 
                 time.sleep(0.01)
                 try:
-                    self._loop.call_soon_threadsafe(self.queue.put_nowait, chunk)
+                    self._loop.call_soon_threadsafe(self.queue.put_nowait, payload)
                 except asyncio.QueueFull:
                     pass
 

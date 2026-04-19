@@ -144,14 +144,14 @@ def test_capture(seconds: int, dump_wav: bool) -> None:
         end = asyncio.get_running_loop().time() + seconds
         while asyncio.get_running_loop().time() < end:
             try:
-                frame = await asyncio.wait_for(mic.queue.get(), timeout=0.05)
+                _ts, frame = await asyncio.wait_for(mic.queue.get(), timeout=0.05)
                 mic_n += 1
                 if dump_wav:
                     mic_frames.append(frame)
             except asyncio.TimeoutError:
                 pass
             try:
-                frame = await asyncio.wait_for(sys_.queue.get(), timeout=0.05)
+                _ts, frame = await asyncio.wait_for(sys_.queue.get(), timeout=0.05)
                 sys_n += 1
                 if dump_wav:
                     sys_frames.append(frame)

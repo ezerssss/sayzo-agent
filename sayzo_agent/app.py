@@ -93,9 +93,14 @@ class Agent:
             if self._paused.is_set():
                 await asyncio.sleep(0.5)
                 continue
-            frame: np.ndarray = await queue.get()
+            # Queue payload is a (capture_mono_ts, frame) tuple. Capture-
+            # stamping happens at the hardware boundary in each capture
+            # module (sounddevice callback / WASAPI read / audio-tap
+            # header); the detector uses `capture_mono_ts` to keep mic and
+            # system buffers aligned to a shared session timeline.
+            capture_mono_ts, frame = await queue.get()
             now = time.monotonic()
-            self.detector.on_frame(source, frame, now)
+            self.detector.on_frame(source, frame, capture_mono_ts, now)
             for seg in vad.feed(frame):
                 self.detector.on_segment(seg, now)
 
@@ -308,7 +313,15 @@ class Agent:
         )
 
         # 6. Sink + upload
-        ended_at = buffers.started_at + timedelta(seconds=buffers.elapsed())
+        # Derive wall-clock started_at / ended_at from the PCM timeline so
+        # record.json lines up with the saved Opus file. `session_t0_mono`
+        # may be earlier than `started_monotonic` (backfill extends the
+        # audio earlier than the _open_session moment); `session_end_mono`
+        # may be slightly later (tail pad equalizes channel lengths).
+        backfill_secs = max(0.0, buffers.started_monotonic - buffers.session_t0_mono)
+        true_started_at = buffers.started_at - timedelta(seconds=backfill_secs)
+        pcm_duration = buffers.pcm_duration(sr)
+        ended_at = true_started_at + timedelta(seconds=pcm_duration)
         record = await loop.run_in_executor(
             self._executor,
             self.sink.write,
@@ -316,7 +329,7 @@ class Agent:
             verdict.title,
             verdict.summary,
             verdict.relevant_span,
-            buffers.started_at,
+            true_started_at,
             ended_at,
             mic_final,
             sys_final,
@@ -326,7 +339,7 @@ class Agent:
         await self.upload.upload(record)
         self._captures_kept += 1
 
-        duration_s = (ended_at - buffers.started_at).total_seconds()
+        duration_s = (ended_at - true_started_at).total_seconds()
         body = f"{verdict.title} \u00b7 {_format_duration(duration_s)}"
         await loop.run_in_executor(
             self._executor, self.notifier.notify, "Conversation saved", body

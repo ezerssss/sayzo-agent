@@ -61,6 +61,17 @@ class ConversationConfig(BaseSettings):
     # any realistic uninterrupted opening utterance; at 16 kHz mono that's
     # ~48 MB per source at 25 min / 16 kHz mono int16.
     max_pre_buffer_secs: float = 1500.0
+    # Gap-fill thresholds for the mono-clock invariant. When a frame arrives
+    # with capture_mono_ts more than this far past "expected next sample
+    # time", the detector zero-fills the gap so buffer offsets stay aligned
+    # with wall-clock. Too tight fires on normal scheduler jitter; too loose
+    # lets real dropped frames shift the timeline.
+    # Mic: sounddevice callbacks fire on ~20 ms cadence; 60 ms tolerates one
+    # skipped wakeup before zero-filling.
+    # System: WASAPI / audio-tap arrive in 500 ms batches; 150 ms tolerates
+    # one scheduler hiccup on either end of a batch.
+    gap_tolerance_secs_mic: float = 0.060
+    gap_tolerance_secs_system: float = 0.150
 
 
 class STTConfig(BaseSettings):

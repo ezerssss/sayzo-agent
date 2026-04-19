@@ -8,12 +8,20 @@ To eliminate frame-boundary artifacts, we accumulate a larger chunk of audio
 at native rate (multiple pipeline frames worth), resample the whole chunk in
 one call, then slice the result into pipeline-sized frames. This avoids the
 discontinuities that per-frame resample_poly would produce.
+
+Each enqueued pipeline frame is a ``(capture_mono_ts, pcm)`` tuple.
+``capture_mono_ts`` is the ``time.monotonic()`` value corresponding to the
+first sample of the frame, derived from PortAudio's ``stream.get_time()``
+correlated to ``time.monotonic()`` at stream open. Fallback: monotonic
+stamp at batch return minus batch duration (lossier, widens cross-source
+bias to ~50 ms).
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import threading
+import time
 from math import gcd
 
 import numpy as np
@@ -46,8 +54,9 @@ class SystemCapture:
     ) -> None:
         self.sample_rate = sample_rate
         self.frame_samples = int(sample_rate * frame_ms / 1000)
+        self.frame_duration = self.frame_samples / sample_rate
         self.device_name = device
-        self.queue: asyncio.Queue[np.ndarray] = asyncio.Queue(maxsize=queue_maxsize)
+        self.queue: asyncio.Queue[tuple[float, np.ndarray]] = asyncio.Queue(maxsize=queue_maxsize)
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
@@ -101,10 +110,11 @@ class SystemCapture:
         # resample_poly would produce at every 20 ms boundary.
         native_samples_per_frame = self.frame_samples * down // up
         batch_native_samples = native_samples_per_frame * _RESAMPLE_BATCH_FRAMES
+        batch_duration = batch_native_samples / native_rate
 
         log.info(
             "system capture started: device=%s native_sr=%d target_sr=%d channels=%d "
-            "(resample %d/%d, batch=%d frames)",
+            "(resample %d/%d, batch=%d frames, batch_dur=%.3fs)",
             loopback["name"],
             native_rate,
             self.sample_rate,
@@ -112,6 +122,7 @@ class SystemCapture:
             up,
             down,
             _RESAMPLE_BATCH_FRAMES,
+            batch_duration,
         )
 
         stream = None
@@ -125,8 +136,47 @@ class SystemCapture:
                 frames_per_buffer=batch_native_samples,
             )
 
+            # Establish a stream-time → monotonic correlation. PortAudio's
+            # `stream.get_time()` gives the current stream clock position
+            # (hardware-grounded); pairing it with `time.monotonic()` at the
+            # same moment lets us convert per-batch stream times into
+            # monotonic seconds.
+            stream_time_ref: float | None = None
+            mono_time_ref: float | None = None
+            stamping_mode = "fallback-monotonic"
+            try:
+                stream_time_ref = float(stream.get_time())
+                mono_time_ref = time.monotonic()
+                stamping_mode = "stream-time"
+            except Exception:
+                log.warning(
+                    "system capture: PortAudio stream.get_time() unavailable — "
+                    "falling back to monotonic-at-return timing (wider ~50 ms bias)."
+                )
+
+            log.info("system capture: stamping mode=%s", stamping_mode)
+
             while not self._stop.is_set():
                 raw = stream.read(batch_native_samples, exception_on_overflow=False)
+                # Stamp capture time IMMEDIATELY after read returns so the
+                # fallback path has minimal extra jitter.
+                mono_at_return = time.monotonic()
+                if stream_time_ref is not None:
+                    try:
+                        stream_time_now = float(stream.get_time())
+                        # `stream_time_now` corresponds (roughly) to the last
+                        # sample in the just-read batch. The first sample was
+                        # captured `batch_duration` earlier.
+                        batch_first_sample_stream = stream_time_now - batch_duration
+                        batch_first_sample_mono = (
+                            mono_time_ref
+                            + (batch_first_sample_stream - stream_time_ref)
+                        )
+                    except Exception:
+                        batch_first_sample_mono = mono_at_return - batch_duration
+                else:
+                    batch_first_sample_mono = mono_at_return - batch_duration
+
                 samples = np.frombuffer(raw, dtype=np.float32)
 
                 # Downmix to mono
@@ -141,16 +191,19 @@ class SystemCapture:
                 # transcriber sees uniform volume regardless of system volume.
                 samples = normalize_rms(samples)
 
-                # Slice into pipeline-sized frames and enqueue
+                # Slice into pipeline-sized frames and enqueue with per-frame
+                # monotonic timestamps derived from the batch's first-sample
+                # time.
                 if self._loop is None:
                     continue
                 pos = 0
                 while pos + self.frame_samples <= len(samples):
                     frame = samples[pos : pos + self.frame_samples]
+                    frame_mono = batch_first_sample_mono + (pos / self.sample_rate)
                     pos += self.frame_samples
                     try:
                         self._loop.call_soon_threadsafe(
-                            self.queue.put_nowait, frame
+                            self.queue.put_nowait, (frame_mono, frame)
                         )
                     except asyncio.QueueFull:
                         log.warning("system queue full, dropping frame")

@@ -8,9 +8,8 @@
 
 $ErrorActionPreference = "Stop"
 
-$version = "0.1.0"
 $arch = if ([System.Environment]::Is64BitOperatingSystem) { "x64" } else { "x86" }
-$installerName = "sayzo-agent-setup-${version}.exe"
+$installerName = "sayzo-agent-setup.exe"
 $downloadUrl = "https://sayzo.app/releases/windows/${installerName}"
 $tempDir = Join-Path $env:TEMP "sayzo-install"
 $installerPath = Join-Path $tempDir $installerName
@@ -26,7 +25,7 @@ if (-not (Test-Path $tempDir)) {
 }
 
 # Download installer.
-Write-Host "  Downloading Sayzo Agent v${version}..." -ForegroundColor White
+Write-Host "  Downloading Sayzo Agent..." -ForegroundColor White
 try {
     Invoke-WebRequest -Uri $downloadUrl -OutFile $installerPath -UseBasicParsing
 } catch {

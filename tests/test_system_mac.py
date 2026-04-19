@@ -33,6 +33,11 @@ def _make_pcm_bytes(n_samples: int, freq: float = 440.0) -> bytes:
     return tone.tobytes()
 
 
+def _framed(pcm: bytes, timestamp: float) -> bytes:
+    """Wrap PCM in the SAYZ/v1 protocol: magic + Float64 ts + UInt32 bytecount + PCM."""
+    return b"SAYZ" + struct.pack("<d", timestamp) + struct.pack("<I", len(pcm)) + pcm
+
+
 class FakeStdout:
     """Simulates an asyncio subprocess stdout that yields predetermined data."""
 
@@ -158,9 +163,11 @@ class TestStartPermissionDenied:
 class TestReader:
     @pytest.mark.asyncio
     async def test_frames_arrive_in_queue(self, cap):
-        """Feed one full batch of PCM and verify frames land in the queue."""
+        """Feed one full batch of SAYZ-framed PCM and verify (ts, frame)
+        tuples land in the queue."""
         pcm = _make_pcm_bytes(cap._batch_native_samples)
-        proc = FakeProc(stdout_data=pcm)
+        framed = _framed(pcm, timestamp=1234.5)
+        proc = FakeProc(stdout_data=framed)
 
         with patch(
             "sayzo_agent.capture.system_mac._find_audio_tap", return_value="/fake/audio-tap"
@@ -172,22 +179,26 @@ class TestReader:
             # Give the reader task a tick to process.
             await asyncio.sleep(0.1)
 
-            frames = []
+            items = []
             while not cap.queue.empty():
-                frames.append(cap.queue.get_nowait())
+                items.append(cap.queue.get_nowait())
 
-            assert len(frames) > 0
-            for frame in frames:
+            assert len(items) > 0
+            for ts, frame in items:
+                assert isinstance(ts, float)
                 assert frame.shape == (cap.frame_samples,)
                 assert frame.dtype == np.float32
 
             await cap.stop()
 
     @pytest.mark.asyncio
-    async def test_resampled_frame_size(self, cap):
-        """Verify that resampled frames have exactly frame_samples samples."""
+    async def test_frame_timestamps_match_header(self, cap):
+        """Per-frame ``capture_mono_ts`` must derive from the batch header's
+        timestamp + the frame's offset within the resampled batch."""
         pcm = _make_pcm_bytes(cap._batch_native_samples)
-        proc = FakeProc(stdout_data=pcm)
+        header_ts = 9999.125
+        framed = _framed(pcm, timestamp=header_ts)
+        proc = FakeProc(stdout_data=framed)
 
         with patch(
             "sayzo_agent.capture.system_mac._find_audio_tap", return_value="/fake/audio-tap"
@@ -197,9 +208,66 @@ class TestReader:
             await cap.start()
             await asyncio.sleep(0.1)
 
-            frame = cap.queue.get_nowait()
+            items = []
+            while not cap.queue.empty():
+                items.append(cap.queue.get_nowait())
+
+            assert len(items) >= 2
+            # First frame's timestamp equals header timestamp.
+            assert abs(items[0][0] - header_ts) < 1e-6
+            # Second frame's timestamp is exactly one frame_duration later.
+            expected_ts = header_ts + cap.frame_duration
+            assert abs(items[1][0] - expected_ts) < 1e-6
+
+            await cap.stop()
+
+    @pytest.mark.asyncio
+    async def test_resampled_frame_size(self, cap):
+        """Verify that resampled frames have exactly frame_samples samples."""
+        pcm = _make_pcm_bytes(cap._batch_native_samples)
+        framed = _framed(pcm, timestamp=0.0)
+        proc = FakeProc(stdout_data=framed)
+
+        with patch(
+            "sayzo_agent.capture.system_mac._find_audio_tap", return_value="/fake/audio-tap"
+        ), patch(
+            "asyncio.create_subprocess_exec", return_value=proc
+        ):
+            await cap.start()
+            await asyncio.sleep(0.1)
+
+            _ts, frame = cap.queue.get_nowait()
             # 16 kHz * 20 ms = 320 samples per frame
             assert frame.shape == (320,)
+
+            await cap.stop()
+
+    @pytest.mark.asyncio
+    async def test_legacy_binary_falls_back_with_warning(self, cap, caplog):
+        """A stale audio-tap binary emits raw PCM without the SAYZ header.
+        The reader should log a WARN and fall back to monotonic-at-read
+        stamping rather than crashing."""
+        # Raw PCM — no SAYZ prefix.
+        pcm = _make_pcm_bytes(cap._batch_native_samples)
+        proc = FakeProc(stdout_data=pcm)
+
+        with patch(
+            "sayzo_agent.capture.system_mac._find_audio_tap", return_value="/fake/audio-tap"
+        ), patch(
+            "asyncio.create_subprocess_exec", return_value=proc
+        ), caplog.at_level("WARNING"):
+            await cap.start()
+            await asyncio.sleep(0.1)
+
+            items = []
+            while not cap.queue.empty():
+                items.append(cap.queue.get_nowait())
+
+            assert len(items) > 0, "fallback path should still produce frames"
+            for ts, frame in items:
+                assert isinstance(ts, float)
+                assert frame.shape == (cap.frame_samples,)
+            assert "stale build" in caplog.text.lower()
 
             await cap.stop()
 
@@ -208,9 +276,12 @@ class TestReader:
         """When the queue is full, extra frames are dropped, not blocking."""
         cap = SystemCapture(sample_rate=16_000, frame_ms=20, queue_maxsize=2)
 
-        # Generate enough data for many frames (3 batches worth).
-        pcm = _make_pcm_bytes(cap._batch_native_samples * 3)
-        proc = FakeProc(stdout_data=pcm)
+        # Generate enough data for many frames (3 batches worth), each properly framed.
+        framed = b""
+        for i in range(3):
+            pcm = _make_pcm_bytes(cap._batch_native_samples)
+            framed += _framed(pcm, timestamp=float(i))
+        proc = FakeProc(stdout_data=framed)
 
         with patch(
             "sayzo_agent.capture.system_mac._find_audio_tap", return_value="/fake/audio-tap"

@@ -10,9 +10,8 @@
 
 set -euo pipefail
 
-VERSION="0.1.0"
 ARCH=$(uname -m)  # x86_64 or arm64
-DMG_NAME="Sayzo-Agent-${VERSION}.dmg"
+DMG_NAME="Sayzo-Agent.dmg"
 DOWNLOAD_URL="https://sayzo.app/releases/macos/${DMG_NAME}"
 APP_NAME="Sayzo Agent"
 APP_PATH="/Applications/${APP_NAME}.app"
@@ -34,7 +33,7 @@ echo ""
 # -----------------------------------------------------------------------
 # Download DMG
 # -----------------------------------------------------------------------
-echo "  Downloading Sayzo Agent v${VERSION} (${ARCH})..."
+echo "  Downloading Sayzo Agent (${ARCH})..."
 DMG_PATH="${TMPDIR_INSTALL}/${DMG_NAME}"
 if ! curl -fSL -o "$DMG_PATH" "$DOWNLOAD_URL"; then
     echo "  Download failed." >&2

@@ -43,7 +43,7 @@ def test_desktop_notifier_swallows_send_failure(monkeypatch):
         def __init__(self, *a, **kw):
             pass
 
-        def send_sync(self, *a, **kw):
+        async def send(self, *a, **kw):
             raise RuntimeError("send blew up")
 
     import types
@@ -63,7 +63,7 @@ def test_desktop_notifier_calls_backend(monkeypatch):
         def __init__(self, *a, **kw):
             pass
 
-        def send_sync(self, *, title: str, message: str, **kw):
+        async def send(self, *, title: str, message: str, **kw):
             calls.append((title, message))
 
     import types

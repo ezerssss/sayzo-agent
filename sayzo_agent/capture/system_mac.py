@@ -16,6 +16,17 @@ The Swift binary must be compiled separately on a Mac::
 Binary lookup order:
 1. Same directory as this file (package-data install).
 2. ``audio-tap`` anywhere on ``PATH``.
+
+Wire protocol (new ``SAYZ/v1``): the Swift binary emits each CoreAudio IO
+block as a framed record:
+
+    [4 bytes magic "SAYZ"][8 bytes Float64 timestamp][4 bytes UInt32 byte count][N bytes Float32 PCM]
+
+where the timestamp is mach-based monotonic seconds (directly comparable to
+Python's ``time.monotonic()`` on macOS). Enqueued frames carry their
+hardware-grounded capture time so cross-source alignment with mic capture
+stays tight. If a stale audio-tap binary emits raw PCM without a header, we
+fall back to monotonic-at-read timing (wider ~50 ms bias) and log a WARN.
 """
 from __future__ import annotations
 
@@ -24,6 +35,8 @@ import logging
 import os
 import shutil
 import signal
+import struct
+import time
 from math import gcd
 from pathlib import Path
 
@@ -43,6 +56,10 @@ _RESAMPLE_BATCH_FRAMES = 25
 
 # Exit code the Swift binary uses when Audio Capture permission is denied.
 _EXIT_PERMISSION_DENIED = 77
+
+# Framing protocol for audio-tap stdout. See main.swift header comment.
+_MAGIC = b"SAYZ"
+_HEADER_SIZE = 16  # 4 magic + 8 Float64 ts + 4 UInt32 byte count
 
 
 def _find_audio_tap() -> str:
@@ -69,9 +86,10 @@ def _find_audio_tap() -> str:
 class SystemCapture:
     """Captures mono PCM frames from all system audio via CoreAudio Process Taps.
 
-    Spawns the ``audio-tap`` Swift helper as an async subprocess and reads raw
-    PCM from its stdout.  Resampled frames are pushed into ``self.queue``
-    exactly like the Windows :class:`system_win.SystemCapture`.
+    Spawns the ``audio-tap`` Swift helper as an async subprocess and reads
+    framed PCM from its stdout. Resampled frames are pushed into
+    ``self.queue`` as ``(capture_mono_ts, frame)`` tuples, matching the
+    Windows :class:`system_win.SystemCapture` interface.
     """
 
     def __init__(
@@ -83,7 +101,8 @@ class SystemCapture:
     ) -> None:
         self.sample_rate = sample_rate
         self.frame_samples = int(sample_rate * frame_ms / 1000)
-        self.queue: asyncio.Queue[np.ndarray] = asyncio.Queue(maxsize=queue_maxsize)
+        self.frame_duration = self.frame_samples / sample_rate
+        self.queue: asyncio.Queue[tuple[float, np.ndarray]] = asyncio.Queue(maxsize=queue_maxsize)
 
         if device is not None:
             log.warning(
@@ -100,6 +119,7 @@ class SystemCapture:
 
         native_samples_per_frame = self.frame_samples * self._down // self._up
         self._batch_native_samples = native_samples_per_frame * _RESAMPLE_BATCH_FRAMES
+        self._batch_native_duration = self._batch_native_samples / _NATIVE_RATE
 
         self._proc: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task | None = None
@@ -182,37 +202,153 @@ class SystemCapture:
     # Internal tasks
     # ------------------------------------------------------------------
 
+    async def _read_block(self, stdout: asyncio.StreamReader) -> tuple[float, np.ndarray] | None:
+        """Read one framed ``(timestamp, samples)`` block.
+
+        Falls back to legacy raw-PCM mode if the first 4 bytes aren't the
+        SAYZ magic — see `_legacy_mode` below. Returns ``None`` on EOF.
+        """
+        try:
+            header = await stdout.readexactly(_HEADER_SIZE)
+        except asyncio.IncompleteReadError:
+            return None
+
+        magic = bytes(header[:4])
+        if magic != _MAGIC:
+            # Stale audio-tap binary: emits raw PCM without a header. Log
+            # once and hand the buffered bytes to the legacy path.
+            log.warning(
+                "audio-tap appears to be a stale build (no SAYZ header) — "
+                "falling back to monotonic-at-read timing. Cross-source bias "
+                "will be wider (~50 ms). Rebuild the Swift binary to fix."
+            )
+            return await self._legacy_mode(stdout, prebuffered=header)
+
+        ts = struct.unpack("<d", bytes(header[4:12]))[0]
+        byte_count = struct.unpack("<I", bytes(header[12:16]))[0]
+        if byte_count == 0:
+            # Defensive: skip empty payloads rather than hanging on readexactly(0)
+            return (ts, np.zeros(0, dtype=np.float32))
+        try:
+            data = await stdout.readexactly(byte_count)
+        except asyncio.IncompleteReadError:
+            return None
+        samples = np.frombuffer(data, dtype=np.float32).copy()
+        return (ts, samples)
+
+    async def _legacy_mode(
+        self, stdout: asyncio.StreamReader, prebuffered: bytes
+    ) -> tuple[float, np.ndarray] | None:
+        """Drain stdout as raw Float32 PCM without timestamp headers.
+
+        Used only when a stale audio-tap binary is detected. We read one
+        batch worth of samples and stamp it with ``time.monotonic()`` at
+        return minus batch duration — same as the Windows fallback path.
+        """
+        batch_bytes = self._batch_native_samples * 4
+        need = batch_bytes - len(prebuffered)
+        try:
+            rest = await stdout.readexactly(need) if need > 0 else b""
+        except asyncio.IncompleteReadError:
+            return None
+        data = bytes(prebuffered) + rest
+        mono_at_return = time.monotonic()
+        ts = mono_at_return - self._batch_native_duration
+        samples = np.frombuffer(data, dtype=np.float32).copy()
+        # Stay in legacy mode for the rest of the session: patch `_read_block`
+        # to skip the magic check. Simpler to re-implement the legacy read
+        # loop directly.
+        self._read_block = self._read_block_legacy  # type: ignore[assignment]
+        return (ts, samples)
+
+    async def _read_block_legacy(
+        self, stdout: asyncio.StreamReader
+    ) -> tuple[float, np.ndarray] | None:
+        """Raw-PCM reader used after a stale-binary detection."""
+        batch_bytes = self._batch_native_samples * 4
+        try:
+            data = await stdout.readexactly(batch_bytes)
+        except asyncio.IncompleteReadError:
+            return None
+        mono_at_return = time.monotonic()
+        ts = mono_at_return - self._batch_native_duration
+        samples = np.frombuffer(data, dtype=np.float32).copy()
+        return (ts, samples)
+
     async def _reader(self) -> None:
-        """Read raw float32 PCM from audio-tap stdout, resample, enqueue."""
+        """Read framed PCM blocks from audio-tap, resample batches of them,
+        and push pipeline frames with per-frame capture timestamps."""
         assert self._proc is not None and self._proc.stdout is not None
         stdout = self._proc.stdout
 
-        # Bytes per batch: mono float32 at native rate.
-        batch_bytes = self._batch_native_samples * 4
+        # Accumulator for native-rate PCM. The first block's timestamp
+        # anchors the batch; per-pipeline-frame stamps are derived by adding
+        # `(resampled_offset / target_sr)`.
+        accum: list[np.ndarray] = []
+        accum_first_mono: float | None = None
 
         try:
             while True:
-                data = await stdout.readexactly(batch_bytes)
-                samples = np.frombuffer(data, dtype=np.float32).copy()
+                block = await self._read_block(stdout)
+                if block is None:
+                    log.info("audio-tap stdout closed (process ended)")
+                    return
+                ts, samples = block
+                if samples.size == 0:
+                    continue
+                if accum_first_mono is None:
+                    accum_first_mono = ts
+                accum.append(samples)
 
+                total_accum = sum(s.size for s in accum)
+                if total_accum < self._batch_native_samples:
+                    continue
+
+                # Enough native-rate samples accumulated for one resample
+                # batch. Process a whole batch; keep the remainder (and its
+                # implied timestamp) for the next iteration.
+                full = np.concatenate(accum) if len(accum) > 1 else accum[0]
+                batch_native = full[: self._batch_native_samples]
+                remainder = full[self._batch_native_samples :]
+
+                batch_first_mono = accum_first_mono
+
+                if remainder.size > 0:
+                    # The remainder's first sample is exactly `batch_native_samples`
+                    # samples after `accum_first_mono`.
+                    accum = [remainder]
+                    accum_first_mono = (
+                        batch_first_mono
+                        + self._batch_native_samples / _NATIVE_RATE
+                    )
+                else:
+                    accum = []
+                    accum_first_mono = None
+
+                # Downmix is unnecessary — Swift already delivers mono.
+                # Resample the whole batch in one call to avoid boundary
+                # artifacts.
                 if self._need_resample:
-                    samples = resample_poly(
-                        samples, self._up, self._down
+                    resampled = resample_poly(
+                        batch_native, self._up, self._down
                     ).astype(np.float32)
+                else:
+                    resampled = batch_native.astype(np.float32, copy=False)
 
-                samples = normalize_rms(samples)
+                # Normalize RMS uniformly across the batch.
+                resampled = normalize_rms(resampled)
 
+                # Slice into pipeline frames with per-frame timestamps.
                 pos = 0
-                while pos + self.frame_samples <= len(samples):
-                    frame = samples[pos : pos + self.frame_samples]
+                while pos + self.frame_samples <= len(resampled):
+                    frame = resampled[pos : pos + self.frame_samples]
+                    frame_mono = batch_first_mono + (pos / self.sample_rate)
                     pos += self.frame_samples
                     try:
-                        self.queue.put_nowait(frame)
+                        self.queue.put_nowait((frame_mono, frame))
                     except asyncio.QueueFull:
                         log.warning("system queue full, dropping frame")
 
-        except asyncio.IncompleteReadError:
-            log.info("audio-tap stdout closed (process ended)")
         except asyncio.CancelledError:
             raise
         except Exception:
