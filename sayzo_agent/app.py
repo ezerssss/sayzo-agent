@@ -38,6 +38,52 @@ def _format_duration(secs: float) -> str:
     return f"{int(round(secs))}s"
 
 
+# Split a Whisper segment whenever its internal words have a pause longer
+# than this. Catches cases where Whisper's own VAD grouping kept a
+# segment together across a turn-taking gap, which would place late-in-
+# segment words before the other speaker's interjection after sort.
+# Turn-taking pauses in natural conversation are typically 400-800 ms;
+# 0.8 s preserves intra-turn hesitation (thinking beats) but splits at
+# real hand-offs.
+TRANSCRIPT_WORD_GAP_SECS = 0.8
+
+
+def _split_segment_by_word_gaps(
+    seg: TranscribedSegment, gap_threshold_secs: float
+) -> list[tuple[float, float, str]]:
+    """Split a Whisper segment at internal word gaps longer than
+    ``gap_threshold_secs``. Returns a list of ``(start, end, text)`` triples
+    covering the same content as the input segment but with tighter start
+    times per sub-segment.
+
+    Falls back to the segment's own bounds when word-level timestamps
+    aren't available (e.g. Whisper didn't populate ``words`` for this
+    segment). Pure / cross-platform — no audio or OS access.
+    """
+    words = seg.words or []
+    if len(words) <= 1:
+        return [(seg.start, seg.end, seg.text)]
+
+    runs: list[list] = [[words[0]]]
+    for w in words[1:]:
+        prev = runs[-1][-1]
+        if w.start - prev.end > gap_threshold_secs:
+            runs.append([w])
+        else:
+            runs[-1].append(w)
+
+    if len(runs) == 1:
+        return [(seg.start, seg.end, seg.text)]
+
+    out: list[tuple[float, float, str]] = []
+    for run in runs:
+        text = "".join(w.text for w in run).strip()
+        if not text:
+            continue
+        out.append((run[0].start, run[-1].end, text))
+    return out or [(seg.start, seg.end, seg.text)]
+
+
 class Agent:
     def __init__(
         self,
@@ -363,11 +409,21 @@ class Agent:
         lines: list[TranscriptLine] = []
 
         # Mic segments → always "user". The mic is the user's own device;
-        # whatever it picks up is treated as the user's speech.
+        # whatever it picks up is treated as the user's speech. Split on
+        # internal word-gaps so late-segment words (after a turn-taking
+        # pause) land after the other speaker's interjection in the final
+        # sort, not before it.
         for s in mic_segs:
-            lines.append(TranscriptLine(speaker="user", start=s.start, end=s.end, text=s.text))
+            for start, end, text in _split_segment_by_word_gaps(s, TRANSCRIPT_WORD_GAP_SECS):
+                if text:
+                    lines.append(
+                        TranscriptLine(speaker="user", start=start, end=end, text=text)
+                    )
 
-        # System segments → other_N via greedy clustering on embeddings
+        # System segments → other_N via greedy clustering on embeddings.
+        # Embeddings use the ORIGINAL (unsplit) segment audio so voice-
+        # matching stays robust; sub-segments from one Whisper segment all
+        # inherit its speaker label.
         sys_embeds: list[np.ndarray] = []
         sys_keep_idx: list[int] = []
         for i, s in enumerate(sys_segs):
@@ -386,9 +442,12 @@ class Agent:
         labels = self.speaker.cluster_others(sys_embeds) if sys_embeds else []
         for label, idx in zip(labels, sys_keep_idx):
             s = sys_segs[idx]
-            lines.append(
-                TranscriptLine(speaker=f"other_{label + 1}", start=s.start, end=s.end, text=s.text)
-            )
+            speaker = f"other_{label + 1}"
+            for start, end, text in _split_segment_by_word_gaps(s, TRANSCRIPT_WORD_GAP_SECS):
+                if text:
+                    lines.append(
+                        TranscriptLine(speaker=speaker, start=start, end=end, text=text)
+                    )
 
         lines.sort(key=lambda l: l.start)
         return lines
