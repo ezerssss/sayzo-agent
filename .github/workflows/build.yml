@@ -38,6 +38,18 @@ jobs:
       - name: Install NSIS
         run: choco install nsis -y
 
+      - name: Install NSIS ApplicationID plugin
+        # Required by sayzo-agent.nsi to set the AUMID on the Start Menu
+        # shortcut — without it Windows 10 silently drops toast notifications
+        # from desktop-notifier. Chocolatey's `nsis` package doesn't bundle
+        # third-party plugins, so we grab the DLL from NSIS SourceForge.
+        shell: pwsh
+        run: |
+          $zip = "$env:TEMP\ApplicationID.zip"
+          Invoke-WebRequest -Uri "https://nsis.sourceforge.io/mediawiki/images/c/c7/ApplicationID.zip" -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath "$env:TEMP\ApplicationID" -Force
+          Copy-Item "$env:TEMP\ApplicationID\Release\ApplicationID.dll" "C:\Program Files (x86)\NSIS\Plugins\x86-unicode\"
+
       - name: Build NSIS installer
         run: |
           $env:PATH += ";C:\Program Files (x86)\NSIS"
