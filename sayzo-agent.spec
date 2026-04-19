@@ -76,9 +76,16 @@ if sys.platform == "darwin":
 # First-run GUI assets — built HTML/JS/CSS bundle that the pywebview window
 # loads. The dev path resolves these via Path(__file__).parent in
 # sayzo_agent/gui/setup/window.py; the frozen path uses sys._MEIPASS.
+# Built in CI via `npm ci && npm run build` before this spec runs — fail
+# loudly if it isn't there so frozen binaries don't ship with a broken
+# setup window that silently skips.
 webui_dist = Path("sayzo_agent/gui/webui/dist")
-if webui_dist.exists():
-    datas.append((str(webui_dist), "sayzo_agent/gui/webui/dist"))
+if not (webui_dist / "index.html").exists():
+    raise SystemExit(
+        f"webui not built: {webui_dist / 'index.html'} missing. "
+        "Run `cd sayzo_agent/gui/webui && npm ci && npm run build` first."
+    )
+datas.append((str(webui_dist), "sayzo_agent/gui/webui/dist"))
 
 # ---------------------------------------------------------------------------
 # Hidden imports — modules loaded lazily or via importlib that PyInstaller

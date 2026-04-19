@@ -21,6 +21,19 @@ jobs:
         with:
           python-version: "3.12"
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Build setup webui
+        # The setup GUI is a Vite + React bundle loaded by pywebview. Built
+        # fresh in CI (not committed) so the frozen binary always ships the
+        # latest dist/. The PyInstaller spec picks it up as a data entry.
+        working-directory: sayzo_agent/gui/webui
+        run: |
+          npm ci
+          npm run build
+
       - name: Install dependencies
         shell: bash
         run: |
@@ -66,6 +79,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Build setup webui
+        working-directory: sayzo_agent/gui/webui
+        run: |
+          npm ci
+          npm run build
 
       - name: Compile audio-tap Swift binary
         run: |
