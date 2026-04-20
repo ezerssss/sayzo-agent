@@ -20,6 +20,7 @@ from .conversation import (
     evaluate_user_turn_gate,
     merge_close_segments,
 )
+from .dsp import apply_mic_dsp, apply_sys_dsp
 from .models import SessionBuffers, SpeechSegment, TranscriptLine
 from .relevance import RelevanceLLM, RelevanceVerdict
 from .sink import CaptureSink
@@ -120,7 +121,11 @@ class Agent:
         self.stt = WhisperSTT(config.stt, models_dir=str(config.models_dir))
         self.speaker = SpeakerIdentifier(config.speaker)
         self.llm = RelevanceLLM(config.llm, models_dir=config.models_dir)
-        self.sink = CaptureSink(config.captures_dir)
+        self.sink = CaptureSink(
+            config.captures_dir,
+            opus_bitrate=config.capture.opus_bitrate,
+            opus_application=config.capture.opus_application,
+        )
         self.upload = upload_client or NoopUploadClient()
         self.notifier: Notifier = notifier or NoopNotifier()
 
@@ -314,7 +319,26 @@ class Agent:
             self._captures_discarded += 1
             return
 
-        # 5. Trim dead air from the final audio. Zero-fill both channels
+        # 5a. Apply DSP to the raw session PCM. Mic gets the full chain
+        # (highpass + noisereduce + peak-norm); system gets a light touch
+        # (highpass + peak-norm). This must happen BEFORE the VAD zero-fill
+        # below — noisereduce's stationary-mode noise estimator would
+        # collapse to ~0 if it saw long stretches of synthetic zeros, and
+        # the denoiser would effectively disable itself. Transcription and
+        # speaker embedding already ran on raw PCM upstream so DSP here has
+        # zero impact on STT quality.
+        mic_dsp, sys_dsp = await asyncio.gather(
+            loop.run_in_executor(
+                self._executor, apply_mic_dsp,
+                bytes(buffers.mic_pcm), sr, self.cfg.capture,
+            ),
+            loop.run_in_executor(
+                self._executor, apply_sys_dsp,
+                bytes(buffers.sys_pcm), sr, self.cfg.capture,
+            ),
+        )
+
+        # 5b. Trim dead air from the final audio. Zero-fill both channels
         # outside the union of mic + system VAD segments so the on-disk
         # capture doesn't carry minutes of hissing system audio during
         # silence, and Opus can compress the silent regions to near-zero
@@ -333,10 +357,10 @@ class Agent:
         )
         pad = self.cfg.conversation.final_audio_speech_pad_secs
         mic_final = build_windowed_pcm(
-            bytes(buffers.mic_pcm), speech_segs, pad_secs=pad, sample_rate=sr
+            mic_dsp, speech_segs, pad_secs=pad, sample_rate=sr
         )
         sys_final = build_windowed_pcm(
-            bytes(buffers.sys_pcm), speech_segs, pad_secs=pad, sample_rate=sr
+            sys_dsp, speech_segs, pad_secs=pad, sample_rate=sr
         )
 
         # Truncate trailing silence: cut both channels at the end of the

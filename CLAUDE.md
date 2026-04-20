@@ -92,7 +92,9 @@ Speaker tagging (Resemblyzer cosine vs voiceprint + greedy clustering for others
     ↓
 Relevance LLM (Qwen 2.5 3B Q4 via llama-cpp-python)
     ↓ [judges participant + extracts relevant span + title + summary]
-CaptureSink (Opus stereo: mic=L, system=R; record.json)
+Post-capture DSP (highpass + spectral-gate denoise on mic; light HPF on system)
+    ↓ [cleans the on-disk audio without affecting STT, which already ran]
+CaptureSink (Opus stereo: mic=L, system=R; `application=voip`; record.json)
     ↓
 UploadClient (NoopUploadClient for now)
 ```
@@ -118,6 +120,7 @@ These are the rules the conversation detector and gate logic encode. Several wer
 - **`relevance.py`** — Loads Qwen lazily on first use, unloads after `idle_unload_secs` (default 5 min) to free ~2 GB of RAM during idle periods. The system prompt is the contract — modifying it changes the JSON shape downstream.
 - **`capture/system.py`** — Uses PyAudioWPatch for WASAPI loopback capture. Captures at the device's native sample rate (typically 48 kHz) and resamples to 16 kHz via scipy to avoid quality loss.
 - **`speaker.py`** — Greedy cosine clustering for other-speaker labels (avoids a sklearn dependency). Heavy imports (`resemblyzer`) are lazy so unit tests don't need them.
+- **`dsp.py`** — Pure numpy/scipy post-processing applied at session close, before Opus encoding. Butterworth highpass + `noisereduce` spectral-gate denoise + peak-normalize on mic; light highpass + peak-normalize on system (no denoise — system audio is typically a clean digital stream already, and aggressive denoising damages music / low-volume speech from the far side). Runs on the heavy-worker executor and is fully decoupled from STT: transcription and speaker embedding read the raw `buffers.mic_pcm` upstream, so DSP here has zero impact on whisper accuracy. All stages are config-flagged under `CaptureConfig` — `SAYZO_CAPTURE__DSP_ENABLED=0` restores raw-PCM output byte-for-byte (minus the encoder's `application=voip` setting, which is intrinsic to the sink path). Opus encoder knobs also live in `CaptureConfig` (`opus_bitrate`, `opus_application`).
 
 ## Distribution caveats (future work)
 

@@ -10,6 +10,10 @@ requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.26",
     "scipy>=1.11",
+    # noisereduce: spectral-gate denoise applied at session close (see dsp.py).
+    # Pure numpy/scipy — pulls matplotlib transitively (used only by its
+    # optional plotting helpers, which we never import).
+    "noisereduce>=3.0",
     "sounddevice>=0.4.6",
     "PyAudioWPatch>=0.2.12; sys_platform == 'win32'",
     "silero-vad>=5.1",

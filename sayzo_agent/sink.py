@@ -21,8 +21,16 @@ def encode_opus_stereo(
     out_path: Path,
     sample_rate: int = 16000,
     bitrate: int = 64000,
+    application: str = "voip",
 ) -> None:
-    """Encode mic (L) + system (R) as a single stereo Opus file via PyAV."""
+    """Encode mic (L) + system (R) as a single stereo Opus file via PyAV.
+
+    ``application`` maps to libopus's own ``application`` flag:
+      - ``voip`` (default) — speech-optimized DSP; best at low bitrates for
+        conversational audio, which is all we ever encode.
+      - ``audio`` — libopus default; tuned for music.
+      - ``lowdelay`` — sacrifices quality for reduced algorithmic delay.
+    """
     import av  # lazy
 
     mic = np.frombuffer(mic_pcm16, dtype=np.int16)
@@ -39,6 +47,14 @@ def encode_opus_stereo(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     container = av.open(str(out_path), mode="w", format="ogg")
     stream = container.add_stream("libopus", rate=sample_rate)
+    # Set encoder-private options before the first encode() call. libopus reads
+    # these when the encoder is opened implicitly on first encode.
+    stream.options = {
+        "application": application,
+        "vbr": "on",
+        "compression_level": "10",
+        "frame_duration": "20",
+    }
     stream.bit_rate = bitrate
     stream.layout = "stereo"
 
@@ -84,8 +100,15 @@ def deserialize_record(data: dict) -> ConversationRecord:
 
 
 class CaptureSink:
-    def __init__(self, captures_dir: Path) -> None:
+    def __init__(
+        self,
+        captures_dir: Path,
+        opus_bitrate: int = 64000,
+        opus_application: str = "voip",
+    ) -> None:
         self.captures_dir = captures_dir
+        self.opus_bitrate = opus_bitrate
+        self.opus_application = opus_application
 
     def write(
         self,
@@ -113,7 +136,12 @@ class CaptureSink:
         start_s, end_s = relevant_span
         audio_rel = "audio.opus"
         encode_opus_stereo(
-            bytes(mic_pcm16), bytes(sys_pcm16), rec_dir / audio_rel, sample_rate=sample_rate
+            bytes(mic_pcm16),
+            bytes(sys_pcm16),
+            rec_dir / audio_rel,
+            sample_rate=sample_rate,
+            bitrate=self.opus_bitrate,
+            application=self.opus_application,
         )
 
         record = ConversationRecord(
