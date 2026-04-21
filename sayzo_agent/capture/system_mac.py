@@ -43,8 +43,6 @@ from pathlib import Path
 import numpy as np
 from scipy.signal import resample_poly
 
-from . import normalize_rms
-
 log = logging.getLogger(__name__)
 
 # audio-tap emits mono float32 PCM at this rate.
@@ -335,8 +333,9 @@ class SystemCapture:
                 else:
                     resampled = batch_native.astype(np.float32, copy=False)
 
-                # Normalize RMS uniformly across the batch.
-                resampled = normalize_rms(resampled)
+                # Raw levels flow through; DSP peak-normalize at session close
+                # sets final loudness. Per-batch RMS normalize used to live
+                # here and caused level jumps at 500 ms batch boundaries.
 
                 # Slice into pipeline frames with per-frame timestamps.
                 pos = 0

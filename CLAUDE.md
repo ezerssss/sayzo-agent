@@ -46,7 +46,6 @@ pytest tests/test_conversation.py::test_gate_passes_late_substantive_user_turn -
 
 # CLI commands (all under one entrypoint)
 sayzo-agent setup         # one-time: download Qwen GGUF (~2 GB) into ~/.sayzo/agent/models/
-sayzo-agent enroll        # one-time: record voiceprint to ~/.sayzo/agent/voiceprint.npy
 sayzo-agent devices       # list mic + loopback devices
 sayzo-agent test-capture  # 10-second capture sanity check
 sayzo-agent run           # main 24/7 loop with verbose terminal output
@@ -88,7 +87,7 @@ Cheap pre-STT gate (substantive user turn rule)
     ↓ [whole session passes or whole session is dropped]
 faster-whisper (transcribe mic + system separately)
     ↓
-Speaker tagging (Resemblyzer cosine vs voiceprint + greedy clustering for others)
+Speaker tagging (mic = "user" by definition; Resemblyzer greedy clustering on system audio for "other_1", "other_2", …)
     ↓
 Relevance LLM (Qwen 2.5 3B Q4 via llama-cpp-python)
     ↓ [judges participant + extracts relevant span + title + summary]
@@ -120,7 +119,7 @@ These are the rules the conversation detector and gate logic encode. Several wer
 - **`relevance.py`** — Loads Qwen lazily on first use, unloads after `idle_unload_secs` (default 5 min) to free ~2 GB of RAM during idle periods. The system prompt is the contract — modifying it changes the JSON shape downstream.
 - **`capture/system.py`** — Uses PyAudioWPatch for WASAPI loopback capture. Captures at the device's native sample rate (typically 48 kHz) and resamples to 16 kHz via scipy to avoid quality loss.
 - **`speaker.py`** — Greedy cosine clustering for other-speaker labels (avoids a sklearn dependency). Heavy imports (`resemblyzer`) are lazy so unit tests don't need them.
-- **`dsp.py`** — Pure numpy/scipy post-processing applied at session close, before Opus encoding. Butterworth highpass + `noisereduce` spectral-gate denoise + peak-normalize on mic; light highpass + peak-normalize on system (no denoise — system audio is typically a clean digital stream already, and aggressive denoising damages music / low-volume speech from the far side). Runs on the heavy-worker executor and is fully decoupled from STT: transcription and speaker embedding read the raw `buffers.mic_pcm` upstream, so DSP here has zero impact on whisper accuracy. All stages are config-flagged under `CaptureConfig` — `SAYZO_CAPTURE__DSP_ENABLED=0` restores raw-PCM output byte-for-byte (minus the encoder's `application=voip` setting, which is intrinsic to the sink path). Opus encoder knobs also live in `CaptureConfig` (`opus_bitrate`, `opus_application`).
+- **`dsp.py`** — Pure numpy/scipy post-processing applied at session close, before Opus encoding. Butterworth highpass + `noisereduce` spectral-gate denoise (default `prop_decrease=0.5`, dialed down from 0.85 to avoid phasey artifacts) + peak-normalize on mic; light highpass + peak-normalize on system (no denoise — system audio is typically a clean digital stream already, and aggressive denoising damages music / low-volume speech from the far side). Runs on the heavy-worker executor and is fully decoupled from STT: transcription and speaker embedding read the raw `buffers.mic_pcm` upstream, so DSP here has zero impact on whisper accuracy. All stages are config-flagged under `CaptureConfig` — `SAYZO_CAPTURE__DSP_ENABLED=0` restores raw-PCM output byte-for-byte (minus the encoder's `application` setting, which is intrinsic to the sink path). Opus encoder knobs also live in `CaptureConfig` (`opus_bitrate`, `opus_application`). Default is `application="audio"` at 96 kbps stereo — transparent for speech, usable for music. Capture modules no longer apply per-batch RMS normalization (previously `_TARGET_RMS=0.02` caused audible pumping); raw captured levels flow through and DSP's peak-normalize at session close handles final loudness.
 
 ## Distribution caveats (future work)
 

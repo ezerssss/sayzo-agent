@@ -281,6 +281,13 @@ func run() {
     guard let converter = AVAudioConverter(from: nativeFmt, to: targetFmt) else {
         die("failed to build AVAudioConverter \(nativeFmt) → \(targetFmt)")
     }
+    // Use the highest-quality sample-rate conversion and channel-mixing
+    // filters available. AVAudioConverter defaults to `.medium`, which is
+    // audibly lossy when the tap's native rate doesn't match our 48 kHz
+    // target (e.g. 44.1 kHz sources like most music players). `.max` is only
+    // slightly more expensive since the converter runs once per CoreAudio
+    // IO block (~10 ms) and the CPU already has bandwidth to spare.
+    converter.sampleRateConverterQuality = .max
     gState.converter = converter
 
     // Reusable 1-second output buffer — IO proc blocks are ~5–50 ms.

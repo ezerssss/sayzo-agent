@@ -20,15 +20,17 @@ def encode_opus_stereo(
     sys_pcm16: bytes,
     out_path: Path,
     sample_rate: int = 16000,
-    bitrate: int = 64000,
-    application: str = "voip",
+    bitrate: int = 96000,
+    application: str = "audio",
 ) -> None:
     """Encode mic (L) + system (R) as a single stereo Opus file via PyAV.
 
     ``application`` maps to libopus's own ``application`` flag:
-      - ``voip`` (default) — speech-optimized DSP; best at low bitrates for
-        conversational audio, which is all we ever encode.
-      - ``audio`` — libopus default; tuned for music.
+      - ``audio`` (default) — libopus's general-purpose mode; preserves high
+        frequencies, stereo imaging, and transients. Good for captures that
+        mix speech with music/game/video audio on the system channel.
+      - ``voip`` — speech-optimized DSP. Lower bitrates survive better but a
+        speech-band filter is applied that audibly degrades non-speech.
       - ``lowdelay`` — sacrifices quality for reduced algorithmic delay.
     """
     import av  # lazy
@@ -103,8 +105,8 @@ class CaptureSink:
     def __init__(
         self,
         captures_dir: Path,
-        opus_bitrate: int = 64000,
-        opus_application: str = "voip",
+        opus_bitrate: int = 96000,
+        opus_application: str = "audio",
     ) -> None:
         self.captures_dir = captures_dir
         self.opus_bitrate = opus_bitrate

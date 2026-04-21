@@ -34,8 +34,6 @@ import time
 import numpy as np
 import sounddevice as sd
 
-from . import normalize_rms
-
 log = logging.getLogger(__name__)
 
 
@@ -100,9 +98,13 @@ class MicCapture:
             capture_mono_ts = wall_clock_ts
         self._last_emitted_ts = capture_mono_ts
 
-        # indata: (frames, channels) float32. We always use mono.
+        # indata: (frames, channels) float32. We always use mono. Raw levels
+        # flow through; final loudness is set by DSP peak-normalize at session
+        # close. Per-frame RMS normalization used to live here but caused
+        # audible volume pumping without helping STT (Whisper normalizes its
+        # own mel spectrogram internally) or VAD/speaker embedding (both are
+        # volume-robust).
         mono = indata[:, 0].copy() if indata.ndim == 2 else indata.copy()
-        mono = normalize_rms(mono)
         try:
             loop.call_soon_threadsafe(self.queue.put_nowait, (capture_mono_ts, mono))
         except RuntimeError:

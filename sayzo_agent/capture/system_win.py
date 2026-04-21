@@ -28,8 +28,6 @@ import numpy as np
 import pyaudiowpatch as pyaudio
 from scipy.signal import resample_poly
 
-from . import normalize_rms
-
 log = logging.getLogger(__name__)
 
 # How many pipeline frames worth of audio to accumulate before resampling.
@@ -187,9 +185,10 @@ class SystemCapture:
                 if need_resample:
                     samples = resample_poly(samples, up, down).astype(np.float32)
 
-                # Normalize the batch to a consistent RMS level so the
-                # transcriber sees uniform volume regardless of system volume.
-                samples = normalize_rms(samples)
+                # Raw levels flow through; final loudness is set by DSP
+                # peak-normalize at session close. A per-batch RMS normalize
+                # used to live here and caused audible level jumps at 500 ms
+                # batch boundaries whenever the source volume varied.
 
                 # Slice into pipeline-sized frames and enqueue with per-frame
                 # monotonic timestamps derived from the batch's first-sample

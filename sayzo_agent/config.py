@@ -21,23 +21,31 @@ class CaptureConfig(BaseSettings):
     mic_device: str | None = None  # None = default input
     sys_device: str | None = None  # None = default loopback
 
-    # Opus encoder (see sink.encode_opus_stereo). `application=voip` selects
-    # libopus's speech-optimized mode — at the same bitrate as the default
-    # `audio` mode, speech quality is noticeably better because bits are
-    # reallocated away from high frequencies / stereo imaging toward the
-    # voice band. Raise opus_bitrate to 80_000 / 96_000 for higher quality at
-    # proportional file-size cost.
-    opus_bitrate: int = 64000
-    opus_application: str = "voip"
+    # Opus encoder (see sink.encode_opus_stereo). `application=audio` is
+    # libopus's general-purpose mode — it preserves high frequencies, stereo
+    # imaging, and transients. We used to run `voip` for its speech-focused
+    # bit allocation, but the speech-band filter it applies murders any
+    # non-speech content on the system channel (music, game audio, video)
+    # and the narrowband artifact leaks into mic-side ambient noise too.
+    # At 96 kbps stereo, `audio` is transparent for speech and good enough
+    # for music; playback sounds markedly better than the old 64 kbps voip
+    # defaults at the cost of ~50% larger files.
+    opus_bitrate: int = 96000
+    opus_application: str = "audio"
 
     # Post-capture DSP (see dsp.py). Runs at session close, after
     # transcription + speaker embedding (both use the raw PCM upstream), so
-    # these settings do not affect STT. `dsp_enabled=False` restores
-    # pre-change audio behavior byte-for-byte (except for the opus_application
-    # change, which is intrinsic to the encoder path).
+    # these settings do not affect STT. `dsp_enabled=False` restores the
+    # raw-PCM path byte-for-byte (except for the opus_application setting,
+    # which is intrinsic to the encoder path).
     dsp_enabled: bool = True
     denoise_enabled: bool = True  # mic channel only
-    denoise_strength: float = 0.85  # noisereduce prop_decrease, 0..1
+    # noisereduce prop_decrease, 0..1. At 0.85 the stationary spectral gate
+    # aggressively suppresses anything it judges "noise-like" — great for
+    # constant hum, but it introduces phasey/robotic artifacts whenever the
+    # noise floor is non-stationary (typing, room tone, far-side chatter).
+    # 0.5 keeps a clear improvement over raw noise without audible artifacts.
+    denoise_strength: float = 0.5
     highpass_mic_hz: float = 80.0  # Butterworth HPF cutoff on mic, 0 = off
     highpass_sys_hz: float = 40.0  # lighter HPF on system (just kill DC/rumble)
     peak_normalize_dbfs: float = -1.0  # post-DSP peak norm target
