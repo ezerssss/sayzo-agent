@@ -1,8 +1,22 @@
 """Tests for the notifier wrapper + duration formatting."""
 from __future__ import annotations
 
+import sys
+import types
+
 from sayzo_agent.app import _format_duration
 from sayzo_agent.notify import DesktopNotifier, NoopNotifier
+
+
+def _install_fake_backend(monkeypatch, sync_cls) -> None:
+    """Register a fake ``desktop_notifier`` package with a stub ``Icon`` and a
+    ``desktop_notifier.sync.DesktopNotifierSync`` pointing at ``sync_cls``."""
+    root = types.ModuleType("desktop_notifier")
+    root.Icon = type("Icon", (), {"__init__": lambda self, **kw: None})  # type: ignore[attr-defined]
+    sub = types.ModuleType("desktop_notifier.sync")
+    sub.DesktopNotifierSync = sync_cls  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "desktop_notifier", root)
+    monkeypatch.setitem(sys.modules, "desktop_notifier.sync", sub)
 
 
 def test_format_duration_subminute():
@@ -21,16 +35,10 @@ def test_noop_notifier_never_raises():
 
 
 def test_desktop_notifier_swallows_init_failure(monkeypatch):
-    import sayzo_agent.notify as notify_mod
-
     def _boom(*a, **kw):
         raise RuntimeError("no backend here")
 
-    # Simulate desktop_notifier import succeeding but constructor failing.
-    import types
-    fake = types.ModuleType("desktop_notifier")
-    fake.DesktopNotifier = _boom  # type: ignore[attr-defined]
-    monkeypatch.setitem(__import__("sys").modules, "desktop_notifier", fake)
+    _install_fake_backend(monkeypatch, _boom)
 
     n = DesktopNotifier(app_name="Test")
     # Must not raise — init failure should leave the notifier a noop.
@@ -39,17 +47,14 @@ def test_desktop_notifier_swallows_init_failure(monkeypatch):
 
 
 def test_desktop_notifier_swallows_send_failure(monkeypatch):
-    class _Backend:
+    class _Sync:
         def __init__(self, *a, **kw):
             pass
 
-        async def send(self, *a, **kw):
+        def send(self, *a, **kw):
             raise RuntimeError("send blew up")
 
-    import types
-    fake = types.ModuleType("desktop_notifier")
-    fake.DesktopNotifier = _Backend  # type: ignore[attr-defined]
-    monkeypatch.setitem(__import__("sys").modules, "desktop_notifier", fake)
+    _install_fake_backend(monkeypatch, _Sync)
 
     n = DesktopNotifier(app_name="Test")
     # Must not raise — send failure is logged and swallowed.
@@ -58,20 +63,27 @@ def test_desktop_notifier_swallows_send_failure(monkeypatch):
 
 def test_desktop_notifier_calls_backend(monkeypatch):
     calls: list[tuple[str, str]] = []
+    inits: list[dict] = []
 
-    class _Backend:
+    class _Sync:
         def __init__(self, *a, **kw):
-            pass
+            inits.append(kw)
 
-        async def send(self, *, title: str, message: str, **kw):
+        def send(self, *, title: str, message: str, **kw):
             calls.append((title, message))
 
-    import types
-    fake = types.ModuleType("desktop_notifier")
-    fake.DesktopNotifier = _Backend  # type: ignore[attr-defined]
-    monkeypatch.setitem(__import__("sys").modules, "desktop_notifier", fake)
+    _install_fake_backend(monkeypatch, _Sync)
 
     n = DesktopNotifier(app_name="Test")
-    n.notify("Conversation saved", "Demo \u00b7 12 min")
+    n.notify("Conversation saved", "Demo · 12 min")
+    n.notify("Conversation saved", "Second · 30s")
 
-    assert calls == [("Conversation saved", "Demo \u00b7 12 min")]
+    # Backend should be constructed exactly once (lazy + cached), and both
+    # sends should go through it — confirming we reuse the persistent loop
+    # instead of spinning up a fresh one per call.
+    assert len(inits) == 1
+    assert inits[0]["app_name"] == "Test"
+    assert calls == [
+        ("Conversation saved", "Demo · 12 min"),
+        ("Conversation saved", "Second · 30s"),
+    ]

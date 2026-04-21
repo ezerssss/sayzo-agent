@@ -46,6 +46,12 @@ class SessionBuffers:
     sys_pcm: bytearray = field(default_factory=bytearray)
     mic_segments: list[SpeechSegment] = field(default_factory=list)
     sys_segments: list[SpeechSegment] = field(default_factory=list)
+    # Mic VAD segments that the echo guard classified as speaker-to-mic bleed
+    # and removed from `mic_segments`. Preserved so downstream steps can zero
+    # the corresponding mic PCM before STT and include the spans in
+    # record.json metadata / debug dumps. Empty when echo guard is disabled
+    # or found nothing to drop.
+    mic_echo_segments: list[SpeechSegment] = field(default_factory=list)
     started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     started_monotonic: float = 0.0
     ended_monotonic: float = 0.0

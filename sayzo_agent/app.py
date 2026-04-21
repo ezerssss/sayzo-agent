@@ -21,6 +21,7 @@ from .conversation import (
     merge_close_segments,
 )
 from .dsp import apply_mic_dsp, apply_sys_dsp
+from . import echo_guard
 from .models import SessionBuffers, SpeechSegment, TranscriptLine
 from .relevance import RelevanceLLM, RelevanceVerdict
 from .sink import CaptureSink
@@ -150,6 +151,8 @@ class Agent:
         self._sweep_in_progress: bool = False
         self._captures_kept: int = 0
         self._captures_discarded: int = 0
+        self._echo_segments_dropped: int = 0
+        self._echo_secs_dropped: float = 0.0
 
     # ---- pipeline ----------------------------------------------------------
 
@@ -202,31 +205,37 @@ class Agent:
         llm_state = "loaded" if d is not None and self.llm._llm is not None else "unloaded"
         kept = self._captures_kept
         discarded = self._captures_discarded
+        echo_n = self._echo_segments_dropped
+        echo_s = self._echo_secs_dropped
         if d.state == SessionState.OPEN and d._buffers is not None:
             elapsed = now - d._session_start_mono
             mic_voiced = d._buffers.mic_total_voiced()
             sys_voiced = d._buffers.sys_total_voiced()
             log.info(
                 "[heartbeat] state=OPEN elapsed=%.1fs mic_voiced=%.1fs sys_voiced=%.1fs "
-                "llm=%s kept=%d discarded=%d",
+                "llm=%s kept=%d discarded=%d echo_dropped=%d/%.0fs",
                 elapsed,
                 mic_voiced,
                 sys_voiced,
                 llm_state,
                 kept,
                 discarded,
+                echo_n,
+                echo_s,
             )
         else:
             mic_pre = len(d._pre_buffers["mic"]) / 2 / d.sample_rate
             sys_pre = len(d._pre_buffers["system"]) / 2 / d.sample_rate
             log.info(
                 "[heartbeat] state=IDLE pre_buffer mic=%.1fs sys=%.1fs llm=%s "
-                "kept=%d discarded=%d",
+                "kept=%d discarded=%d echo_dropped=%d/%.0fs",
                 mic_pre,
                 sys_pre,
                 llm_state,
                 kept,
                 discarded,
+                echo_n,
+                echo_s,
             )
 
     def _maybe_run_upload_sweep(self, now: float) -> None:
@@ -259,7 +268,44 @@ class Agent:
             self._sweep_in_progress = False
 
     async def _process_session(self, buffers: SessionBuffers) -> None:
-        # 1. Cheap gate
+        loop = asyncio.get_running_loop()
+        sr = self.cfg.capture.sample_rate
+
+        # 0. Echo guard — classify mic VAD segments as user speech or
+        # speaker-to-mic bleed, then strip echo entries from
+        # `buffers.mic_segments` and record them on `buffers.mic_echo_segments`.
+        # Runs BEFORE the gate so passive "user listens to a podcast" sessions
+        # fail substantive-user-turn on real (non-echo-inflated) mic totals,
+        # saving STT cost and keeping polluted transcripts away from the LLM.
+        eg_report = None
+        if self.cfg.echo_guard.enabled:
+            eg_report = await loop.run_in_executor(
+                self._executor,
+                echo_guard.classify_buffers,
+                buffers, sr, self.cfg.echo_guard,
+            )
+            log.info(
+                "[echo_guard] kept=%d dropped=%d dropped_secs=%.1f",
+                eg_report.segments_kept,
+                eg_report.segments_dropped,
+                eg_report.seconds_dropped,
+            )
+            for r in eg_report.per_segment:
+                if not r.echo_spans:
+                    continue
+                lag_ms = int(round(r.lag_samples * 1000.0 / sr))
+                for es, ee in r.echo_spans:
+                    log.info(
+                        "[echo_guard]   drop %.2f-%.2fs coh=%.2f "
+                        "resid_speech_p=%.2f lag=%dms xcorr=%.2f "
+                        "rms_mic=%.3f rms_sys=%.3f",
+                        es, ee, r.coherence, r.residual_speech_prob,
+                        lag_ms, r.xcorr_peak, r.mic_rms, r.sys_rms,
+                    )
+            self._echo_segments_dropped += eg_report.segments_dropped
+            self._echo_secs_dropped += eg_report.seconds_dropped
+
+        # 1. Cheap gate (operates on echo-cleaned mic_segments)
         gate = evaluate_user_turn_gate(buffers, self.cfg.conversation)
         log.info("[gate] %s", gate.reason)
         if not gate.passed:
@@ -267,14 +313,27 @@ class Agent:
             self._captures_discarded += 1
             return
 
-        loop = asyncio.get_running_loop()
-
         # 2a. Language probe on the mic stream. Sayzo is English-only, so if
         # the user was confidently speaking another language we bail now
         # rather than burn CPU transcribing nonsense (Whisper forced to
         # English on e.g. Tagalog produces hallucinated English). Set
         # STTConfig.non_english_discard_prob=1.0 to disable.
-        mic_bytes = bytes(buffers.mic_pcm)
+        #
+        # mic_bytes has the echo regions zero'd out (with a short cosine
+        # taper at boundaries) so Whisper never sees echo content and
+        # attributes it to the user. The raw buffers.mic_pcm is preserved
+        # for DSP at step 5a — noisereduce's stationary estimator needs a
+        # contiguous input and would collapse on long zero runs.
+        mic_bytes_raw = bytes(buffers.mic_pcm)
+        if buffers.mic_echo_segments:
+            mic_bytes = echo_guard.zero_out_echo_regions(
+                mic_bytes_raw,
+                [(s.start_ts, s.end_ts) for s in buffers.mic_echo_segments],
+                sample_rate=sr,
+                taper_ms=self.cfg.echo_guard.taper_ms,
+            )
+        else:
+            mic_bytes = mic_bytes_raw
         if mic_bytes:
             mic_lang, mic_lang_prob = await loop.run_in_executor(
                 self._executor, self.stt.detect_language, mic_bytes
@@ -299,7 +358,6 @@ class Agent:
         # + occasional comment), transcribe system audio only in ±pad windows
         # around mic VAD segments. Cuts STT cost dramatically without changing
         # discard logic — the LLM is still the source of truth.
-        sr = self.cfg.capture.sample_rate
         elapsed = max(buffers.elapsed(), 1e-6)
         density = gate.mic_total / elapsed
         sys_pcm_full = bytes(buffers.sys_pcm)
@@ -318,7 +376,7 @@ class Agent:
             "[stt] mode=%s density=%.3f transcribing mic=%.1fs sys=%.1fs (orig sys=%.1fs)",
             mode,
             density,
-            len(buffers.mic_pcm) / 2 / sr,
+            len(mic_bytes) / 2 / sr,
             len(sys_pcm_for_stt) / 2 / sr,
             len(sys_pcm_full) / 2 / sr,
         )
@@ -382,39 +440,39 @@ class Agent:
             ),
         )
 
-        # 5b. Trim dead air from the final audio. Zero-fill both channels
-        # outside the union of mic + system VAD segments so the on-disk
-        # capture doesn't carry minutes of hissing system audio during
-        # silence, and Opus can compress the silent regions to near-zero
-        # bits. Timestamps are preserved 1:1 — `relevant_span` and
+        # 5b. Trim dead air from the final audio. Per-channel: each track
+        # trims against its OWN VAD segments. Mic uses mic_segments (already
+        # echo-cleaned at step 0), so echo-only periods are silent on the
+        # saved mic track; sys uses sys_segments and carries the far-side
+        # audio as usual. Timestamps are preserved 1:1 — `relevant_span` and
         # transcript offsets still line up with the saved file.
         #
-        # Before zeroing, we merge any two speech segments whose gap is
+        # Before zeroing, merge any two segments on a channel whose gap is
         # shorter than `final_audio_merge_gap_secs`. This preserves
         # conversational pauses (response latency, thinking beats, intra-
         # turn hesitation) as real audio — those pauses are coachable
         # signal for speech analysis. True dead air longer than the merge
         # gap still gets removed.
-        raw_speech_segs = list(buffers.mic_segments) + list(buffers.sys_segments)
-        speech_segs = merge_close_segments(
-            raw_speech_segs, gap_secs=self.cfg.conversation.final_audio_merge_gap_secs
-        )
+        gap = self.cfg.conversation.final_audio_merge_gap_secs
         pad = self.cfg.conversation.final_audio_speech_pad_secs
-        mic_final = build_windowed_pcm(
-            mic_dsp, speech_segs, pad_secs=pad, sample_rate=sr
-        )
-        sys_final = build_windowed_pcm(
-            sys_dsp, speech_segs, pad_secs=pad, sample_rate=sr
-        )
+        mic_trim_segs = merge_close_segments(list(buffers.mic_segments), gap_secs=gap)
+        sys_trim_segs = merge_close_segments(list(buffers.sys_segments), gap_secs=gap)
+        mic_final = build_windowed_pcm(mic_dsp, mic_trim_segs, pad_secs=pad, sample_rate=sr)
+        sys_final = build_windowed_pcm(sys_dsp, sys_trim_segs, pad_secs=pad, sample_rate=sr)
 
         # Truncate trailing silence: cut both channels at the end of the
-        # last speech segment + pad. The session buffer includes up to
-        # joint_silence_close_secs of dead air at the tail — no reason to
-        # keep it on disk.
+        # last speech segment on EITHER channel + pad. The session buffer
+        # includes up to joint_silence_close_secs of dead air at the tail —
+        # no reason to keep it on disk.
         full_secs = len(buffers.mic_pcm) / 2 / sr
-        if speech_segs:
-            last_end = max(s.end_ts for s in speech_segs)
-            cut_sample = min(int((last_end + pad) * sr), len(mic_final) // 2)
+        all_segs = list(buffers.mic_segments) + list(buffers.sys_segments)
+        if all_segs:
+            last_end = max(s.end_ts for s in all_segs)
+            cut_sample = min(
+                int((last_end + pad) * sr),
+                len(mic_final) // 2,
+                len(sys_final) // 2,
+            )
             cut_byte = cut_sample * 2
             mic_final = mic_final[:cut_byte]
             sys_final = sys_final[:cut_byte]
@@ -436,6 +494,19 @@ class Agent:
         true_started_at = buffers.started_at - timedelta(seconds=backfill_secs)
         pcm_duration = buffers.pcm_duration(sr)
         ended_at = true_started_at + timedelta(seconds=pcm_duration)
+        metadata = {
+            "close_reason": buffers.close_reason.value if buffers.close_reason else None,
+            "upload": empty_upload_state(),
+        }
+        if eg_report is not None:
+            metadata["echo_guard"] = {
+                "enabled": eg_report.enabled,
+                "segments_kept": eg_report.segments_kept,
+                "segments_dropped": eg_report.segments_dropped,
+                "seconds_dropped": eg_report.seconds_dropped,
+                "dropped_spans": [[s, e] for s, e in eg_report.dropped_spans],
+                "thresholds": eg_report.thresholds,
+            }
         record = await loop.run_in_executor(
             self._executor,
             self.sink.write,
@@ -448,10 +519,7 @@ class Agent:
             mic_final,
             sys_final,
             sr,
-            {
-                "close_reason": buffers.close_reason.value if buffers.close_reason else None,
-                "upload": empty_upload_state(),
-            },
+            metadata,
         )
         rec_dir = self.cfg.captures_dir / record.id
         await self.retry_mgr.try_upload(record, rec_dir)

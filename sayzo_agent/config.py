@@ -126,6 +126,54 @@ class SpeakerConfig(BaseSettings):
     max_other_speakers: int = 4
 
 
+class EchoGuardConfig(BaseSettings):
+    """Per-segment classifier that drops speaker-to-mic bleed (echo) before
+    the substantive-user-turn gate and STT. See
+    ~/.claude/plans/we-have-a-big-twinkling-wilkes.md for design.
+
+    Biased toward keeping user speech — the prior enrollment-based approach
+    was reverted for false-positive drops. AND of two tests (coherence high
+    AND residual has no speech) is required to drop a segment.
+    """
+    enabled: bool = True
+
+    # Cheap skips
+    min_system_rms: float = 0.005  # float32 RMS, ~-46 dBFS
+    min_mic_rms_for_test: float = 0.002
+    min_xcorr_peak: float = 0.15  # normalized cross-correlation peak
+
+    # Classification thresholds (both must fire to drop).
+    # Tuned for server-side channel-based diarization (Deepgram): any echo
+    # residue on the mic channel is attributed to the user by Deepgram even
+    # at low amplitude, so we bias more aggressively toward dropping. Real
+    # meeting users speak at -20 to -10 dBFS, producing residual-speech
+    # probabilities near 1.0, well above the keep threshold.
+    coh_high_threshold: float = 0.50  # mean weighted speech-band coherence
+    residual_speech_keep_prob: float = 0.25  # Silero max chunk prob → keep
+
+    # Delay / FFT sizing
+    xcorr_search_ms: int = 200  # ± delay window for alignment
+    fft_window_samples: int = 2048  # ~128 ms Welch nperseg
+    speech_band_lo_hz: float = 300.0
+    speech_band_hi_hz: float = 3400.0
+
+    # Subdivision catches Silero segments that merge echo + user into one VAD
+    # segment (and reiteration cases where user echoes a phrase after a short
+    # pause). Fine hop catches short echo fragments inside longer merged
+    # segments — the "in today a" / "few seconds" class of leaks.
+    subdivide_long_segments_secs: float = 4.0  # 0 disables
+    subdivide_window_secs: float = 1.0
+    subdivide_hop_secs: float = 0.25
+
+    # Cosine fade at zero'd-region boundaries so Whisper's log-mel frontend
+    # doesn't see a spectral cliff at echo → user transitions.
+    taper_ms: float = 5.0
+
+    # Opt-in: dump per-dropped-segment WAVs (mic + sys + residual) under
+    # <data_dir>/logs/echo_debug/<session_id>/ for offline inspection.
+    debug: bool = False
+
+
 class LLMConfig(BaseSettings):
     repo_id: str = "Qwen/Qwen2.5-3B-Instruct-GGUF"
     filename: str = "qwen2.5-3b-instruct-q4_k_m.gguf"
@@ -215,6 +263,7 @@ class Config(BaseSettings):
     conversation: ConversationConfig = Field(default_factory=ConversationConfig)
     stt: STTConfig = Field(default_factory=STTConfig)
     speaker: SpeakerConfig = Field(default_factory=SpeakerConfig)
+    echo_guard: EchoGuardConfig = Field(default_factory=EchoGuardConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)
     upload: UploadConfig = Field(default_factory=UploadConfig)
