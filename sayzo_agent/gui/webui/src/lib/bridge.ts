@@ -5,6 +5,7 @@ export type SetupStatus = {
   has_token: boolean;
   has_model: boolean;
   has_mic_permission: boolean | null;
+  has_permissions_onboarded: boolean;
   is_complete: boolean;
 };
 
@@ -15,6 +16,10 @@ export type ConfigSnapshot = {
   auth_url: string;
 };
 
+export type PermissionResult = {
+  granted: boolean | null;
+};
+
 declare global {
   interface Window {
     pywebview: {
@@ -23,8 +28,20 @@ declare global {
         get_config_snapshot(): Promise<ConfigSnapshot>;
         start_login(): Promise<{ started: boolean }>;
         start_model_download(): Promise<{ started: boolean }>;
+
+        // Permissions (new).
+        prompt_mic_permission(): Promise<PermissionResult>;
+        prompt_audio_capture_permission(): Promise<PermissionResult>;
+        prompt_notification_permission(): Promise<PermissionResult>;
+        open_mic_settings(): Promise<null>;
+        open_audio_capture_settings(): Promise<null>;
+        open_notification_settings(): Promise<null>;
+        mark_permissions_onboarded(): Promise<null>;
+
+        // Legacy MicPermission recovery screen.
         open_mac_privacy_settings(): Promise<null>;
         recheck_mac_permission(): Promise<SetupStatus>;
+
         finish(): Promise<null>;
         quit_app(): Promise<null>;
       };
@@ -96,6 +113,38 @@ export const bridge = {
     await whenReady();
     return window.pywebview.api.start_model_download();
   },
+
+  // Permissions.
+  async promptMicPermission() {
+    await whenReady();
+    return window.pywebview.api.prompt_mic_permission();
+  },
+  async promptAudioCapturePermission() {
+    await whenReady();
+    return window.pywebview.api.prompt_audio_capture_permission();
+  },
+  async promptNotificationPermission() {
+    await whenReady();
+    return window.pywebview.api.prompt_notification_permission();
+  },
+  async openMicSettings() {
+    await whenReady();
+    return window.pywebview.api.open_mic_settings();
+  },
+  async openAudioCaptureSettings() {
+    await whenReady();
+    return window.pywebview.api.open_audio_capture_settings();
+  },
+  async openNotificationSettings() {
+    await whenReady();
+    return window.pywebview.api.open_notification_settings();
+  },
+  async markPermissionsOnboarded() {
+    await whenReady();
+    return window.pywebview.api.mark_permissions_onboarded();
+  },
+
+  // Legacy recovery-path methods.
   async openMacPrivacySettings() {
     await whenReady();
     return window.pywebview.api.open_mac_privacy_settings();
@@ -104,6 +153,7 @@ export const bridge = {
     await whenReady();
     return window.pywebview.api.recheck_mac_permission();
   },
+
   async finish() {
     await whenReady();
     return window.pywebview.api.finish();

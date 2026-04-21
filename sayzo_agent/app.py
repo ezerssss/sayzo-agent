@@ -27,7 +27,9 @@ from .sink import CaptureSink
 from .speaker import SpeakerIdentifier
 from .stt import WhisperSTT, TranscribedSegment
 from .notify import NoopNotifier, Notifier
+from .retry import empty_upload_state
 from .upload import NoopUploadClient, UploadClient
+from .upload_retry import UploadRetryManager
 from .vad import SileroVAD
 
 log = logging.getLogger(__name__)
@@ -93,6 +95,7 @@ class Agent:
         mic_capture=None,
         sys_capture=None,
         notifier: Optional[Notifier] = None,
+        auth_client=None,
     ) -> None:
         self.cfg = config
         self.mic = mic_capture or MicCapture(
@@ -130,10 +133,21 @@ class Agent:
         self.notifier: Notifier = notifier or NoopNotifier()
 
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sayzo-heavy")
+        self.retry_mgr = UploadRetryManager(
+            captures_dir=config.captures_dir,
+            upload_client=self.upload,
+            notifier=self.notifier,
+            executor=self._executor,
+            config=config.upload,
+            auth_client=auth_client,
+        )
         self._stop = asyncio.Event()
         self._paused = asyncio.Event()  # clear = running, set = paused
         self._processing_tasks: set[asyncio.Task] = set()
+        self._background_tasks: set[asyncio.Task] = set()
         self._heartbeat_last: float = 0.0
+        self._upload_sweep_last: float = 0.0
+        self._sweep_in_progress: bool = False
         self._captures_kept: int = 0
         self._captures_discarded: int = 0
 
@@ -162,6 +176,7 @@ class Agent:
             self.detector.tick(now)
             self.llm.maybe_unload(now)
             self._maybe_heartbeat(now)
+            self._maybe_run_upload_sweep(now)
             buffers = self.detector.take_closed_session()
             while buffers is not None:
                 task = asyncio.create_task(self._process_session(buffers))
@@ -213,6 +228,35 @@ class Agent:
                 kept,
                 discarded,
             )
+
+    def _maybe_run_upload_sweep(self, now: float) -> None:
+        """Fire a retry sweep every `retry_sweep_interval_secs` monotonic seconds.
+        Skipped while a previous sweep is still running so long sweeps can't
+        stack. Set `cfg.upload.retry_sweep_interval_secs <= 0` to disable."""
+        interval = self.cfg.upload.retry_sweep_interval_secs
+        if interval <= 0:
+            return
+        if self._upload_sweep_last == 0.0:
+            # Arm the timer; the startup_sweep background task covers the first run.
+            self._upload_sweep_last = now
+            return
+        if now - self._upload_sweep_last < interval:
+            return
+        if self._sweep_in_progress:
+            return
+        self._upload_sweep_last = now
+        self._sweep_in_progress = True
+        task = asyncio.create_task(self._run_periodic_sweep())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _run_periodic_sweep(self) -> None:
+        try:
+            await self.retry_mgr.sweep_once()
+        except Exception:
+            log.warning("[upload] periodic sweep failed", exc_info=True)
+        finally:
+            self._sweep_in_progress = False
 
     async def _process_session(self, buffers: SessionBuffers) -> None:
         # 1. Cheap gate
@@ -404,9 +448,13 @@ class Agent:
             mic_final,
             sys_final,
             sr,
-            {"close_reason": buffers.close_reason.value if buffers.close_reason else None},
+            {
+                "close_reason": buffers.close_reason.value if buffers.close_reason else None,
+                "upload": empty_upload_state(),
+            },
         )
-        await self.upload.upload(record)
+        rec_dir = self.cfg.captures_dir / record.id
+        await self.retry_mgr.try_upload(record, rec_dir)
         self._captures_kept += 1
 
         duration_s = (ended_at - true_started_at).total_seconds()
@@ -494,6 +542,15 @@ class Agent:
 
     async def run(self) -> None:
         self.cfg.ensure_dirs()
+
+        # Drain any unuploaded captures from prior runs (failed transients,
+        # stuck in_flight records, legacy records from before upload-state
+        # tracking existed). Runs as a background task so capture can start
+        # immediately even if the backlog is large.
+        startup_sweep_task = asyncio.create_task(self.retry_mgr.startup_sweep())
+        self._background_tasks.add(startup_sweep_task)
+        startup_sweep_task.add_done_callback(self._background_tasks.discard)
+
         await self.mic.start()
         await self.sys.start()
 
@@ -518,6 +575,18 @@ class Agent:
             if self._processing_tasks:
                 log.info("[agent] waiting for %d in-flight session(s)...", len(self._processing_tasks))
                 await asyncio.gather(*self._processing_tasks, return_exceptions=True)
+            # Wait for background tasks (startup sweep, periodic sweep). Give
+            # them a short grace window; if they're still running, cancel.
+            if self._background_tasks:
+                log.info("[agent] waiting for %d background task(s)...", len(self._background_tasks))
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*self._background_tasks, return_exceptions=True),
+                        timeout=10.0,
+                    )
+                except asyncio.TimeoutError:
+                    for t in self._background_tasks:
+                        t.cancel()
             self._executor.shutdown(wait=True)
             log.info("[agent] stopped")
 

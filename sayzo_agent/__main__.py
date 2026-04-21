@@ -499,6 +499,7 @@ def run() -> None:
     from .auth.store import TokenStore
 
     upload_client = None
+    auth_client = None
     store = TokenStore(cfg.auth_path)
     if not store.has_tokens():
         log.warning("Not authenticated. Run `sayzo-agent login` to enable uploads.")
@@ -509,15 +510,15 @@ def run() -> None:
 
         auth_server = HttpAuthServer(cfg.auth.auth_url, cfg.auth.client_id, cfg.auth.scopes)
         store = TokenStore(cfg.auth_path, auth_server=auth_server)
-        client = AuthenticatedClient(cfg.auth.effective_server_url, store)
-        upload_client = AuthenticatedUploadClient(client, cfg.captures_dir)
+        auth_client = AuthenticatedClient(cfg.auth.effective_server_url, store)
+        upload_client = AuthenticatedUploadClient(auth_client, cfg.captures_dir)
         log.info("Uploads enabled → %s", cfg.auth.effective_server_url)
 
     from .app import Agent
     from .notify import DesktopNotifier, NoopNotifier
 
     notifier = DesktopNotifier(app_name="Sayzo.Agent") if cfg.notifications_enabled else NoopNotifier()
-    agent = Agent(cfg, upload_client=upload_client, notifier=notifier)
+    agent = Agent(cfg, upload_client=upload_client, notifier=notifier, auth_client=auth_client)
 
     async def _main() -> None:
         loop = asyncio.get_running_loop()
@@ -581,13 +582,14 @@ def service(force_setup: bool) -> None:
     )
     log.warning(
         "first-run gate: force_setup=%s mac_first_launch=%s is_complete=%s "
-        "(token=%s model=%s mic=%s) → show_gui=%s",
+        "(token=%s model=%s mic=%s onboarded=%s) → show_gui=%s",
         force_setup,
         mac_first_launch,
         setup_status.is_complete,
         setup_status.has_token,
         setup_status.has_model,
         setup_status.has_mic_permission,
+        setup_status.has_permissions_onboarded,
         should_show_gui,
     )
 
@@ -621,6 +623,7 @@ def service(force_setup: bool) -> None:
     from .gui.tray import TrayIcon, TrayState, Status
 
     upload_client = None
+    auth_client = None
     store = TokenStore(cfg.auth_path)
     if store.has_tokens() and cfg.auth.effective_server_url:
         from .auth.client import AuthenticatedClient
@@ -629,8 +632,8 @@ def service(force_setup: bool) -> None:
 
         auth_server = HttpAuthServer(cfg.auth.auth_url, cfg.auth.client_id, cfg.auth.scopes)
         store = TokenStore(cfg.auth_path, auth_server=auth_server)
-        client = AuthenticatedClient(cfg.auth.effective_server_url, store)
-        upload_client = AuthenticatedUploadClient(client, cfg.captures_dir)
+        auth_client = AuthenticatedClient(cfg.auth.effective_server_url, store)
+        upload_client = AuthenticatedUploadClient(auth_client, cfg.captures_dir)
         log.warning("uploads enabled → %s", cfg.auth.effective_server_url)
 
     from .app import Agent
@@ -640,7 +643,7 @@ def service(force_setup: bool) -> None:
     tray = TrayIcon(tray_state, cfg.captures_dir)
 
     notifier = DesktopNotifier(app_name="Sayzo.Agent") if cfg.notifications_enabled else NoopNotifier()
-    agent = Agent(cfg, upload_client=upload_client, notifier=notifier)
+    agent = Agent(cfg, upload_client=upload_client, notifier=notifier, auth_client=auth_client)
 
     async def _main() -> None:
         loop = asyncio.get_running_loop()

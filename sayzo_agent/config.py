@@ -155,6 +155,42 @@ class AuthConfig(BaseSettings):
         return ""
 
 
+class UploadConfig(BaseSettings):
+    # Periodic retry-sweep cadence. The sweep scans captures_dir for records
+    # whose next_attempt_at has passed and tries to upload them. Set <= 0 to
+    # disable the periodic sweep (startup sweep still runs).
+    retry_sweep_interval_secs: float = 900.0  # 15 min
+
+    # Exponential-ish backoff for `transient` failures, in seconds. Each
+    # successive failure waits the NEXT value; the final value is the
+    # steady-state cap (applied with ±10% jitter to avoid burst stampedes).
+    transient_backoff_secs: list[int] = [300, 900, 3600, 10800, 21600]
+
+    # After this many `permanent_other` attempts a record becomes
+    # `failed_permanent` and is never retried. `permanent_client` (4xx from
+    # the server) is always terminal after 1 attempt.
+    max_permanent_other_attempts: int = 3
+
+    # When the server returns 402 credit_limit_reached, pause ALL uploads
+    # (live + retry) for this long. Default 24h per spec — retrying sooner
+    # just hammers the server when the user genuinely has no credits.
+    credit_lockout_secs: float = 86400.0
+
+    # How many records the retry sweep uploads per tick. Caps per-sweep work
+    # so even a backlog of thousands doesn't drag a single sweep to an hour.
+    # Startup sweep uses this same cap. Set <= 0 for unlimited.
+    max_uploads_per_sweep: int = 20
+
+    # How many concurrent uploads may run. Keep at 1 — the server is the
+    # bottleneck and concurrent multi-minute opus uploads would blow out a
+    # home uplink.
+    max_concurrent_uploads: int = 1
+
+    # Filename for the persisted global-pause sidecar, stored under
+    # captures_dir. Atomic-written (temp + os.replace).
+    pause_state_filename: str = ".upload_state.json"
+
+
 class Config(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="SAYZO_",
@@ -181,6 +217,7 @@ class Config(BaseSettings):
     speaker: SpeakerConfig = Field(default_factory=SpeakerConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)
+    upload: UploadConfig = Field(default_factory=UploadConfig)
 
     @property
     def models_dir(self) -> Path:

@@ -68,6 +68,17 @@ class TokenStore:
     def has_tokens(self) -> bool:
         return self._load() is not None
 
+    def invalidate_cache(self) -> None:
+        """Drop the in-memory token cache so the next ``get_valid_token()``
+        call re-reads from disk.
+
+        Needed when a concurrent ``sayzo-agent login`` subprocess has written
+        a fresh token file — otherwise this process's cached copy would stay
+        stale until restart, because ``_load()`` only reads from disk the
+        first time and then returns the cached value forever.
+        """
+        self._tokens = None
+
     async def get_valid_token(self) -> str:
         async with self._lock:
             tokens = self._load()

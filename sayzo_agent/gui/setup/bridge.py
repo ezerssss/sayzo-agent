@@ -23,10 +23,12 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-# Audio Capture deep link — there's no public sub-pane for the Audio Capture
-# permission specifically, so we land the user on the general Privacy & Security
-# screen and they scroll to find Sayzo.
+# Legacy deep-link kept for the MicPermission recovery screen.
 _MAC_PRIVACY_DEEPLINK = "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
+
+# Marker file written when the user completes the Permissions onboarding
+# screen. Must match _PERMISSIONS_MARKER_NAME in detect.py.
+_PERMISSIONS_MARKER_NAME = ".permissions_onboarded_v1"
 
 
 class SetupResult(enum.Enum):
@@ -119,6 +121,78 @@ class Bridge:
         ).start()
         return {"started": True}
 
+    # ---- Permissions (new) -------------------------------------------
+
+    def prompt_mic_permission(self) -> dict[str, Any]:
+        """User clicked Grant on the Microphone row. Fires the macOS TCC
+        Microphone dialog on first call (subsequent calls are silent)."""
+        if sys.platform != "darwin":
+            return {"granted": None}
+        from sayzo_agent.gui.setup import mac_permissions
+
+        return {"granted": mac_permissions.prompt_microphone()}
+
+    def prompt_audio_capture_permission(self) -> dict[str, Any]:
+        """User clicked Grant on the Audio Capture row. Fires the macOS
+        Audio Capture TCC dialog on first call."""
+        if sys.platform != "darwin":
+            return {"granted": None}
+        from sayzo_agent.gui.setup import mac_permissions
+
+        return {"granted": mac_permissions.prompt_audio_capture()}
+
+    def prompt_notification_permission(self) -> dict[str, Any]:
+        """User clicked Grant on the Notifications row. On macOS, fires the
+        UNUserNotificationCenter dialog on first call. On Windows, just
+        returns current toast-authorization status (non-prompting)."""
+        if sys.platform == "darwin":
+            from sayzo_agent.gui.setup import mac_permissions
+
+            return {"granted": mac_permissions.prompt_notifications()}
+        if sys.platform == "win32":
+            from sayzo_agent.gui.setup import win_permissions
+
+            return {"granted": win_permissions.has_notification_permission()}
+        return {"granted": None}
+
+    def open_mic_settings(self) -> None:
+        if sys.platform == "darwin":
+            from sayzo_agent.gui.setup import mac_permissions
+
+            mac_permissions.open_mic_settings()
+
+    def open_audio_capture_settings(self) -> None:
+        if sys.platform == "darwin":
+            from sayzo_agent.gui.setup import mac_permissions
+
+            mac_permissions.open_audio_capture_settings()
+
+    def open_notification_settings(self) -> None:
+        if sys.platform == "darwin":
+            from sayzo_agent.gui.setup import mac_permissions
+
+            mac_permissions.open_notification_settings()
+        elif sys.platform == "win32":
+            from sayzo_agent.gui.setup import win_permissions
+
+            win_permissions.open_notification_settings()
+
+    def mark_permissions_onboarded(self) -> None:
+        """Record that the user has completed the Permissions screen so it
+        isn't shown again on subsequent launches."""
+        path = self._cfg.data_dir / _PERMISSIONS_MARKER_NAME
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch(exist_ok=True)
+        except OSError:
+            log.warning(
+                "failed to write permissions-onboarded marker at %s",
+                path,
+                exc_info=True,
+            )
+
+    # ---- Legacy (MicPermission recovery screen) -----------------------
+
     def open_mac_privacy_settings(self) -> None:
         if sys.platform != "darwin":
             return
@@ -128,9 +202,10 @@ class Bridge:
             log.warning("failed to open Privacy settings: %s", e)
 
     def recheck_mac_permission(self) -> dict[str, Any]:
-        """Re-run the full detection. Returns updated status synchronously
-        (cheap — bounded by the audio-tap probe timeout)."""
-        return detect_setup(self._cfg).to_dict()
+        """Re-run detection with the audio-tap probe enabled. User-initiated
+        (clicked from the recovery MicPermission screen after they've been
+        told what the probe does), so the probe's TCC impact is acceptable."""
+        return detect_setup(self._cfg, probe_mac_permission=True).to_dict()
 
     def finish(self) -> None:
         """User clicked the success/done button. Setup is considered complete."""
