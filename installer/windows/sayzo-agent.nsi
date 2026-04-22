@@ -18,7 +18,13 @@
 
 !define PRODUCT_NAME "Sayzo Agent"
 !define PRODUCT_PUBLISHER "Sayzo"
-!define PRODUCT_VERSION "0.1.0"
+; PRODUCT_VERSION is normally injected by CI via `makensis /DPRODUCT_VERSION=$VERSION ...`
+; where $VERSION is read from pyproject.toml (the single source of truth for Phase A
+; auto-update). The !ifndef guard keeps local/dev `makensis ...` invocations working
+; without requiring the flag — they'll just produce an installer labelled 0.0.0-dev.
+!ifndef PRODUCT_VERSION
+    !define PRODUCT_VERSION "0.0.0-dev"
+!endif
 !define PRODUCT_EXE "sayzo-agent.exe"
 !define SERVICE_EXE "sayzo-agent-service.exe"
 !define INSTALL_DIR "$PROGRAMFILES64\Sayzo\Agent"
@@ -64,6 +70,16 @@ UninstallIcon "..\..\installer\assets\logo.ico"
 
 Section "Install"
     SetOutPath "$INSTDIR"
+
+    ; Stop any running agent before overwriting its exes. Without this, a user
+    ; re-running the installer (the Phase A "Download update" path) hits
+    ; ERROR_SHARING_VIOLATION on sayzo-agent.exe / sayzo-agent-service.exe mid
+    ; File /r and the install aborts with files half-replaced. Idempotent —
+    ; both commands exit non-zero on "task/process not found" and we ignore
+    ; the return. The Task Scheduler task itself is re-created below with /F.
+    nsExec::ExecToLog 'schtasks /End /TN "Sayzo Agent"'
+    nsExec::ExecToLog 'taskkill /IM sayzo-agent-service.exe /F'
+    nsExec::ExecToLog 'taskkill /IM sayzo-agent.exe /F'
 
     ; Copy the entire PyInstaller bundle directory.
     ; The NSIS script must be invoked from the repo root where dist/sayzo-agent/ exists.

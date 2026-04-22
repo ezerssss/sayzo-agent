@@ -84,6 +84,7 @@ async def _do_login(cfg, no_browser: bool = False, quiet: bool = False) -> None:
 
 
 @click.group()
+@click.version_option(package_name="sayzo-agent")
 def cli() -> None:
     """Sayzo local listening agent."""
 
@@ -564,7 +565,8 @@ def service(force_setup: bool) -> None:
         return
 
     write_pid(cfg.pid_path)
-    log.warning("sayzo-agent service starting (pid=%d)", os.getpid())
+    from . import __version__
+    log.warning("sayzo-agent service starting v%s (pid=%d)", __version__, os.getpid())
 
     # First-run gate. Detect missing setup signals (auth token, LLM weights,
     # macOS mic permission) and open the GUI setup window if any is missing
@@ -679,7 +681,67 @@ def service(force_setup: bool) -> None:
                 was_paused = paused
                 tray.update()
 
+        # Best-effort update check. Surfaces "Download Sayzo vX.Y.Z" in the
+        # tray menu + fires ONE toast per newly-discovered version when the
+        # public manifest at sayzo.app/releases/latest.json advertises
+        # something newer than our installed __version__. Failures are logged
+        # and swallowed — auto-update must never break capture. The two env
+        # overrides exist so the E2E test in the plan's Verification section
+        # can trigger a check in seconds instead of hours.
+        async def _update_check() -> None:
+            from . import __version__
+            from .update import check
+            from .gui.tray import UpdateOffer
+
+            initial_delay = float(
+                os.environ.get("SAYZO_UPDATE_CHECK_INITIAL_DELAY_SECS", 60)
+            )
+            interval = float(
+                os.environ.get("SAYZO_UPDATE_CHECK_INTERVAL_SECS", 6 * 60 * 60)
+            )
+            try:
+                await asyncio.sleep(initial_delay)
+            except asyncio.CancelledError:
+                return
+
+            notified_versions: set[str] = set()
+            while not agent._stop.is_set():
+                try:
+                    info = await check(__version__)
+                except Exception:
+                    log.warning("[update] check failed", exc_info=True)
+                    info = None
+
+                if info is None:
+                    tray_state.set_update_offer(None)
+                else:
+                    tray_state.set_update_offer(
+                        UpdateOffer(version=info.version, url=info.url)
+                    )
+                    if info.version not in notified_versions:
+                        notified_versions.add(info.version)
+                        body = info.notes or f"v{info.version} is ready to install."
+                        # Dispatch the toast on the heavy-worker executor to
+                        # match the sink's invariant: on Windows, WinRT pins
+                        # its COM apartment to whichever thread first builds
+                        # the backend, so every notify() call must go through
+                        # the same executor. See sink.py:530 + notify.py
+                        # docstring for the full rationale.
+                        try:
+                            await loop.run_in_executor(
+                                agent._executor, notifier.notify,
+                                "Sayzo update available", body,
+                            )
+                        except Exception:
+                            log.warning("[update] toast failed", exc_info=True)
+
+                try:
+                    await asyncio.sleep(interval)
+                except asyncio.CancelledError:
+                    return
+
         asyncio.create_task(_tray_bridge())
+        asyncio.create_task(_update_check())
         await agent.run()
 
     try:

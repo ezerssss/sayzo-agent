@@ -58,9 +58,15 @@ jobs:
           Invoke-WebRequest -Uri "https://aka.ms/vs/17/release/vc_redist.x64.exe" -OutFile "installer\windows\VC_redist.x64.exe"
 
       - name: Build NSIS installer
+        # Pass the version from pyproject.toml (single source of truth for
+        # Phase A auto-update) into the NSIS script via /DPRODUCT_VERSION so
+        # Add/Remove Programs, the uninstall registry entry, and latest.json
+        # all agree. The NSIS script has a !ifndef fallback for dev builds.
         run: |
+          $VERSION = python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])"
+          Write-Host "Building NSIS installer for version $VERSION"
           $env:PATH += ";C:\Program Files (x86)\NSIS"
-          makensis installer\windows\sayzo-agent.nsi
+          makensis "/DPRODUCT_VERSION=$VERSION" installer\windows\sayzo-agent.nsi
 
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
@@ -217,3 +223,44 @@ jobs:
             artifacts/macos/Sayzo-Agent.dmg \
             installer/install.sh \
             root@"$HOST":/var/www/sayzo/releases/macos/
+
+      # Auto-update manifest (Phase A, notify-only). The running agent fetches
+      # this file on startup + every 6h and raises a tray/toast notification
+      # when its advertised version is newer than __version__. Hosted at the
+      # releases root (not under windows/ or macos/) so both platforms share
+      # one URL.
+      - name: Generate latest.json
+        env:
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          VERSION=$(python3 -c 'import tomllib;print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')
+          WIN_SHA=$(sha256sum artifacts/windows/sayzo-agent-setup.exe | cut -d' ' -f1)
+          MAC_SHA=$(sha256sum artifacts/macos/Sayzo-Agent.dmg | cut -d' ' -f1)
+          RELEASED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          # Sanitize notes for JSON embedding: first line only, strip quotes
+          # and backslashes. Commit messages are untrusted input at this scale.
+          NOTES=$(printf '%s' "${COMMIT_MESSAGE:-}" | head -n1 | tr -d '"\\')
+          cat > latest.json <<EOF
+          {
+            "version": "$VERSION",
+            "released_at": "$RELEASED_AT",
+            "notes": "$NOTES",
+            "windows": {
+              "url": "https://sayzo.app/releases/windows/sayzo-agent-setup.exe",
+              "sha256": "$WIN_SHA"
+            },
+            "macos": {
+              "url": "https://sayzo.app/releases/macos/Sayzo-Agent.dmg",
+              "sha256": "$MAC_SHA"
+            }
+          }
+          EOF
+          cat latest.json
+
+      - name: Upload manifest
+        env:
+          HOST: ${{ secrets.DROPLET_HOST }}
+        run: |
+          scp -i ~/.ssh/deploy_key \
+            latest.json \
+            root@"$HOST":/var/www/sayzo/releases/latest.json

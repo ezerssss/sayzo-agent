@@ -35,6 +35,14 @@ class Status(enum.Enum):
     ERROR = "error"
 
 
+@dataclass(frozen=True)
+class UpdateOffer:
+    """Advertised newer version of the agent, surfaced in the tray menu."""
+
+    version: str
+    url: str
+
+
 @dataclass
 class TrayState:
     """Thread-safe state shared between the agent loop and the tray icon."""
@@ -44,6 +52,7 @@ class TrayState:
     _lock: threading.Lock = field(default_factory=threading.Lock)
     pause_event: threading.Event = field(default_factory=threading.Event)
     quit_event: threading.Event = field(default_factory=threading.Event)
+    _update_offer: UpdateOffer | None = None
 
     def set_status(self, status: Status, error_message: str = "") -> None:
         with self._lock:
@@ -53,6 +62,14 @@ class TrayState:
     def get_status(self) -> tuple[Status, str]:
         with self._lock:
             return self.status, self.error_message
+
+    def set_update_offer(self, offer: UpdateOffer | None) -> None:
+        with self._lock:
+            self._update_offer = offer
+
+    def get_update_offer(self) -> UpdateOffer | None:
+        with self._lock:
+            return self._update_offer
 
 
 # ---------------------------------------------------------------------------
@@ -235,6 +252,13 @@ class TrayIcon:
             self.state.quit_event.set()
             icon.stop()
 
+        def on_open_update(icon, item):
+            offer = self.state.get_update_offer()
+            if offer is None:
+                return
+            import webbrowser
+            webbrowser.open(offer.url)
+
         def pause_text(item):
             return "Resume" if self.state.pause_event.is_set() else "Pause"
 
@@ -244,9 +268,21 @@ class TrayIcon:
                 return f"Status: {err}"
             return f"Status: {s.value.replace('_', ' ').title()}"
 
+        def update_text(item):
+            offer = self.state.get_update_offer()
+            return f"Download Sayzo v{offer.version}" if offer else ""
+
+        def update_visible(item):
+            return self.state.get_update_offer() is not None
+
         menu = pystray.Menu(
             pystray.MenuItem(status_text, None, enabled=False),
             pystray.Menu.SEPARATOR,
+            # Only rendered when the update-check task has surfaced a newer
+            # version on TrayState. Click opens the platform-specific installer
+            # URL in the user's browser; the existing installer (NSIS on Win,
+            # DMG drag on Mac) handles the replace.
+            pystray.MenuItem(update_text, on_open_update, visible=update_visible),
             pystray.MenuItem(pause_text, on_pause_resume),
             pystray.MenuItem("Open captures folder", on_open_captures),
             pystray.Menu.SEPARATOR,

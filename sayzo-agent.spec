@@ -9,9 +9,24 @@ main executable plus all dependencies.  The platform installer (NSIS on Windows,
 DMG on macOS) wraps this directory for end-user distribution.
 """
 import sys
+import tomllib
 from pathlib import Path
 
+from PyInstaller.utils.hooks import copy_metadata
+
 block_cipher = None
+
+# ---------------------------------------------------------------------------
+# Version — single source of truth is pyproject.toml. Phase A auto-update
+# compares the runtime __version__ (resolved via importlib.metadata) against
+# latest.json. Every place that carries a version string (this spec's
+# CFBundleShortVersionString, NSIS's PRODUCT_VERSION via /DPRODUCT_VERSION in
+# CI, and __init__.py's importlib.metadata read) derives from this file, so a
+# release is a one-line edit to pyproject.toml followed by a push.
+# ---------------------------------------------------------------------------
+
+with open("pyproject.toml", "rb") as _f:
+    _sayzo_version = tomllib.load(_f)["project"]["version"]
 
 # ---------------------------------------------------------------------------
 # App icon — Sayzo logo. .ico on Windows, .icns on macOS.
@@ -31,6 +46,11 @@ else:
 # ---------------------------------------------------------------------------
 
 datas = []
+
+# Bundle sayzo-agent's own dist-info so `importlib.metadata.version("sayzo-agent")`
+# resolves inside the frozen .app / .exe — drives __version__ in __init__.py
+# and the Click `--version` flag.
+datas += copy_metadata("sayzo-agent")
 
 # Silero VAD ONNX model — silero_vad ships it as package data.
 import silero_vad
@@ -311,7 +331,7 @@ if sys.platform == "darwin":
         icon=app_icon,
         bundle_identifier="com.sayzo.agent",
         info_plist={
-            "CFBundleShortVersionString": "0.1.0",
+            "CFBundleShortVersionString": _sayzo_version,
             "LSUIElement": True,  # hide from Dock (tray-only background app)
             "NSMicrophoneUsageDescription": (
                 "Sayzo needs microphone access to capture your "
