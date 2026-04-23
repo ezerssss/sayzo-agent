@@ -12,7 +12,7 @@ import sys
 import tomllib
 from pathlib import Path
 
-from PyInstaller.utils.hooks import copy_metadata
+from PyInstaller.utils.hooks import collect_submodules, copy_metadata
 
 block_cipher = None
 
@@ -170,7 +170,22 @@ if sys.platform == "win32":
         "webview.platforms.winforms",
         "clr_loader",
         "pythonnet",
+        # pywin32 modules used by arm/platform_win.py's foreground/window
+        # queries. These are simple at module level so PyInstaller usually
+        # picks them up, but pin them here to be explicit.
+        "pythoncom",
+        "pywintypes",
+        "win32gui",
+        "win32process",
+        "win32api",
     ]
+    # arm/platform_win.py imports pycaw + comtypes inside function bodies
+    # (try/except guarded) so PyInstaller's static scanner can't see them.
+    # Use collect_submodules to pull the whole package tree — comtypes has
+    # dynamic runtime codegen and pycaw.pycaw imports several submodules
+    # via pycaw.api.* which collect_submodules walks automatically.
+    hiddenimports += collect_submodules("pycaw")
+    hiddenimports += collect_submodules("comtypes")
 
 # macOS-specific
 if sys.platform == "darwin":

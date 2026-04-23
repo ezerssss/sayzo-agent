@@ -39,7 +39,11 @@ def get_mic_holders() -> list[MicHolder]:
         from pycaw.constants import CLSID_MMDeviceEnumerator
         from comtypes import CLSCTX_ALL, CoCreateInstance, GUID
     except Exception:
-        log.debug("[arm.win] pycaw unavailable", exc_info=True)
+        # PyInstaller often misses nested imports; surface this at WARNING so
+        # a broken bundle is diagnosable from the service log without
+        # enabling DEBUG.
+        log.warning("[arm.win] pycaw/comtypes import failed — meeting "
+                    "detection disabled", exc_info=True)
         return []
 
     # Device role enum values — pycaw doesn't expose these directly.
@@ -70,7 +74,11 @@ def get_mic_holders() -> list[MicHolder]:
         session_enum = mgr.GetSessionEnumerator()
         count = session_enum.GetCount()
     except Exception:
-        log.debug("[arm.win] capture-endpoint session enum failed", exc_info=True)
+        log.warning(
+            "[arm.win] capture-endpoint session enum failed — "
+            "meeting detection disabled",
+            exc_info=True,
+        )
         return []
 
     holders: list[MicHolder] = []
