@@ -8,10 +8,12 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 import click
 
+from .arm.hotkey import humanize_binding
 from .config import load_config
 
 
@@ -516,9 +518,9 @@ def run() -> None:
         log.info("Uploads enabled → %s", cfg.auth.effective_server_url)
 
     from .app import Agent
-    from .notify import DesktopNotifier, NoopNotifier
+    from .notify import APP_AUMID, DesktopNotifier, NoopNotifier
 
-    notifier = DesktopNotifier(app_name="Sayzo.Agent") if cfg.notifications_enabled else NoopNotifier()
+    notifier = DesktopNotifier(app_name=APP_AUMID) if cfg.notifications_enabled else NoopNotifier()
     agent = Agent(cfg, upload_client=upload_client, notifier=notifier, auth_client=auth_client)
 
     async def _main() -> None:
@@ -639,12 +641,12 @@ def service(force_setup: bool) -> None:
         log.warning("uploads enabled → %s", cfg.auth.effective_server_url)
 
     from .app import Agent
-    from .notify import DesktopNotifier, NoopNotifier
+    from .notify import APP_AUMID, DesktopNotifier, NoopNotifier
 
     tray_state = TrayState()
     tray = TrayIcon(tray_state, cfg.captures_dir)
 
-    notifier = DesktopNotifier(app_name="Sayzo.Agent") if cfg.notifications_enabled else NoopNotifier()
+    notifier = DesktopNotifier(app_name=APP_AUMID) if cfg.notifications_enabled else NoopNotifier()
     agent = Agent(cfg, upload_client=upload_client, notifier=notifier, auth_client=auth_client)
 
     async def _main() -> None:
@@ -665,20 +667,79 @@ def service(force_setup: bool) -> None:
         if sys.platform == "win32":
             signal.signal(signal.SIGBREAK, lambda *_: _handle_stop())
 
-        # Poll the tray thread for pause/resume/quit signals.
+        # Bridge the tray thread with the asyncio loop: poll for user clicks
+        # on the Arm/Stop / Settings... / Reopen setup / Quit menu items, and
+        # push the ArmController's state back to the tray so labels and
+        # tooltip stay in sync across armings.
+        from .arm import ArmState
+        from .gui.tray import Status as TrayStatus
+
+        # One-at-a-time guards — a user clicking Settings... or Reopen setup
+        # twice shouldn't spin up two tk roots in parallel. tkinter's
+        # mainloop returns when the window closes; flags are cleared from
+        # the worker thread at that point.
+        settings_open = threading.Event()
+        onboarding_open = threading.Event()
+
+        def _open_settings() -> None:
+            try:
+                from .gui.settings_window import open_settings_window
+
+                open_settings_window(cfg, agent.arm)
+            except Exception:
+                log.warning("[tray] settings window crashed", exc_info=True)
+            finally:
+                settings_open.clear()
+
+        def _open_onboarding() -> None:
+            try:
+                from .onboarding import open_onboarding_window
+
+                open_onboarding_window(cfg, agent.arm)
+            except Exception:
+                log.warning("[tray] onboarding window crashed", exc_info=True)
+            finally:
+                onboarding_open.clear()
+
         async def _tray_bridge() -> None:
-            was_paused = False
+            last_arm_state: ArmState | None = None
+            last_hotkey: str | None = None
             while not agent._stop.is_set():
                 await asyncio.sleep(0.5)
                 if tray_state.quit_event.is_set():
                     _handle_stop()
                     return
-                paused = tray_state.pause_event.is_set()
-                if paused and not was_paused:
-                    agent.pause()
-                elif not paused and was_paused:
-                    agent.resume()
-                was_paused = paused
+                # User clicked the Arm/Stop menu item. Fire the same code
+                # path the hotkey uses — confirmation toast + arm/disarm.
+                if tray_state.arm_toggle_event.is_set():
+                    tray_state.arm_toggle_event.clear()
+                    asyncio.create_task(agent.arm.arm_from_tray())
+                # Settings... — open the tkinter settings window on a worker
+                # thread so the asyncio loop keeps ticking. Reentrancy guard
+                # ensures a double-click doesn't create a second window.
+                if tray_state.settings_event.is_set():
+                    tray_state.settings_event.clear()
+                    if not settings_open.is_set():
+                        settings_open.set()
+                        loop.run_in_executor(None, _open_settings)
+                # Reopen setup — open the onboarding walkthrough (bypasses
+                # the onboarding.json flag so users can revisit it any time).
+                if tray_state.reopen_setup_event.is_set():
+                    tray_state.reopen_setup_event.clear()
+                    if not onboarding_open.is_set():
+                        onboarding_open.set()
+                        loop.run_in_executor(None, _open_onboarding)
+                # Sync ArmController state → tray state.
+                cur_state = agent.arm.state
+                cur_hotkey = agent.arm.current_hotkey
+                if cur_state != last_arm_state:
+                    tray_state.set_status(
+                        TrayStatus.ARMED if cur_state == ArmState.ARMED else TrayStatus.DISARMED
+                    )
+                    last_arm_state = cur_state
+                if cur_hotkey != last_hotkey:
+                    tray_state.set_hotkey_display(humanize_binding(cur_hotkey))
+                    last_hotkey = cur_hotkey
                 tray.update()
 
         # Best-effort update check. Surfaces "Download Sayzo vX.Y.Z" in the
@@ -749,8 +810,6 @@ def service(force_setup: bool) -> None:
             # macOS: pystray uses AppKit, which requires NSStatusItem to be
             # instantiated on the main thread. Run asyncio on a worker thread
             # and hand the main thread to pystray.
-            import threading
-
             asyncio_exc: list[BaseException] = []
 
             def _asyncio_runner() -> None:

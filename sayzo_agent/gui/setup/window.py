@@ -38,6 +38,27 @@ def _webui_index_path() -> Path:
     return base / "index.html"
 
 
+def _icon_path() -> Path | None:
+    """Pick the Sayzo logo to pass to pywebview.
+
+    On Windows .ico renders sharper in the taskbar; elsewhere we use PNG.
+    Returns None if no asset is bundled.
+    """
+    if getattr(sys, "frozen", False):
+        base = Path(sys._MEIPASS) / "installer" / "assets"  # type: ignore[attr-defined]
+    else:
+        # gui/setup/window.py — climb to repo root.
+        base = Path(__file__).resolve().parent.parent.parent.parent / "installer" / "assets"
+    if sys.platform == "win32":
+        ico = base / "logo.ico"
+        if ico.exists():
+            return ico
+    png = base / "logo.png"
+    if png.exists():
+        return png
+    return None
+
+
 class SetupWindow:
     """Owns the pywebview window + bridge for the first-run flow."""
 
@@ -73,7 +94,14 @@ class SetupWindow:
 
         # webview.start() blocks until the window is destroyed. debug=True
         # opens the devtools panel — gated on Config.debug for ad-hoc UI work.
-        webview.start(debug=self._cfg.debug)
+        # ``icon`` sets the taskbar/dock icon so the installer window shows
+        # Sayzo in dev previews (in production the NSIS-installed shortcut
+        # provides the icon via its AUMID).
+        icon_arg: dict = {}
+        icon_path = _icon_path()
+        if icon_path is not None:
+            icon_arg["icon"] = str(icon_path)
+        webview.start(debug=self._cfg.debug, **icon_arg)
 
         log.info("setup window closed: result=%s", self._bridge.result.value)
         return self._bridge.result

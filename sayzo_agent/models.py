@@ -12,8 +12,11 @@ Source = Literal["mic", "system"]
 
 class SessionCloseReason(str, Enum):
     JOINT_SILENCE = "joint_silence"
-    SAFETY_CAP = "safety_cap"
+    SAFETY_CAP = "safety_cap"  # retained for backward compat with on-disk records; not emitted in the armed model
     SHUTDOWN = "shutdown"
+    HOTKEY_END = "hotkey_end"
+    CHECKIN_WRAP_UP = "checkin_wrap_up"
+    WHITELIST_ENDED = "whitelist_ended"
 
 
 @dataclass

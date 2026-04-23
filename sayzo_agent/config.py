@@ -59,7 +59,10 @@ class VADConfig(BaseSettings):
 
 class ConversationConfig(BaseSettings):
     joint_silence_close_secs: float = 45.0
-    max_session_secs: float = 3600.0
+    # max_session_secs was the 60-min safety cap used in the always-on model.
+    # Removed in the armed model: the user explicitly armed, can hotkey-stop,
+    # and the long-meeting check-in toast (see ArmConfig) is the backstop for
+    # unattended long sessions.
     min_user_turn_secs: float = 8.0
     min_user_total_secs: float = 15.0
     min_user_turns_for_total: int = 2
@@ -182,6 +185,210 @@ class LLMConfig(BaseSettings):
     idle_unload_secs: float = 300.0
 
 
+class DetectorSpec(BaseSettings):
+    """Per-app detection rule for the whitelist auto-suggest path.
+
+    See :mod:`sayzo_agent.arm.detectors` for matching logic.
+
+    - ``app_key`` is a stable identity used for cooldown bucketing across
+      sessions.
+    - ``display_name`` is the user-facing label interpolated into consent /
+      meeting-ended toasts.
+    - ``process_names`` lists Windows executable names (e.g. ``zoom.exe``)
+      that, when found holding an active capture session, match the rule.
+    - ``bundle_ids`` lists macOS bundle identifiers (e.g. ``us.zoom.xos``)
+      treated equivalently on macOS. Mac can't attribute mic-in-use to a
+      specific process cheaply, so a running+recently-foreground check is
+      used instead (see ``arm/platform_mac.py``).
+    - ``is_browser`` marks rules that only trigger when the browser process
+      holds the mic AND one of ``url_patterns`` matches the active tab.
+      This is how Google Meet / Teams web / Zoom web / Webex / Whereby /
+      Jitsi / 8x8 are matched.
+    """
+
+    app_key: str
+    display_name: str
+    process_names: list[str] = Field(default_factory=list)
+    bundle_ids: list[str] = Field(default_factory=list)
+    is_browser: bool = False
+    url_patterns: list[str] = Field(default_factory=list)
+
+
+def default_detector_specs() -> list[DetectorSpec]:
+    """Ship-with whitelist. Users override via `SAYZO_ARM__DETECTORS` or the
+    settings GUI (whitelist editor deferred to post-v1)."""
+    return [
+        # Desktop meeting apps — detected by process name (Win) or bundle id (Mac)
+        # holding an active capture session / mic running system-wide.
+        DetectorSpec(
+            app_key="zoom", display_name="Zoom",
+            process_names=["zoom.exe", "CptHost.exe"],
+            bundle_ids=["us.zoom.xos"],
+        ),
+        DetectorSpec(
+            app_key="teams_desktop", display_name="Microsoft Teams",
+            process_names=["ms-teams.exe", "Teams.exe"],
+            bundle_ids=["com.microsoft.teams", "com.microsoft.teams2"],
+        ),
+        DetectorSpec(
+            app_key="discord", display_name="Discord",
+            process_names=["Discord.exe"],
+            bundle_ids=["com.hnc.Discord"],
+        ),
+        DetectorSpec(
+            app_key="slack", display_name="Slack",
+            process_names=["slack.exe"],
+            bundle_ids=["com.tinyspeck.slackmacgap"],
+        ),
+        DetectorSpec(
+            app_key="webex", display_name="Webex",
+            process_names=["webex.exe", "CiscoCollabHost.exe"],
+            bundle_ids=["Cisco-Systems.Spark", "com.webex.meetingmanager"],
+        ),
+        DetectorSpec(
+            app_key="skype", display_name="Skype",
+            process_names=["Skype.exe"],
+            bundle_ids=["com.skype.skype"],
+        ),
+        DetectorSpec(
+            app_key="facetime", display_name="FaceTime",
+            bundle_ids=["com.apple.FaceTime"],  # macOS only
+        ),
+        DetectorSpec(
+            app_key="whatsapp", display_name="WhatsApp",
+            process_names=["WhatsApp.exe"],
+            bundle_ids=["net.whatsapp.WhatsApp"],
+        ),
+        DetectorSpec(
+            app_key="signal", display_name="Signal",
+            process_names=["Signal.exe"],
+            bundle_ids=["org.whispersystems.signal-desktop"],
+        ),
+        DetectorSpec(
+            app_key="gotomeeting", display_name="GoTo",
+            process_names=["g2mcomm.exe", "g2mlauncher.exe"],
+            bundle_ids=["com.logmein.GoToMeeting"],
+        ),
+        DetectorSpec(
+            app_key="bluejeans", display_name="BlueJeans",
+            process_names=["BlueJeans.exe"],
+            bundle_ids=["com.bluejeans.app"],
+        ),
+        DetectorSpec(
+            app_key="chime", display_name="Amazon Chime",
+            process_names=["Chime.exe"],
+            bundle_ids=["com.amazon.Chime"],
+        ),
+        DetectorSpec(
+            app_key="ringcentral", display_name="RingCentral",
+            process_names=["RingCentral.exe", "RCMeetings.exe"],
+            bundle_ids=["com.ringcentral.rcoffice"],
+        ),
+        DetectorSpec(
+            app_key="dialpad", display_name="Dialpad",
+            process_names=["Dialpad.exe"],
+            bundle_ids=["co.dialpad.dialpad"],
+        ),
+
+        # Web meeting platforms — browser holds the mic AND URL matches pattern.
+        DetectorSpec(
+            app_key="gmeet", display_name="Google Meet", is_browser=True,
+            url_patterns=[r"^https://meet\.google\.com/[a-z]{3,4}-[a-z]{3,4}-[a-z]{3,4}"],
+        ),
+        DetectorSpec(
+            app_key="teams_web", display_name="Microsoft Teams",
+            is_browser=True,
+            url_patterns=[
+                r"teams\.microsoft\.com/.+/l/meetup-join/",
+                r"teams\.microsoft\.com/_#/conversations/.+/meeting",
+            ],
+        ),
+        DetectorSpec(
+            app_key="zoom_web", display_name="Zoom", is_browser=True,
+            url_patterns=[
+                r"^https://[^/]+\.zoom\.us/wc/join/",
+                r"^https://[^/]+\.zoom\.us/j/\d+",
+            ],
+        ),
+        DetectorSpec(
+            app_key="webex_web", display_name="Webex", is_browser=True,
+            url_patterns=[r"^https://[^/]+\.webex\.com/(meet|wbxmjs|webappng)/"],
+        ),
+        DetectorSpec(
+            app_key="whereby", display_name="Whereby", is_browser=True,
+            url_patterns=[r"^https://whereby\.com/[^/]+"],
+        ),
+        DetectorSpec(
+            app_key="jitsi", display_name="Jitsi Meet", is_browser=True,
+            url_patterns=[r"^https://meet\.jit\.si/[^/]+"],
+        ),
+        DetectorSpec(
+            app_key="8x8", display_name="8x8 Meet", is_browser=True,
+            url_patterns=[r"^https://8x8\.vc/[^/]+"],
+        ),
+    ]
+
+
+class ArmConfig(BaseSettings):
+    """Configuration for the armed-only capture model.
+
+    See ``~/.claude/plans/so-right-now-what-snug-corbato.md`` for the full
+    design. The armed model replaces always-listening: audio streams only
+    open after an explicit arm signal (hotkey or whitelist consent).
+    """
+
+    # Global hotkey binding. Users can change this via the Settings GUI (see
+    # sayzo_agent.gui.settings_window) or the onboarding walkthrough. Values
+    # are written to data_dir/user_settings.json and overlaid onto this
+    # default at load time; SAYZO_ARM__HOTKEY env var still wins.
+    hotkey: str = "ctrl+alt+s"
+
+    # How often the whitelist watcher polls foreground + mic-holders while
+    # disarmed, and the meeting-ended watcher polls while armed.
+    poll_interval_secs: float = 2.0
+
+    # Whitelist consent toast timings.
+    consent_toast_timeout_secs: float = 30.0
+
+    # Hotkey confirmation toast timings (both start + stop).
+    hotkey_confirm_timeout_secs: float = 10.0
+
+    # End-of-meeting confirmation toast (fires when detector enters
+    # PENDING_CLOSE on joint silence).
+    end_toast_timeout_secs: float = 15.0
+
+    # Cooldowns for the whitelist consent toast, keyed by app_key.
+    cooldown_after_decline_secs: float = 1800.0  # 30 min after "Not now" / timeout
+    cooldown_after_session_secs: float = 600.0   # 10 min after session naturally ended
+
+    # Long-meeting check-in: elapsed-session marks (seconds from session
+    # open) at which to fire the "still in the meeting?" toast. Hourly until
+    # 2h, then every 30 min. Extends indefinitely with 30-min steps.
+    long_meeting_checkin_marks_secs: list[float] = Field(
+        default_factory=lambda: [3600, 7200, 9000, 10800, 12600, 14400, 16200, 18000]
+    )
+    checkin_toast_timeout_secs: float = 15.0
+
+    # Meeting-ended watcher (whitelist-armed sessions only).
+    # How long the arm-app can be absent from mic-holders before the toast
+    # fires. Absorbs transient drops / immediate-rejoin scenarios.
+    whitelist_arm_release_grace_secs: float = 15.0
+    meeting_ended_toast_timeout_secs: float = 15.0
+    # After "Keep going", snooze the watcher this long before re-asking.
+    # Each snooze-expiry fires a fresh toast; non-response on that toast
+    # defaults to Wrap up and commits the close.
+    meeting_ended_snooze_secs: float = 600.0
+
+    # Per-app detection rules. Populated from ``default_detector_specs()``.
+    detectors: list[DetectorSpec] = Field(default_factory=default_detector_specs)
+
+    # Sub-toggle for the "Sayzo is capturing — Press X to stop" toast fired
+    # after every successful arm. Exposed in the Settings window. Master
+    # ``Config.notifications_enabled`` still wins; consent + end-of-meeting
+    # toasts are unaffected (they're how the user decides what to capture).
+    notify_post_arm: bool = True
+
+
 class AuthConfig(BaseSettings):
     auth_url: str = "https://sayzo.app/api/auth"
     client_id: str = "sayzo-desktop"  # Public OAuth client ID (no secret — PKCE)
@@ -255,8 +462,15 @@ class Config(BaseSettings):
     # can see at a glance whether the agent is idle, in a session, etc. Set
     # to 0 to disable. Override via SAYZO_HEARTBEAT_SECS.
     heartbeat_secs: float = 30.0
-    # Native desktop toast after each kept session. SAYZO_NOTIFICATIONS_ENABLED=0 to disable.
+    # Master toggle — when False, no non-consent toasts fire. Consent +
+    # end-of-meeting toasts still fire (they're how the user decides what
+    # gets captured). SAYZO_NOTIFICATIONS_ENABLED=0 to disable.
     notifications_enabled: bool = True
+    # Sub-toggles under the master. Exposed in the Settings window's
+    # Notifications pane; persisted to user_settings.json. See also
+    # ``ArmConfig.notify_post_arm`` for the arm-time sub-toggle.
+    notify_welcome: bool = True
+    notify_capture_saved: bool = True
 
     capture: CaptureConfig = Field(default_factory=CaptureConfig)
     vad: VADConfig = Field(default_factory=VADConfig)
@@ -265,6 +479,7 @@ class Config(BaseSettings):
     speaker: SpeakerConfig = Field(default_factory=SpeakerConfig)
     echo_guard: EchoGuardConfig = Field(default_factory=EchoGuardConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
+    arm: ArmConfig = Field(default_factory=ArmConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)
     upload: UploadConfig = Field(default_factory=UploadConfig)
 
@@ -296,6 +511,52 @@ class Config(BaseSettings):
 
 
 def load_config() -> Config:
-    cfg = Config()
+    """Build a Config with layered overrides.
+
+    Load order, lowest to highest precedence:
+      1. Pydantic field defaults.
+      2. ``data_dir/user_settings.json`` (written by the Settings GUI /
+         onboarding; survives restarts).
+      3. ``SAYZO_*`` environment variables (dev overrides — still win).
+
+    Pydantic-settings puts init kwargs above env vars by default, so we
+    explicitly filter out any user-settings field for which a matching
+    ``SAYZO_*__*`` env var is present. The env var then flows through the
+    normal source chain and wins.
+    """
+    # First resolve the data_dir so we know where to look for user settings.
+    # Env var SAYZO_DATA_DIR still wins; we need a Config instance to know
+    # the effective value.
+    probe = Config()
+    data_dir = probe.data_dir
+
+    from . import settings_store
+    user = settings_store.load(data_dir)
+
+    # Build nested init kwargs, dropping any leaf that env already overrode.
+    init_kwargs: dict = {}
+
+    # Top-level scalar fields (notifications master + sub-toggles, etc.).
+    # Filter by env — only the non-nested SAYZO_* vars count here.
+    env_top_keys = {
+        k[len("SAYZO_"):].lower()
+        for k in os.environ
+        if k.upper().startswith("SAYZO_") and "__" not in k[len("SAYZO_"):]
+    }
+    for key in ("notifications_enabled", "notify_welcome", "notify_capture_saved"):
+        if key in user and key not in env_top_keys:
+            init_kwargs[key] = user[key]
+
+    if isinstance(user.get("arm"), dict):
+        env_arm_keys = {
+            k[len("SAYZO_ARM__"):].lower()
+            for k in os.environ
+            if k.upper().startswith("SAYZO_ARM__")
+        }
+        user_arm = {k: v for k, v in user["arm"].items() if k.lower() not in env_arm_keys}
+        if user_arm:
+            init_kwargs["arm"] = {**probe.arm.model_dump(), **user_arm}
+
+    cfg = Config(**init_kwargs) if init_kwargs else probe
     cfg.ensure_dirs()
     return cfg

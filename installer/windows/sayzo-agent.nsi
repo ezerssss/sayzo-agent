@@ -45,6 +45,13 @@ UninstallIcon "..\..\installer\assets\logo.ico"
 !define MUI_ABORTWARNING
 !define MUI_ICON "..\..\installer\assets\logo.ico"
 !define MUI_UNICON "..\..\installer\assets\logo.ico"
+
+; Welcome page — introduces the armed-only model so users understand what
+; they're installing before files hit disk. Copy is the approved draft from
+; installer/copy_draft.md; mirror any future revisions of that file here.
+!define MUI_WELCOMEPAGE_TITLE "Sayzo — the English speaking coach you bring to your meetings."
+!define MUI_WELCOMEPAGE_TEXT "Sayzo captures conversations from your meetings and turns them into personalized English-speaking drills. It only listens when you say so: press a keyboard shortcut, or say yes to a prompt when Sayzo notices you're in a meeting.$\r$\n$\r$\nYour microphone stays off until then."
+!insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_INSTFILES
 
 ; Finish page with a "Launch Sayzo Agent" checkbox that runs the windowless
@@ -52,6 +59,8 @@ UninstallIcon "..\..\installer\assets\logo.ico"
 ; missing setup signals and opens its own first-run GUI if needed — that's
 ; the whole point of the GUI installer path. See ~/.claude/plans/i-created-a-memory-quizzical-cosmos.md.
 ; The MUI_FINISHPAGE_RUN_* defines must come BEFORE MUI_PAGE_FINISH.
+!define MUI_FINISHPAGE_TITLE "Sayzo is ready."
+!define MUI_FINISHPAGE_TEXT "We'll open a quick setup window so you can pick your start-recording shortcut. You can change it anytime from the Sayzo tray menu."
 !define MUI_FINISHPAGE_RUN "$INSTDIR\${SERVICE_EXE}"
 ; --force-setup makes the service open the GUI regardless of detect_setup's
 ; verdict — users get visual confirmation right after install even if they

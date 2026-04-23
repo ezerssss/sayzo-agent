@@ -20,7 +20,6 @@ from sayzo_agent.models import SessionCloseReason, SpeechSegment
 def _cfg(**overrides) -> ConversationConfig:
     base = dict(
         joint_silence_close_secs=10.0,
-        max_session_secs=600.0,
         min_user_turn_secs=8.0,
         min_user_total_secs=15.0,
         min_user_turns_for_total=2,
@@ -228,6 +227,7 @@ def test_session_stays_open_during_long_user_monologue():
 
 
 def test_session_closes_on_joint_silence():
+    """Legacy path: no on_pending_close callback → silence closes immediately."""
     d = ConversationDetector(_cfg(joint_silence_close_secs=5.0))
     d.on_segment(SpeechSegment("mic", 0.0, 9.0), now=100.0)
     d.on_segment(SpeechSegment("system", 9.0, 10.0), now=110.0)
@@ -239,13 +239,95 @@ def test_session_closes_on_joint_silence():
     assert closed.close_reason == SessionCloseReason.JOINT_SILENCE
 
 
-def test_safety_cap_checkpoints_session():
-    d = ConversationDetector(_cfg(max_session_secs=30.0))
+def test_pending_close_holds_session_when_callback_registered():
+    """Armed model: on_pending_close takes responsibility for commit/revert."""
+    d = ConversationDetector(_cfg(joint_silence_close_secs=5.0))
+    d.on_pending_close = lambda: None  # ArmController stand-in
     d.on_segment(SpeechSegment("mic", 0.0, 9.0), now=100.0)
-    d.tick(135.0)  # 35s after open → past cap
+    d.on_segment(SpeechSegment("system", 9.0, 10.0), now=110.0)
+    d.tick(120.0)
+    assert d.state == SessionState.PENDING_CLOSE
+    # Nothing written yet — buffers are held.
+    assert d.take_closed_session() is None
+
+
+def test_pending_close_commit_produces_capture():
+    d = ConversationDetector(_cfg(joint_silence_close_secs=5.0))
+    d.on_pending_close = lambda: None
+    d.on_segment(SpeechSegment("mic", 0.0, 9.0), now=100.0)
+    d.on_segment(SpeechSegment("system", 9.0, 10.0), now=110.0)
+    d.tick(120.0)
+    assert d.state == SessionState.PENDING_CLOSE
+    d.commit_close(121.0, SessionCloseReason.JOINT_SILENCE)
+    assert d.state == SessionState.IDLE
     closed = d.take_closed_session()
     assert closed is not None
-    assert closed.close_reason == SessionCloseReason.SAFETY_CAP
+    assert closed.close_reason == SessionCloseReason.JOINT_SILENCE
+
+
+def test_pending_close_revert_keeps_session_open():
+    d = ConversationDetector(_cfg(joint_silence_close_secs=5.0))
+    d.on_pending_close = lambda: None
+    d.on_segment(SpeechSegment("mic", 0.0, 9.0), now=100.0)
+    d.on_segment(SpeechSegment("system", 9.0, 10.0), now=110.0)
+    d.tick(120.0)
+    d.revert_close(121.0)
+    assert d.state == SessionState.OPEN
+    # Silence timer reset — tick shortly after must not re-enter PENDING_CLOSE
+    d.tick(123.0)
+    assert d.state == SessionState.OPEN
+    # But prolonged silence eventually re-enters PENDING_CLOSE
+    d.tick(127.0)
+    assert d.state == SessionState.PENDING_CLOSE
+
+
+def test_pending_close_auto_reverts_on_speech():
+    """A VAD segment arriving during PENDING_CLOSE is ground truth that the
+    meeting continued; the detector auto-reverts to OPEN."""
+    d = ConversationDetector(_cfg(joint_silence_close_secs=5.0))
+    d.on_pending_close = lambda: None
+    d.on_segment(SpeechSegment("mic", 0.0, 9.0), now=100.0)
+    d.on_segment(SpeechSegment("system", 9.0, 10.0), now=110.0)
+    d.tick(120.0)
+    assert d.state == SessionState.PENDING_CLOSE
+    # User resumes talking
+    d.on_segment(SpeechSegment("mic", 20.0, 22.0), now=122.0)
+    assert d.state == SessionState.OPEN
+
+
+def test_shutdown_during_pending_close_commits_not_discards():
+    """force_close on PENDING_CLOSE must preserve the capture on the way out."""
+    d = ConversationDetector(_cfg(joint_silence_close_secs=5.0))
+    d.on_pending_close = lambda: None
+    d.on_segment(SpeechSegment("mic", 0.0, 9.0), now=100.0)
+    d.tick(120.0)
+    assert d.state == SessionState.PENDING_CLOSE
+    d.force_close(121.0)
+    closed = d.take_closed_session()
+    assert closed is not None
+    assert closed.close_reason == SessionCloseReason.SHUTDOWN
+
+
+def test_reset_source_epochs_clears_state():
+    d = ConversationDetector(_cfg())
+    d._source_epoch_mono["mic"] = 100.0
+    d._source_frames_seen["mic"] = 50
+    d._pre_buffers["mic"].extend(b"\x00" * 100)
+    d._pre_start_sample["mic"] = 10
+    d.reset_source_epochs()
+    assert d._source_epoch_mono == {"mic": None, "system": None}
+    assert d._source_frames_seen == {"mic": 0, "system": 0}
+    assert len(d._pre_buffers["mic"]) == 0
+    assert d._pre_start_sample["mic"] == 0
+
+
+def test_reset_source_epochs_raises_when_not_idle():
+    d = ConversationDetector(_cfg())
+    d.on_segment(SpeechSegment("mic", 0.0, 1.0), now=100.0)
+    assert d.state == SessionState.OPEN
+    import pytest
+    with pytest.raises(RuntimeError):
+        d.reset_source_epochs()
 
 
 def test_gate_passes_long_turn():
@@ -354,7 +436,7 @@ def test_density_late_substantive_turn_is_above_threshold():
 
 def test_density_passive_media_is_below_threshold():
     """A 60-min YouTube + one 10s comment should land in the windowed path."""
-    cfg = _cfg(joint_silence_close_secs=120.0, max_session_secs=4000.0)
+    cfg = _cfg(joint_silence_close_secs=120.0)
     d = ConversationDetector(cfg)
     d.on_segment(SpeechSegment("system", 0.0, 1800.0), now=100.0)
     d.on_segment(SpeechSegment("mic", 1800.0, 1810.0), now=1910.0)  # 10s comment

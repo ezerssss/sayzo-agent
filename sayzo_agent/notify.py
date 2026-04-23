@@ -2,16 +2,45 @@
 
 Failures are always swallowed and logged — a broken toast backend must never
 bring down the main capture pipeline.
+
+In the armed-only model (v1.0+) this module has two jobs:
+
+1. **Fire-and-forget** via ``notify(title, body)`` — same semantics as
+   before (capture-saved, post-arm guidance, stream-open error, etc.).
+2. **Interactive consent** via ``ask_consent(...)`` — toast with two action
+   buttons, await the user's click (or timeout), return ``"yes"``, ``"no"``,
+   or ``"timeout"``. Used by the ArmController for whitelist consent, hotkey
+   start/stop confirmation, end-of-meeting confirmation, long-meeting
+   check-in, and meeting-ended-watcher toasts.
+
+Interactive buttons require ``desktop-notifier``'s async API. The sync
+wrapper we used to rely on is deprecated and doesn't round-trip button
+callbacks reliably on Windows. Instead we spin up a dedicated asyncio loop
+on a background daemon thread (created eagerly in ``__init__`` so the first
+consent toast isn't gated on loop startup), and marshal all work onto it
+via ``asyncio.run_coroutine_threadsafe``.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 import threading
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Optional, Protocol
 
 log = logging.getLogger(__name__)
+
+
+ConsentResult = Literal["yes", "no", "timeout"]
+
+
+# AUMID that every Sayzo notifier instance must be constructed with. Must
+# match the Start Menu shortcut AppUserModelID set by the NSIS installer
+# (see ``installer/windows/sayzo-agent.nsi``) — otherwise WinRT toasts
+# silently fail to render on Windows 10. On macOS this is the display name
+# attributed to the notification. Any drift is a silent regression.
+APP_AUMID = "Sayzo.Agent"
 
 
 class Notifier(Protocol):
@@ -21,6 +50,18 @@ class Notifier(Protocol):
 class NoopNotifier:
     def notify(self, title: str, body: str) -> None:
         log.debug("[notify] (noop) %s — %s", title, body)
+
+    def ask_consent(
+        self,
+        title: str,
+        body: str,
+        yes_label: str,
+        no_label: str,
+        timeout_secs: float,
+        default_on_timeout: ConsentResult = "timeout",
+    ) -> ConsentResult:
+        log.debug("[notify] (noop) consent %s — %s → %s", title, body, default_on_timeout)
+        return default_on_timeout
 
 
 def _logo_path() -> Path:
@@ -38,36 +79,30 @@ def _logo_path() -> Path:
 
 
 class DesktopNotifier:
-    """Native toast via the `desktop-notifier` PyPI package.
+    """Native toast via the `desktop-notifier` PyPI package, async backend.
 
-    Uses the library's synchronous wrapper (``DesktopNotifierSync``) which
-    keeps one persistent asyncio loop alive inside the object. That matters on
-    the Windows WinRT backend: it registers internal handlers that marshal
-    back into the loop via ``call_soon_threadsafe`` when a toast is
-    activated / dismissed / fails. Spinning up ``asyncio.run()`` per call
-    (our earlier approach) closed the loop on return, so WinRT's later
-    callback landed on a dead loop and logged
-    ``RuntimeError: Event loop is closed``. With a persistent loop the
-    callback just queues and never fires — harmless here since we don't
-    register interaction handlers.
+    Owns a dedicated asyncio loop running on a daemon background thread.
+    Both ``notify`` and ``ask_consent`` are thread-safe — they marshal onto
+    the loop via ``asyncio.run_coroutine_threadsafe``.
 
-    Backend construction is lazy. On Windows the WinRT backend marshals COM
-    interfaces to the thread that built it; any cross-thread ``.send()`` from
-    another thread raises ``RPC_E_WRONG_THREAD`` (WinError -2147417842). The
-    sink dispatches every ``notify()`` call on the heavy-worker pool
-    (``ThreadPoolExecutor(max_workers=1)``), so building the backend on first
-    call pins the COM apartment to that worker for the life of the process.
+    The backend is constructed eagerly in ``__init__`` (on the background
+    thread, since Windows WinRT pins COM to the constructing thread). If
+    backend init fails the notifier degrades to a noop — exceptions are
+    logged, never propagated.
 
     ``app_name`` must match the AUMID set on the Start Menu shortcut by the
     NSIS installer ("Sayzo.Agent") for WinRT toasts to appear at all on
     Windows 10; on macOS it's the display name attributed to the notification.
+    Interactive button callbacks work on both WinRT (Windows 10+) and
+    NSUserNotification (macOS) back-ends.
     """
 
     def __init__(self, app_name: str = "Sayzo") -> None:
         self._app_name = app_name
-        self._impl = None
+        self._impl = None  # desktop_notifier.DesktopNotifier instance
         self._init_failed = False
-        self._init_lock = threading.Lock()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._loop_ready = threading.Event()
 
         # On Windows the desktop-notifier backend activates winrt notification
         # APIs, which load Windows Runtime DLLs that subsequently break torch's
@@ -81,34 +116,128 @@ class DesktopNotifier:
             except Exception:
                 pass
 
-    def _ensure_impl(self) -> None:
-        """Construct the backend lazily on whichever thread first calls
-        notify(). Subsequent calls reuse the cached instance."""
-        if self._impl is not None or self._init_failed:
-            return
-        with self._init_lock:
-            if self._impl is not None or self._init_failed:
-                return
-            try:
-                from desktop_notifier import Icon
-                from desktop_notifier.sync import DesktopNotifierSync
+        self._thread = threading.Thread(
+            target=self._thread_main,
+            name=f"{app_name}-notifier",
+            daemon=True,
+        )
+        self._thread.start()
+        # Block briefly for the loop to come up so the first caller doesn't
+        # race the loop creation. If the thread errors out before ready, the
+        # wait times out and later calls no-op.
+        self._loop_ready.wait(timeout=5.0)
 
-                icon_path = _logo_path()
-                app_icon = Icon(path=icon_path) if icon_path.exists() else None
-                self._impl = DesktopNotifierSync(
-                    app_name=self._app_name, app_icon=app_icon
-                )
+    # ---- loop thread -------------------------------------------------------
+
+    def _thread_main(self) -> None:
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self._loop = loop
+        except Exception:
+            self._init_failed = True
+            self._loop_ready.set()
+            log.warning("[notify] event loop init failed; toasts disabled", exc_info=True)
+            return
+
+        try:
+            from desktop_notifier import DesktopNotifier as _Async, Icon
+            icon_path = _logo_path()
+            app_icon = Icon(path=icon_path) if icon_path.exists() else None
+            self._impl = _Async(app_name=self._app_name, app_icon=app_icon)
+        except Exception:
+            self._init_failed = True
+            log.warning(
+                "[notify] backend init failed; toasts disabled", exc_info=True
+            )
+
+        self._loop_ready.set()
+        try:
+            loop.run_forever()
+        finally:
+            try:
+                loop.close()
             except Exception:
-                self._init_failed = True
-                log.warning(
-                    "[notify] backend init failed; toasts disabled", exc_info=True
-                )
+                pass
+
+    # ---- public API --------------------------------------------------------
 
     def notify(self, title: str, body: str) -> None:
-        self._ensure_impl()
-        if self._impl is None:
+        """Fire-and-forget toast. Thread-safe."""
+        if self._init_failed or self._impl is None or self._loop is None:
             return
         try:
-            self._impl.send(title=title, message=body)
+            asyncio.run_coroutine_threadsafe(
+                self._send(title, body), self._loop
+            )
+        except Exception:
+            log.warning("[notify] schedule failed", exc_info=True)
+
+    def ask_consent(
+        self,
+        title: str,
+        body: str,
+        yes_label: str,
+        no_label: str,
+        timeout_secs: float,
+        default_on_timeout: ConsentResult = "no",
+    ) -> ConsentResult:
+        """Show an interactive toast with two action buttons, block up to
+        ``timeout_secs`` for a response, return ``"yes"``, ``"no"``, or
+        ``"timeout"`` (which maps to ``default_on_timeout`` in the caller's
+        semantic layer if desired — we pass it through distinctly so callers
+        can distinguish "clicked No" from "ignored")."""
+        if self._init_failed or self._impl is None or self._loop is None:
+            return default_on_timeout
+        try:
+            fut = asyncio.run_coroutine_threadsafe(
+                self._ask(title, body, yes_label, no_label, timeout_secs),
+                self._loop,
+            )
+            return fut.result(timeout=timeout_secs + 5.0)
+        except Exception:
+            log.warning("[notify] ask_consent failed", exc_info=True)
+            return default_on_timeout
+
+    # ---- loop-local coroutines ---------------------------------------------
+
+    async def _send(self, title: str, body: str) -> None:
+        try:
+            assert self._impl is not None
+            await self._impl.send(title=title, message=body)
         except Exception:
             log.warning("[notify] send failed", exc_info=True)
+
+    async def _ask(
+        self,
+        title: str,
+        body: str,
+        yes_label: str,
+        no_label: str,
+        timeout_secs: float,
+    ) -> ConsentResult:
+        from desktop_notifier import Button
+
+        loop = asyncio.get_running_loop()
+        result_fut: asyncio.Future[ConsentResult] = loop.create_future()
+
+        def _resolve(value: ConsentResult) -> None:
+            if not result_fut.done():
+                result_fut.set_result(value)
+
+        yes_btn = Button(title=yes_label, on_pressed=lambda: _resolve("yes"))
+        no_btn = Button(title=no_label, on_pressed=lambda: _resolve("no"))
+
+        try:
+            assert self._impl is not None
+            await self._impl.send(
+                title=title, message=body, buttons=[yes_btn, no_btn]
+            )
+        except Exception:
+            log.warning("[notify] ask send failed", exc_info=True)
+            return "timeout"
+
+        try:
+            return await asyncio.wait_for(result_fut, timeout=timeout_secs)
+        except asyncio.TimeoutError:
+            return "timeout"

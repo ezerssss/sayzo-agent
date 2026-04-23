@@ -32,7 +32,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 
@@ -45,6 +45,11 @@ log = logging.getLogger(__name__)
 class SessionState(str, Enum):
     IDLE = "idle"
     OPEN = "open"
+    # Joint silence has been observed; the session's buffers are held and
+    # an end-confirmation prompt is being shown. The session may either
+    # commit (become closed) or revert (go back to OPEN with a reset silence
+    # timer) based on the user's answer.
+    PENDING_CLOSE = "pending_close"
 
 
 @dataclass
@@ -82,6 +87,13 @@ class ConversationDetector:
         self.state = SessionState.IDLE
         self._buffers: Optional[SessionBuffers] = None
         self._closed_queue: list[SessionBuffers] = []
+        # Called when the detector transitions OPEN → PENDING_CLOSE on joint
+        # silence. The ArmController subscribes to this and shows the end-
+        # confirmation toast; on the user's answer it calls `commit_close()`
+        # or `revert_close()`. If no callback is registered (unit tests), the
+        # detector commits immediately — preserving the legacy behavior where
+        # joint silence directly closed the session.
+        self.on_pending_close: Optional[Callable[[], None]] = None
         # Track the last voiced wall time on each source (monotonic seconds).
         self._last_voiced_mono: dict[Source, float] = {"mic": 0.0, "system": 0.0}
         self._session_start_mono: float = 0.0
@@ -322,8 +334,15 @@ class ConversationDetector:
             self._source_epoch_mono[source] = capture_mono_ts - first_frame_duration
 
         # Determine which buffer we're writing to, and look up the current
-        # "end of this source's stream" in monotonic time.
-        if self.state != SessionState.OPEN or self._buffers is None:
+        # "end of this source's stream" in monotonic time. PENDING_CLOSE
+        # behaves like OPEN here — PCM keeps flowing into the session buffer
+        # so audio during the end-confirmation toast window is preserved and
+        # part of the same capture if the user says "Not yet".
+        in_session = (
+            self.state in (SessionState.OPEN, SessionState.PENDING_CLOSE)
+            and self._buffers is not None
+        )
+        if not in_session:
             pre = self._pre_buffers[source]
             dst = pre
             stream_end = self._stream_end_mono[source]
@@ -334,6 +353,7 @@ class ConversationDetector:
                 stream_end = capture_mono_ts
             pre_mode = True
         else:
+            assert self._buffers is not None
             dst = self._buffers.mic_pcm if source == "mic" else self._buffers.sys_pcm
             stream_end = self._stream_end_mono[source]
             if stream_end is None:
@@ -366,7 +386,18 @@ class ConversationDetector:
                 self._pre_start_sample[source] += overflow // 2
 
     def on_segment(self, seg: SpeechSegment, now: float) -> None:
-        """Register a closed VAD segment on `seg.source`."""
+        """Register a closed VAD segment on `seg.source`.
+
+        If the detector is in PENDING_CLOSE when a segment arrives, the user
+        has resumed speaking during the end-confirmation toast window — the
+        pending close auto-reverts so the meeting continues as one capture.
+        """
+        if self.state == SessionState.PENDING_CLOSE:
+            log.info(
+                "[session] PENDING_CLOSE auto-reverted (VAD speech on %s)",
+                seg.source,
+            )
+            self.revert_close(now)
         if self.state == SessionState.IDLE:
             self._open_session(now, seg.source, seg.start_ts)
             assert self._buffers is not None
@@ -396,23 +427,95 @@ class ConversationDetector:
         )
 
     def tick(self, now: float) -> None:
-        """Periodic check for session close."""
-        if self.state != SessionState.OPEN or self._buffers is None:
-            return
+        """Periodic check for session close via joint silence.
 
-        # Safety cap
-        if now - self._session_start_mono >= self.cfg.max_session_secs:
-            self._close_session(now, SessionCloseReason.SAFETY_CAP)
+        On joint silence, the detector transitions OPEN → PENDING_CLOSE and
+        calls `on_pending_close` so the ArmController can show the end-
+        confirmation toast. The session's PCM buffers are held in memory;
+        nothing is written to disk yet. The caller resolves via
+        `commit_close()` ("Yes, done"), `revert_close()` ("Not yet"), or
+        lets a VAD segment auto-revert (user resumed speaking).
+
+        Unit-test compatibility: when no `on_pending_close` callback is
+        registered, the detector commits immediately, preserving the legacy
+        behavior where joint silence directly closed the session.
+        """
+        if self.state != SessionState.OPEN or self._buffers is None:
             return
 
         # Joint silence: both sources have been quiet for >= threshold
         last_any = max(self._last_voiced_mono["mic"], self._last_voiced_mono["system"])
         if last_any > 0 and (now - last_any) >= self.cfg.joint_silence_close_secs:
-            self._close_session(now, SessionCloseReason.JOINT_SILENCE)
+            self.state = SessionState.PENDING_CLOSE
+            log.info(
+                "[session] PENDING_CLOSE (joint silence %.1fs) — awaiting user confirmation",
+                now - last_any,
+            )
+            if self.on_pending_close is not None:
+                try:
+                    self.on_pending_close()
+                except Exception:
+                    log.exception("[session] on_pending_close callback raised")
+            else:
+                # Legacy test path: no arm controller attached, commit immediately.
+                self.commit_close(now, SessionCloseReason.JOINT_SILENCE)
+
+    def commit_close(
+        self, now: float, reason: SessionCloseReason = SessionCloseReason.JOINT_SILENCE
+    ) -> None:
+        """Finalize a PENDING_CLOSE or OPEN session and hand buffers to the
+        closed queue. Called by the ArmController after the end-confirmation
+        toast resolves with "Yes, done", or from `force_close()`.
+
+        Safe to call from either OPEN (test-path / shutdown) or PENDING_CLOSE.
+        """
+        if self.state == SessionState.IDLE or self._buffers is None:
+            return
+        self._close_session(now, reason)
+
+    def revert_close(self, now: float) -> None:
+        """Cancel a pending close — the user said "Not yet", or a VAD segment
+        arrived during the confirmation window. Session goes back to OPEN
+        with the silence timer reset so the next 45 s silence would re-trigger
+        `PENDING_CLOSE` afresh."""
+        if self.state != SessionState.PENDING_CLOSE or self._buffers is None:
+            return
+        self.state = SessionState.OPEN
+        # Reset silence clocks so `tick` doesn't immediately re-enter
+        # PENDING_CLOSE on the very next call. `now` is treated as
+        # "voice-equivalent" on both sources — the next real VAD segment
+        # will overwrite these as usual.
+        self._last_voiced_mono["mic"] = now
+        self._last_voiced_mono["system"] = now
+        log.info("[session] PENDING_CLOSE reverted — continuing session")
 
     def force_close(self, now: float) -> None:
-        if self.state == SessionState.OPEN:
+        """Force-close regardless of current state. Used on agent shutdown;
+        also commits a PENDING_CLOSE session so in-flight audio is preserved
+        on exit rather than discarded.
+        """
+        if self.state in (SessionState.OPEN, SessionState.PENDING_CLOSE):
             self._close_session(now, SessionCloseReason.SHUTDOWN)
+
+    def reset_source_epochs(self) -> None:
+        """Reset the per-source clock anchors so the next frame behaves as if
+        the source started fresh. Called by the ArmController on every
+        disarm → arm transition, alongside SileroVAD.reset(). Together they
+        ensure re-armed sessions don't carry stale epoch anchors from a
+        previously-armed cold-session that has long since ended.
+
+        Must only be called while IDLE.
+        """
+        if self.state != SessionState.IDLE:
+            raise RuntimeError(
+                f"reset_source_epochs requires state=IDLE, got {self.state}"
+            )
+        self._source_epoch_mono = {"mic": None, "system": None}
+        self._source_frames_seen = {"mic": 0, "system": 0}
+        self._stream_end_mono = {"mic": None, "system": None}
+        for src in ("mic", "system"):
+            self._pre_buffers[src].clear()
+            self._pre_start_sample[src] = 0
 
     # ---- output API --------------------------------------------------------
 

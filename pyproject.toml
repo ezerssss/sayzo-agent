@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sayzo-agent"
-version = "0.1.0"
-description = "Local 24/7 listening agent for Sayzo — captures real conversations the user participates in for downstream English-coaching analysis."
+version = "1.0.0"
+description = "Armed-only capture agent for Sayzo — records meetings on user consent (hotkey or whitelisted meeting app) and feeds them to downstream English-coaching analysis."
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.26",
@@ -38,6 +38,17 @@ dependencies = [
     "Pillow>=10.0",
     "desktop-notifier>=6.2",
     "pywebview>=5.3,<6",
+    # Armed-only capture model (v1.0+).
+    # Global hotkey listener + process / window queries.
+    "pynput>=1.7",
+    "psutil>=5.9",
+    # Windows: mic-holder detection via WASAPI audio sessions, foreground
+    # window via Win32.
+    "pycaw>=20240210; sys_platform == 'win32'",
+    "pywin32>=306; sys_platform == 'win32'",
+    # macOS: mic-active query via CoreAudio, frontmost app via NSWorkspace.
+    "pyobjc-framework-Cocoa>=10.0; sys_platform == 'darwin'",
+    "pyobjc-framework-CoreAudio>=10.0; sys_platform == 'darwin'",
 ]
 
 [project.optional-dependencies]

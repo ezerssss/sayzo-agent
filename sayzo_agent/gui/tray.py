@@ -1,14 +1,35 @@
-"""System tray icon for the background service.
+"""System tray icon for the background service (armed-only model, v1.0+).
 
-Runs pystray on its own thread alongside the asyncio Agent loop.  Communication
-is via a shared :class:`TrayState` dataclass protected by a threading lock.
+Runs pystray on its own thread alongside the asyncio Agent loop. The shared
+:class:`TrayState` dataclass is the communication surface — the tray thread
+sets ``arm_toggle_event`` / ``quit_event`` / ``settings_event`` /
+``reopen_setup_event``, and the asyncio loop's ``_tray_bridge`` polls them
+and calls into the ``ArmController`` accordingly.
+
+Menu layout (plan section 11):
+
+    Disarmed:
+        Arm Sayzo   (Ctrl+Alt+S)
+        ---
+        Settings...
+        Reopen setup
+        Open captures folder
+        ---
+        Quit Sayzo
+
+    Armed:
+        Stop recording   (Ctrl+Alt+S)
+        ---
+        (same tail as disarmed)
+
+The hotkey string is interpolated at render time so the menu always reflects
+the user's current binding (even after a rebind via the Settings window).
 """
 from __future__ import annotations
 
 import enum
 import logging
 import os
-import platform
 import subprocess
 import sys
 import threading
@@ -29,10 +50,22 @@ _ICON_SIZE = 128
 # ---------------------------------------------------------------------------
 
 class Status(enum.Enum):
+    """Armed state as rendered in the tray.
+
+    Value strings double as the tooltip suffix: ``"armed"`` / ``"disarmed"``.
+    ``error`` is set when capture stream acquisition failed on arm. Legacy
+    ``LISTENING`` / ``PAUSED`` values are retained so older callers still
+    resolve, but the tray logic only branches on ARMED vs DISARMED now.
+    """
+
+    ARMED = "armed"
+    DISARMED = "disarmed"
+    ERROR = "error"
+    # Back-compat aliases — older callers (e.g. test helpers) may still
+    # reference these. They all render as DISARMED in the menu.
     LISTENING = "listening"
     PAUSED = "paused"
     SETTING_UP = "setting_up"
-    ERROR = "error"
 
 
 @dataclass(frozen=True)
@@ -45,13 +78,33 @@ class UpdateOffer:
 
 @dataclass
 class TrayState:
-    """Thread-safe state shared between the agent loop and the tray icon."""
+    """Thread-safe state shared between the agent loop and the tray icon.
 
-    status: Status = Status.LISTENING
+    **Tray-thread → asyncio-loop signals**:
+    - ``arm_toggle_event`` — fired when user clicks the top Arm/Stop item.
+      The ``_tray_bridge`` in ``__main__.py`` calls
+      ``arm_controller.arm_from_tray()`` on the asyncio loop.
+    - ``settings_event`` — "Settings..." clicked; opens the settings GUI.
+    - ``reopen_setup_event`` — "Reopen setup" clicked; re-runs onboarding.
+    - ``quit_event`` — "Quit Sayzo" clicked; agent shuts down.
+
+    **Asyncio-loop → tray-thread signals** (kept in sync by the bridge):
+    - ``status`` — ARMED / DISARMED / ERROR. Drives the top-menu label.
+    - ``hotkey_display`` — current hotkey binding as a human string
+      (``"Ctrl+Alt+S"``) interpolated into the menu labels.
+    """
+
+    status: Status = Status.DISARMED
     error_message: str = ""
+    hotkey_display: str = "Ctrl+Alt+S"
     _lock: threading.Lock = field(default_factory=threading.Lock)
-    pause_event: threading.Event = field(default_factory=threading.Event)
+    arm_toggle_event: threading.Event = field(default_factory=threading.Event)
+    settings_event: threading.Event = field(default_factory=threading.Event)
+    reopen_setup_event: threading.Event = field(default_factory=threading.Event)
     quit_event: threading.Event = field(default_factory=threading.Event)
+    # Legacy pause-event — kept for back-compat with CLI entrypoints that
+    # still reference it. Unused by the tray menu itself.
+    pause_event: threading.Event = field(default_factory=threading.Event)
     _update_offer: UpdateOffer | None = None
 
     def set_status(self, status: Status, error_message: str = "") -> None:
@@ -62,6 +115,14 @@ class TrayState:
     def get_status(self) -> tuple[Status, str]:
         with self._lock:
             return self.status, self.error_message
+
+    def set_hotkey_display(self, hotkey: str) -> None:
+        with self._lock:
+            self.hotkey_display = hotkey
+
+    def get_hotkey_display(self) -> str:
+        with self._lock:
+            return self.hotkey_display
 
     def set_update_offer(self, offer: UpdateOffer | None) -> None:
         with self._lock:
@@ -74,8 +135,7 @@ class TrayState:
 
 # ---------------------------------------------------------------------------
 # Tray icon — loads the Sayzo logo from the bundled assets directory. Status
-# indication lives in the tooltip title + menu labels (no more colored
-# circles, per user request — the green dot felt unsettling).
+# indication lives in the tooltip title + menu labels.
 # ---------------------------------------------------------------------------
 
 
@@ -96,7 +156,7 @@ def _make_icon(status: Status) -> Image.Image:
     """Return the Sayzo logo as a PIL image, cached on first load.
 
     ``status`` is accepted for signature compatibility — the visual doesn't
-    change per status anymore. Users get status info via tooltip + menu.
+    change per status. Users get status info via tooltip + menu labels.
     """
     global _cached_icon
     if _cached_icon is not None:
@@ -105,8 +165,6 @@ def _make_icon(status: Status) -> Image.Image:
     path = _logo_path()
     try:
         img = Image.open(path).convert("RGBA")
-        # pystray on macOS expects reasonably small/square icons; scale down
-        # big PNGs to _ICON_SIZE so we don't bloat memory.
         if max(img.size) > _ICON_SIZE:
             img.thumbnail((_ICON_SIZE, _ICON_SIZE), Image.Resampling.LANCZOS)
         _cached_icon = img
@@ -202,7 +260,7 @@ class TrayIcon:
         On macOS, icon/title mutation touches AppKit objects which is only
         safe on the main thread. We skip cross-thread mutation there; the
         menu text callbacks still re-evaluate dynamically when the menu is
-        opened, so pause/resume labels stay correct.
+        opened, so arm/disarm labels stay correct.
         """
         if self._icon is None:
             return
@@ -213,10 +271,7 @@ class TrayIcon:
         if sys.platform == "darwin":
             return
         self._icon.icon = _make_icon(status)
-        if status == Status.ERROR and error_msg:
-            self._icon.title = f"Sayzo Agent — {error_msg}"
-        else:
-            self._icon.title = f"Sayzo Agent — {status.value.replace('_', ' ').title()}"
+        self._icon.title = self._tooltip_for(status, error_msg)
 
     def stop(self) -> None:
         """Stop the tray icon. Safe to call from any thread."""
@@ -228,20 +283,32 @@ class TrayIcon:
 
     # -- internal ----------------------------------------------------------
 
+    def _tooltip_for(self, status: Status, error_msg: str) -> str:
+        hotkey = self.state.get_hotkey_display()
+        if status == Status.ERROR and error_msg:
+            return f"Sayzo — {error_msg}"
+        if status == Status.ARMED:
+            return f"Sayzo — capturing. Press {hotkey} to stop."
+        # Everything else (DISARMED and legacy aliases) → disarmed tooltip.
+        return f"Sayzo — idle. Press {hotkey} or join a meeting."
+
     def _run(self) -> None:
         import pystray
 
         status, _ = self.state.get_status()
         self._current_status = status
 
-        def on_pause_resume(icon, item):
-            if self.state.pause_event.is_set():
-                self.state.pause_event.clear()
-                self.state.set_status(Status.LISTENING)
-            else:
-                self.state.pause_event.set()
-                self.state.set_status(Status.PAUSED)
-            self.update()
+        # ---- menu callbacks (run on the tray thread) -----------------------
+
+        def on_arm_toggle(icon, item):
+            """Top-menu click: signal the asyncio loop to arm or disarm."""
+            self.state.arm_toggle_event.set()
+
+        def on_settings(icon, item):
+            self.state.settings_event.set()
+
+        def on_reopen_setup(icon, item):
+            self.state.reopen_setup_event.set()
 
         def on_open_captures(icon, item):
             self.captures_dir.mkdir(parents=True, exist_ok=True)
@@ -259,40 +326,37 @@ class TrayIcon:
             import webbrowser
             webbrowser.open(offer.url)
 
-        def pause_text(item):
-            return "Resume" if self.state.pause_event.is_set() else "Pause"
+        # ---- dynamic text callbacks (re-evaluated each menu open) ---------
 
-        def status_text(item):
-            s, err = self.state.get_status()
-            if s == Status.ERROR and err:
-                return f"Status: {err}"
-            return f"Status: {s.value.replace('_', ' ').title()}"
+        def arm_label(item) -> str:
+            status_now, _ = self.state.get_status()
+            hotkey = self.state.get_hotkey_display()
+            if status_now == Status.ARMED:
+                return f"Stop recording   ({hotkey})"
+            return f"Arm Sayzo   ({hotkey})"
 
-        def update_text(item):
+        def update_text(item) -> str:
             offer = self.state.get_update_offer()
             return f"Download Sayzo v{offer.version}" if offer else ""
 
-        def update_visible(item):
+        def update_visible(item) -> bool:
             return self.state.get_update_offer() is not None
 
         menu = pystray.Menu(
-            pystray.MenuItem(status_text, None, enabled=False),
+            pystray.MenuItem(arm_label, on_arm_toggle, default=True),
             pystray.Menu.SEPARATOR,
-            # Only rendered when the update-check task has surfaced a newer
-            # version on TrayState. Click opens the platform-specific installer
-            # URL in the user's browser; the existing installer (NSIS on Win,
-            # DMG drag on Mac) handles the replace.
             pystray.MenuItem(update_text, on_open_update, visible=update_visible),
-            pystray.MenuItem(pause_text, on_pause_resume),
+            pystray.MenuItem("Settings...", on_settings),
+            pystray.MenuItem("Reopen setup", on_reopen_setup),
             pystray.MenuItem("Open captures folder", on_open_captures),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Quit", on_quit),
+            pystray.MenuItem("Quit Sayzo", on_quit),
         )
 
         self._icon = pystray.Icon(
             name="sayzo-agent",
             icon=_make_icon(status),
-            title=f"Sayzo Agent — {status.value.replace('_', ' ').title()}",
+            title=self._tooltip_for(status, ""),
             menu=menu,
         )
 

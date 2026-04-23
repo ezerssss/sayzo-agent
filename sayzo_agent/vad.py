@@ -61,6 +61,17 @@ class SileroVAD:
         except Exception:
             pass
 
+    def reset(self) -> None:
+        """Reset the VAD to a cold-start state.
+
+        Called when the agent re-arms after being disarmed. The sample counter
+        and model state rewind to zero so the next frame is treated as the
+        first frame on a freshly-started stream. The detector's
+        `_source_epoch_mono` also resets separately; together they ensure
+        VAD-derived timestamps anchor correctly against the new stream.
+        """
+        self.reset_session(start_sample=0)
+
     def _to_ts(self, sample: int) -> float:
         return (sample - self._session_start_sample) / self.SAMPLE_RATE
 

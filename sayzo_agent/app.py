@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
@@ -10,6 +11,7 @@ from typing import Optional
 
 import numpy as np
 
+from .arm import ArmController
 from .capture.mic import MicCapture
 from .capture import SystemCapture
 from .config import Config
@@ -154,19 +156,53 @@ class Agent:
         self._echo_segments_dropped: int = 0
         self._echo_secs_dropped: float = 0.0
 
+        # Armed-only model: the ArmController owns mic + system stream
+        # lifecycle (start on arm, stop on disarm), hotkey confirmations,
+        # whitelist consent toast, PENDING_CLOSE end-confirmation, long-
+        # meeting check-ins, and meeting-ended watcher. Agent.run() defers
+        # all capture-start decisions to it.
+        self.arm = ArmController(
+            self.cfg.arm,
+            self.detector,
+            mic_capture=self.mic,
+            sys_capture=self.sys,
+            vad_mic=self.vad_mic,
+            vad_sys=self.vad_sys,
+            notifier=self.notifier,
+        )
+
     # ---- pipeline ----------------------------------------------------------
 
     async def _consume(self, source: str, queue: asyncio.Queue, vad: SileroVAD) -> None:
+        """Drain one capture queue while the agent is armed.
+
+        Disarmed means: no capture streams are open (ArmController.disarm
+        stopped them), so ``queue`` won't receive new frames. We block on
+        ``armed_event`` to avoid busy-spinning, and use a short timeout on
+        ``queue.get()`` so the disarm transition is noticed even if a few
+        frames remain buffered.
+        """
         while not self._stop.is_set():
             if self._paused.is_set():
                 await asyncio.sleep(0.5)
                 continue
+            # Armed gate — block here while disarmed. ArmController sets the
+            # event when streams are open and producing frames.
+            try:
+                await asyncio.wait_for(self.arm.armed_event.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            if self._stop.is_set():
+                break
             # Queue payload is a (capture_mono_ts, frame) tuple. Capture-
             # stamping happens at the hardware boundary in each capture
             # module (sounddevice callback / WASAPI read / audio-tap
             # header); the detector uses `capture_mono_ts` to keep mic and
             # system buffers aligned to a shared session timeline.
-            capture_mono_ts, frame = await queue.get()
+            try:
+                capture_mono_ts, frame = await asyncio.wait_for(queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue  # re-check armed_event in case we disarmed
             now = time.monotonic()
             self.detector.on_frame(source, frame, capture_mono_ts, now)
             for seg in vad.feed(frame):
@@ -207,35 +243,48 @@ class Agent:
         discarded = self._captures_discarded
         echo_n = self._echo_segments_dropped
         echo_s = self._echo_secs_dropped
+        arm_state = self.arm.state.value.upper()
+        arm_reason = self.arm._reason
+        reason_tag = ""
+        if arm_reason is not None:
+            reason_tag = f" ({arm_reason.app_key or arm_reason.source})"
         if d.state == SessionState.OPEN and d._buffers is not None:
             elapsed = now - d._session_start_mono
             mic_voiced = d._buffers.mic_total_voiced()
             sys_voiced = d._buffers.sys_total_voiced()
             log.info(
-                "[heartbeat] state=OPEN elapsed=%.1fs mic_voiced=%.1fs sys_voiced=%.1fs "
+                "[heartbeat] state=%s%s OPEN elapsed=%.1fs mic_voiced=%.1fs sys_voiced=%.1fs "
                 "llm=%s kept=%d discarded=%d echo_dropped=%d/%.0fs",
-                elapsed,
-                mic_voiced,
-                sys_voiced,
-                llm_state,
-                kept,
-                discarded,
-                echo_n,
-                echo_s,
+                arm_state, reason_tag,
+                elapsed, mic_voiced, sys_voiced,
+                llm_state, kept, discarded, echo_n, echo_s,
+            )
+        elif d.state == SessionState.PENDING_CLOSE and d._buffers is not None:
+            elapsed = now - d._session_start_mono
+            last_any = max(d._last_voiced_mono["mic"], d._last_voiced_mono["system"])
+            silence = now - last_any if last_any > 0 else 0.0
+            log.info(
+                "[heartbeat] state=%s%s PENDING_CLOSE elapsed=%.1fs silence=%.1fs "
+                "llm=%s kept=%d discarded=%d",
+                arm_state, reason_tag, elapsed, silence,
+                llm_state, kept, discarded,
+            )
+        elif arm_state == "DISARMED":
+            log.info(
+                "[heartbeat] state=DISARMED waiting for hotkey or meeting detect "
+                "llm=%s kept=%d discarded=%d echo_dropped=%d/%.0fs",
+                llm_state, kept, discarded, echo_n, echo_s,
             )
         else:
+            # Armed but no session yet (streams open, waiting for first VAD segment).
             mic_pre = len(d._pre_buffers["mic"]) / 2 / d.sample_rate
             sys_pre = len(d._pre_buffers["system"]) / 2 / d.sample_rate
             log.info(
-                "[heartbeat] state=IDLE pre_buffer mic=%.1fs sys=%.1fs llm=%s "
+                "[heartbeat] state=%s%s IDLE pre_buffer mic=%.1fs sys=%.1fs llm=%s "
                 "kept=%d discarded=%d echo_dropped=%d/%.0fs",
-                mic_pre,
-                sys_pre,
-                llm_state,
-                kept,
-                discarded,
-                echo_n,
-                echo_s,
+                arm_state, reason_tag,
+                mic_pre, sys_pre,
+                llm_state, kept, discarded, echo_n, echo_s,
             )
 
     def _maybe_run_upload_sweep(self, now: float) -> None:
@@ -526,10 +575,11 @@ class Agent:
         self._captures_kept += 1
 
         duration_s = (ended_at - true_started_at).total_seconds()
-        body = f"{verdict.title} \u00b7 {_format_duration(duration_s)}"
-        await loop.run_in_executor(
-            self._executor, self.notifier.notify, "Conversation saved", body
-        )
+        if self.cfg.notify_capture_saved:
+            body = f"{verdict.title} \u00b7 {_format_duration(duration_s)}"
+            await loop.run_in_executor(
+                self._executor, self.notifier.notify, "Conversation saved", body
+            )
 
     def _transcribe_both(
         self, mic_pcm: bytes, sys_pcm: bytes, sr: int
@@ -619,26 +669,42 @@ class Agent:
         self._background_tasks.add(startup_sweep_task)
         startup_sweep_task.add_done_callback(self._background_tasks.discard)
 
-        await self.mic.start()
-        await self.sys.start()
+        # Start the arm controller — registers the hotkey listener and
+        # kicks off the whitelist watcher. Capture streams stay CLOSED
+        # until the user arms via hotkey or accepts a consent toast.
+        await self.arm.start()
+
+        # First-launch welcome toast — fires once per install, flagged by
+        # data_dir/welcomed.json so reopening the agent doesn't re-surface
+        # the message.
+        self._maybe_fire_welcome_toast()
+
+        # First-launch onboarding walkthrough — runs on a worker thread so
+        # the asyncio loop keeps ticking. Flag at data_dir/onboarding.json.
+        self._maybe_run_onboarding()
 
         consumers = [
             asyncio.create_task(self._consume("mic", self.mic.queue, self.vad_mic)),
             asyncio.create_task(self._consume("system", self.sys.queue, self.vad_sys)),
             asyncio.create_task(self._ticker()),
         ]
-        log.info("[agent] running. Ctrl+C to stop.")
+        log.info(
+            "[agent] running. Shortcut: %s. Ctrl+C to stop.",
+            self.arm.current_hotkey,
+        )
         try:
             await self._stop.wait()
         finally:
             for t in consumers:
                 t.cancel()
-            await self.mic.stop()
-            await self.sys.stop()
-            self.detector.force_close(time.monotonic())
+            # Stop the arm controller — force-closes any open session,
+            # stops streams, unregisters hotkey, cancels background watchers.
+            await self.arm.stop()
+            # Pick up any buffers force_close enqueued so they reach the sink.
             buffers = self.detector.take_closed_session()
-            if buffers is not None:
+            while buffers is not None:
                 await self._process_session(buffers)
+                buffers = self.detector.take_closed_session()
             # Wait for any in-flight _process_session tasks to finish
             if self._processing_tasks:
                 log.info("[agent] waiting for %d in-flight session(s)...", len(self._processing_tasks))
@@ -657,6 +723,59 @@ class Agent:
                         t.cancel()
             self._executor.shutdown(wait=True)
             log.info("[agent] stopped")
+
+    def _maybe_run_onboarding(self) -> None:
+        """Open the first-run onboarding walkthrough if the user hasn't done it.
+
+        Runs on a worker thread so the agent's asyncio loop keeps ticking.
+        The flag at ``data_dir/onboarding.json`` records completion; its
+        absence means the walkthrough needs to run. Crashes in the window
+        never kill the agent — they're logged and swallowed.
+        """
+        try:
+            from .onboarding import has_onboarded, open_onboarding_window
+        except Exception:
+            log.debug("[agent] onboarding module unavailable", exc_info=True)
+            return
+        try:
+            if has_onboarded(self.cfg.data_dir):
+                return
+        except Exception:
+            log.debug("[agent] onboarding flag check failed", exc_info=True)
+            return
+
+        def worker() -> None:
+            try:
+                open_onboarding_window(self.cfg, self.arm)
+            except Exception:
+                log.warning("[agent] onboarding window crashed", exc_info=True)
+
+        threading.Thread(target=worker, name="onboarding", daemon=True).start()
+
+    def _maybe_fire_welcome_toast(self) -> None:
+        """Fire the first-launch welcome toast once per install.
+
+        Flagged by ``data_dir/welcomed.json``. Non-interactive. Suppressed
+        entirely when ``cfg.notifications_enabled`` or ``cfg.notify_welcome``
+        is False.
+        """
+        if not self.cfg.notifications_enabled or not self.cfg.notify_welcome:
+            return
+        flag = self.cfg.data_dir / "welcomed.json"
+        if flag.exists():
+            return
+        try:
+            self.notifier.notify(
+                "Sayzo is running",
+                f"Press {self.arm.current_hotkey} anytime to start a meeting capture. "
+                "We'll also ask you when we notice you're in a meeting.",
+            )
+        except Exception:
+            log.debug("[agent] welcome toast failed (non-fatal)", exc_info=True)
+        try:
+            flag.write_text("{}", encoding="utf-8")
+        except OSError:
+            log.debug("[agent] welcome flag write failed (non-fatal)", exc_info=True)
 
     def pause(self) -> None:
         self._paused.set()
