@@ -54,6 +54,13 @@ class ForegroundInfo:
     # True if the frontmost process is a known browser.
     is_browser: bool = False
 
+    # All visible top-level window titles owned by any browser process. On
+    # Windows this is populated via ``platform_win.get_browser_window_titles``
+    # so the matcher can find a Meet / Teams / Zoom-web tab even when the
+    # user has Alt+Tab'd away from the browser. Empty on macOS (no cheap
+    # enumeration without per-window Apple Events).
+    browser_window_titles: tuple[str, ...] = field(default_factory=tuple)
+
 
 @dataclass(frozen=True)
 class MicHolder:
@@ -98,7 +105,7 @@ class MatchResult:
     source: MatchSource
 
 
-_COMPILED_URL_CACHE: dict[str, re.Pattern[str]] = {}
+_COMPILED_PATTERN_CACHE: dict[str, re.Pattern[str]] = {}
 
 
 BROWSER_PROCESS_NAMES = frozenset({
@@ -127,12 +134,34 @@ def _browser_holds_mic(mic: MicState, foreground: ForegroundInfo) -> bool:
 
 
 def _compile(pattern: str) -> re.Pattern[str]:
-    cached = _COMPILED_URL_CACHE.get(pattern)
+    cached = _COMPILED_PATTERN_CACHE.get(pattern)
     if cached is not None:
         return cached
     compiled = re.compile(pattern)
-    _COMPILED_URL_CACHE[pattern] = compiled
+    _COMPILED_PATTERN_CACHE[pattern] = compiled
     return compiled
+
+
+def _collect_browser_titles(foreground: ForegroundInfo) -> list[str]:
+    """Flatten every title-ish field on ForegroundInfo into a deduped list.
+    Used by browser-spec matching so we can try regexes against every
+    available title without worrying about which field the platform layer
+    happened to populate.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for t in (
+        foreground.browser_tab_title,
+        foreground.window_title,
+        *foreground.browser_window_titles,
+    ):
+        if not t:
+            continue
+        if t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+    return out
 
 
 def match_whitelist(
@@ -197,29 +226,48 @@ def match_whitelist(
                     source="mic_active_plus_running",
                 )
 
-    # Pass 3 — browsers. Need the browser to be the mic-holder (Windows) or
-    # the foreground app (macOS — since we can't attribute per-process) AND
-    # the active tab URL to match.
-    if foreground.is_browser:
+    # Pass 3 — browsers. Gate on a browser actually holding the mic
+    # (Windows: pycaw attribution; macOS: mic.active + browser-is-foreground).
+    # We no longer require the browser to be foreground on Windows — the user
+    # can Alt+Tab to a terminal during a Meet call and we still want to
+    # attribute the mic-hold to the right browser spec.
+    if _browser_holds_mic(mic, foreground):
         url = foreground.browser_tab_url or ""
-        # On macOS without Automation permission we get only the title; try
-        # a loose fallback against that (the user-facing regexes include
-        # a "Meet – " style pattern for Google Meet).
-        title = foreground.browser_tab_title or foreground.window_title or ""
-        if _browser_holds_mic(mic, foreground):
-            for spec in specs:
-                if not spec.is_browser:
-                    continue
-                for pattern in spec.url_patterns:
-                    rx = _compile(pattern)
-                    if rx.search(url) or rx.search(title):
-                        return MatchResult(
-                            app_key=spec.app_key,
-                            display_name=spec.display_name,
-                            source="browser_mic_plus_url",
-                        )
+        titles = _collect_browser_titles(foreground)
+        for spec in specs:
+            if not spec.is_browser:
+                continue
+            if _browser_spec_matches(spec, url, titles):
+                return MatchResult(
+                    app_key=spec.app_key,
+                    display_name=spec.display_name,
+                    source="browser_mic_plus_url",
+                )
 
     return None
+
+
+def _browser_spec_matches(spec: DetectorSpec, url: str, titles: list[str]) -> bool:
+    """True if ``spec`` matches either the URL or any of the titles.
+
+    URL patterns are tried against ``url`` first and also against the titles
+    as a legacy fallback (some macOS configs populate tab titles with the
+    URL string when Automation permission was denied). ``title_patterns``
+    are title-only — they're how Windows matches without a URL at all.
+    """
+    for pattern in spec.url_patterns:
+        rx = _compile(pattern)
+        if url and rx.search(url):
+            return True
+        for t in titles:
+            if rx.search(t):
+                return True
+    for pattern in spec.title_patterns:
+        rx = _compile(pattern)
+        for t in titles:
+            if rx.search(t):
+                return True
+    return False
 
 
 def arm_app_still_holding_mic(
@@ -255,16 +303,12 @@ def arm_app_still_holding_mic(
                     return True
         return False
 
-    # Browser spec: still-holding means the currently-focused browser has
-    # the mic AND the active tab URL still matches one of the patterns.
-    if not foreground.is_browser:
-        return False
+    # Browser spec: still-holding means a browser still has the mic AND the
+    # active tab URL or any browser window title still matches the spec.
+    # Foreground doesn't have to be the browser — same rationale as
+    # ``match_whitelist``'s Pass 3.
     if not _browser_holds_mic(mic, foreground):
         return False
     url = foreground.browser_tab_url or ""
-    title = foreground.browser_tab_title or foreground.window_title or ""
-    for pattern in spec.url_patterns:
-        rx = _compile(pattern)
-        if rx.search(url) or rx.search(title):
-            return True
-    return False
+    titles = _collect_browser_titles(foreground)
+    return _browser_spec_matches(spec, url, titles)

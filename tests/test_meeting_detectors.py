@@ -126,6 +126,74 @@ def test_gmeet_title_fallback_matches_without_url():
     assert r.app_key == "gmeet"
 
 
+def test_gmeet_matches_windows_chrome_title_when_browser_foreground():
+    """Windows: no tab URL, Chrome is foreground, window title has the
+    canonical Meet format. The new title_patterns should match."""
+    fg = ForegroundInfo(
+        process_name="chrome.exe",
+        is_browser=True,
+        browser_tab_url=None,
+        window_title="Meet - ojg-gdmq-tzn - Google Chrome",
+        browser_tab_title="Meet - ojg-gdmq-tzn - Google Chrome",
+    )
+    mic = MicState(holders=[MicHolder("chrome.exe", 1111)])
+    r = match_whitelist(SPECS, fg, mic)
+    assert r is not None
+    assert r.app_key == "gmeet"
+    assert r.source == "browser_mic_plus_url"
+
+
+def test_gmeet_matches_via_background_browser_window_on_windows():
+    """Windows: user Alt+Tab'd to a terminal while in Meet. Chrome isn't
+    foreground, but it still holds the mic and one of the browser's visible
+    windows has the Meet title. The matcher should walk
+    browser_window_titles and match anyway."""
+    fg = ForegroundInfo(
+        process_name="WindowsTerminal.exe",
+        is_browser=False,
+        browser_window_titles=(
+            "(1) YouTube - Google Chrome",
+            "Meet - ojg-gdmq-tzn - Google Chrome",
+        ),
+    )
+    mic = MicState(holders=[MicHolder("chrome.exe", 1111)])
+    r = match_whitelist(SPECS, fg, mic)
+    assert r is not None
+    assert r.app_key == "gmeet"
+    assert r.source == "browser_mic_plus_url"
+
+
+def test_gmeet_no_match_when_no_browser_window_has_meet():
+    """Chrome holds the mic but none of its windows is a Meet URL/title
+    (e.g. the user is on a WebRTC demo site). No match — we shouldn't
+    blindly attribute the capture to gmeet."""
+    fg = ForegroundInfo(
+        process_name="WindowsTerminal.exe",
+        is_browser=False,
+        browser_window_titles=(
+            "YouTube - Google Chrome",
+            "GitHub · Where software is built - Google Chrome",
+        ),
+    )
+    mic = MicState(holders=[MicHolder("chrome.exe", 1111)])
+    assert match_whitelist(SPECS, fg, mic) is None
+
+
+def test_gmeet_title_prefix_notification_count_still_matches():
+    """Chrome prefixes window titles with ``(N) `` when the tab has unread
+    notifications. The title regex has to tolerate that."""
+    fg = ForegroundInfo(
+        process_name="chrome.exe",
+        is_browser=True,
+        browser_tab_url=None,
+        window_title="(3) Meet - ojg-gdmq-tzn - Google Chrome",
+    )
+    mic = MicState(holders=[MicHolder("chrome.exe", 1111)])
+    r = match_whitelist(SPECS, fg, mic)
+    assert r is not None
+    assert r.app_key == "gmeet"
+
+
 # ---- Teams web ---------------------------------------------------------
 
 

@@ -48,6 +48,19 @@ def get_mic_holders() -> list[MicHolder]:
     return []
 
 
+def get_browser_window_titles() -> list[str]:
+    """macOS: no cheap way to enumerate all browser window titles.
+
+    Per-window Apple Events (``get title of every window of application …``)
+    would require Automation permission per-browser and would slow the
+    watcher poll to hundreds of ms. For v1 we rely on the foreground
+    browser's tab URL/title already populated in ``get_foreground_info``;
+    the matcher's title-pattern path still works when the user is focused
+    on the browser. Returns empty otherwise.
+    """
+    return []
+
+
 def is_mic_active() -> bool:
     """Is any process currently capturing from the default input device?
 

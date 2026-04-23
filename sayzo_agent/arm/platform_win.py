@@ -62,10 +62,11 @@ def get_mic_holders() -> list[MicHolder]:
             CLSCTX_ALL,
         )
         device = enumerator.GetDefaultAudioEndpoint(EDATAFLOW_CAPTURE, EROLE_CONSOLE)
-        # Activate IAudioSessionManager2 on the capture endpoint.
-        mgr = device.Activate(
-            IAudioSessionManager2._iid_, CLSCTX_ALL, None,
-        )
+        # IMMDevice.Activate returns an IUnknown pointer in comtypes; cast to
+        # the real interface before calling its methods or .GetSessionEnumerator
+        # raises AttributeError.
+        raw = device.Activate(IAudioSessionManager2._iid_, CLSCTX_ALL, None)
+        mgr = raw.QueryInterface(IAudioSessionManager2)
         session_enum = mgr.GetSessionEnumerator()
         count = session_enum.GetCount()
     except Exception:
@@ -138,3 +139,53 @@ def get_foreground_info() -> ForegroundInfo:
         # handles Google Meet / Teams web for most cases.
         browser_tab_url=None,
     )
+
+
+def get_browser_window_titles() -> list[str]:
+    """Return visible top-level window titles owned by any browser process.
+
+    Needed so the matcher can find a Meet / Teams / Zoom-web window even
+    when the user Alt+Tabs away from the browser. The pycaw mic-session
+    attribution tells us a browser is capturing, but the active window is
+    whatever the user is looking at — so we enumerate every browser window
+    and let the matcher pick whichever title satisfies a detector spec.
+    """
+    try:
+        import win32gui
+        import win32process
+        import psutil
+    except Exception:
+        log.debug("[arm.win] win32/psutil unavailable", exc_info=True)
+        return []
+
+    titles: list[str] = []
+    pid_name_cache: dict[int, str] = {}
+
+    def _cb(hwnd: int, _: object) -> None:
+        try:
+            if not win32gui.IsWindowVisible(hwnd):
+                return
+            t = win32gui.GetWindowText(hwnd)
+            if not t:
+                return
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            if pid <= 0:
+                return
+            name = pid_name_cache.get(pid)
+            if name is None:
+                try:
+                    name = psutil.Process(pid).name() or ""
+                except Exception:
+                    name = ""
+                pid_name_cache[pid] = name
+            if name.lower() in BROWSER_PROCESS_NAMES:
+                titles.append(t)
+        except Exception:
+            return
+
+    try:
+        win32gui.EnumWindows(_cb, None)
+    except Exception:
+        log.debug("[arm.win] EnumWindows failed", exc_info=True)
+        return []
+    return titles

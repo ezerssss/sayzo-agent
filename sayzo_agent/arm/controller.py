@@ -102,6 +102,7 @@ class ArmController:
         is_mic_active: Optional[Callable[[], bool]] = None,
         get_running_processes: Optional[Callable[[], frozenset[str]]] = None,
         get_foreground_info: Optional[Callable[[], ForegroundInfo]] = None,
+        get_browser_window_titles: Optional[Callable[[], list[str]]] = None,
     ) -> None:
         self.cfg = cfg
         self.detector = detector
@@ -132,6 +133,9 @@ class ArmController:
         self._q_is_mic_active = is_mic_active or _default_is_mic_active()
         self._q_running_procs = get_running_processes or _default_get_running_processes()
         self._q_foreground = get_foreground_info or _default_get_foreground_info()
+        self._q_browser_titles = (
+            get_browser_window_titles or _default_get_browser_window_titles()
+        )
 
         self._stop = asyncio.Event()
 
@@ -436,7 +440,7 @@ class ArmController:
                     continue
                 try:
                     mic = self._snapshot_mic_state()
-                    fg = self._q_foreground()
+                    fg = self._snapshot_foreground()
                 except Exception:
                     log.debug("[arm] whitelist snapshot failed", exc_info=True)
                     continue
@@ -529,7 +533,7 @@ class ArmController:
                     continue
                 try:
                     mic = self._snapshot_mic_state()
-                    fg = self._q_foreground()
+                    fg = self._snapshot_foreground()
                 except Exception:
                     log.debug("[arm] meeting-ended snapshot failed", exc_info=True)
                     continue
@@ -570,6 +574,26 @@ class ArmController:
         active = bool(self._q_is_mic_active())
         running = self._q_running_procs() or frozenset()
         return MicState(holders=list(holders), active=active, running_processes=running)
+
+    def _snapshot_foreground(self) -> ForegroundInfo:
+        """Foreground info enriched with all visible browser window titles.
+
+        The platform ``get_foreground_info`` query only knows about the
+        frontmost window; we layer ``browser_window_titles`` on top so the
+        matcher can find a Meet / Teams / Zoom-web window even when the
+        user Alt+Tabs to a non-browser.
+        """
+        fg = self._q_foreground()
+        try:
+            titles = self._q_browser_titles() or []
+        except Exception:
+            log.debug("[arm] browser-titles query failed", exc_info=True)
+            titles = []
+        if not titles:
+            return fg
+        # Dataclass is frozen — build a new instance with the titles merged in.
+        from dataclasses import replace
+        return replace(fg, browser_window_titles=tuple(titles))
 
     async def _ask_consent(
         self, title: str, body: str, yes: str, no: str, timeout_secs: float,
@@ -627,6 +651,16 @@ def _default_get_foreground_info():
         from .platform_mac import get_foreground_info as fn
         return fn
     return lambda: ForegroundInfo()
+
+
+def _default_get_browser_window_titles():
+    if sys.platform == "win32":
+        from .platform_win import get_browser_window_titles as fn
+        return fn
+    if sys.platform == "darwin":
+        from .platform_mac import get_browser_window_titles as fn
+        return fn
+    return lambda: []
 
 
 def _human_duration(secs: float) -> str:

@@ -204,6 +204,10 @@ class DetectorSpec(BaseSettings):
       holds the mic AND one of ``url_patterns`` matches the active tab.
       This is how Google Meet / Teams web / Zoom web / Webex / Whereby /
       Jitsi / 8x8 are matched.
+    - ``title_patterns`` are tried against any visible browser window title
+      when ``is_browser`` is True. Needed on Windows where we can't cheaply
+      read the active-tab URL; the Chrome/Edge window title (e.g. ``Meet -
+      abc-defg-hij - Google Chrome``) is the only signal available.
     """
 
     app_key: str
@@ -212,6 +216,7 @@ class DetectorSpec(BaseSettings):
     bundle_ids: list[str] = Field(default_factory=list)
     is_browser: bool = False
     url_patterns: list[str] = Field(default_factory=list)
+    title_patterns: list[str] = Field(default_factory=list)
 
 
 def default_detector_specs() -> list[DetectorSpec]:
@@ -290,10 +295,14 @@ def default_detector_specs() -> list[DetectorSpec]:
             bundle_ids=["co.dialpad.dialpad"],
         ),
 
-        # Web meeting platforms — browser holds the mic AND URL matches pattern.
+        # Web meeting platforms — browser holds the mic AND URL or title
+        # matches. Title patterns are a Windows fallback (no cheap tab-URL
+        # read) and are deliberately specific enough to avoid matching a
+        # logged-out landing page.
         DetectorSpec(
             app_key="gmeet", display_name="Google Meet", is_browser=True,
             url_patterns=[r"^https://meet\.google\.com/[a-z]{3,4}-[a-z]{3,4}-[a-z]{3,4}"],
+            title_patterns=[r"\bMeet - [a-z]{3,4}-[a-z]{3,4}-[a-z]{3,4}\b"],
         ),
         DetectorSpec(
             app_key="teams_web", display_name="Microsoft Teams",
@@ -309,6 +318,9 @@ def default_detector_specs() -> list[DetectorSpec]:
                 r"^https://[^/]+\.zoom\.us/wc/join/",
                 r"^https://[^/]+\.zoom\.us/j/\d+",
             ],
+            # Zoom web titles the meeting window "Zoom Meeting"; distinct
+            # enough from their marketing pages / client downloads.
+            title_patterns=[r"\bZoom Meeting\b"],
         ),
         DetectorSpec(
             app_key="webex_web", display_name="Webex", is_browser=True,
