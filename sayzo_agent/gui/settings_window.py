@@ -73,15 +73,28 @@ log = logging.getLogger(__name__)
 PANE_NAMES = ("Shortcut", "Permissions", "Account", "Notifications")
 
 
-def open_settings_window(cfg: "Config", arm: "ArmController") -> None:
+def open_settings_window(
+    cfg: "Config",
+    arm: "ArmController",
+    *,
+    pane: Optional[str] = None,
+) -> None:
     """Blocking: opens the settings window and returns when the user closes it.
+
+    Args:
+        cfg: Agent config.
+        arm: Live ArmController (for hotkey rebinding).
+        pane: Optional pane name (e.g., ``"Account"``). When set, the
+            window opens with that pane selected — used by the auth-expiry
+            toast action button so the user lands directly on the
+            sign-in surface.
 
     Safe to call from a worker thread. Tkinter pins widget access to the
     thread that created the root; every widget call below is local to
     this function's thread.
     """
     try:
-        app = _SettingsApp(cfg, arm)
+        app = _SettingsApp(cfg, arm, initial_pane=pane)
         app.run()
     except Exception:
         log.warning("[settings] window crashed", exc_info=True)
@@ -94,7 +107,13 @@ class _SettingsApp:
     MIN_SIZE = (680, 460)
     SIDEBAR_WIDTH = 220
 
-    def __init__(self, cfg: "Config", arm: "ArmController") -> None:
+    def __init__(
+        self,
+        cfg: "Config",
+        arm: "ArmController",
+        *,
+        initial_pane: Optional[str] = None,
+    ) -> None:
         self._cfg = cfg
         self._arm = arm
         self._root = tk.Tk()
@@ -104,7 +123,17 @@ class _SettingsApp:
         apply_sayzo_theme(self._root)
         apply_sayzo_icon(self._root)
 
-        self._current_pane = tk.StringVar(value=PANE_NAMES[0])
+        # Honour initial_pane when it matches a known pane name — otherwise
+        # fall back to the first pane. Case-insensitive to keep the caller
+        # API forgiving (the tray passes a lowercased tag at the moment).
+        start_pane = PANE_NAMES[0]
+        if initial_pane is not None:
+            for name in PANE_NAMES:
+                if name.lower() == initial_pane.lower():
+                    start_pane = name
+                    break
+
+        self._current_pane = tk.StringVar(value=start_pane)
         self._sidebar_items: dict[str, _SidebarItem] = {}
         self._panes: dict[str, _Pane] = {}
         self._content_frame: Optional[ttk.Frame] = None
@@ -413,21 +442,51 @@ class _PermissionsPane(_Pane):
 
 
 class _AccountPane(_Pane):
-    """Renders signed-in vs. signed-out state from the TokenStore."""
+    """Renders signed-in vs. signed-out state from the TokenStore.
+
+    When signed out, the pane has three UI states to handle the PKCE
+    flow's failure modes without dead-ending the user (the tester found
+    that a stuck browser flow had no recovery surface before):
+
+    - ``idle``: "You're not signed in" + Sign in button.
+    - ``pending``: "Waiting for sign-in…" + countdown + Cancel button +
+      "Copy URL" block. This state starts when Sign in is clicked and
+      ends on success / cancel / timeout.
+    - ``error``: error message + Try again button.
+    """
 
     def __init__(self, parent: tk.Widget, cfg: "Config") -> None:
         super().__init__(parent)
         self._cfg = cfg
         self._inner = ttk.Frame(self._frame, style="Sayzo.TFrame")
         self._inner.pack(fill="both", expand=True)
+
+        # Sign-in state machine (only relevant when signed out).
+        self._ui_state: str = "idle"  # "idle" | "pending" | "error"
+        self._error_message: Optional[str] = None
+        self._login_url: Optional[str] = None
+        self._seconds_remaining: Optional[int] = None
+        self._cancel_event: Optional[threading.Event] = None
+        self._countdown_label: Optional[ttk.Label] = None
+
         self._render()
 
     def show(self) -> None:
         # Re-render on each show so state is fresh after sign-in/out.
+        # Reset the transient UI state too — someone re-entering the pane
+        # after a failed attempt should land on idle, not error.
+        self._ui_state = "idle"
+        self._error_message = None
+        self._login_url = None
+        self._seconds_remaining = None
+        self._rebuild()
+        super().show()
+
+    def _rebuild(self) -> None:
         for child in self._inner.winfo_children():
             child.destroy()
+        self._countdown_label = None
         self._render()
-        super().show()
 
     def _has_tokens(self) -> bool:
         from ..auth.store import TokenStore
@@ -442,21 +501,82 @@ class _AccountPane(_Pane):
             self._inner, text="Account", style="H1.Sayzo.TLabel",
         ).pack(anchor="w")
 
-        if not self._has_tokens():
-            ttk.Label(
-                self._inner,
-                text="You're not signed in. Sayzo will keep captures on this "
-                     "machine until you do — so no coaching drills yet.",
-                style="Muted.Sayzo.TLabel",
-                wraplength=480, justify="left",
-            ).pack(anchor="w", pady=(PAD_SM, PAD_XL))
-            RoundedButton(
-                self._inner, "Sign in",
-                command=self._sign_in,
-                variant="primary",
-            ).pack(anchor="w")
+        if self._has_tokens():
+            self._render_signed_in()
             return
 
+        # Signed-out branch.
+        if self._ui_state == "pending":
+            self._render_pending()
+        elif self._ui_state == "error":
+            self._render_error()
+        else:
+            self._render_idle()
+
+    def _render_idle(self) -> None:
+        ttk.Label(
+            self._inner,
+            text="You're not signed in. Sayzo will keep captures on this "
+                 "machine until you do — so no coaching drills yet.",
+            style="Muted.Sayzo.TLabel",
+            wraplength=480, justify="left",
+        ).pack(anchor="w", pady=(PAD_SM, PAD_XL))
+        RoundedButton(
+            self._inner, "Sign in",
+            command=self._sign_in,
+            variant="primary",
+        ).pack(anchor="w")
+
+    def _render_pending(self) -> None:
+        self._countdown_label = ttk.Label(
+            self._inner,
+            text=self._pending_text(),
+            style="Muted.Sayzo.TLabel",
+            wraplength=480, justify="left",
+        )
+        self._countdown_label.pack(anchor="w", pady=(PAD_SM, PAD_MD))
+
+        RoundedButton(
+            self._inner, "Cancel",
+            command=self._cancel_sign_in,
+            variant="secondary",
+        ).pack(anchor="w", pady=(0, PAD_XL))
+
+        ttk.Label(
+            self._inner,
+            text="Having trouble? Copy the sign-in URL and paste it into "
+                 "any browser to finish.",
+            style="Muted.Sayzo.TLabel",
+            wraplength=480, justify="left",
+        ).pack(anchor="w", pady=(0, PAD_SM))
+
+        url_row = ttk.Frame(self._inner, style="Sayzo.TFrame")
+        url_row.pack(anchor="w", fill="x")
+
+        url_var = tk.StringVar(value=self._login_url or "")
+        entry = ttk.Entry(url_row, textvariable=url_var, state="readonly")
+        entry.pack(side="left", fill="x", expand=True, padx=(0, PAD_SM))
+
+        RoundedButton(
+            url_row, "Copy",
+            command=lambda: self._copy_url_to_clipboard(),
+            variant="secondary",
+        ).pack(side="left")
+
+    def _render_error(self) -> None:
+        ttk.Label(
+            self._inner,
+            text=f"Sign-in failed: {self._error_message or 'Unknown error.'}",
+            style="Muted.Sayzo.TLabel",
+            wraplength=480, justify="left",
+        ).pack(anchor="w", pady=(PAD_SM, PAD_XL))
+        RoundedButton(
+            self._inner, "Try again",
+            command=self._sign_in,
+            variant="primary",
+        ).pack(anchor="w")
+
+    def _render_signed_in(self) -> None:
         ttk.Label(
             self._inner,
             text="Signed in. Your captures sync to your account so you can "
@@ -492,6 +612,14 @@ class _AccountPane(_Pane):
             variant="danger",
         ).pack(side="left", padx=(PAD_SM, 0))
 
+    def _pending_text(self) -> str:
+        if self._seconds_remaining is not None and self._seconds_remaining > 0:
+            return (
+                f"Waiting for sign-in in your browser… "
+                f"({self._seconds_remaining}s left)"
+            )
+        return "Waiting for sign-in in your browser…"
+
     def _add_kv_row(self, parent: tk.Widget, key: str, value: str) -> None:
         row = ttk.Frame(parent, style="Sayzo.TFrame")
         row.pack(fill="x", pady=(0, PAD_XS))
@@ -511,19 +639,101 @@ class _AccountPane(_Pane):
         except OSError:
             return None
 
+    # ---- sign-in state transitions ---------------------------------------
+
     def _sign_in(self) -> None:
+        self._ui_state = "pending"
+        self._error_message = None
+        self._login_url = None
+        self._seconds_remaining = None
+        self._cancel_event = threading.Event()
+        self._rebuild()
+
+        cancel_evt = self._cancel_event
+
+        def on_url(url: str) -> None:
+            self._frame.after(0, self._on_url_ready, url)
+
+        def on_tick(secs: int) -> None:
+            self._frame.after(0, self._on_tick, secs)
+
         def worker() -> None:
+            from ..auth.exceptions import AuthenticationCancelled
             try:
                 from ..__main__ import _do_login
-                asyncio.run(_do_login(self._cfg, quiet=True))
-            except Exception:
+                asyncio.run(
+                    _do_login(
+                        self._cfg,
+                        quiet=True,
+                        cancel_event=cancel_evt,
+                        on_url_ready=on_url,
+                        on_tick=on_tick,
+                    )
+                )
+            except AuthenticationCancelled:
+                self._frame.after(0, self._on_cancelled)
+                return
+            except Exception as e:
                 log.warning("[settings] login from settings failed", exc_info=True)
+                msg = str(e)
+                self._frame.after(0, self._on_error, msg)
+                return
+            self._frame.after(0, self._on_success)
+
+        threading.Thread(
+            target=worker, name="settings-login", daemon=True
+        ).start()
+
+    def _cancel_sign_in(self) -> None:
+        if self._cancel_event is not None:
+            self._cancel_event.set()
+        # Worker will emit AuthenticationCancelled → _on_cancelled resets UI.
+
+    def _on_url_ready(self, url: str) -> None:
+        self._login_url = url
+        if self._ui_state == "pending":
+            self._rebuild()
+
+    def _on_tick(self, secs: int) -> None:
+        self._seconds_remaining = secs
+        if self._ui_state == "pending" and self._countdown_label is not None:
             try:
-                self._frame.after(0, self.show)
-            except Exception:
+                self._countdown_label.config(text=self._pending_text())
+            except tk.TclError:
+                # Widget destroyed (user navigated away) — drop silently.
                 pass
 
-        threading.Thread(target=worker, name="settings-login", daemon=True).start()
+    def _on_success(self) -> None:
+        self._ui_state = "idle"
+        self._cancel_event = None
+        self._rebuild()  # re-reads has_tokens → signed-in branch
+
+    def _on_error(self, msg: str) -> None:
+        self._ui_state = "error"
+        self._error_message = msg
+        self._cancel_event = None
+        self._rebuild()
+
+    def _on_cancelled(self) -> None:
+        self._ui_state = "idle"
+        self._cancel_event = None
+        self._login_url = None
+        self._seconds_remaining = None
+        self._rebuild()
+
+    def _copy_url_to_clipboard(self) -> None:
+        if not self._login_url:
+            return
+        try:
+            top = self._frame.winfo_toplevel()
+            top.clipboard_clear()
+            top.clipboard_append(self._login_url)
+            # Force an update so the clipboard content sticks after the
+            # call returns (tkinter quirk — without update(), the clipboard
+            # is cleared when the root's event loop idles).
+            top.update()
+        except Exception:
+            log.debug("[settings] clipboard copy failed", exc_info=True)
 
     def _sign_out(self) -> None:
         from ..auth.store import TokenStore

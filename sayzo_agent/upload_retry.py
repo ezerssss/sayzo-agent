@@ -303,9 +303,14 @@ class UploadRetryManager:
                 await self._persist_pause_state()
                 fire_toast = True
         if fire_toast:
+            # Body guides packaged-app users to the Settings → Account pane.
+            # CLI users can still run `sayzo-agent login` but most installs
+            # these days are .app / .exe and have no terminal surface.
             await self._fire_notification(
                 "Sayzo: sign-in required",
-                "Please run `sayzo-agent login` to resume uploads.",
+                "Your Sayzo session expired. Click the Sayzo icon in the "
+                "menu bar and open Settings → Account to sign in again — "
+                "captures will keep saving locally until then.",
             )
 
     async def _check_auth_recovery(self) -> None:

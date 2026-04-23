@@ -49,6 +49,7 @@ declare global {
         get_status(): Promise<SetupStatus>;
         get_config_snapshot(): Promise<ConfigSnapshot>;
         start_login(): Promise<{ started: boolean }>;
+        cancel_login(): Promise<{ cancelled: boolean }>;
         start_model_download(): Promise<{ started: boolean }>;
 
         // Per-permission prompts (one screen each).
@@ -135,6 +136,10 @@ export const bridge = {
   async startLogin() {
     await whenReady();
     return window.pywebview.api.start_login();
+  },
+  async cancelLogin() {
+    await whenReady();
+    return window.pywebview.api.cancel_login();
   },
   async startModelDownload() {
     await whenReady();

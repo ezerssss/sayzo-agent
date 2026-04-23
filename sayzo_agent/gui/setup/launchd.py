@@ -65,13 +65,40 @@ def _plist_path() -> Path:
     return Path.home() / "Library" / "LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist"
 
 
+def _is_currently_loaded() -> bool:
+    """Is ``com.sayzo.agent`` already loaded in the user's launchd registry?
+
+    Returns False on any error (including the "not loaded" case, which
+    ``launchctl list <label>`` signals with a non-zero exit and stderr
+    ``Could not find service "…"``).
+    """
+    try:
+        result = subprocess.run(
+            ["launchctl", "list", LAUNCH_AGENT_LABEL],
+            capture_output=True,
+            check=False,
+        )
+    except OSError:
+        return False
+    return result.returncode == 0
+
+
 def ensure_launchd_registered() -> bool:
     """Write the LaunchAgent plist and load it.
 
+    Skips the ``unload``+``load`` cycle when the plist body is unchanged
+    and the job is already loaded — crucial on setup-complete, because we
+    call this from inside the running service and a needless ``load``
+    with ``RunAtLoad=true`` spawns a second instance that races with
+    the first (the first wins the PID file; the second exits via
+    "service already running, exiting" — harmless but noisy).
+
     Returns:
-        True  if the plist was written/refreshed and ``launchctl load`` ran
-        False if we skipped (non-darwin, or the .app isn't installed at the
-              expected path so registration would be pointing at nothing)
+        True  if the plist was written/refreshed and loaded (or was
+              already loaded in a matching state)
+        False if we skipped (non-darwin, or the .app isn't installed at
+              the expected path so registration would be pointing at
+              nothing) or a subprocess call failed
 
     Never raises; logs and returns False on any error so the caller (the
     service start path) doesn't crash on a non-fatal registration failure.
@@ -93,22 +120,30 @@ def ensure_launchd_registered() -> bool:
 
     try:
         plist_path.parent.mkdir(parents=True, exist_ok=True)
-        # Compare to existing content before rewriting to avoid pointless
-        # unload/load churn when nothing changed.
         existing = plist_path.read_text(encoding="utf-8") if plist_path.exists() else ""
-        if existing != plist_body:
+        plist_changed = existing != plist_body
+        currently_loaded = _is_currently_loaded()
+
+        if not plist_changed and currently_loaded:
+            log.info(
+                "launchd plist already loaded and unchanged at %s — skipping reload",
+                plist_path,
+            )
+            return True
+
+        if plist_changed:
             plist_path.write_text(plist_body, encoding="utf-8")
             os.chmod(plist_path, 0o644)
             log.info("wrote launchd plist to %s", plist_path)
-        else:
-            log.info("launchd plist already up to date at %s", plist_path)
 
-        # Unload first (no-op if not loaded) so a refreshed plist takes effect.
-        subprocess.run(
-            ["launchctl", "unload", str(plist_path)],
-            capture_output=True,
-            check=False,
-        )
+        # Only unload if the job is actually loaded — avoids an unnecessary
+        # stop/start on the plist-just-written + not-loaded-yet path.
+        if currently_loaded:
+            subprocess.run(
+                ["launchctl", "unload", str(plist_path)],
+                capture_output=True,
+                check=False,
+            )
         result = subprocess.run(
             ["launchctl", "load", str(plist_path)],
             capture_output=True,

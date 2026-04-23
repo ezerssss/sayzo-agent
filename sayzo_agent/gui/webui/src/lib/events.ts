@@ -5,15 +5,21 @@
 //   { type: "download_progress", done: 12345, total: 67890 }
 //   { type: "download_done", path: "/path/to/file" }
 //   { type: "download_error", message: "..." }
+//   { type: "login_url", url: "https://…/authorize?…" }
+//   { type: "login_tick", seconds_remaining: 42 }
 //   { type: "login_done" }
 //   { type: "login_error", message: "..." }
+//   { type: "login_cancelled" }
 
 export type SayzoEvent =
   | { type: "download_progress"; done: number; total: number }
   | { type: "download_done"; path: string }
   | { type: "download_error"; message: string }
+  | { type: "login_url"; url: string }
+  | { type: "login_tick"; seconds_remaining: number }
   | { type: "login_done" }
   | { type: "login_error"; message: string }
+  | { type: "login_cancelled" }
   | { type: "status_updated"; status: unknown }; // future-proof
 
 type Listener = (evt: SayzoEvent) => void;

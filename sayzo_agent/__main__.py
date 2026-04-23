@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+import typing
 
 import click
 
@@ -52,8 +53,22 @@ def _setup_file_logging(logs_dir) -> None:
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
-async def _do_login(cfg, no_browser: bool = False, quiet: bool = False) -> None:
-    """Run the login flow (PKCE primary, device code fallback)."""
+async def _do_login(
+    cfg,
+    no_browser: bool = False,
+    quiet: bool = False,
+    *,
+    cancel_event: threading.Event | None = None,
+    on_url_ready: "typing.Callable[[str], None] | None" = None,
+    on_tick: "typing.Callable[[int], None] | None" = None,
+) -> None:
+    """Run the login flow (PKCE primary, device code fallback).
+
+    The optional keyword callbacks are plumbed straight through to the
+    PKCE flow so GUI callers (setup-window bridge, Settings Account pane)
+    can surface progress and cancel state. See ``auth/pkce.py`` for the
+    semantics.
+    """
     from .auth.device import device_code_flow
     from .auth.pkce import pkce_flow
     from .auth.server import HttpAuthServer
@@ -74,6 +89,9 @@ async def _do_login(cfg, no_browser: bool = False, quiet: bool = False) -> None:
                 scopes=cfg.auth.scopes,
                 redirect_port=cfg.auth.redirect_port,
                 timeout_secs=cfg.auth.login_timeout_secs,
+                cancel_event=cancel_event,
+                on_url_ready=on_url_ready,
+                on_tick=on_tick,
             )
         except PKCEUnavailable:
             if not quiet:

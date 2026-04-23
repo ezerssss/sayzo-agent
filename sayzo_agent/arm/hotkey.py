@@ -1,34 +1,85 @@
 """Global hotkey listener with asyncio bridge.
 
-Backed by ``pynput`` — works on Windows without elevation and on macOS
-with one-time Accessibility permission (surfaced during the onboarding
-walkthrough). Rebinding at runtime is supported: ``rebind(new_binding)``
-unregisters the old combo and registers the new one.
+Two backends:
 
-Threading model: pynput runs its listener on a dedicated background thread.
-When the combo fires, we marshal the event onto the ArmController's asyncio
-loop via ``loop.call_soon_threadsafe(callback)`` — no ``janus`` needed since
-we just need an edge-triggered signal, not a queue.
+- **Windows (and Linux for dev/tests)** — ``pynput`` ``GlobalHotKeys``.
+  Works on Windows without elevation; Linux path is unused in prod but
+  keeps unit tests portable.
+- **macOS** — Carbon ``RegisterEventHotKey`` via ctypes (see
+  ``hotkey_mac.py``). pynput's listener thread trips
+  ``dispatch_assert_queue_fail`` in ``TSMGetInputSourceProperty`` on
+  macOS 15+ because Text Input Sources APIs are now main-thread-only.
+  Carbon hot keys deliver events to NSApp's main event loop directly.
+
+Rebinding at runtime is supported on both backends:
+``rebind(new_binding)`` unregisters the old combo and registers the new
+one.
+
+Threading contract (identical across backends): the registered callback
+is invoked via ``loop.call_soon_threadsafe`` — edge-triggered signal
+on the ArmController's asyncio loop.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 from typing import Callable, Optional
 
 log = logging.getLogger(__name__)
 
 
 class HotkeySource:
-    """Wrap a pynput ``GlobalHotKeys`` listener around a single binding.
+    """Platform-dispatching facade over the concrete hotkey backends.
 
-    ``callback`` is invoked on the ArmController's event loop every time the
-    user presses the combo. If registration fails (permission denied, parse
-    error, conflict with another app), ``register()`` logs a warning and
-    leaves the listener unregistered. The rest of the agent continues to
-    work — users without Accessibility permission on macOS fall back to
-    the tray menu.
+    ``callback`` is invoked on the ArmController's event loop every time
+    the user presses the combo. If registration fails (permission denied,
+    parse error, conflict with another app), ``register()`` logs a warning
+    and leaves the listener unregistered. The rest of the agent continues
+    to work — users without Accessibility permission on macOS fall back
+    to the tray menu.
     """
+
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        callback: Callable[[], None],
+    ) -> None:
+        if sys.platform == "darwin":
+            from .hotkey_mac import MacHotkeySource
+            self._impl: _HotkeyBackend = MacHotkeySource(loop, callback)
+        else:
+            self._impl = _PynputHotkeySource(loop, callback)
+
+    def register(self, binding: str) -> Optional[str]:
+        return self._impl.register(binding)
+
+    def unregister(self) -> None:
+        self._impl.unregister()
+
+    def rebind(self, new_binding: str) -> Optional[str]:
+        return self._impl.rebind(new_binding)
+
+    @property
+    def binding(self) -> Optional[str]:
+        return self._impl.binding
+
+
+# Protocol-ish base class (duck-typed in practice — the Mac backend is a
+# separate module and doesn't inherit). Kept here for type-annotation
+# readability only.
+class _HotkeyBackend:
+    def register(self, binding: str) -> Optional[str]: ...  # pragma: no cover
+    def unregister(self) -> None: ...  # pragma: no cover
+    def rebind(self, new_binding: str) -> Optional[str]: ...  # pragma: no cover
+    @property
+    def binding(self) -> Optional[str]: ...  # pragma: no cover
+
+
+class _PynputHotkeySource:
+    """Wrap a pynput ``GlobalHotKeys`` listener around a single binding.
+    Used on Windows + Linux. On macOS, :class:`HotkeySource` dispatches
+    to :class:`~sayzo_agent.arm.hotkey_mac.MacHotkeySource` instead."""
 
     def __init__(
         self,

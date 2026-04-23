@@ -107,8 +107,6 @@ export function App() {
         // After login we want the user to see the download screen next,
         // not a jump to permissions.
         setScreen("download");
-      } else if (evt.type === "login_error") {
-        setGlobalError(evt.message);
       } else if (evt.type === "download_done" && config) {
         const s = await bridge.getStatus();
         setStatus(s);
