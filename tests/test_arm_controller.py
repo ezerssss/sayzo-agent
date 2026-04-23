@@ -445,6 +445,96 @@ async def test_rebind_hotkey_updates_cfg_on_success(monkeypatch):
     assert ctrl.cfg.hotkey == "ctrl+alt+shift+r"
 
 
+# ---- tray click: no confirmation, reentrancy lock -------------------
+
+
+async def test_tray_click_arms_without_confirmation_toast():
+    """Tray menu click is deliberate (the label IS the action) — we must
+    not fire a 'Start recording?' consent toast on top of it."""
+    notifier = FakeNotifier()
+    ctrl, _, mic, sys_cap, *_ = _make_controller(notifier=notifier)
+
+    await ctrl.arm_from_tray()
+    assert ctrl.state == ArmState.ARMED
+    assert mic.start_count == 1 and sys_cap.start_count == 1
+    # No consent toast was shown — only the non-interactive "Sayzo is
+    # capturing" post-arm guidance counts as fire-and-forget.
+    assert notifier.consent_calls == []
+
+    await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
+
+
+async def test_tray_click_disarms_without_confirmation_toast():
+    """Counterpart to the arm case: clicking 'Stop recording' from the
+    tray must stop immediately, not pop a 'Stop recording?' toast.
+
+    The user's report was: they click Stop, a toast appears, the mic
+    indicator stays on (because disarm hasn't actually happened yet),
+    they click again to try to force it, and the state ends up flipped.
+    This test pins the fix — tray disarm never asks.
+    """
+    notifier = FakeNotifier()
+    ctrl, _, mic, sys_cap, *_ = _make_controller(notifier=notifier)
+
+    await ctrl.arm_from_tray()  # arm
+    consent_calls_before = len(notifier.consent_calls)
+    await ctrl.arm_from_tray()  # disarm
+    assert ctrl.state == ArmState.DISARMED
+    assert mic.stop_count == 1 and sys_cap.stop_count == 1
+    # Disarm path added zero new consent toasts.
+    assert len(notifier.consent_calls) == consent_calls_before
+
+
+async def test_tray_click_drops_concurrent_second_click():
+    """Rapid double-click on the tray menu should not stack two
+    transitions. While the first is mid-await (mic stream opening), the
+    second click must be dropped — queuing would produce the classic
+    'I clicked stop and it armed again' flip-flop the user reported."""
+    ctrl, _, mic, sys_cap, *_ = _make_controller()
+
+    # Gate mic.start so the first click is parked mid-transition while
+    # we fire the second click.
+    gate = asyncio.Event()
+    original_start = mic.start
+
+    async def slow_start() -> None:
+        await gate.wait()
+        await original_start()
+
+    mic.start = slow_start  # type: ignore[assignment]
+
+    task1 = asyncio.create_task(ctrl.arm_from_tray())
+    # Let task1 begin and park at the mic.start gate.
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    # Second click arrives while task1 is stuck — must be dropped.
+    task2 = asyncio.create_task(ctrl.arm_from_tray())
+    await asyncio.sleep(0)
+    assert task2.done()  # returned immediately via the in-flight guard
+
+    gate.set()
+    await task1
+    assert ctrl.state == ArmState.ARMED
+    assert mic.start_count == 1 and sys_cap.start_count == 1
+
+    await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
+
+
+async def test_state_change_callback_fires_on_arm_and_disarm():
+    """__main__'s _tray_bridge registers a callback so the tray menu
+    label updates the moment arm state flips — not 0.5 s later on the
+    next poll. Verify the hook fires for both directions."""
+    ctrl, _, *_ = _make_controller()
+    events: list[ArmState] = []
+    ctrl.set_state_change_callback(lambda: events.append(ctrl.state))
+
+    await ctrl.arm_from_tray()
+    assert events == [ArmState.ARMED]
+
+    await ctrl.arm_from_tray()
+    assert events == [ArmState.ARMED, ArmState.DISARMED]
+
+
 async def test_rebind_hotkey_surfaces_error_on_conflict():
     ctrl, _, *_ = _make_controller()
 

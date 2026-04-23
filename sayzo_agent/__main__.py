@@ -708,16 +708,37 @@ def service(force_setup: bool) -> None:
             finally:
                 settings_open.clear()
 
+        def _sync_arm_state_to_tray() -> None:
+            """Push ArmController.state → TrayState immediately.
+
+            Called both from the bridge's 0.5 s poll and (synchronously, on
+            the asyncio loop) from ArmController's state-change callback so
+            menu labels reflect arm/disarm the moment the transition
+            finishes — not up to 0.5 s later. Without this the user saw
+            "right-click menu still says Start recording" right after
+            arming.
+            """
+            cur = agent.arm.state
+            tray_state.set_status(
+                TrayStatus.ARMED if cur == ArmState.ARMED else TrayStatus.DISARMED
+            )
+            tray.update()
+
+        agent.arm.set_state_change_callback(_sync_arm_state_to_tray)
+
         async def _tray_bridge() -> None:
-            last_arm_state: ArmState | None = None
             last_hotkey: str | None = None
+            # Seed the tray with the current state once; subsequent pushes
+            # come from ArmController's state-change callback.
+            _sync_arm_state_to_tray()
             while not agent._stop.is_set():
                 await asyncio.sleep(0.5)
                 if tray_state.quit_event.is_set():
                     _handle_stop()
                     return
-                # User clicked the Arm/Stop menu item. Fire the same code
-                # path the hotkey uses — confirmation toast + arm/disarm.
+                # User clicked the Arm/Stop menu item. ArmController handles
+                # the transition atomically (no confirmation toast) and
+                # drops rapid double-clicks via its own in-flight flag.
                 if tray_state.arm_toggle_event.is_set():
                     tray_state.arm_toggle_event.clear()
                     asyncio.create_task(agent.arm.arm_from_tray())
@@ -729,18 +750,13 @@ def service(force_setup: bool) -> None:
                     if not settings_open.is_set():
                         settings_open.set()
                         loop.run_in_executor(None, _open_settings)
-                # Sync ArmController state → tray state.
-                cur_state = agent.arm.state
+                # Belt-and-braces poll sync in case the callback ever fails
+                # to fire (e.g. state changed before the callback was wired).
+                _sync_arm_state_to_tray()
                 cur_hotkey = agent.arm.current_hotkey
-                if cur_state != last_arm_state:
-                    tray_state.set_status(
-                        TrayStatus.ARMED if cur_state == ArmState.ARMED else TrayStatus.DISARMED
-                    )
-                    last_arm_state = cur_state
                 if cur_hotkey != last_hotkey:
                     tray_state.set_hotkey_display(humanize_binding(cur_hotkey))
                     last_hotkey = cur_hotkey
-                tray.update()
 
         # Best-effort update check. Surfaces "Download Sayzo vX.Y.Z" in the
         # tray menu + fires ONE toast per newly-discovered version when the

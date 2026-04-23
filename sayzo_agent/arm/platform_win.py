@@ -11,10 +11,22 @@ Two capabilities exposed to the ArmController:
 Both are best-effort: on any COM/Win32 failure we log and return empty
 results. The ArmController tolerates empties — it just means no whitelist
 match fires this poll.
+
+**COM-apartment isolation**: ``get_mic_holders`` MUST run on a thread whose
+apartment is STA (apartment-threaded), because comtypes 1.4.x calls
+``CoInitializeEx(STA)`` at module-import time and will raise
+``RPC_E_CHANGED_MODE`` if the thread was already initialized to MTA. The
+service process's main thread gets MTA'd early by pystray/pywebview, so we
+can't import comtypes there. Solution: a dedicated single-worker
+``ThreadPoolExecutor`` whose initializer calls ``pythoncom.CoInitialize()``
+(STA) before any comtypes import occurs on that thread, and every
+mic-holder query runs through that executor.
 """
 from __future__ import annotations
 
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 from .detectors import BROWSER_PROCESS_NAMES, ForegroundInfo, MicHolder
@@ -22,28 +34,60 @@ from .detectors import BROWSER_PROCESS_NAMES, ForegroundInfo, MicHolder
 log = logging.getLogger(__name__)
 
 
-def get_mic_holders() -> list[MicHolder]:
-    """Enumerate processes with an active capture session on the default mic.
+_com_executor: Optional[ThreadPoolExecutor] = None
+_com_executor_lock = threading.Lock()
 
-    Uses pycaw to open the default ``eCapture`` endpoint and iterate its
-    audio sessions. Returns empty list on any failure (device absent,
-    permission denied, COM error).
+
+def _com_thread_initializer() -> None:
+    """Runs once on the COM worker thread before any submitted task.
+
+    Initializes the thread's apartment to STA so comtypes's module-level
+    ``CoInitializeEx`` (done the first time pycaw is imported here) agrees
+    with the existing mode and returns ``S_FALSE`` instead of raising
+    ``RPC_E_CHANGED_MODE``. Without this, pycaw's import would fail inside
+    the bundled service because the main thread is already MTA.
     """
     try:
+        import pythoncom
+        pythoncom.CoInitialize()
+    except Exception:
+        log.warning(
+            "[arm.win] COM worker thread init failed — mic detection disabled",
+            exc_info=True,
+        )
+
+
+def _get_com_executor() -> ThreadPoolExecutor:
+    global _com_executor
+    with _com_executor_lock:
+        if _com_executor is None:
+            _com_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="sayzo-com",
+                initializer=_com_thread_initializer,
+            )
+        return _com_executor
+
+
+def _mic_holders_on_com_thread() -> list[MicHolder]:
+    """The real mic-holder query. Must run on the COM worker thread because
+    the comtypes objects returned here (IMMDevice, IAudioSessionManager2,
+    session enumerator, individual sessions) are apartment-thread-affine
+    and can only be used on the thread they were created on."""
+    try:
         from pycaw.pycaw import (
-            AudioUtilities,
             IAudioSessionControl2,
             IAudioSessionManager2,
             IMMDeviceEnumerator,
         )
         from pycaw.constants import CLSID_MMDeviceEnumerator
-        from comtypes import CLSCTX_ALL, CoCreateInstance, GUID
+        from comtypes import CLSCTX_ALL, CoCreateInstance
     except Exception:
-        # PyInstaller often misses nested imports; surface this at WARNING so
-        # a broken bundle is diagnosable from the service log without
-        # enabling DEBUG.
-        log.warning("[arm.win] pycaw/comtypes import failed — meeting "
-                    "detection disabled", exc_info=True)
+        log.warning(
+            "[arm.win] pycaw/comtypes import failed on COM worker thread — "
+            "meeting detection disabled",
+            exc_info=True,
+        )
         return []
 
     # Device role enum values — pycaw doesn't expose these directly.
@@ -53,13 +97,6 @@ def get_mic_holders() -> list[MicHolder]:
     import psutil
 
     try:
-        # Initialize COM for the calling thread. Must be done per thread.
-        import pythoncom
-        try:
-            pythoncom.CoInitialize()
-        except Exception:
-            pass
-
         enumerator = CoCreateInstance(
             CLSID_MMDeviceEnumerator,
             IMMDeviceEnumerator,
@@ -75,8 +112,7 @@ def get_mic_holders() -> list[MicHolder]:
         count = session_enum.GetCount()
     except Exception:
         log.warning(
-            "[arm.win] capture-endpoint session enum failed — "
-            "meeting detection disabled",
+            "[arm.win] capture-endpoint session enum failed",
             exc_info=True,
         )
         return []
@@ -104,6 +140,27 @@ def get_mic_holders() -> list[MicHolder]:
             continue
 
     return holders
+
+
+def get_mic_holders() -> list[MicHolder]:
+    """Enumerate processes with an active capture session on the default mic.
+
+    Submits the query to the COM worker thread (see module docstring).
+    Returns empty list on any failure — the ArmController tolerates that.
+    """
+    try:
+        fut = _get_com_executor().submit(_mic_holders_on_com_thread)
+        # 2 s matches the watcher's poll interval; if a single query takes
+        # longer than a full poll, something is badly wrong and we'd rather
+        # skip this round than stack queries.
+        return fut.result(timeout=2.0)
+    except Exception:
+        log.warning(
+            "[arm.win] mic-holder worker call failed — meeting detection "
+            "skipped this poll",
+            exc_info=True,
+        )
+        return []
 
 
 def get_foreground_info() -> ForegroundInfo:

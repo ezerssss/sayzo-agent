@@ -139,6 +139,21 @@ class ArmController:
 
         self._stop = asyncio.Event()
 
+        # Drops a second tray click while a previous one is still mid-
+        # transition. Without it, a rapid double-click could spawn two
+        # overlapping tasks that both pass the "if self.state == X: return"
+        # early-out (that check runs BEFORE mic.start awaits) and end up
+        # double-starting streams + creating duplicate check-in tasks
+        # (user report: "all the state gets fucked up"). A plain bool
+        # works because we flip it synchronously before the first await,
+        # so a concurrent entry always sees True.
+        self._tray_transition_in_flight: bool = False
+
+        # Optional callback fired after any arm/disarm transition completes.
+        # Used by __main__'s _tray_bridge to push the new state to the tray
+        # immediately instead of waiting for the next 0.5 s poll.
+        self._state_change_callback: Optional[Callable[[], None]] = None
+
         # Wire the detector's pending-close hook.
         self.detector.on_pending_close = self._on_pending_close
 
@@ -194,13 +209,49 @@ class ArmController:
             self.cfg.hotkey = new_binding
         return err
 
+    def set_state_change_callback(self, cb: Optional[Callable[[], None]]) -> None:
+        """Register a callback invoked after every ARMED<->DISARMED flip.
+
+        Called synchronously on the asyncio loop from ``_fire_state_change``.
+        The callback MUST be non-blocking and thread-safe — the tray bridge
+        uses it to push the new state to ``TrayState`` right away so menu
+        labels don't lag the real arm state by up to one poll interval.
+        """
+        self._state_change_callback = cb
+
+    def _fire_state_change(self) -> None:
+        cb = self._state_change_callback
+        if cb is None:
+            return
+        try:
+            cb()
+        except Exception:
+            log.exception("[arm] state-change callback raised (non-fatal)")
+
     async def arm_from_tray(self) -> None:
-        """Tray-menu "Arm" click. No confirmation toast — the menu click is
-        already deliberate. Same arm flow as hotkey."""
-        if self.state == ArmState.ARMED:
-            await self._disarm_with_confirm()
-        else:
-            await self._arm_internal(ArmReason(source="hotkey"))
+        """Tray-menu click: flip state with no confirmation toast.
+
+        The menu label IS the action — if the label says "Stop recording",
+        clicking it stops. Surfacing a "Stop recording?" toast on top would
+        be redundant and (combined with any label lag) is what the user saw
+        as "it asks me in the toast to stop recording but then it still gets
+        a hold of my mic". Hotkey disarms still confirm; the tray does not.
+
+        Drops a second tray click while a previous transition is still in
+        flight — queuing would produce the classic "I clicked stop and it
+        armed again" flip-flop.
+        """
+        if self._tray_transition_in_flight:
+            log.info("[arm] tray click ignored (transition in flight)")
+            return
+        self._tray_transition_in_flight = True
+        try:
+            if self.state == ArmState.ARMED:
+                await self._disarm_internal(SessionCloseReason.HOTKEY_END)
+            else:
+                await self._arm_internal(ArmReason(source="hotkey"))
+        finally:
+            self._tray_transition_in_flight = False
 
     # ---- hotkey path -------------------------------------------------------
 
@@ -325,6 +376,7 @@ class ArmController:
         self._reason = reason
         self.armed_event.set()
         log.info("[arm] ARMED (reason=%s app=%s)", reason.source, reason.app_key or "-")
+        self._fire_state_change()
 
         # Post-arm guidance toast (non-interactive). Skipped when the
         # Notifications pane's "Sayzo is capturing" sub-toggle is off.
@@ -394,6 +446,7 @@ class ArmController:
         self._reason = None
         self.armed_event.clear()
         log.info("[arm] DISARMED (reason=%s)", close_reason.value)
+        self._fire_state_change()
 
     # ---- detector hook ----------------------------------------------------
 

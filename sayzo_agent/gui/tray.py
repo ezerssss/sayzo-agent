@@ -21,6 +21,14 @@ Menu layout:
         ---
         (same tail as disarmed)
 
+The top item is NOT a pystray ``default`` item — a bare left-click on the
+icon must not arm/disarm. The user has to open the menu and click the
+label explicitly so the action always matches what the label promises.
+
+Tray menu clicks are treated as final by ``ArmController.arm_from_tray``:
+no additional confirmation toast fires on either arm or disarm (the label
+IS the confirmation). Hotkey transitions still confirm via toast.
+
 The hotkey string is interpolated at render time so the menu always reflects
 the user's current binding (even after a rebind via the Settings window).
 The "Reopen setup" menu item that used to open a separate tkinter
@@ -270,9 +278,20 @@ class TrayIcon:
             return
         self._current_status = status
         if sys.platform == "darwin":
+            # AppKit NSMenu mutation must happen on main thread; we're on
+            # asyncio's background thread here. The menu item's `text`
+            # callback re-evaluates on each menu open, so labels still
+            # refresh — just via pystray's own menu-rebuild path instead.
             return
         self._icon.icon = _make_icon(status)
         self._icon.title = self._tooltip_for(status, error_msg)
+        # Pystray on Windows is a no-op (menu is rebuilt on each right-
+        # click), but on Linux/GTK the native menu is long-lived and needs
+        # this kick so callable `text`/`visible` get re-evaluated.
+        try:
+            self._icon.update_menu()
+        except Exception:
+            log.debug("tray update_menu failed (non-fatal)", exc_info=True)
 
     def stop(self) -> None:
         """Stop the tray icon. Safe to call from any thread."""
@@ -346,8 +365,15 @@ class TrayIcon:
         def update_visible(item) -> bool:
             return self.state.get_update_offer() is not None
 
+        # NOTE: no ``default=True`` on the arm toggle — a single left-click
+        # on the tray icon should NOT silently arm/disarm. The user reported
+        # accidentally kicking off a recording by clicking the icon, then
+        # seeing a stale menu label on the next open ("still says Start
+        # recording" even though we were already armed). Requiring an
+        # explicit menu click makes the intent unambiguous and lets the
+        # label always be the ground truth for what happens next.
         menu = pystray.Menu(
-            pystray.MenuItem(arm_label, on_arm_toggle, default=True),
+            pystray.MenuItem(arm_label, on_arm_toggle),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(update_text, on_open_update, visible=update_visible),
             pystray.MenuItem("Settings...", on_settings),
