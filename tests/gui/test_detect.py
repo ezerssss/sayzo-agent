@@ -90,13 +90,14 @@ def test_empty_model_file_is_incomplete(cfg: Config) -> None:
 def test_both_signals_complete_when_not_darwin(cfg: Config) -> None:
     _write_token(cfg)
     _write_model(cfg)
+    _write_onboarded_marker(cfg)
     with patch("sayzo_agent.gui.setup.detect.sys.platform", "win32"):
         status = detect_setup(cfg)
     assert status.has_token is True
     assert status.has_model is True
     assert status.has_mic_permission is None
-    # Non-darwin platforms always report onboarded=True; the Permissions
-    # screen is macOS-only.
+    # Windows now walks the shortcut + notifications screens too, so the
+    # onboarded marker is the same gate it is on macOS.
     assert status.has_permissions_onboarded is True
     assert status.is_complete is True
 
@@ -241,16 +242,16 @@ def test_mac_onboarded_marker_flows_into_is_complete(cfg: Config) -> None:
     assert status.is_complete is True
 
 
-def test_onboarded_marker_ignored_on_non_darwin(cfg: Config) -> None:
-    """On Windows/Linux the Permissions screen doesn't exist; has_permissions_
-    onboarded must be True regardless of marker presence."""
+def test_not_onboarded_blocks_is_complete_on_non_darwin(cfg: Config) -> None:
+    """Windows now walks the same linear setup flow (shortcut + notifications
+    screens), so the onboarded marker gates is_complete on both platforms."""
     _write_token(cfg)
     _write_model(cfg)
     # Don't write the marker.
     with patch("sayzo_agent.gui.setup.detect.sys.platform", "win32"):
         status = detect_setup(cfg)
-    assert status.has_permissions_onboarded is True
-    assert status.is_complete is True
+    assert status.has_permissions_onboarded is False
+    assert status.is_complete is False
 
 
 # ---------------------------------------------------------------------------

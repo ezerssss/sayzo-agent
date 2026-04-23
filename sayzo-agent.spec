@@ -333,21 +333,31 @@ if sys.platform == "darwin":
         info_plist={
             "CFBundleShortVersionString": _sayzo_version,
             "LSUIElement": True,  # hide from Dock (tray-only background app)
+            # Usage descriptions are the copy the OS shows in its TCC
+            # dialogs. They MUST match Sayzo's armed-only invariant: mic /
+            # audio-capture / automation are only used during a capture the
+            # user explicitly started (hotkey) or agreed to (meeting-detect
+            # prompt). Anything that sounds like passive always-on listening
+            # is a bug — it contradicts the product.
             "NSMicrophoneUsageDescription": (
-                "Sayzo needs microphone access to capture your "
-                "conversations for English coaching."
+                "Sayzo opens the microphone only when you start a "
+                "recording. It stays off otherwise."
             ),
             "NSAudioCaptureUsageDescription": (
-                "Sayzo records audio from other apps (e.g. Zoom, FaceTime, "
-                "Meet) so it can transcribe conversations you're part of."
+                "So Sayzo can hear the other person in your meetings "
+                "(Zoom, Meet, FaceTime, etc.) — only while you're recording."
             ),
             # macOS 14.4 is the floor — CoreAudio Process Taps API is unavailable
             # on earlier releases.
             "LSMinimumSystemVersion": "14.4",
-            # First-run GUI uses Apple Events to deep-link into System Settings
-            # for granting microphone permission.
+            # AppleEvents is used to read the active tab URL in Chrome /
+            # Safari / Edge / Arc / Brave — we need it to tell whether
+            # you're in a web meeting vs. just browsing. We never read
+            # page contents.
             "NSAppleEventsUsageDescription": (
-                "Sayzo opens System Settings to help you grant microphone access."
+                "So Sayzo can tell when you're in a web meeting (Google "
+                "Meet, Teams, etc.). Only the tab's URL — never what's on "
+                "the page."
             ),
             "LSApplicationCategoryType": "public.app-category.productivity",
         },

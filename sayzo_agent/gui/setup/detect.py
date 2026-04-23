@@ -53,10 +53,12 @@ class SetupStatus:
                     startup, since probing would fire the TCC dialog before
                     the user has seen the in-app explanation)
 
-    ``has_permissions_onboarded`` is macOS-only state. On non-darwin it is
-    always ``True`` (the Permissions screen is macOS-specific). On darwin
-    it is ``True`` once the user has clicked Continue on the Permissions
-    screen (marker file written).
+    ``has_permissions_onboarded`` is the "user reached the Done screen"
+    gate on both platforms. On Windows it's still checked (the user needs
+    to walk the shortcut + notifications screens), and on macOS it covers
+    the fuller Mic → Audio Capture → Accessibility → Automation →
+    Notifications → Shortcut flow. The field name is historical — it
+    predates folding the tkinter onboarding into the pywebview window.
 
     ``is_complete`` is computed once at detection time rather than derived
     lazily, so the snapshot is stable across platform patches in tests and
@@ -88,14 +90,14 @@ def _compute_is_complete(
 ) -> bool:
     if not has_token or not has_model:
         return False
-    if sys.platform == "darwin":
-        # Onboarding is the gate we actually enforce. The probed mic
-        # permission only blocks if it was explicitly False (recovery path
-        # when the user previously denied); inconclusive (None) never blocks.
-        if not has_permissions_onboarded:
-            return False
-        if has_mic_permission is False:
-            return False
+    # The onboarding marker is what we enforce on both platforms now. A
+    # macOS user with a denied mic probe will be walked through the Mic
+    # screen inside the pywebview flow, so a soft "reopen Settings" loop
+    # is no longer needed at the detect layer.
+    if not has_permissions_onboarded:
+        return False
+    if sys.platform == "darwin" and has_mic_permission is False:
+        return False
     return True
 
 
@@ -175,9 +177,9 @@ def detect_setup(cfg: Config, *, probe_mac_permission: bool = False) -> SetupSta
         has_mic_permission: bool | None = _check_mac_mic_permission()
     else:
         has_mic_permission = None
-    has_permissions_onboarded = (
-        sys.platform != "darwin" or _check_permissions_onboarded(cfg)
-    )
+    # Check the marker on BOTH platforms now — Windows also needs to walk
+    # the shortcut + notifications screens, so the gate fires the same way.
+    has_permissions_onboarded = _check_permissions_onboarded(cfg)
     is_complete = _compute_is_complete(
         has_token=has_token,
         has_model=has_model,

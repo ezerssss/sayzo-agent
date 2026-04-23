@@ -362,14 +362,6 @@ class _PermissionsPane(_Pane):
         for label, desc, key in self._MAC_ROWS:
             self._add_row(label, desc, key)
 
-        make_divider(self._frame, pady=PAD_XL)
-
-        RoundedButton(
-            self._frame, "Reopen setup walkthrough",
-            command=self._reopen_setup,
-            variant="secondary",
-        ).pack(anchor="w")
-
     def _add_row(self, label: str, desc: str, key: str) -> None:
         row = ttk.Frame(self._frame, style="Sayzo.TFrame")
         row.pack(fill="x", pady=(0, PAD_LG))
@@ -416,13 +408,6 @@ class _PermissionsPane(_Pane):
         except Exception:
             log.warning("[settings] re_request %s failed", key, exc_info=True)
 
-    def _reopen_setup(self) -> None:
-        # The tray event bridge owns actually opening the walkthrough. For
-        # now, closing Settings and clicking "Reopen setup" from the tray
-        # is the user-facing flow; the Settings-side button is here to make
-        # the feature discoverable from the Permissions pane.
-        log.info("[settings] user clicked reopen setup walkthrough from settings")
-
 
 # ---- Account pane ----------------------------------------------------------
 
@@ -460,8 +445,8 @@ class _AccountPane(_Pane):
         if not self._has_tokens():
             ttk.Label(
                 self._inner,
-                text="You're not signed in. Sayzo will keep captures locally, "
-                     "but won't sync them to the webapp until you sign in.",
+                text="You're not signed in. Sayzo will keep captures on this "
+                     "machine until you do — so no coaching drills yet.",
                 style="Muted.Sayzo.TLabel",
                 wraplength=480, justify="left",
             ).pack(anchor="w", pady=(PAD_SM, PAD_XL))
@@ -474,8 +459,10 @@ class _AccountPane(_Pane):
 
         ttk.Label(
             self._inner,
-            text="Signed in to Sayzo.",
+            text="Signed in. Your captures sync to your account so you can "
+                 "drill the coaching moments in the Sayzo web app.",
             style="Muted.Sayzo.TLabel",
+            wraplength=480, justify="left",
         ).pack(anchor="w", pady=(PAD_SM, PAD_XL))
 
         card = ttk.Frame(self._inner, style="Sayzo.TFrame")

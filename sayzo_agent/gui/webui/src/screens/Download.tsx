@@ -65,7 +65,7 @@ export function Download({ onDone, onCancel }: Props) {
     <Layout
       step="02"
       title="Setting things up"
-      subtitle="Downloading what Sayzo needs to listen and help you improve your English. This lives on your computer once it's done — about 2 GB, a one-time setup."
+      subtitle="Getting Sayzo ready — about 2 GB, one time only."
       footer={
         <>
           <Button variant="ghost" onClick={onCancel}>

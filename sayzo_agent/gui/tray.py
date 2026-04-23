@@ -2,17 +2,16 @@
 
 Runs pystray on its own thread alongside the asyncio Agent loop. The shared
 :class:`TrayState` dataclass is the communication surface — the tray thread
-sets ``arm_toggle_event`` / ``quit_event`` / ``settings_event`` /
-``reopen_setup_event``, and the asyncio loop's ``_tray_bridge`` polls them
-and calls into the ``ArmController`` accordingly.
+sets ``arm_toggle_event`` / ``quit_event`` / ``settings_event``, and the
+asyncio loop's ``_tray_bridge`` polls them and calls into the
+``ArmController`` accordingly.
 
-Menu layout (plan section 11):
+Menu layout:
 
     Disarmed:
-        Arm Sayzo   (Ctrl+Alt+S)
+        Start recording   (Ctrl+Alt+S)
         ---
         Settings...
-        Reopen setup
         Open captures folder
         ---
         Quit Sayzo
@@ -24,6 +23,10 @@ Menu layout (plan section 11):
 
 The hotkey string is interpolated at render time so the menu always reflects
 the user's current binding (even after a rebind via the Settings window).
+The "Reopen setup" menu item that used to open a separate tkinter
+walkthrough is gone — the pywebview first-run window now covers everything,
+and the Settings window is the post-setup surface for hotkey/permissions
+tweaks.
 """
 from __future__ import annotations
 
@@ -85,7 +88,6 @@ class TrayState:
       The ``_tray_bridge`` in ``__main__.py`` calls
       ``arm_controller.arm_from_tray()`` on the asyncio loop.
     - ``settings_event`` — "Settings..." clicked; opens the settings GUI.
-    - ``reopen_setup_event`` — "Reopen setup" clicked; re-runs onboarding.
     - ``quit_event`` — "Quit Sayzo" clicked; agent shuts down.
 
     **Asyncio-loop → tray-thread signals** (kept in sync by the bridge):
@@ -100,7 +102,6 @@ class TrayState:
     _lock: threading.Lock = field(default_factory=threading.Lock)
     arm_toggle_event: threading.Event = field(default_factory=threading.Event)
     settings_event: threading.Event = field(default_factory=threading.Event)
-    reopen_setup_event: threading.Event = field(default_factory=threading.Event)
     quit_event: threading.Event = field(default_factory=threading.Event)
     # Legacy pause-event — kept for back-compat with CLI entrypoints that
     # still reference it. Unused by the tray menu itself.
@@ -290,7 +291,10 @@ class TrayIcon:
         if status == Status.ARMED:
             return f"Sayzo — capturing. Press {hotkey} to stop."
         # Everything else (DISARMED and legacy aliases) → disarmed tooltip.
-        return f"Sayzo — idle. Press {hotkey} or join a meeting."
+        # Phrasing conveys the armed-only invariant: the mic is off right
+        # now, and a capture only starts when the user explicitly arms it
+        # or accepts a meeting-detect prompt.
+        return f"Sayzo — mic off. Press {hotkey} to start, or we'll ask when you're in a meeting."
 
     def _run(self) -> None:
         import pystray
@@ -306,9 +310,6 @@ class TrayIcon:
 
         def on_settings(icon, item):
             self.state.settings_event.set()
-
-        def on_reopen_setup(icon, item):
-            self.state.reopen_setup_event.set()
 
         def on_open_captures(icon, item):
             self.captures_dir.mkdir(parents=True, exist_ok=True)
@@ -333,7 +334,10 @@ class TrayIcon:
             hotkey = self.state.get_hotkey_display()
             if status_now == Status.ARMED:
                 return f"Stop recording   ({hotkey})"
-            return f"Arm Sayzo   ({hotkey})"
+            # "Start recording" keeps parity with the hotkey confirmation
+            # toast and the Stop label — avoids the "Arm Sayzo" jargon, which
+            # reads as technical to a non-dev user.
+            return f"Start recording   ({hotkey})"
 
         def update_text(item) -> str:
             offer = self.state.get_update_offer()
@@ -347,7 +351,6 @@ class TrayIcon:
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(update_text, on_open_update, visible=update_visible),
             pystray.MenuItem("Settings...", on_settings),
-            pystray.MenuItem("Reopen setup", on_reopen_setup),
             pystray.MenuItem("Open captures folder", on_open_captures),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit Sayzo", on_quit),

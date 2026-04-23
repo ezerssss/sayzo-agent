@@ -20,6 +20,28 @@ export type PermissionResult = {
   granted: boolean | null;
 };
 
+export type HotkeyState = {
+  binding: string;
+  display: string;
+};
+
+export type HotkeyValidation = {
+  error: string | null;
+};
+
+export type HotkeySaveResult = {
+  error: string | null;
+  display?: string;
+};
+
+export type AutomationPromptResult = {
+  prompted: string[]; // short labels of browsers we hit
+};
+
+export type AccessibilityOpenResult = {
+  opened: boolean;
+};
+
 declare global {
   interface Window {
     pywebview: {
@@ -29,19 +51,24 @@ declare global {
         start_login(): Promise<{ started: boolean }>;
         start_model_download(): Promise<{ started: boolean }>;
 
-        // Permissions (new).
+        // Per-permission prompts (one screen each).
         prompt_mic_permission(): Promise<PermissionResult>;
         prompt_audio_capture_permission(): Promise<PermissionResult>;
         prompt_notification_permission(): Promise<PermissionResult>;
+        prompt_automation_permission(): Promise<AutomationPromptResult>;
+
+        // Settings deep-links.
         open_mic_settings(): Promise<null>;
         open_audio_capture_settings(): Promise<null>;
         open_notification_settings(): Promise<null>;
+        open_accessibility_settings(): Promise<AccessibilityOpenResult>;
+
+        // Hotkey (persisted to user_settings.json).
+        get_hotkey(): Promise<HotkeyState>;
+        validate_hotkey(binding: string): Promise<HotkeyValidation>;
+        save_hotkey(binding: string): Promise<HotkeySaveResult>;
+
         mark_permissions_onboarded(): Promise<null>;
-
-        // Legacy MicPermission recovery screen.
-        open_mac_privacy_settings(): Promise<null>;
-        recheck_mac_permission(): Promise<SetupStatus>;
-
         finish(): Promise<null>;
         quit_app(): Promise<null>;
       };
@@ -127,6 +154,10 @@ export const bridge = {
     await whenReady();
     return window.pywebview.api.prompt_notification_permission();
   },
+  async promptAutomationPermission() {
+    await whenReady();
+    return window.pywebview.api.prompt_automation_permission();
+  },
   async openMicSettings() {
     await whenReady();
     return window.pywebview.api.open_mic_settings();
@@ -139,19 +170,28 @@ export const bridge = {
     await whenReady();
     return window.pywebview.api.open_notification_settings();
   },
+  async openAccessibilitySettings() {
+    await whenReady();
+    return window.pywebview.api.open_accessibility_settings();
+  },
+
+  // Hotkey.
+  async getHotkey() {
+    await whenReady();
+    return window.pywebview.api.get_hotkey();
+  },
+  async validateHotkey(binding: string) {
+    await whenReady();
+    return window.pywebview.api.validate_hotkey(binding);
+  },
+  async saveHotkey(binding: string) {
+    await whenReady();
+    return window.pywebview.api.save_hotkey(binding);
+  },
+
   async markPermissionsOnboarded() {
     await whenReady();
     return window.pywebview.api.mark_permissions_onboarded();
-  },
-
-  // Legacy recovery-path methods.
-  async openMacPrivacySettings() {
-    await whenReady();
-    return window.pywebview.api.open_mac_privacy_settings();
-  },
-  async recheckMacPermission() {
-    await whenReady();
-    return window.pywebview.api.recheck_mac_permission();
   },
 
   async finish() {

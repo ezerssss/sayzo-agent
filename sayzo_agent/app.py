@@ -677,11 +677,12 @@ class Agent:
         # First-launch welcome toast — fires once per install, flagged by
         # data_dir/welcomed.json so reopening the agent doesn't re-surface
         # the message.
+        #
+        # Note: the old tkinter onboarding walkthrough that used to run at
+        # this point is gone. Everything it covered (hotkey, accessibility,
+        # automation, per-permission explanations) now lives inside the
+        # pywebview first-run window before the tray is even up.
         self._maybe_fire_welcome_toast()
-
-        # First-launch onboarding walkthrough — runs on a worker thread so
-        # the asyncio loop keeps ticking. Flag at data_dir/onboarding.json.
-        self._maybe_run_onboarding()
 
         consumers = [
             asyncio.create_task(self._consume("mic", self.mic.queue, self.vad_mic)),
@@ -723,34 +724,6 @@ class Agent:
                         t.cancel()
             self._executor.shutdown(wait=True)
             log.info("[agent] stopped")
-
-    def _maybe_run_onboarding(self) -> None:
-        """Open the first-run onboarding walkthrough if the user hasn't done it.
-
-        Runs on a worker thread so the agent's asyncio loop keeps ticking.
-        The flag at ``data_dir/onboarding.json`` records completion; its
-        absence means the walkthrough needs to run. Crashes in the window
-        never kill the agent — they're logged and swallowed.
-        """
-        try:
-            from .onboarding import has_onboarded, open_onboarding_window
-        except Exception:
-            log.debug("[agent] onboarding module unavailable", exc_info=True)
-            return
-        try:
-            if has_onboarded(self.cfg.data_dir):
-                return
-        except Exception:
-            log.debug("[agent] onboarding flag check failed", exc_info=True)
-            return
-
-        def worker() -> None:
-            try:
-                open_onboarding_window(self.cfg, self.arm)
-            except Exception:
-                log.warning("[agent] onboarding window crashed", exc_info=True)
-
-        threading.Thread(target=worker, name="onboarding", daemon=True).start()
 
     def _maybe_fire_welcome_toast(self) -> None:
         """Fire the first-launch welcome toast once per install.

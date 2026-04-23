@@ -3,57 +3,93 @@ import { bridge, SetupStatus, ConfigSnapshot } from "./lib/bridge";
 import { subscribe, SayzoEvent } from "./lib/events";
 import { Welcome } from "./screens/Welcome";
 import { Download } from "./screens/Download";
-import { MicPermission } from "./screens/MicPermission";
-import { Permissions } from "./screens/Permissions";
-import { NotificationsWin } from "./screens/NotificationsWin";
+import { Microphone } from "./screens/Microphone";
+import { AudioCapture } from "./screens/AudioCapture";
+import { Accessibility } from "./screens/Accessibility";
+import { Automation } from "./screens/Automation";
+import { Notifications } from "./screens/Notifications";
+import { Shortcut } from "./screens/Shortcut";
 import { Done } from "./screens/Done";
 import { Alert } from "./components/ui/Alert";
 
+// Linear per-platform screen sequence. The first two (welcome, download)
+// are skippable if the user already signed in / already has the model —
+// e.g. when the install was cancelled mid-flow and re-opened. Everything
+// after that is a straight walk to the Done screen.
+//
+// macOS (9): welcome → download → microphone → audio-capture →
+//            accessibility → automation → notifications → shortcut → done
+// Windows (5): welcome → download → notifications → shortcut → done
 type Screen =
   | "loading"
   | "welcome"
   | "download"
-  | "mic"
-  | "permissions"
-  | "notifications-win"
+  | "microphone"
+  | "audio-capture"
+  | "accessibility"
+  | "automation"
+  | "notifications"
+  | "shortcut"
   | "done";
 
-// Pick the next screen based on the latest detection. Order matches the
-// natural setup sequence: log in → fetch model → grant permissions → done.
-// On macOS the Permissions screen is the primary permission step; the
-// legacy "mic" recovery screen only fires if the user has already been
-// onboarded but audio-tap explicitly reports denial (via recheck).
-function nextScreen(status: SetupStatus, platform: string): Screen {
+function sequenceFor(platform: string): Screen[] {
+  if (platform === "darwin") {
+    return [
+      "welcome",
+      "download",
+      "microphone",
+      "audio-capture",
+      "accessibility",
+      "automation",
+      "notifications",
+      "shortcut",
+      "done",
+    ];
+  }
+  return ["welcome", "download", "notifications", "shortcut", "done"];
+}
+
+function initialScreen(
+  status: SetupStatus,
+  sequence: Screen[],
+): Screen {
   if (!status.has_token) return "welcome";
   if (!status.has_model) return "download";
-  if (platform === "darwin") {
-    if (!status.has_permissions_onboarded) return "permissions";
-    if (status.has_mic_permission === false) return "mic";
-  } else if (platform === "win32") {
-    return "notifications-win";
-  }
-  return "done";
+  // Already-complete flow won't reach here (detect_setup + .setup-seen gates
+  // the window entirely), but guard anyway: jump to the first screen after
+  // download so the user can still walk through permissions.
+  return sequence[2] ?? "done";
+}
+
+function stepLabel(screen: Screen, sequence: Screen[]): string | undefined {
+  if (screen === "loading" || screen === "done") return undefined;
+  const idx = sequence.indexOf(screen);
+  if (idx < 0) return undefined;
+  // "01" / "02" / ...
+  return String(idx + 1).padStart(2, "0");
 }
 
 export function App() {
   const [screen, setScreen] = useState<Screen>("loading");
   const [status, setStatus] = useState<SetupStatus | null>(null);
   const [config, setConfig] = useState<ConfigSnapshot | null>(null);
+  const [hotkeyDisplay, setHotkeyDisplay] = useState("Ctrl+Alt+S");
   const [globalError, setGlobalError] = useState<string | null>(null);
 
-  // Initial status fetch + ongoing event subscription.
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const [s, c] = await Promise.all([
+        const [s, c, h] = await Promise.all([
           bridge.getStatus(),
           bridge.getConfigSnapshot(),
+          bridge.getHotkey(),
         ]);
         if (cancelled) return;
         setStatus(s);
         setConfig(c);
-        setScreen(nextScreen(s, c.platform));
+        setHotkeyDisplay(h.display);
+        setScreen(initialScreen(s, sequenceFor(c.platform)));
       } catch (e) {
         if (!cancelled) setGlobalError(String(e));
       }
@@ -65,17 +101,22 @@ export function App() {
 
   useEffect(() => {
     return subscribe(async (evt: SayzoEvent) => {
-      if (evt.type === "login_done") {
-        // Refresh status and advance.
+      if (evt.type === "login_done" && config) {
         const s = await bridge.getStatus();
         setStatus(s);
-        if (config) setScreen(nextScreen(s, config.platform));
+        // After login we want the user to see the download screen next,
+        // not a jump to permissions.
+        setScreen("download");
       } else if (evt.type === "login_error") {
         setGlobalError(evt.message);
-      } else if (evt.type === "download_done") {
+      } else if (evt.type === "download_done" && config) {
         const s = await bridge.getStatus();
         setStatus(s);
-        if (config) setScreen(nextScreen(s, config.platform));
+        // After download, advance to the first post-download screen in
+        // this platform's sequence.
+        const seq = sequenceFor(config.platform);
+        const postDownload = seq[2] ?? "done";
+        setScreen(postDownload);
       }
     });
   }, [config]);
@@ -84,15 +125,15 @@ export function App() {
     void bridge.quitApp();
   }
 
-  async function advanceAfterPermissionsScreen() {
-    const s = await bridge.getStatus();
-    setStatus(s);
-    if (config) {
-      // After onboarding, skip the permissions/mic screens and go to done.
-      // We call nextScreen but it will now return "done" because the
-      // marker is written.
-      setScreen(nextScreen(s, config.platform));
+  function advance() {
+    if (!config) return;
+    const seq = sequenceFor(config.platform);
+    const idx = seq.indexOf(screen);
+    if (idx < 0 || idx >= seq.length - 1) {
+      setScreen("done");
+      return;
     }
+    setScreen(seq[idx + 1]);
   }
 
   if (globalError) {
@@ -115,16 +156,19 @@ export function App() {
     );
   }
 
+  const sequence = sequenceFor(config.platform);
+  const step = stepLabel(screen, sequence);
+
   switch (screen) {
     case "welcome":
       return (
         <Welcome
           onSignedIn={() => {
-            // App-level event listener (above) advances on login_done; this
-            // is a no-op safety hook in case events get lost.
+            // App-level listener advances on login_done; this is a
+            // no-op safety hook in case events get lost.
             void bridge.getStatus().then((s) => {
               setStatus(s);
-              setScreen(nextScreen(s, config.platform));
+              setScreen("download");
             });
           }}
           onCancel={handleCancel}
@@ -133,37 +177,76 @@ export function App() {
     case "download":
       return (
         <Download
-          onDone={() => {
-            void bridge.getStatus().then((s) => {
-              setStatus(s);
-              setScreen(nextScreen(s, config.platform));
-            });
+          onDone={() => advance()}
+          onCancel={handleCancel}
+        />
+      );
+    case "microphone":
+      return (
+        <Microphone
+          step={step!}
+          onNext={advance}
+          onCancel={handleCancel}
+        />
+      );
+    case "audio-capture":
+      return (
+        <AudioCapture
+          step={step!}
+          onNext={advance}
+          onCancel={handleCancel}
+        />
+      );
+    case "accessibility":
+      return (
+        <Accessibility
+          step={step!}
+          onNext={advance}
+          onCancel={handleCancel}
+        />
+      );
+    case "automation":
+      return (
+        <Automation
+          step={step!}
+          onNext={advance}
+          onCancel={handleCancel}
+        />
+      );
+    case "notifications":
+      return (
+        <Notifications
+          step={step!}
+          platform={config.platform}
+          onNext={advance}
+          onCancel={handleCancel}
+        />
+      );
+    case "shortcut":
+      return (
+        <Shortcut
+          step={step!}
+          onNext={(binding) => {
+            // Refresh the hotkey display so the Done screen's copy
+            // reflects the user's actual pick.
+            void bridge.getHotkey().then((h) => setHotkeyDisplay(h.display));
+            // Fallback in case getHotkey races — use the just-saved binding.
+            setHotkeyDisplay(
+              binding
+                .split("+")
+                .map((p) => (p.length === 1 ? p.toUpperCase() : titleCase(p)))
+                .join("+"),
+            );
+            setScreen("done");
           }}
           onCancel={handleCancel}
         />
       );
-    case "permissions":
-      return (
-        <Permissions
-          onDone={() => void advanceAfterPermissionsScreen()}
-          onCancel={handleCancel}
-        />
-      );
-    case "notifications-win":
-      return (
-        <NotificationsWin
-          onDone={() => setScreen("done")}
-          onCancel={handleCancel}
-        />
-      );
-    case "mic":
-      return (
-        <MicPermission
-          onGranted={() => setScreen("done")}
-          onCancel={handleCancel}
-        />
-      );
     case "done":
-      return <Done />;
+      return <Done hotkeyDisplay={hotkeyDisplay} />;
   }
+}
+
+function titleCase(s: string): string {
+  return s.charAt(0).toUpperCase() + s.slice(1);
 }

@@ -13,8 +13,11 @@ import logging
 import subprocess
 import sys
 import threading
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
+from sayzo_agent import settings_store
+from sayzo_agent.arm.hotkey import humanize_binding, validate_binding
 from sayzo_agent.config import Config
 from sayzo_agent.gui.setup.detect import detect_setup
 
@@ -23,12 +26,29 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-# Legacy deep-link kept for the MicPermission recovery screen.
-_MAC_PRIVACY_DEEPLINK = "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
+# Deep-link into the Accessibility pane — without this, the global hotkey
+# can't register while another app is focused on macOS.
+_MAC_ACCESSIBILITY_DEEPLINK = (
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+)
 
-# Marker file written when the user completes the Permissions onboarding
-# screen. Must match _PERMISSIONS_MARKER_NAME in detect.py.
+# Marker file written when the user completes the full first-run flow. Must
+# match _PERMISSIONS_MARKER_NAME in detect.py. Kept for back-compat with
+# detect.py's gate logic; the name is historical, it now signals "user
+# completed the whole setup", not just the permissions step.
 _PERMISSIONS_MARKER_NAME = ".permissions_onboarded_v1"
+
+# Bundle paths + AppleScript application names for the Automation consent
+# loop. Each installed browser surfaces its own TCC prompt the first time
+# we run an AppleScript against it.
+_BROWSER_APPLESCRIPTS: list[tuple[str, str, str]] = [
+    # (bundle path, AppleScript application name, short label for logs)
+    ("/Applications/Google Chrome.app", "Google Chrome", "chrome"),
+    ("/Applications/Safari.app", "Safari", "safari"),
+    ("/Applications/Microsoft Edge.app", "Microsoft Edge", "edge"),
+    ("/Applications/Arc.app", "Arc", "arc"),
+    ("/Applications/Brave Browser.app", "Brave Browser", "brave"),
+]
 
 
 class SetupResult(enum.Enum):
@@ -177,9 +197,113 @@ class Bridge:
 
             win_permissions.open_notification_settings()
 
+    # ---- Accessibility (macOS — needed for global hotkey) -----------
+
+    def open_accessibility_settings(self) -> dict[str, Any]:
+        """Deep-link into System Settings → Privacy & Security → Accessibility.
+
+        macOS has no programmatic grant for Accessibility — the user must
+        drag the Sayzo Agent app into the allow-list manually. We return
+        ``{"opened": True}`` on a best-effort spawn, ``{"opened": False}``
+        otherwise, so the frontend can flip its state accordingly.
+        """
+        if sys.platform != "darwin":
+            return {"opened": False}
+        try:
+            subprocess.Popen(["open", _MAC_ACCESSIBILITY_DEEPLINK])
+            return {"opened": True}
+        except OSError as e:
+            log.warning("failed to open Accessibility settings: %s", e)
+            return {"opened": False}
+
+    # ---- Automation (macOS — per-browser tab-URL read) ---------------
+
+    def prompt_automation_permission(self) -> dict[str, Any]:
+        """Fire one throwaway AppleScript per installed browser so the OS
+        surfaces the Automation TCC dialog for each.
+
+        Returns ``{"prompted": [...]}`` listing the short labels of the
+        browsers we actually hit. Empty list = no browsers installed from
+        the supported set. Spawns run in a worker thread so the bridge call
+        returns immediately — the TCC dialogs queue up serially.
+        """
+        if sys.platform != "darwin":
+            return {"prompted": []}
+        threading.Thread(
+            target=self._automation_worker,
+            name="setup-automation",
+            daemon=True,
+        ).start()
+        prompted = [
+            label for path, _app, label in _BROWSER_APPLESCRIPTS
+            if Path(path).exists()
+        ]
+        return {"prompted": prompted}
+
+    def _automation_worker(self) -> None:
+        for path, app_name, label in _BROWSER_APPLESCRIPTS:
+            if not Path(path).exists():
+                continue
+            script = (
+                f'tell application "{app_name}" to '
+                "get URL of active tab of front window"
+            )
+            try:
+                subprocess.run(
+                    ["osascript", "-e", script],
+                    capture_output=True,
+                    timeout=3.0,
+                )
+            except subprocess.TimeoutExpired:
+                log.debug("[bridge] automation probe timed out for %s", label)
+            except OSError:
+                log.debug("[bridge] osascript missing", exc_info=True)
+                return
+
+    # ---- Hotkey (persisted to user_settings.json) -------------------
+
+    def get_hotkey(self) -> dict[str, Any]:
+        """Return the saved hotkey (or the default if none) plus its
+        human-readable form for display."""
+        raw = settings_store.load(self._cfg.data_dir)
+        binding = raw.get("arm", {}).get("hotkey") or self._cfg.arm.hotkey
+        return {"binding": binding, "display": humanize_binding(binding)}
+
+    def validate_hotkey(self, binding: str) -> dict[str, Any]:
+        """Run the shared validator (rejects bare keys, OS-reserved combos).
+
+        Returns ``{"error": null}`` on success or ``{"error": "..."}``.
+        The React capture widget calls this before saving so the user gets
+        the exact same error text the tkinter widget used to show.
+        """
+        err = validate_binding(binding)
+        return {"error": err}
+
+    def save_hotkey(self, binding: str) -> dict[str, Any]:
+        """Persist the binding to ``user_settings.json``. Validated first
+        so we don't write garbage — a failed save returns the error and
+        leaves disk state untouched."""
+        err = validate_binding(binding)
+        if err is not None:
+            return {"error": err}
+        try:
+            settings_store.save(
+                self._cfg.data_dir, {"arm": {"hotkey": binding}},
+            )
+        except OSError as e:
+            log.warning("failed to save hotkey to settings", exc_info=True)
+            return {"error": f"Couldn't save: {e}"}
+        return {"error": None, "display": humanize_binding(binding)}
+
+    # ---- Setup-completion marker ------------------------------------
+
     def mark_permissions_onboarded(self) -> None:
-        """Record that the user has completed the Permissions screen so it
-        isn't shown again on subsequent launches."""
+        """Record that the user has reached the end of the first-run flow.
+
+        Written by the Done screen just before ``finish()``. The name is
+        historical — detect.py still uses ``has_permissions_onboarded`` as
+        the gate for "should we re-open the setup window next launch".
+        """
         path = self._cfg.data_dir / _PERMISSIONS_MARKER_NAME
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -190,22 +314,6 @@ class Bridge:
                 path,
                 exc_info=True,
             )
-
-    # ---- Legacy (MicPermission recovery screen) -----------------------
-
-    def open_mac_privacy_settings(self) -> None:
-        if sys.platform != "darwin":
-            return
-        try:
-            subprocess.Popen(["open", _MAC_PRIVACY_DEEPLINK])
-        except OSError as e:
-            log.warning("failed to open Privacy settings: %s", e)
-
-    def recheck_mac_permission(self) -> dict[str, Any]:
-        """Re-run detection with the audio-tap probe enabled. User-initiated
-        (clicked from the recovery MicPermission screen after they've been
-        told what the probe does), so the probe's TCC impact is acceptable."""
-        return detect_setup(self._cfg, probe_mac_permission=True).to_dict()
 
     def finish(self) -> None:
         """User clicked the success/done button. Setup is considered complete."""

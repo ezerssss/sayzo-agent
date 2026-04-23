@@ -32,7 +32,7 @@ export function Welcome({ onSignedIn, onCancel }: Props) {
     <Layout
       step="01"
       title="Welcome to Sayzo"
-      subtitle="A two-minute setup so the agent can listen, transcribe on your machine, and sync coachable moments to your account for the web app."
+      subtitle="A quick two-minute setup. Nothing records until you say so."
       footer={
         <>
           <Button variant="ghost" onClick={onCancel} disabled={busy}>
@@ -45,8 +45,8 @@ export function Welcome({ onSignedIn, onCancel }: Props) {
       }
     >
       <p className="text-sm leading-relaxed text-ink-muted">
-        Signing in opens your browser to sayzo.app so Sayzo can link this
-        machine to your account and surface coachable moments in the web app.
+        Signing in links this machine to your account so your captures
+        become coaching drills in the Sayzo web app.
       </p>
       {error && (
         <Alert className="mt-6">

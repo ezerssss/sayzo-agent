@@ -668,18 +668,17 @@ def service(force_setup: bool) -> None:
             signal.signal(signal.SIGBREAK, lambda *_: _handle_stop())
 
         # Bridge the tray thread with the asyncio loop: poll for user clicks
-        # on the Arm/Stop / Settings... / Reopen setup / Quit menu items, and
-        # push the ArmController's state back to the tray so labels and
-        # tooltip stay in sync across armings.
+        # on the Arm/Stop / Settings... / Quit menu items, and push the
+        # ArmController's state back to the tray so labels and tooltip stay
+        # in sync across armings.
         from .arm import ArmState
         from .gui.tray import Status as TrayStatus
 
-        # One-at-a-time guards — a user clicking Settings... or Reopen setup
-        # twice shouldn't spin up two tk roots in parallel. tkinter's
-        # mainloop returns when the window closes; flags are cleared from
-        # the worker thread at that point.
+        # One-at-a-time guard — a user double-clicking Settings... shouldn't
+        # spin up two tk roots in parallel. tkinter's mainloop returns when
+        # the window closes; the flag is cleared from the worker thread at
+        # that point.
         settings_open = threading.Event()
-        onboarding_open = threading.Event()
 
         def _open_settings() -> None:
             try:
@@ -690,16 +689,6 @@ def service(force_setup: bool) -> None:
                 log.warning("[tray] settings window crashed", exc_info=True)
             finally:
                 settings_open.clear()
-
-        def _open_onboarding() -> None:
-            try:
-                from .onboarding import open_onboarding_window
-
-                open_onboarding_window(cfg, agent.arm)
-            except Exception:
-                log.warning("[tray] onboarding window crashed", exc_info=True)
-            finally:
-                onboarding_open.clear()
 
         async def _tray_bridge() -> None:
             last_arm_state: ArmState | None = None
@@ -722,13 +711,6 @@ def service(force_setup: bool) -> None:
                     if not settings_open.is_set():
                         settings_open.set()
                         loop.run_in_executor(None, _open_settings)
-                # Reopen setup — open the onboarding walkthrough (bypasses
-                # the onboarding.json flag so users can revisit it any time).
-                if tray_state.reopen_setup_event.is_set():
-                    tray_state.reopen_setup_event.clear()
-                    if not onboarding_open.is_set():
-                        onboarding_open.set()
-                        loop.run_in_executor(None, _open_onboarding)
                 # Sync ArmController state → tray state.
                 cur_state = agent.arm.state
                 cur_hotkey = agent.arm.current_hotkey
