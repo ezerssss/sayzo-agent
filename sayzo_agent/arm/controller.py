@@ -430,7 +430,13 @@ class ArmController:
     # ---- whitelist watcher (runs while DISARMED) -------------------------
 
     async def _run_whitelist_watcher(self) -> None:
+        log.info(
+            "[arm] whitelist watcher started (poll=%.1fs, %d detectors)",
+            self.cfg.poll_interval_secs, len(self.cfg.detectors),
+        )
         try:
+            last_match_key: Optional[str] = None
+            last_debug_dump = 0.0
             while not self._stop.is_set():
                 try:
                     await asyncio.sleep(self.cfg.poll_interval_secs)
@@ -444,12 +450,40 @@ class ArmController:
                 except Exception:
                     log.debug("[arm] whitelist snapshot failed", exc_info=True)
                     continue
+                # One INFO-level dump per minute while disarmed so the log
+                # shows whether the watcher is actually seeing capture
+                # sessions, foreground info, etc. Critical for diagnosing
+                # "I'm in a call and no toast fired" in the field.
+                now_mono = time.monotonic()
+                if now_mono - last_debug_dump >= 60.0:
+                    last_debug_dump = now_mono
+                    holder_names = [h.process_name for h in mic.holders]
+                    log.info(
+                        "[arm] watcher poll: holders=%s fg_proc=%s is_browser=%s "
+                        "browser_windows=%d",
+                        holder_names or "[]", fg.process_name, fg.is_browser,
+                        len(fg.browser_window_titles),
+                    )
                 match = _d.match_whitelist(self.cfg.detectors, fg, mic)
                 if match is None:
+                    last_match_key = None
                     continue
                 now = time.monotonic()
+                # One-shot INFO log per match transition so field debugging
+                # doesn't require raising the global log level.
+                if match.app_key != last_match_key:
+                    log.info(
+                        "[arm] whitelist matched %s (%s) via %s",
+                        match.display_name, match.app_key, match.source,
+                    )
+                    last_match_key = match.app_key
                 if self._cooldowns.active(match.app_key, now):
+                    log.debug(
+                        "[arm] whitelist match for %s suppressed by cooldown",
+                        match.app_key,
+                    )
                     continue
+                log.info("[arm] firing consent toast for %s", match.app_key)
                 # Show consent toast.
                 result = await self._ask_consent(
                     "Sayzo is ready to coach you",
@@ -459,6 +493,7 @@ class ArmController:
                     timeout_secs=self.cfg.consent_toast_timeout_secs,
                     default_on_timeout="no",
                 )
+                log.info("[arm] consent toast for %s → %s", match.app_key, result)
                 if self.state != ArmState.DISARMED:
                     # User armed via hotkey while the toast was up. Drop.
                     continue
