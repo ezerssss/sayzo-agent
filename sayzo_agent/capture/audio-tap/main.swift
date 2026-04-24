@@ -250,12 +250,14 @@ func resolveAudioObjectsForPIDs(_ targetPIDs: [pid_t]) -> [AudioObjectID] {
     let count = Int(size) / MemoryLayout<AudioObjectID>.size
     if count == 0 { return [] }
 
-    // Step 2: list data.
+    // Step 2: list data. `baseAddress` is optional, but we just early-
+    // returned on count==0 so the buffer is non-empty — force-unwrap.
     var objects = [AudioObjectID](repeating: 0, count: count)
-    let dataStatus = objects.withUnsafeMutableBufferPointer { buf in
-        AudioObjectGetPropertyData(
+    let dataStatus: OSStatus = objects.withUnsafeMutableBufferPointer { buf in
+        guard let base = buf.baseAddress else { return OSStatus(-1) }
+        return AudioObjectGetPropertyData(
             AudioObjectID(kAudioObjectSystemObject),
-            &addrList, 0, nil, &size, buf.baseAddress
+            &addrList, 0, nil, &size, base
         )
     }
     if dataStatus != noErr {
