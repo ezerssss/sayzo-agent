@@ -61,6 +61,17 @@ def get_browser_window_titles() -> list[str]:
     return []
 
 
+def get_browser_window_urls() -> list[str]:
+    """macOS: stub. The foreground browser's active-tab URL is already
+    populated on ``ForegroundInfo.browser_tab_url`` via AppleScript in
+    ``get_foreground_info``. Enumerating URLs of every window of every
+    browser would require the same per-browser Automation permission plus
+    multiple osascript spawns per poll — deferred until a macOS user
+    reports an Alt+Tab-equivalent mis-match.
+    """
+    return []
+
+
 def is_mic_active() -> bool:
     """Is any process currently capturing from the default input device?
 

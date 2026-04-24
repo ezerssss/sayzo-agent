@@ -36,6 +36,12 @@ from sayzo_agent.gui.settings_window import (
         "https://zoom.us/j/1234567890?pwd=xyz",
         ("zoom.us", "/j/1234567890"),
     ),
+    # Bare domains: host-only input is accepted with an empty path. Non-strict
+    # ``_url_pattern`` discards the path anyway, so the whole-host match works;
+    # ``_submit_web`` is responsible for rejecting strict+empty-path at submit.
+    ("chatgpt.com", ("chatgpt.com", "")),
+    ("https://example.com", ("example.com", "")),
+    ("https://example.com/", ("example.com", "")),
 ])
 def test_parse_valid_urls(url: str, expected: tuple[str, str]):
     assert _parse_meeting_url(url) == expected
@@ -45,8 +51,6 @@ def test_parse_valid_urls(url: str, expected: tuple[str, str]):
     "",  # empty
     "not a url",  # no scheme / no dots
     "https://",  # empty host
-    "https://example.com",  # no path
-    "https://example.com/",  # root path
     "/just/a/path",  # no host
 ])
 def test_parse_rejects_invalid(url: str):

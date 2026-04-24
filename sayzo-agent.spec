@@ -179,13 +179,15 @@ if sys.platform == "win32":
         "win32process",
         "win32api",
     ]
-    # arm/platform_win.py imports pycaw + comtypes inside function bodies
-    # (try/except guarded) so PyInstaller's static scanner can't see them.
-    # Use collect_submodules to pull the whole package tree — comtypes has
-    # dynamic runtime codegen and pycaw.pycaw imports several submodules
-    # via pycaw.api.* which collect_submodules walks automatically.
+    # arm/platform_win.py imports pycaw + comtypes + uiautomation inside
+    # function bodies (try/except guarded) so PyInstaller's static scanner
+    # can't see them. Use collect_submodules to pull the whole package
+    # tree — comtypes has dynamic runtime codegen, pycaw.pycaw imports
+    # several submodules via pycaw.api.*, and uiautomation lazy-imports
+    # its generated UIA type-library bindings.
     hiddenimports += collect_submodules("pycaw")
     hiddenimports += collect_submodules("comtypes")
+    hiddenimports += collect_submodules("uiautomation")
 
 # macOS-specific
 if sys.platform == "darwin":

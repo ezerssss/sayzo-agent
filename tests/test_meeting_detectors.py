@@ -340,3 +340,122 @@ def test_arm_app_still_holding_ignores_disabled_flag():
     fg = ForegroundInfo(process_name="zoom.exe")
     mic = MicState(holders=[MicHolder("zoom.exe", 1234)])
     assert arm_app_still_holding_mic("zoom", specs, mic, fg) is True
+
+
+# ---- user-added URL detectors (Settings → Web tab) ---------------------
+#
+# These mirror the spec shape produced by ``_submit_web`` in
+# ``gui/settings_window.py``: ``is_browser=True`` + ``url_patterns`` only,
+# NO ``title_patterns``. Before v1.5.0 the foreground tab URL was always
+# ``None`` on Windows (no UIA read), so these specs could never match and
+# custom URLs pasted in Settings silently did nothing. With
+# ``platform_win.get_browser_tab_url`` populating ``browser_tab_url`` +
+# ``browser_window_urls``, the matcher should now find them.
+
+
+def _custom_url_specs(pattern: str) -> list[DetectorSpec]:
+    return [
+        DetectorSpec(
+            app_key="custom_site",
+            display_name="Custom Site",
+            is_browser=True,
+            url_patterns=[pattern],
+        ),
+    ]
+
+
+def test_custom_url_spec_matches_via_foreground_tab_url():
+    """The ``_submit_web`` regex ``^https://chatgpt\\.com/`` matches when
+    the foreground browser's active tab URL is populated."""
+    specs = _custom_url_specs(r"^https://chatgpt\.com/")
+    fg = ForegroundInfo(
+        process_name="chrome.exe",
+        is_browser=True,
+        browser_tab_url="https://chatgpt.com/c/abc-123",
+    )
+    mic = MicState(holders=[MicHolder("chrome.exe", 9999)])
+    r = match_whitelist(specs, fg, mic)
+    assert r is not None
+    assert r.app_key == "custom_site"
+    assert r.source == "browser_mic_plus_url"
+
+
+def test_custom_url_spec_matches_via_background_browser_window_url():
+    """User Alt+Tab'd away from the browser during a voice chat. Chrome
+    still holds the mic, and one of the visible Chrome windows has the
+    matching URL. The matcher should walk ``browser_window_urls``."""
+    specs = _custom_url_specs(r"^https://chatgpt\.com/")
+    fg = ForegroundInfo(
+        process_name="WindowsTerminal.exe",
+        is_browser=False,
+        browser_window_urls=(
+            "https://news.ycombinator.com/",
+            "https://chatgpt.com/c/xyz",
+        ),
+    )
+    mic = MicState(holders=[MicHolder("chrome.exe", 9999)])
+    r = match_whitelist(specs, fg, mic)
+    assert r is not None
+    assert r.app_key == "custom_site"
+    assert r.source == "browser_mic_plus_url"
+
+
+def test_custom_url_spec_no_match_when_urls_and_titles_absent():
+    """Pre-v1.5 behavior under a UIA failure: no URL read, no title
+    pattern. The custom spec can't match — caller should surface the
+    unmatched mic-holder in seen-apps instead of firing a wrong toast.
+    """
+    specs = _custom_url_specs(r"^https://chatgpt\.com/")
+    fg = ForegroundInfo(
+        process_name="chrome.exe",
+        is_browser=True,
+        browser_tab_url=None,
+        window_title="ChatGPT - Google Chrome",  # title has no URL — can't match
+    )
+    mic = MicState(holders=[MicHolder("chrome.exe", 9999)])
+    assert match_whitelist(specs, fg, mic) is None
+
+
+def test_custom_strict_url_spec_matches_exact_meeting_only():
+    """``_submit_web`` strict mode bakes the path into the regex (e.g.
+    ``^https://example\\.com/room/42$``). The matcher should match only
+    that exact URL — navigating to a different room breaks the match."""
+    specs = _custom_url_specs(r"^https://example\.com/room/42")
+    mic = MicState(holders=[MicHolder("chrome.exe", 9999)])
+
+    fg_correct = ForegroundInfo(
+        process_name="chrome.exe", is_browser=True,
+        browser_tab_url="https://example.com/room/42",
+    )
+    r = match_whitelist(specs, fg_correct, mic)
+    assert r is not None and r.app_key == "custom_site"
+
+    fg_other_room = ForegroundInfo(
+        process_name="chrome.exe", is_browser=True,
+        browser_tab_url="https://example.com/room/99",
+    )
+    assert match_whitelist(specs, fg_other_room, mic) is None
+
+
+def test_custom_url_spec_arm_app_still_holding_via_window_urls():
+    """Meeting-ended watcher: a custom URL spec should stay ``True`` as
+    long as a browser still has the mic AND any browser window URL still
+    matches the spec. Mirrors the fg-away case above."""
+    specs = _custom_url_specs(r"^https://chatgpt\.com/")
+    fg = ForegroundInfo(
+        process_name="WindowsTerminal.exe",
+        is_browser=False,
+        browser_window_urls=("https://chatgpt.com/c/xyz",),
+    )
+    mic = MicState(holders=[MicHolder("chrome.exe", 9999)])
+    assert arm_app_still_holding_mic("custom_site", specs, mic, fg) is True
+
+    # And goes False the moment the tab navigates away.
+    fg_elsewhere = ForegroundInfo(
+        process_name="WindowsTerminal.exe",
+        is_browser=False,
+        browser_window_urls=("https://news.ycombinator.com/",),
+    )
+    assert arm_app_still_holding_mic(
+        "custom_site", specs, mic, fg_elsewhere,
+    ) is False

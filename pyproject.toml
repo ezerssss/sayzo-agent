@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sayzo-agent"
-version = "1.4.2"
+version = "1.5.0"
 description = "Armed-only capture agent for Sayzo — records meetings on user consent (hotkey or whitelisted meeting app) and feeds them to downstream English-coaching analysis."
 requires-python = ">=3.10"
 dependencies = [
@@ -46,6 +46,12 @@ dependencies = [
     # window via Win32.
     "pycaw>=20240210; sys_platform == 'win32'",
     "pywin32>=306; sys_platform == 'win32'",
+    # Windows: active-browser-tab URL read via UIAutomation. Used by
+    # platform_win.get_browser_tab_url / get_browser_window_urls so
+    # user-added web meeting URLs (custom detectors) actually match
+    # without needing hand-authored title regex fallbacks. Pure-Python
+    # comtypes wrapper; comtypes itself is already pulled in by pycaw.
+    "uiautomation>=2.0; sys_platform == 'win32'",
     # macOS: mic-active query via CoreAudio, frontmost app via NSWorkspace.
     "pyobjc-framework-Cocoa>=10.0; sys_platform == 'darwin'",
     "pyobjc-framework-CoreAudio>=10.0; sys_platform == 'darwin'",

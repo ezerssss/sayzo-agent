@@ -1992,7 +1992,13 @@ class _AddAppDialog:
             self._web_preview_var.set("⚠️  That doesn't look like a meeting URL.")
         else:
             host, path = parsed
-            if self._web_strict_var.get() and path:
+            strict = self._web_strict_var.get()
+            if strict and not path:
+                self._web_preview_var.set(
+                    "⚠️  Strict match needs a path — paste a full meeting "
+                    "URL, or uncheck “Only match this exact meeting”."
+                )
+            elif strict:
                 self._web_preview_var.set(f"{host}{path} — this exact meeting only")
             else:
                 self._web_preview_var.set(f"{host}/… — any meeting on this site")
@@ -2096,11 +2102,24 @@ class _AddAppDialog:
         url = self._web_url_var.get().strip()
         parsed = _parse_meeting_url(url)
         if parsed is None:
-            self._web_status_var.set("That doesn't look like a meeting URL — it should start with https:// and have a site and a meeting path.")
+            self._web_status_var.set(
+                "That doesn't look like a URL — it should have a site like "
+                "chatgpt.com or meet.google.com/abc-defg-hij."
+            )
             return
         host, path = parsed
-        name = self._web_name_var.get().strip() or _display_name_from_host(host)
         strict = bool(self._web_strict_var.get())
+        if strict and not path:
+            # Strict without a path would just build the non-strict pattern
+            # and mislabel it "this exact meeting only" — reject so the user
+            # can either paste the full URL or uncheck strict.
+            self._web_status_var.set(
+                "“Only match this exact meeting” needs a URL with a path "
+                "(e.g. /j/1234567890). Paste the full meeting URL, or "
+                "uncheck that option to match the whole site."
+            )
+            return
+        name = self._web_name_var.get().strip() or _display_name_from_host(host)
         pattern = _url_pattern(host, path, strict=strict)
         key_seed = host + (path if strict else "")
         spec = DetectorSpec(
@@ -2167,9 +2186,12 @@ def _unique_app_key(seed: str, taken: list[str]) -> str:
 def _parse_meeting_url(url: str) -> Optional[tuple[str, str]]:
     """Extract ``(host, path)`` from a user-pasted meeting URL.
 
-    Returns ``None`` if the URL doesn't have both a netloc and a non-empty
-    path — we don't want to match the root domain of a big site like
-    ``chrome.google.com`` as "every page on Google is a meeting".
+    Returns ``None`` only when the URL has no usable host (empty string,
+    ``https://`` with nothing after it, a path-only input like
+    ``/just/a/path``). Bare domains like ``chatgpt.com`` are accepted and
+    returned as ``(host, "")`` — the caller decides how to treat an empty
+    path (non-strict matches the whole host either way; strict needs a
+    path and should reject an empty one at submit time).
     """
     if not url:
         return None
@@ -2184,8 +2206,8 @@ def _parse_meeting_url(url: str) -> Optional[tuple[str, str]]:
     if not host or "." not in host:
         return None
     path = parsed.path or ""
-    if not path or path == "/":
-        return None
+    if path == "/":
+        path = ""
     # Strip trailing slash for consistent regex building.
     if path.endswith("/"):
         path = path.rstrip("/")

@@ -61,6 +61,14 @@ class ForegroundInfo:
     # enumeration without per-window Apple Events).
     browser_window_titles: tuple[str, ...] = field(default_factory=tuple)
 
+    # Active-tab URLs for every visible browser window (Windows: read via
+    # UIAutomation in ``platform_win.get_browser_window_urls``). Parallel
+    # to ``browser_window_titles`` — needed so user-added URL detectors
+    # (which only ship ``url_patterns``, no title_patterns) still match
+    # when the browser isn't foreground. Empty on macOS: the active-tab
+    # URL already populates ``browser_tab_url`` via AppleScript.
+    browser_window_urls: tuple[str, ...] = field(default_factory=tuple)
+
 
 @dataclass(frozen=True)
 class MicHolder:
@@ -164,6 +172,27 @@ def _collect_browser_titles(foreground: ForegroundInfo) -> list[str]:
     return out
 
 
+def _collect_browser_urls(foreground: ForegroundInfo) -> list[str]:
+    """Flatten the foreground tab URL + every background browser window
+    URL into a deduped list. Used by browser-spec matching so url_patterns
+    can hit either the foreground (user's active tab) or an Alt+Tab'd
+    background browser window that's holding the mic.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for u in (
+        foreground.browser_tab_url,
+        *foreground.browser_window_urls,
+    ):
+        if not u:
+            continue
+        if u in seen:
+            continue
+        seen.add(u)
+        out.append(u)
+    return out
+
+
 def match_whitelist(
     specs: list[DetectorSpec],
     foreground: ForegroundInfo,
@@ -236,12 +265,12 @@ def match_whitelist(
     # can Alt+Tab to a terminal during a Meet call and we still want to
     # attribute the mic-hold to the right browser spec.
     if _browser_holds_mic(mic, foreground):
-        url = foreground.browser_tab_url or ""
+        urls = _collect_browser_urls(foreground)
         titles = _collect_browser_titles(foreground)
         for spec in active_specs:
             if not spec.is_browser:
                 continue
-            if _browser_spec_matches(spec, url, titles):
+            if _browser_spec_matches(spec, urls, titles):
                 return MatchResult(
                     app_key=spec.app_key,
                     display_name=spec.display_name,
@@ -251,18 +280,26 @@ def match_whitelist(
     return None
 
 
-def _browser_spec_matches(spec: DetectorSpec, url: str, titles: list[str]) -> bool:
-    """True if ``spec`` matches either the URL or any of the titles.
+def _browser_spec_matches(
+    spec: DetectorSpec, urls: list[str], titles: list[str],
+) -> bool:
+    """True if ``spec`` matches any of ``urls`` (preferred) or ``titles``.
 
-    URL patterns are tried against ``url`` first and also against the titles
-    as a legacy fallback (some macOS configs populate tab titles with the
-    URL string when Automation permission was denied). ``title_patterns``
-    are title-only — they're how Windows matches without a URL at all.
+    URL patterns are tried against ``urls`` first — that's the reliable
+    signal when UIA / AppleScript can read the active tab. They're also
+    tried against ``titles`` as a legacy fallback (some macOS configs
+    populate tab titles with the URL string when Automation permission
+    was denied, and a minority of users set browser flags that put the
+    full URL in the window title). ``title_patterns`` are title-only —
+    that's how Windows matches the ship-with Meet/Zoom-web specs when
+    UIA can't read the omnibox (minimized-to-tray, PWA-mode windows,
+    etc.).
     """
     for pattern in spec.url_patterns:
         rx = _compile(pattern)
-        if url and rx.search(url):
-            return True
+        for u in urls:
+            if rx.search(u):
+                return True
         for t in titles:
             if rx.search(t):
                 return True
@@ -313,6 +350,6 @@ def arm_app_still_holding_mic(
     # ``match_whitelist``'s Pass 3.
     if not _browser_holds_mic(mic, foreground):
         return False
-    url = foreground.browser_tab_url or ""
+    urls = _collect_browser_urls(foreground)
     titles = _collect_browser_titles(foreground)
-    return _browser_spec_matches(spec, url, titles)
+    return _browser_spec_matches(spec, urls, titles)
