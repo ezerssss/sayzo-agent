@@ -60,6 +60,48 @@ _MAGIC = b"SAYZ"
 _HEADER_SIZE = 16  # 4 magic + 8 Float64 ts + 4 UInt32 byte count
 
 
+def _expand_pid_tree(seed_pids: tuple[int, ...]) -> tuple[int, ...]:
+    """Return seed PIDs + all their recursive descendants via psutil.
+
+    macOS parity with Windows' ``PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE``.
+    Without this, Electron apps (Discord, Slack, Teams) route audio through
+    renderer / helper sub-processes and the per-app tap would silently miss
+    their audio.
+
+    Best-effort: processes that have died between enumeration and expansion,
+    or that we don't have permission to inspect, are silently dropped — the
+    seed PIDs themselves still get included.
+    """
+    if not seed_pids:
+        return ()
+    pids: set[int] = set()
+    try:
+        import psutil
+    except Exception:
+        log.debug("psutil unavailable — returning seed PIDs without expansion")
+        return tuple(sorted(p for p in seed_pids if p > 0))
+
+    for pid in seed_pids:
+        if pid <= 0:
+            continue
+        pids.add(pid)
+        try:
+            proc = psutil.Process(pid)
+        except Exception:
+            continue
+        try:
+            for child in proc.children(recursive=True):
+                try:
+                    cpid = int(child.pid)
+                    if cpid > 0:
+                        pids.add(cpid)
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return tuple(sorted(pids))
+
+
 def _find_audio_tap() -> str:
     """Locate the ``audio-tap`` binary, raising FileNotFoundError if absent."""
     # 1. Next to this file (package_data install / dev checkout).
@@ -96,10 +138,13 @@ class SystemCapture:
         frame_ms: int = 20,
         device: str | None = None,
         queue_maxsize: int = 200,
+        *,
+        system_scope: str = "arm_app",
     ) -> None:
         self.sample_rate = sample_rate
         self.frame_samples = int(sample_rate * frame_ms / 1000)
         self.frame_duration = self.frame_samples / sample_rate
+        self.system_scope = system_scope  # "arm_app" | "endpoint"
         self.queue: asyncio.Queue[tuple[float, np.ndarray]] = asyncio.Queue(maxsize=queue_maxsize)
 
         if device is not None:
@@ -122,17 +167,48 @@ class SystemCapture:
         self._proc: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task | None = None
         self._stderr_task: asyncio.Task | None = None
+        self._target_pids: tuple[int, ...] = ()
 
     # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
 
-    async def start(self) -> None:
+    async def start(self, *, target_pids: tuple[int, ...] = ()) -> None:
+        """Spawn the audio-tap helper.
+
+        ``target_pids``: when non-empty, expanded via
+        ``psutil.Process.children(recursive=True)`` to include descendant
+        helper processes (mirrors Windows' ``INCLUDE_TARGET_PROCESS_TREE``
+        so Electron apps like Discord, which route audio through helper
+        renderers, work out of the box) and passed to the Swift helper as
+        ``--pids``. Empty list ⇒ global tap (today's behavior).
+        """
         binary = _find_audio_tap()
-        log.info("starting audio-tap: %s", binary)
+        # Safety-valve opt-out: user set system_scope=endpoint to force the
+        # pre-v1.7.0 global-tap behavior.
+        if self.system_scope == "endpoint" and target_pids:
+            log.info(
+                "system capture: system_scope=endpoint — ignoring target_pids=%s "
+                "and using global tap per config",
+                ",".join(str(p) for p in target_pids),
+            )
+            target_pids = ()
+        expanded = _expand_pid_tree(target_pids)
+        self._target_pids = expanded
+        args = [binary]
+        if expanded:
+            args.extend(["--pids", ",".join(str(p) for p in expanded)])
+            log.info(
+                "starting audio-tap: %s --pids %s (from %d seed PID(s), "
+                "expanded to %d incl. descendants)",
+                binary, ",".join(str(p) for p in expanded),
+                len(target_pids), len(expanded),
+            )
+        else:
+            log.info("starting audio-tap: %s", binary)
 
         self._proc = await asyncio.create_subprocess_exec(
-            binary,
+            *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )

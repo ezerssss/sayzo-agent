@@ -437,6 +437,69 @@ def test_custom_strict_url_spec_matches_exact_meeting_only():
     assert match_whitelist(specs, fg_other_room, mic) is None
 
 
+# ---- target_pids population --------------------------------------------
+#
+# Per-app system-audio capture (v1.7.0) scopes the system loopback to the
+# PIDs that matched the whitelist. On Windows those PIDs come from
+# ``mic.holders`` inline; on macOS the ArmController resolves them via a
+# platform helper (psutil + NSWorkspace).
+
+
+def test_zoom_match_carries_holder_pid():
+    """Windows desktop match: ``target_pids`` = Zoom's PID from mic.holders."""
+    fg = ForegroundInfo(process_name="zoom.exe")
+    mic = MicState(holders=[MicHolder("zoom.exe", 1234)])
+    r = match_whitelist(SPECS, fg, mic)
+    assert r is not None
+    assert r.target_pids == (1234,)
+
+
+def test_zoom_match_carries_all_matching_holder_pids():
+    """Multiple Zoom processes (main + CptHost) → all PIDs."""
+    fg = ForegroundInfo(process_name="zoom.exe")
+    mic = MicState(holders=[
+        MicHolder("zoom.exe", 1234),
+        MicHolder("CptHost.exe", 4321),
+        MicHolder("unrelated.exe", 9999),  # shouldn't appear
+    ])
+    r = match_whitelist(SPECS, fg, mic)
+    assert r is not None
+    assert r.target_pids == (1234, 4321)
+
+
+def test_gmeet_match_carries_browser_holder_pid():
+    """Browser match: ``target_pids`` = PIDs of browser process(es) holding
+    the mic. Per-tab scoping isn't possible (known limitation)."""
+    fg = ForegroundInfo(
+        process_name="chrome.exe",
+        is_browser=True,
+        browser_tab_url="https://meet.google.com/abc-defg-hij",
+    )
+    mic = MicState(holders=[
+        MicHolder("chrome.exe", 1111),
+        MicHolder("spotify.exe", 2222),  # not a browser, must not be included
+    ])
+    r = match_whitelist(SPECS, fg, mic)
+    assert r is not None
+    assert r.app_key == "gmeet"
+    assert r.target_pids == (1111,)
+
+
+def test_macos_proxy_match_has_empty_target_pids():
+    """macOS proxy path can't attribute PIDs inline (``mic.holders=[]``);
+    the ArmController resolves them via a platform helper before arming.
+    The MatchResult itself comes back with an empty tuple."""
+    fg = ForegroundInfo(bundle_id="us.zoom.xos")
+    mic = MicState(
+        active=True,
+        running_processes=frozenset({"us.zoom.xos"}),
+    )
+    r = match_whitelist(SPECS, fg, mic)
+    assert r is not None
+    assert r.source == "mic_active_plus_running"
+    assert r.target_pids == ()
+
+
 def test_custom_url_spec_arm_app_still_holding_via_window_urls():
     """Meeting-ended watcher: a custom URL spec should stay ``True`` as
     long as a browser still has the mic AND any browser window URL still

@@ -1,5 +1,19 @@
-// audio-tap — Capture all system audio via CoreAudio Process Taps (macOS 14.4+),
+// audio-tap — Capture system audio via CoreAudio Process Taps (macOS 14.4+),
 // pipe timestamp-framed PCM to stdout.
+//
+// CLI:
+//   audio-tap                          # tap ALL system audio (global tap)
+//   audio-tap --pids 1234,5678         # tap ONLY audio from listed PIDs
+//                                       # (include-mode, per-process)
+//
+// When --pids is specified, the helper enumerates
+// `kAudioHardwarePropertyProcessObjectList`, maps each AudioObjectID to its
+// PID via `kAudioProcessPropertyPID`, and passes the matching AudioObjectIDs
+// into `CATapDescription(monoMixdownOfProcesses:)`. PIDs that have no
+// matching audio-process object yet (e.g. app hasn't produced audio since
+// launch) are skipped. If NONE of the requested PIDs resolve to an audio
+// object, the helper logs a WARNING to stderr and falls back to a global
+// tap so the caller doesn't end up with a silent capture.
 //
 // Wire protocol (new in protocol version 1): each capture block is written as
 //
@@ -21,7 +35,7 @@
 //   swiftc -O -o audio-tap main.swift \
 //       -framework CoreAudio -framework AudioToolbox -framework AVFoundation
 //
-// Test:
+// Test (global tap):
 //   ./audio-tap | python3 -c 'import sys, struct
 //       while True:
 //           h = sys.stdin.buffer.read(16)
@@ -29,6 +43,9 @@
 //           magic, ts, n = h[:4], struct.unpack("<d", h[4:12])[0], struct.unpack("<I", h[12:16])[0]
 //           pcm = sys.stdin.buffer.read(n)
 //           print(magic, ts, n, len(pcm))'
+//
+// Test (per-app):
+//   ./audio-tap --pids $(pgrep -x "zoom.us")
 //
 // Why CoreAudio taps (not ScreenCaptureKit): the tap permission prompt is
 // audio-only ("Audio Capture") instead of the alarming "Screen Recording"
@@ -174,6 +191,117 @@ func die(_ msg: String, code: Int32 = 1) -> Never {
     exit(code)
 }
 
+// Parse `--pids 1234,5678` out of the CLI args. Returns an empty array when
+// the flag is absent or malformed — the caller then falls through to the
+// global-tap path. Any unparseable entry in the comma list is skipped with a
+// stderr warning, not fatal.
+func parseTargetPIDs() -> [pid_t] {
+    let args = CommandLine.arguments
+    guard let flagIdx = args.firstIndex(of: "--pids"), flagIdx + 1 < args.count else {
+        return []
+    }
+    let raw = args[flagIdx + 1]
+    var result: [pid_t] = []
+    for part in raw.split(separator: ",") {
+        let trimmed = part.trimmingCharacters(in: .whitespaces)
+        if trimmed.isEmpty { continue }
+        if let pid = pid_t(trimmed) {
+            result.append(pid)
+        } else {
+            fputs("audio-tap: ignoring unparseable pid token \"\(trimmed)\"\n", stderr)
+        }
+    }
+    return result
+}
+
+// Enumerate every process audio object currently known to CoreAudio, keep
+// the ones whose PID is in `targetPIDs`. Returns the matched AudioObjectIDs
+// in the order they were reported by CoreAudio (order doesn't matter for the
+// tap mixdown, we just need the set).
+//
+// Returns an empty array if:
+// - `kAudioHardwarePropertyProcessObjectList` read fails (macOS ABI change?
+//   permission revoked?)
+// - None of the requested PIDs is currently producing audio (e.g. user just
+//   launched Zoom and it hasn't hit the speakers yet).
+// Caller falls back to global tap in that case; we log to stderr either way.
+func resolveAudioObjectsForPIDs(_ targetPIDs: [pid_t]) -> [AudioObjectID] {
+    if targetPIDs.isEmpty { return [] }
+    let wanted = Set(targetPIDs)
+
+    // Step 1: list size.
+    var addrList = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyProcessObjectList,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var size: UInt32 = 0
+    let sizeStatus = AudioObjectGetPropertyDataSize(
+        AudioObjectID(kAudioObjectSystemObject), &addrList, 0, nil, &size
+    )
+    if sizeStatus != noErr {
+        fputs(
+            "audio-tap: process-object list size query failed (OSStatus \(sizeStatus)); "
+                + "falling back to global tap\n",
+            stderr
+        )
+        return []
+    }
+    let count = Int(size) / MemoryLayout<AudioObjectID>.size
+    if count == 0 { return [] }
+
+    // Step 2: list data.
+    var objects = [AudioObjectID](repeating: 0, count: count)
+    let dataStatus = objects.withUnsafeMutableBufferPointer { buf in
+        AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &addrList, 0, nil, &size, buf.baseAddress
+        )
+    }
+    if dataStatus != noErr {
+        fputs(
+            "audio-tap: process-object list read failed (OSStatus \(dataStatus)); "
+                + "falling back to global tap\n",
+            stderr
+        )
+        return []
+    }
+
+    // Step 3: for each object, read its PID and keep matching ones.
+    var addrPID = AudioObjectPropertyAddress(
+        mSelector: kAudioProcessPropertyPID,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var matched: [AudioObjectID] = []
+    for obj in objects {
+        var pid: pid_t = 0
+        var pidSize: UInt32 = UInt32(MemoryLayout<pid_t>.size)
+        let pidStatus = AudioObjectGetPropertyData(
+            obj, &addrPID, 0, nil, &pidSize, &pid
+        )
+        if pidStatus != noErr { continue }
+        if wanted.contains(pid) {
+            matched.append(obj)
+        }
+    }
+
+    if matched.isEmpty {
+        fputs(
+            "audio-tap: none of the requested PIDs (\(targetPIDs)) currently "
+                + "have an audio-process object — falling back to global tap\n",
+            stderr
+        )
+    } else {
+        fputs(
+            "audio-tap: per-app scope: matched \(matched.count) audio objects "
+                + "out of \(targetPIDs.count) requested PIDs\n",
+            stderr
+        )
+    }
+    return matched
+}
+
 // Read the tap's native audio stream format — the format IO proc will deliver.
 func readTapStreamFormat(_ tapID: AudioObjectID) -> AudioStreamBasicDescription? {
     var asbd = AudioStreamBasicDescription()
@@ -212,9 +340,33 @@ func installSignalHandlers() {
 func run() {
     installSignalHandlers()
 
-    // 1. System-wide mono tap. Empty exclusion list: this binary produces no
-    //    audio output, so including it in the global tap is a no-op.
-    let tapDesc = CATapDescription(monoGlobalTapButExcludeProcesses: [])
+    // 1. Decide between per-process (include-mode) and global tap.
+    //
+    //    `--pids` specified AND we successfully resolved at least one PID
+    //    to an audio-process object → include-mode mono tap of just those
+    //    objects. This is what enables "capture Zoom, ignore Spotify".
+    //
+    //    Otherwise (no --pids, or zero matches) → global mono tap with an
+    //    empty exclusion list (our binary doesn't produce audio output so
+    //    excluding nothing is fine).
+    let targetPIDs = parseTargetPIDs()
+    let matchedObjects = resolveAudioObjectsForPIDs(targetPIDs)
+    let tapDesc: CATapDescription
+    if !matchedObjects.isEmpty {
+        tapDesc = CATapDescription(monoMixdownOfProcesses: matchedObjects)
+        fputs(
+            "audio-tap: tapping \(matchedObjects.count) process(es) "
+                + "(pids=\(targetPIDs))\n",
+            stderr
+        )
+    } else {
+        tapDesc = CATapDescription(monoGlobalTapButExcludeProcesses: [])
+        if !targetPIDs.isEmpty {
+            fputs("audio-tap: per-app scope requested but no matches — using global tap\n", stderr)
+        } else {
+            fputs("audio-tap: using global tap\n", stderr)
+        }
+    }
     tapDesc.uuid = UUID()
     tapDesc.muteBehavior = .unmuted
 

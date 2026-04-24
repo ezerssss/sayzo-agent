@@ -19,7 +19,8 @@ import sys
 import time
 from typing import Optional
 
-from .detectors import ForegroundInfo, MicHolder
+from ..config import DetectorSpec
+from .detectors import BROWSER_PROCESS_NAMES, ForegroundInfo, MicHolder
 
 log = logging.getLogger(__name__)
 
@@ -46,6 +47,89 @@ def get_mic_holders() -> list[MicHolder]:
     ``is_mic_active`` + ``get_running_processes`` + ``get_foreground_info`` for
     the ``mic_active_plus_running`` match source."""
     return []
+
+
+# Known browser bundle ids. Used by ``resolve_pids_for_spec`` for browser
+# specs so per-app system-audio capture can scope to the browser's PID tree
+# even though we couldn't attribute the mic-hold to a specific browser.
+# Parallel to ``detectors.BROWSER_PROCESS_NAMES`` (which covers Windows
+# process executable names).
+_BROWSER_BUNDLE_IDS = frozenset(_BROWSER_BUNDLES.keys())
+
+
+def resolve_pids_for_spec(spec: "DetectorSpec") -> tuple[int, ...]:
+    """Enumerate PIDs currently matching ``spec`` via psutil + NSWorkspace.
+
+    Used on macOS (where ``MicHolder.pid`` is unavailable) to populate
+    ``ArmReason.target_pids`` before arming. For browser specs we return
+    the PIDs of every running browser process — per-tab scoping isn't
+    possible without a browser extension, so all tabs in that browser's
+    PID tree will be captured.
+
+    Empty tuple on any error — caller treats empty as "fall back to
+    endpoint-wide capture".
+    """
+    if sys.platform != "darwin":
+        return ()
+
+    pids: set[int] = set()
+    target_bundles: set[str]
+    target_names: set[str]
+    if spec.is_browser:
+        target_bundles = {b.lower() for b in _BROWSER_BUNDLE_IDS}
+        target_names = {n.lower() for n in BROWSER_PROCESS_NAMES}
+    else:
+        target_bundles = {b.lower() for b in spec.bundle_ids}
+        target_names = {p.lower() for p in spec.process_names}
+
+    # NSWorkspace: bundle id → PID (cheap; already in-process).
+    if target_bundles:
+        try:
+            from AppKit import NSWorkspace  # type: ignore[import-not-found]
+            ws = NSWorkspace.sharedWorkspace()
+            for app in ws.runningApplications():
+                try:
+                    bid = app.bundleIdentifier()
+                    if not bid:
+                        continue
+                    if str(bid).lower() not in target_bundles:
+                        continue
+                    pid = int(app.processIdentifier() or 0)
+                    if pid > 0:
+                        pids.add(pid)
+                except Exception:
+                    continue
+        except Exception:
+            log.debug(
+                "[arm.mac] NSWorkspace PID enumeration failed for %s",
+                spec.app_key,
+                exc_info=True,
+            )
+
+    # psutil fallback: process name → PID. Catches non-bundled CLI-style
+    # helpers (e.g. zoom auxiliary processes) that NSWorkspace doesn't
+    # surface as NSRunningApplication entries.
+    if target_names:
+        try:
+            import psutil
+            for p in psutil.process_iter(["pid", "name"]):
+                try:
+                    name = (p.info.get("name") or "").lower()
+                    if not name or name not in target_names:
+                        continue
+                    pid = int(p.info.get("pid") or p.pid or 0)
+                    if pid > 0:
+                        pids.add(pid)
+                except Exception:
+                    continue
+        except Exception:
+            log.debug(
+                "[arm.mac] psutil PID enumeration failed for %s",
+                spec.app_key,
+                exc_info=True,
+            )
+
+    return tuple(sorted(pids))
 
 
 def get_browser_window_titles() -> list[str]:

@@ -49,15 +49,20 @@ class SystemCapture:
         frame_ms: int = 20,
         device: str | None = None,
         queue_maxsize: int = 200,
+        *,
+        system_scope: str = "arm_app",
     ) -> None:
         self.sample_rate = sample_rate
         self.frame_samples = int(sample_rate * frame_ms / 1000)
         self.frame_duration = self.frame_samples / sample_rate
         self.device_name = device
+        self.system_scope = system_scope  # "arm_app" | "endpoint"
         self.queue: asyncio.Queue[tuple[float, np.ndarray]] = asyncio.Queue(maxsize=queue_maxsize)
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
+        self._target_pids: tuple[int, ...] = ()
+        self._process_loopback = None  # filled when per-app capture wins
 
     def _find_loopback_device(self, pa: pyaudio.PyAudio) -> dict:
         """Find the WASAPI loopback device for the default speakers."""
@@ -216,16 +221,93 @@ class SystemCapture:
             pa.terminate()
             log.info("system capture stopped")
 
-    async def start(self) -> None:
+    async def start(self, *, target_pids: tuple[int, ...] = ()) -> None:
+        """Start system-audio capture.
+
+        ``target_pids``: when non-empty, scope the loopback to those
+        processes via WASAPI process loopback (requires Windows 10 2004 /
+        build 19041). On activation failure (older OS, COM init error,
+        PID no longer exists, etc.) we log a warning and fall back to
+        endpoint-wide capture so the user doesn't lose audio.
+
+        Empty / None target_pids ⇒ today's endpoint-wide loopback.
+        """
         self._loop = asyncio.get_running_loop()
         self._stop.clear()
+        # Safety-valve opt-out: user set system_scope=endpoint to force the
+        # pre-v1.7.0 behavior (e.g. per-app capture misbehaving on their box).
+        if self.system_scope == "endpoint" and target_pids:
+            log.info(
+                "system capture: system_scope=endpoint — ignoring target_pids=%s "
+                "and using endpoint-wide loopback per config",
+                ",".join(str(p) for p in target_pids),
+            )
+            target_pids = ()
+        self._target_pids = tuple(target_pids)
+
+        if target_pids:
+            delegate = await self._try_start_process_loopback(target_pids)
+            if delegate is not None:
+                # Successfully attached to the process-loopback client.
+                # Re-expose its queue as our own so downstream (_consume)
+                # reads from the per-process stream without any awareness
+                # of the delegation.
+                self._process_loopback = delegate
+                self.queue = delegate.queue
+                return
+            log.warning(
+                "system capture: process loopback unavailable for pids=%s — "
+                "falling back to endpoint-wide loopback for this session",
+                ",".join(str(p) for p in target_pids),
+            )
+
         self._thread = threading.Thread(
             target=self._run, name="system-capture", daemon=True
         )
         self._thread.start()
+
+    async def _try_start_process_loopback(self, target_pids: tuple[int, ...]):
+        """Try to spin up + start a ProcessLoopbackCapture.
+
+        Returns the running delegate on success, or None on any error. Kept
+        separate so unit tests can mock it to exercise the fallback path
+        without needing real WASAPI.
+        """
+        try:
+            from . import system_win_process  # lazy — avoids import on pure-endpoint runs
+        except Exception:
+            log.debug("system_win_process import failed", exc_info=True)
+            return None
+        if not system_win_process.is_supported():
+            log.info(
+                "system capture: Windows build too old for process loopback "
+                "(need build %d+); using endpoint fallback",
+                system_win_process._MIN_WIN_BUILD,
+            )
+            return None
+        try:
+            delegate = system_win_process.ProcessLoopbackCapture(
+                target_pids,
+                sample_rate=self.sample_rate,
+                frame_ms=int(self.frame_duration * 1000),
+            )
+            await delegate.start()
+        except Exception:
+            log.warning(
+                "system capture: ProcessLoopbackCapture start failed", exc_info=True
+            )
+            return None
+        return delegate
 
     async def stop(self) -> None:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
+        delegate = getattr(self, "_process_loopback", None)
+        if delegate is not None:
+            try:
+                await delegate.stop()
+            except Exception:
+                log.debug("process-loopback delegate stop failed", exc_info=True)
+            self._process_loopback = None

@@ -33,7 +33,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Literal, Optional
 
-from ..config import ArmConfig
+from ..config import ArmConfig, DetectorSpec
 from ..conversation import ConversationDetector, SessionState
 from ..models import SessionCloseReason
 from ..notify import ConsentResult, DesktopNotifier, Notifier
@@ -66,11 +66,16 @@ class ArmReason:
       accepted.
     - ``app_key`` and ``display_name`` are populated only for whitelist
       arms; they drive the meeting-ended watcher and the cooldown bucket.
+    - ``target_pids`` is threaded into ``SystemCapture.start`` so the
+      system-audio capture scopes to just those processes (WASAPI process
+      loopback on Windows, CoreAudio Process Tap include-list on macOS).
+      Empty tuple ⇒ endpoint-wide capture (today's behavior / fallback).
     """
 
     source: ArmSource
     app_key: Optional[str] = None
     display_name: Optional[str] = None
+    target_pids: tuple[int, ...] = ()
 
 
 @dataclass
@@ -165,6 +170,10 @@ class ArmController:
         get_foreground_info: Optional[Callable[[], ForegroundInfo]] = None,
         get_browser_window_titles: Optional[Callable[[], list[str]]] = None,
         get_browser_window_urls: Optional[Callable[[], list[str]]] = None,
+        # Resolves PIDs for a whitelist-matched spec when the match
+        # result doesn't already carry them (macOS path; Windows gets
+        # PIDs directly from ``mic.holders`` so this returns ()).
+        resolve_pids_for_spec: Optional[Callable[[DetectorSpec], tuple[int, ...]]] = None,
     ) -> None:
         self.cfg = cfg
         self.detector = detector
@@ -207,6 +216,9 @@ class ArmController:
         )
         self._q_browser_urls = (
             get_browser_window_urls or _default_get_browser_window_urls()
+        )
+        self._q_resolve_pids_for_spec = (
+            resolve_pids_for_spec or _default_resolve_pids_for_spec()
         )
 
         self._stop = asyncio.Event()
@@ -321,7 +333,12 @@ class ArmController:
             if self.state == ArmState.ARMED:
                 await self._disarm_internal(SessionCloseReason.HOTKEY_END)
             else:
-                await self._arm_internal(ArmReason(source="hotkey"))
+                await self._arm_internal(
+                    ArmReason(
+                        source="hotkey",
+                        target_pids=self._resolve_hotkey_target_pids(),
+                    )
+                )
         finally:
             self._tray_transition_in_flight = False
 
@@ -355,7 +372,12 @@ class ArmController:
             "Sayzo will capture this conversation so we can coach you on it.",
             "Yes, start", "Cancel",
         ):
-            await self._arm_internal(ArmReason(source="hotkey"))
+            await self._arm_internal(
+                ArmReason(
+                    source="hotkey",
+                    target_pids=self._resolve_hotkey_target_pids(),
+                )
+            )
 
     async def _disarm_with_confirm(self) -> None:
         """Show the stop-confirmation toast. On Yes / double-tap, disarm."""
@@ -446,12 +468,19 @@ class ArmController:
         self.state = ArmState.ARMED
         self._reason = reason
         self.armed_event.set()
-        log.info("[arm] ARMED (reason=%s app=%s)", reason.source, reason.app_key or "-")
+        scope_desc = (
+            f"app(pids={','.join(str(p) for p in reason.target_pids)})"
+            if reason.target_pids else "endpoint"
+        )
+        log.info(
+            "[arm] ARMED (reason=%s app=%s scope=%s)",
+            reason.source, reason.app_key or "-", scope_desc,
+        )
         self._fire_state_change()
 
         try:
             await self.mic.start()
-            await self.sys.start()
+            await self._start_sys_capture(reason.target_pids)
         except Exception as exc:
             log.warning("[arm] capture start failed: %s", exc, exc_info=True)
             # Best-effort close whatever did open so we don't leak streams.
@@ -675,6 +704,7 @@ class ArmController:
                             source="whitelist",
                             app_key=match.app_key,
                             display_name=match.display_name,
+                            target_pids=self._resolve_target_pids_for_match(match),
                         )
                     )
                 else:
@@ -775,6 +805,174 @@ class ArmController:
             log.exception("[arm] meeting-ended watcher crashed")
 
     # ---- helpers ----------------------------------------------------------
+
+    def _resolve_target_pids_for_match(self, match: _d.MatchResult) -> tuple[int, ...]:
+        """Resolve the PID set to scope system-audio capture to.
+
+        Prefers ``match.target_pids`` (filled on Windows from mic.holders).
+        Falls back to the injected resolver (macOS → psutil + NSWorkspace)
+        when the match was a mac path that couldn't attribute PIDs inline.
+        Empty tuple ⇒ caller uses endpoint-wide capture.
+        """
+        if match.target_pids:
+            return match.target_pids
+        spec = next(
+            (s for s in self.cfg.detectors if s.app_key == match.app_key),
+            None,
+        )
+        if spec is None:
+            return ()
+        try:
+            pids = self._q_resolve_pids_for_spec(spec) or ()
+        except Exception:
+            log.debug(
+                "[arm] resolve_pids_for_spec(%s) failed — falling back to endpoint scope",
+                match.app_key, exc_info=True,
+            )
+            return ()
+        return tuple(pids)
+
+    async def _start_sys_capture(self, target_pids: tuple[int, ...]) -> None:
+        """Call ``SystemCapture.start`` with a ``target_pids`` kwarg when
+        supported, falling back to the no-arg signature.
+
+        Allows test fakes and pre-phase-B/C captures that don't yet accept
+        the kwarg to keep working unmodified.
+        """
+        try:
+            await self.sys.start(target_pids=target_pids)
+        except TypeError:
+            await self.sys.start()
+
+    def _resolve_hotkey_target_pids(self) -> tuple[int, ...]:
+        """Smart-guess which PIDs to scope capture to for a hotkey-triggered
+        arm. The two platforms diverge because macOS has no per-process
+        mic-holder attribution.
+
+        **Windows** (``mic.holders`` has real PIDs):
+          1. Any whitelisted apps among the mic-holders → PIDs of those
+             holders only (ignores unknowns like Cortana / voice assistants).
+          2. Otherwise, any unknown apps holding the mic → all of their
+             PIDs (catches new meeting apps we haven't whitelisted yet).
+          3. Nothing holding the mic → endpoint-wide fallback.
+
+        **macOS** (no per-process mic attribution):
+          1. Mic active + foreground matches a whitelisted spec → PIDs
+             enumerated for that spec via the platform resolver.
+          2. Mic active + foreground is an identifiable app → PIDs for
+             that app (treats foreground as the likely meeting app).
+          3. Mic not active, or foreground unknown → endpoint fallback.
+        """
+        try:
+            mic = self._snapshot_mic_state()
+            fg = self._snapshot_foreground()
+        except Exception:
+            log.debug("[arm] hotkey smart-guess snapshot failed", exc_info=True)
+            return ()
+
+        if sys.platform == "win32":
+            return self._resolve_hotkey_target_pids_win(mic)
+        if sys.platform == "darwin":
+            return self._resolve_hotkey_target_pids_mac(mic, fg)
+        return ()
+
+    def _resolve_hotkey_target_pids_win(self, mic: MicState) -> tuple[int, ...]:
+        if not mic.holders:
+            return ()
+        whitelisted_proc_names: set[str] = set()
+        for spec in self.cfg.detectors:
+            if spec.disabled or spec.is_browser:
+                continue
+            for name in spec.process_names:
+                whitelisted_proc_names.add(name.lower())
+
+        whitelisted_pids: set[int] = set()
+        all_pids: set[int] = set()
+        for h in mic.holders:
+            if h.pid <= 0:
+                continue
+            all_pids.add(h.pid)
+            if h.process_name.lower() in whitelisted_proc_names:
+                whitelisted_pids.add(h.pid)
+
+        if whitelisted_pids:
+            log.info(
+                "[arm] hotkey smart-guess (win): scoping to %d whitelisted mic-holder(s)",
+                len(whitelisted_pids),
+            )
+            return tuple(sorted(whitelisted_pids))
+        if all_pids:
+            log.info(
+                "[arm] hotkey smart-guess (win): scoping to %d unknown mic-holder(s)",
+                len(all_pids),
+            )
+            return tuple(sorted(all_pids))
+        return ()
+
+    def _resolve_hotkey_target_pids_mac(
+        self, mic: MicState, fg: ForegroundInfo,
+    ) -> tuple[int, ...]:
+        if not mic.active:
+            return ()
+        fg_proc = (fg.process_name or "").lower()
+        fg_bundle = (fg.bundle_id or "").lower()
+        if not fg_proc and not fg_bundle:
+            return ()
+
+        # Pass 1: foreground matches a whitelisted spec → use the real
+        # resolver for that spec (enumerates all PIDs matching its
+        # process_names + bundle_ids).
+        for spec in self.cfg.detectors:
+            if spec.disabled:
+                continue
+            targets = {b.lower() for b in spec.bundle_ids} | {
+                p.lower() for p in spec.process_names
+            }
+            if (fg_proc and fg_proc in targets) or (fg_bundle and fg_bundle in targets):
+                try:
+                    pids = tuple(self._q_resolve_pids_for_spec(spec) or ())
+                except Exception:
+                    log.debug(
+                        "[arm] resolve_pids_for_spec(%s) raised — "
+                        "continuing with foreground-only fallback",
+                        spec.app_key, exc_info=True,
+                    )
+                    pids = ()
+                if pids:
+                    log.info(
+                        "[arm] hotkey smart-guess (mac): scoping to "
+                        "whitelisted %s via foreground (%d pids)",
+                        spec.app_key, len(pids),
+                    )
+                    return pids
+                # Resolver returned empty — fall through to Pass 2.
+                break
+
+        # Pass 2: foreground is some identifiable app; enumerate its PIDs
+        # even though it isn't whitelisted (user explicitly hotkey'd, so we
+        # believe them about intent).
+        synthetic = DetectorSpec(
+            app_key="__hotkey_fg__",
+            display_name="(foreground)",
+            process_names=[fg.process_name] if fg.process_name else [],
+            bundle_ids=[fg.bundle_id] if fg.bundle_id else [],
+            is_browser=fg.is_browser,
+        )
+        try:
+            pids = tuple(self._q_resolve_pids_for_spec(synthetic) or ())
+        except Exception:
+            log.debug(
+                "[arm] resolve_pids_for_spec(synthetic foreground) raised",
+                exc_info=True,
+            )
+            pids = ()
+        if pids:
+            log.info(
+                "[arm] hotkey smart-guess (mac): scoping to foreground "
+                "(%d pids, bundle=%s)",
+                len(pids), fg_bundle or fg_proc,
+            )
+        return pids
 
     def _snapshot_mic_state(self) -> MicState:
         holders = self._q_mic_holders() or []
@@ -961,6 +1159,21 @@ def _default_get_browser_window_urls():
         from .platform_mac import get_browser_window_urls as fn
         return fn
     return lambda: []
+
+
+def _default_resolve_pids_for_spec() -> Callable[[DetectorSpec], tuple[int, ...]]:
+    """Per-OS default PID resolver.
+
+    - Windows: ``MatchResult.target_pids`` is always filled from
+      ``mic.holders`` during ``match_whitelist``, so this fallback returns
+      empty. (If future paths need a Windows enumerator, slot it here.)
+    - macOS: delegate to ``platform_mac.resolve_pids_for_spec`` which
+      enumerates via psutil + NSWorkspace.
+    """
+    if sys.platform == "darwin":
+        from .platform_mac import resolve_pids_for_spec as fn
+        return fn
+    return lambda spec: ()
 
 
 def _human_duration(secs: float) -> str:

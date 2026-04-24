@@ -110,6 +110,7 @@ class Agent:
             sample_rate=config.capture.sample_rate,
             frame_ms=config.capture.frame_ms,
             device=config.capture.sys_device,
+            system_scope=config.capture.system_scope,
         )
         self.vad_mic = SileroVAD(
             "mic",
@@ -248,7 +249,12 @@ class Agent:
         arm_reason = self.arm._reason
         reason_tag = ""
         if arm_reason is not None:
-            reason_tag = f" ({arm_reason.app_key or arm_reason.source})"
+            label = arm_reason.app_key or arm_reason.source
+            if arm_reason.target_pids:
+                pids_csv = ",".join(str(p) for p in arm_reason.target_pids)
+                reason_tag = f" ({label} scope=app[{pids_csv}])"
+            else:
+                reason_tag = f" ({label} scope=endpoint)"
         if d.state == SessionState.OPEN and d._buffers is not None:
             elapsed = now - d._session_start_mono
             mic_voiced = d._buffers.mic_total_voiced()

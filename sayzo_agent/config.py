@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -20,6 +21,21 @@ class CaptureConfig(BaseSettings):
     frame_ms: int = 20
     mic_device: str | None = None  # None = default input
     sys_device: str | None = None  # None = default loopback
+
+    # v1.7.0: per-app system-audio scoping. When the agent arms for a
+    # specific app (whitelist consent, or hotkey smart-guess identified
+    # a mic-holder), the system-audio capture scopes to just that app's
+    # PIDs via WASAPI process loopback on Windows / CoreAudio process tap
+    # include-list on macOS. Prevents Spotify / YouTube bleeding into a
+    # Zoom capture.
+    #
+    # - ``arm_app`` (default): scope to the armed app's PIDs when known,
+    #   fall back to endpoint-wide loopback otherwise (older OS builds,
+    #   activation failures, hotkey with no mic-holder).
+    # - ``endpoint``: always use endpoint-wide loopback, like pre-v1.7.0.
+    #   Safety valve for users on unusual configurations where per-app
+    #   capture misbehaves — ``SAYZO_CAPTURE__SYSTEM_SCOPE=endpoint``.
+    system_scope: Literal["arm_app", "endpoint"] = "arm_app"
 
     # Opus encoder (see sink.encode_opus_stereo). `application=audio` is
     # libopus's general-purpose mode — it preserves high frequencies, stereo

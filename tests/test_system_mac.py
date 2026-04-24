@@ -322,3 +322,122 @@ class TestDeviceWarning:
         with caplog.at_level("WARNING"):
             SystemCapture(device="some-device")
         assert "ignored on macOS" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Per-app (target_pids) — v1.7.0
+# ---------------------------------------------------------------------------
+
+class TestTargetPIDs:
+    @pytest.mark.asyncio
+    async def test_start_without_pids_omits_flag(self, cap):
+        """Default (no target_pids) must spawn audio-tap with no CLI args —
+        the Swift helper reads 0 args as "use the global tap", matching
+        pre-v1.7.0 behavior exactly."""
+        pcm = _make_pcm_bytes(cap._batch_native_samples)
+        proc = FakeProc(stdout_data=_framed(pcm, 0.0))
+
+        captured_args: list[str] = []
+
+        async def fake_spawn(*args, **kwargs):
+            captured_args.extend(args)
+            return proc
+
+        with patch(
+            "sayzo_agent.capture.system_mac._find_audio_tap", return_value="/fake/audio-tap"
+        ), patch(
+            "asyncio.create_subprocess_exec", side_effect=fake_spawn
+        ):
+            await cap.start()
+            await cap.stop()
+
+        assert captured_args == ["/fake/audio-tap"]
+
+    @pytest.mark.asyncio
+    async def test_start_with_pids_passes_flag(self, cap):
+        """Non-empty target_pids must be forwarded as ``--pids 1234,5678`` so
+        the Swift helper can scope the CoreAudio tap."""
+        pcm = _make_pcm_bytes(cap._batch_native_samples)
+        proc = FakeProc(stdout_data=_framed(pcm, 0.0))
+
+        captured_args: list[str] = []
+
+        async def fake_spawn(*args, **kwargs):
+            captured_args.extend(args)
+            return proc
+
+        # Skip the process-tree expansion for this unit test — just pass
+        # through the seed PIDs as-is.
+        with patch(
+            "sayzo_agent.capture.system_mac._find_audio_tap", return_value="/fake/audio-tap"
+        ), patch(
+            "sayzo_agent.capture.system_mac._expand_pid_tree", side_effect=lambda pids: pids
+        ), patch(
+            "asyncio.create_subprocess_exec", side_effect=fake_spawn
+        ):
+            await cap.start(target_pids=(1234, 5678))
+            await cap.stop()
+
+        assert "--pids" in captured_args
+        pids_idx = captured_args.index("--pids")
+        assert captured_args[pids_idx + 1] == "1234,5678"
+
+    def test_expand_pid_tree_empty_is_empty(self):
+        from sayzo_agent.capture.system_mac import _expand_pid_tree
+        assert _expand_pid_tree(()) == ()
+
+    def test_expand_pid_tree_filters_negative_seeds(self):
+        """Defensive: a caller passing ``-1`` / ``0`` shouldn't leak into the
+        tap set (those aren't valid PIDs and CoreAudio would skip them, but
+        cleaner to drop them upstream)."""
+        from sayzo_agent.capture.system_mac import _expand_pid_tree
+        # No real process so psutil.children can't help — just verify the
+        # invalid seeds are dropped and valid ones survive.
+        import os
+        own_pid = os.getpid()
+        result = _expand_pid_tree((-1, 0, own_pid))
+        assert own_pid in result
+        assert -1 not in result
+        assert 0 not in result
+
+    def test_expand_pid_tree_includes_descendants(self, monkeypatch):
+        """Seed PID's recursive children must be added — mirrors Windows'
+        ``INCLUDE_TARGET_PROCESS_TREE`` so Electron helpers aren't missed."""
+        from sayzo_agent.capture import system_mac as mod
+
+        class _FakeChild:
+            def __init__(self, pid: int) -> None:
+                self.pid = pid
+
+        class _FakeProc:
+            def __init__(self, pid: int) -> None:
+                self.pid = pid
+
+            def children(self, recursive: bool = False):
+                if self.pid == 1000:
+                    return [_FakeChild(1001), _FakeChild(1002)]
+                return []
+
+        class _FakePsutil:
+            Process = _FakeProc
+
+        monkeypatch.setattr(mod, "psutil", _FakePsutil, raising=False)
+
+        # Inject via the import-time closure — _expand_pid_tree does
+        # ``import psutil`` inside its body, so we have to monkeypatch the
+        # name at the module level before calling it. Simpler: call the
+        # helper with stubbed builtins.
+        import builtins
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "psutil":
+                return _FakePsutil
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+
+        result = mod._expand_pid_tree((1000,))
+        assert 1000 in result
+        assert 1001 in result
+        assert 1002 in result

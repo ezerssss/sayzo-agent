@@ -156,7 +156,10 @@ def test_capture(seconds: int, dump_wav: bool) -> None:
         from .capture import SystemCapture
 
         mic = MicCapture(cfg.capture.sample_rate, cfg.capture.frame_ms, cfg.capture.mic_device)
-        sys_ = SystemCapture(cfg.capture.sample_rate, cfg.capture.frame_ms, cfg.capture.sys_device)
+        sys_ = SystemCapture(
+            cfg.capture.sample_rate, cfg.capture.frame_ms, cfg.capture.sys_device,
+            system_scope=cfg.capture.system_scope,
+        )
         await mic.start()
         await sys_.start()
         mic_n = sys_n = 0

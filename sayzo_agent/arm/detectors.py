@@ -106,11 +106,18 @@ class MatchResult:
       and for the ArmController's ``_armed_for_app_key`` tracking.
     - ``display_name`` is user-facing; interpolated into toast copy.
     - ``source`` records which match path fired, for logging + tests.
+    - ``target_pids`` is the set of PIDs the system-audio capture should
+      scope to when armed for this match. On Windows this is populated
+      directly from ``mic.holders`` (we have per-session PIDs). On macOS
+      it's empty here — the ArmController fills it via a platform
+      helper (psutil + NSWorkspace) before arming. Empty tuple means
+      "fall back to endpoint-wide capture".
     """
 
     app_key: str
     display_name: str
     source: MatchSource
+    target_pids: tuple[int, ...] = ()
 
 
 _COMPILED_PATTERN_CACHE: dict[str, re.Pattern[str]] = {}
@@ -204,6 +211,11 @@ def match_whitelist(
     before browser-URL matches, so if Zoom desktop is running a meeting
     while Chrome has Google Meet open in the background, we attribute the
     match to Zoom.
+
+    ``MatchResult.target_pids`` is populated on the Windows path directly
+    from ``mic.holders``. macOS paths leave it empty here; the
+    ArmController resolves PIDs via a platform helper (psutil +
+    NSWorkspace) before arming. Empty tuple ⇒ endpoint-wide capture.
     """
     # User-disabled detectors are invisible to matching. Filter once here
     # so the three passes below don't each repeat the check.
@@ -223,6 +235,7 @@ def match_whitelist(
                     app_key=spec.app_key,
                     display_name=spec.display_name,
                     source="mic_session",
+                    target_pids=_pids_for_desktop_holders(spec, mic),
                 )
 
     # Pass 2 — macOS proxy. Mic is active system-wide AND a whitelisted
@@ -275,9 +288,37 @@ def match_whitelist(
                     app_key=spec.app_key,
                     display_name=spec.display_name,
                     source="browser_mic_plus_url",
+                    target_pids=_pids_for_browser_holders(mic),
                 )
 
     return None
+
+
+def _pids_for_desktop_holders(spec: DetectorSpec, mic: MicState) -> tuple[int, ...]:
+    """PIDs from ``mic.holders`` whose process name matches ``spec``.
+
+    Windows path: ``mic.holders`` has real PIDs from pycaw, so we can scope
+    system-audio capture to exactly those processes. macOS path: empty,
+    because ``mic.holders`` is always empty on macOS. The ArmController
+    fills those via a platform resolver (``platform_mac.resolve_pids_for_spec``)
+    before arming.
+    """
+    names = {p.lower() for p in spec.process_names}
+    pids = {h.pid for h in mic.holders if h.pid > 0 and h.process_name.lower() in names}
+    return tuple(sorted(pids))
+
+
+def _pids_for_browser_holders(mic: MicState) -> tuple[int, ...]:
+    """PIDs from ``mic.holders`` that belong to any known browser process.
+
+    Used by the browser match path. Per-tab scoping isn't possible (all tabs
+    share the browser's PID tree) — documented as a known limitation.
+    """
+    pids = {
+        h.pid for h in mic.holders
+        if h.pid > 0 and h.process_name.lower() in BROWSER_PROCESS_NAMES
+    }
+    return tuple(sorted(pids))
 
 
 def _browser_spec_matches(

@@ -31,9 +31,13 @@ class FakeCapture:
         self.start_count = 0
         self.stop_count = 0
         self.fail_next_start = False
+        # Latest value passed to start() — lets tests assert that
+        # whitelist / hotkey smart-guess PIDs reach the capture layer.
+        self.last_target_pids: tuple[int, ...] = ()
 
-    async def start(self) -> None:
+    async def start(self, *, target_pids: tuple[int, ...] = ()) -> None:
         self.start_count += 1
+        self.last_target_pids = tuple(target_pids)
         if self.fail_next_start:
             self.fail_next_start = False
             raise RuntimeError("simulated capture failure")
@@ -302,7 +306,7 @@ async def test_pending_close_auto_revert_on_speech_skips_confirmation():
 async def test_whitelist_match_fires_consent_and_arms_on_yes():
     notifier = FakeNotifier()
     notifier.consent_script = ["yes"]
-    ctrl, _, mic, *_ = _make_controller(
+    ctrl, _, mic, sys_cap, *_ = _make_controller(
         notifier=notifier,
         mic_holders=[MicHolder("zoom.exe", 1234)],
     )
@@ -313,6 +317,78 @@ async def test_whitelist_match_fires_consent_and_arms_on_yes():
     await asyncio.sleep(0.15)
     assert ctrl.state == ArmState.ARMED
     assert ctrl._reason is not None and ctrl._reason.app_key == "zoom"
+    # v1.7.0: whitelist arm should scope system-audio capture to Zoom's PID.
+    assert ctrl._reason.target_pids == (1234,)
+    assert sys_cap.last_target_pids == (1234,)
+
+    ctrl._whitelist_task.cancel()
+    try:
+        await ctrl._whitelist_task
+    except asyncio.CancelledError:
+        pass
+    await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
+
+
+async def test_whitelist_arm_uses_resolver_when_match_has_no_pids():
+    """macOS path: ``match_whitelist`` returns empty target_pids because
+    ``mic.holders`` is empty on Mac. The controller must fall back to the
+    injected resolver (``resolve_pids_for_spec``) to fill PIDs before
+    arming, then pass them to ``sys.start``."""
+    notifier = FakeNotifier()
+    notifier.consent_script = ["yes"]
+
+    resolver_calls: list[str] = []
+
+    def fake_resolver(spec) -> tuple[int, ...]:
+        resolver_calls.append(spec.app_key)
+        if spec.app_key == "zoom":
+            return (7777, 8888)
+        return ()
+
+    cfg = ArmConfig(
+        hotkey="ctrl+alt+s",
+        poll_interval_secs=0.01,
+        hotkey_confirm_timeout_secs=0.1,
+        consent_toast_timeout_secs=0.1,
+        end_toast_timeout_secs=0.1,
+        checkin_toast_timeout_secs=0.1,
+        meeting_ended_toast_timeout_secs=0.1,
+        whitelist_arm_release_grace_secs=0.03,
+        meeting_ended_snooze_secs=0.05,
+        decline_release_grace_secs=0.05,
+        cooldown_after_session_secs=600.0,
+        long_meeting_checkin_marks_secs=[3600.0],
+        detectors=default_detector_specs(),
+    )
+    conv_cfg = ConversationConfig(joint_silence_close_secs=1.0)
+    detector = ConversationDetector(conv_cfg)
+    mic = FakeCapture()
+    sys_cap = FakeCapture()
+    vad_m = FakeVAD()
+    vad_s = FakeVAD()
+
+    ctrl = ArmController(
+        cfg, detector,
+        mic_capture=mic, sys_capture=sys_cap,
+        vad_mic=vad_m, vad_sys=vad_s,
+        notifier=notifier,
+        # Simulate the macOS path: mic.active True, no holders, whitelisted
+        # Zoom is running + frontmost via bundle id.
+        get_mic_holders=lambda: [],
+        is_mic_active=lambda: True,
+        get_running_processes=lambda: frozenset({"us.zoom.xos"}),
+        get_foreground_info=lambda: ForegroundInfo(bundle_id="us.zoom.xos"),
+        resolve_pids_for_spec=fake_resolver,
+    )
+
+    ctrl._loop = asyncio.get_running_loop()
+    ctrl._whitelist_task = asyncio.create_task(ctrl._run_whitelist_watcher())
+    await asyncio.sleep(0.15)
+    assert ctrl.state == ArmState.ARMED
+    assert ctrl._reason is not None and ctrl._reason.app_key == "zoom"
+    assert ctrl._reason.target_pids == (7777, 8888)
+    assert sys_cap.last_target_pids == (7777, 8888)
+    assert "zoom" in resolver_calls
 
     ctrl._whitelist_task.cancel()
     try:
@@ -498,6 +574,141 @@ async def test_meeting_ended_keep_going_snoozes_and_refires():
         await ctrl._whitelist_task
     except asyncio.CancelledError:
         pass
+
+
+# ---- hotkey smart-guess (v1.7.0) -----------------------------------
+#
+# Verifies the Windows and macOS branches of `_resolve_hotkey_target_pids`.
+# On Windows we drive with synthetic mic.holders; on macOS we flip
+# sys.platform and drive via foreground + mic.active + an injected resolver.
+
+
+async def test_hotkey_smart_guess_wins_whitelisted_over_unknown(monkeypatch):
+    """Windows multi-holder rule: Zoom + Cortana both holding mic → tap
+    Zoom only. The whitelisted-first tier keeps the voice-assistant
+    false-positive from contaminating the session."""
+    monkeypatch.setattr("sayzo_agent.arm.controller.sys.platform", "win32")
+    notifier = FakeNotifier()
+    notifier.consent_script = ["yes"]
+    ctrl, _, mic, sys_cap, *_ = _make_controller(
+        notifier=notifier,
+        mic_holders=[
+            MicHolder("zoom.exe", 1234),
+            MicHolder("cortana.exe", 9999),
+        ],
+    )
+    await ctrl._on_hotkey_pressed()
+    assert ctrl.state == ArmState.ARMED
+    assert sys_cap.last_target_pids == (1234,)
+
+    await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
+
+
+async def test_hotkey_smart_guess_wins_all_holders_when_none_whitelisted(monkeypatch):
+    """Windows: no whitelisted apps hold the mic → scope to every
+    mic-holder (catches new meeting apps that aren't in the whitelist)."""
+    monkeypatch.setattr("sayzo_agent.arm.controller.sys.platform", "win32")
+    notifier = FakeNotifier()
+    notifier.consent_script = ["yes"]
+    ctrl, _, mic, sys_cap, *_ = _make_controller(
+        notifier=notifier,
+        mic_holders=[
+            MicHolder("newmeeting.exe", 5555),
+            MicHolder("oldvoipapp.exe", 6666),
+        ],
+    )
+    await ctrl._on_hotkey_pressed()
+    assert ctrl.state == ArmState.ARMED
+    assert sys_cap.last_target_pids == (5555, 6666)
+
+    await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
+
+
+async def test_hotkey_smart_guess_wins_endpoint_when_no_holders(monkeypatch):
+    """Windows: nothing holds the mic → empty tuple → SystemCapture falls
+    back to endpoint-wide loopback (today's behavior)."""
+    monkeypatch.setattr("sayzo_agent.arm.controller.sys.platform", "win32")
+    notifier = FakeNotifier()
+    notifier.consent_script = ["yes"]
+    ctrl, _, mic, sys_cap, *_ = _make_controller(notifier=notifier)
+    await ctrl._on_hotkey_pressed()
+    assert ctrl.state == ArmState.ARMED
+    assert sys_cap.last_target_pids == ()
+
+    await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
+
+
+async def test_hotkey_smart_guess_mac_uses_whitelisted_resolver_on_match(monkeypatch):
+    """macOS: foreground matches a whitelisted spec → resolver populates
+    PIDs. On Mac, mic.holders is empty so the rule keys off foreground +
+    mic.active."""
+    monkeypatch.setattr("sayzo_agent.arm.controller.sys.platform", "darwin")
+
+    notifier = FakeNotifier()
+    notifier.consent_script = ["yes"]
+
+    def fake_resolver(spec):
+        if spec.app_key == "zoom":
+            return (3000, 3001)
+        return ()
+
+    cfg = ArmConfig(
+        hotkey="ctrl+alt+s",
+        poll_interval_secs=0.01,
+        hotkey_confirm_timeout_secs=0.1,
+        consent_toast_timeout_secs=0.1,
+        end_toast_timeout_secs=0.1,
+        checkin_toast_timeout_secs=0.1,
+        meeting_ended_toast_timeout_secs=0.1,
+        whitelist_arm_release_grace_secs=0.03,
+        meeting_ended_snooze_secs=0.05,
+        decline_release_grace_secs=0.05,
+        cooldown_after_session_secs=600.0,
+        long_meeting_checkin_marks_secs=[3600.0],
+        detectors=default_detector_specs(),
+    )
+    conv_cfg = ConversationConfig(joint_silence_close_secs=1.0)
+    detector = ConversationDetector(conv_cfg)
+    mic = FakeCapture()
+    sys_cap = FakeCapture()
+    vad_m = FakeVAD()
+    vad_s = FakeVAD()
+
+    ctrl = ArmController(
+        cfg, detector,
+        mic_capture=mic, sys_capture=sys_cap,
+        vad_mic=vad_m, vad_sys=vad_s,
+        notifier=notifier,
+        get_mic_holders=lambda: [],
+        is_mic_active=lambda: True,
+        get_running_processes=lambda: frozenset({"us.zoom.xos"}),
+        get_foreground_info=lambda: ForegroundInfo(bundle_id="us.zoom.xos"),
+        resolve_pids_for_spec=fake_resolver,
+    )
+
+    await ctrl._on_hotkey_pressed()
+    assert ctrl.state == ArmState.ARMED
+    assert sys_cap.last_target_pids == (3000, 3001)
+
+    await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
+
+
+async def test_hotkey_smart_guess_mac_endpoint_when_mic_inactive(monkeypatch):
+    """macOS: mic not active → endpoint fallback, regardless of what's in
+    the foreground."""
+    monkeypatch.setattr("sayzo_agent.arm.controller.sys.platform", "darwin")
+    notifier = FakeNotifier()
+    notifier.consent_script = ["yes"]
+    ctrl, _, _, sys_cap, *_ = _make_controller(
+        notifier=notifier,
+        mic_active=False,
+        foreground=ForegroundInfo(bundle_id="us.zoom.xos"),
+    )
+    await ctrl._on_hotkey_pressed()
+    assert ctrl.state == ArmState.ARMED
+    assert sys_cap.last_target_pids == ()
+
+    await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
 
 
 # ---- rebind ---------------------------------------------------------
