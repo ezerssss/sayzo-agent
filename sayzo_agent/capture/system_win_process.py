@@ -283,6 +283,12 @@ class ProcessLoopbackCapture:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._threads: list[threading.Thread] = []
         self._stop = threading.Event()
+        # Per-thread readiness signal (event + success flag). ``start()``
+        # awaits these so an activation failure surfaces to the caller
+        # instead of dying silently inside the thread and leaving us with
+        # a "delegate started OK" lie + empty queue for the whole session.
+        self._ready_events: list[threading.Event] = []
+        self._ready_ok: list[bool] = []
 
     # ---- lifecycle --------------------------------------------------------
 
@@ -309,15 +315,54 @@ class ProcessLoopbackCapture:
         # and runs an independent capture loop. Threads enqueue onto the
         # shared asyncio.Queue via call_soon_threadsafe, so contention on
         # the queue is the only cross-thread synchronization.
-        for pid in self.target_pids:
+        for idx, pid in enumerate(self.target_pids):
+            ready = threading.Event()
+            self._ready_events.append(ready)
+            self._ready_ok.append(False)
             t = threading.Thread(
                 target=self._run_for_pid,
-                args=(pid,),
+                args=(pid, idx, ready),
                 name=f"system-proc-loopback-pid{pid}",
                 daemon=True,
             )
             self._threads.append(t)
             t.start()
+
+        # Wait for every thread to signal readiness (or for the wait to
+        # time out). If none activated successfully, raise so
+        # ``SystemCapture._try_start_process_loopback`` can fall back to
+        # endpoint-wide capture for this session — otherwise we'd end up
+        # with a silent delegate + empty queue for the whole meeting.
+        activation_deadline_secs = 5.0
+        await asyncio.to_thread(
+            self._wait_for_readiness, activation_deadline_secs,
+        )
+        if not any(self._ready_ok):
+            # Best-effort: tear down whatever threads did spin up.
+            self._stop.set()
+            raise RuntimeError(
+                f"process-loopback activation failed for all {len(self.target_pids)} PID(s)"
+            )
+        if not all(self._ready_ok):
+            # Some succeeded, some didn't. Keep going with the successes —
+            # better than losing the whole session. Failed ones are already
+            # exited threads (no cleanup needed).
+            log.warning(
+                "[proc-loopback] only %d/%d target PIDs activated successfully",
+                sum(self._ready_ok), len(self._ready_ok),
+            )
+
+    def _wait_for_readiness(self, timeout_secs: float) -> None:
+        """Block until every thread's readiness event is set, or the overall
+        timeout elapses. Runs on a thread-pool worker (from
+        ``asyncio.to_thread``) so the main event loop keeps ticking.
+        """
+        deadline = time.monotonic() + timeout_secs
+        for ev in self._ready_events:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            ev.wait(timeout=remaining)
 
     async def stop(self) -> None:
         self._stop.set()
@@ -327,48 +372,60 @@ class ProcessLoopbackCapture:
 
     # ---- per-PID capture thread ------------------------------------------
 
-    def _run_for_pid(self, pid: int) -> None:
+    def _run_for_pid(self, pid: int, ready_idx: int, ready: threading.Event) -> None:
         """Blocking loop: activate a process-loopback IAudioClient for ``pid``,
         initialize it in shared / event-driven / loopback mode, then poll
         IAudioCaptureClient in an event-driven loop until ``_stop`` is set.
 
-        On any activation failure we log and exit the thread — the outer
-        ``SystemCapture`` in system_win.py catches an empty queue / absent
-        thread as "fall back to endpoint capture".
+        On any activation failure we log, signal readiness (with success=False),
+        and exit the thread — ``start()`` picks that up and raises, so
+        ``SystemCapture`` falls back to endpoint-wide capture for the session.
         """
         try:
-            import comtypes  # type: ignore[import-not-found]
-            comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
-        except Exception:
-            log.exception("[proc-loopback] CoInitializeEx failed for pid=%d", pid)
-            return
-
-        try:
-            syms = _load_comtypes_symbols()
-        except Exception:
-            log.exception("[proc-loopback] comtypes symbol load failed for pid=%d", pid)
-            return
-
-        try:
-            audio_client = _activate_process_loopback_client(syms, pid)
-        except Exception:
-            log.exception("[proc-loopback] activation failed for pid=%d", pid)
-            return
-        if audio_client is None:
-            log.warning("[proc-loopback] no IAudioClient returned for pid=%d", pid)
-            return
-
-        log.info("[proc-loopback] activated client for pid=%d", pid)
-        try:
-            self._capture_loop(audio_client, pid)
-        except Exception:
-            log.exception("[proc-loopback] capture loop crashed for pid=%d", pid)
-        finally:
             try:
-                audio_client.Release()  # type: ignore[attr-defined]
+                import comtypes  # type: ignore[import-not-found]
+                comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
             except Exception:
-                pass
-            log.info("[proc-loopback] capture thread exiting for pid=%d", pid)
+                log.exception("[proc-loopback] CoInitializeEx failed for pid=%d", pid)
+                return
+
+            try:
+                syms = _load_comtypes_symbols()
+            except Exception:
+                log.exception("[proc-loopback] comtypes symbol load failed for pid=%d", pid)
+                return
+
+            try:
+                audio_client = _activate_process_loopback_client(syms, pid)
+            except Exception:
+                log.exception("[proc-loopback] activation failed for pid=%d", pid)
+                return
+            if audio_client is None:
+                log.warning("[proc-loopback] no IAudioClient returned for pid=%d", pid)
+                return
+
+            log.info("[proc-loopback] activated client for pid=%d", pid)
+            # Mark this PID as successfully activated so ``start()`` stops
+            # waiting and returns to the caller (who then reads from
+            # ``self.queue``).
+            self._ready_ok[ready_idx] = True
+            ready.set()
+
+            try:
+                self._capture_loop(audio_client, pid)
+            except Exception:
+                log.exception("[proc-loopback] capture loop crashed for pid=%d", pid)
+            finally:
+                try:
+                    audio_client.Release()  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+                log.info("[proc-loopback] capture thread exiting for pid=%d", pid)
+        finally:
+            # Unconditional readiness signal — even on failure we must set
+            # the event so ``start()``'s wait loop doesn't block for the
+            # full activation timeout.
+            ready.set()
 
     def _capture_loop(self, audio_client, pid: int) -> None:
         """Drain the IAudioCaptureClient until ``_stop`` is set.
@@ -629,15 +686,20 @@ def _activate_process_loopback_client(syms: dict, pid: int, *, timeout_secs: flo
 
     async_op_ptr = ctypes.c_void_p(0)
 
-    # handler is a comtypes COMObject — pass the QI'd pointer to our
-    # completion handler interface.
+    # handler is a comtypes COMObject — we need the raw pointer to the
+    # completion-handler interface. ``ctypes.cast(..., c_void_p)`` reads
+    # the address out of the comtypes wrapper; ``int()`` doesn't work
+    # here because comtypes interface objects marshal to raw bytes, not
+    # a Python int (observed in field logs: ValueError invalid literal
+    # for int() with base 10: b'\\x18\\x06\\xf0\\xc4O\\x02\\x00\\x00').
     handler_iface = handler.QueryInterface(syms["IActivateAudioInterfaceCompletionHandler"])
+    handler_ptr = ctypes.cast(handler_iface, ctypes.c_void_p)
 
     hr = ActivateAudioInterfaceAsync(
         _VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
         ctypes.byref(syms["IID_IAudioClient"]),
         ctypes.byref(pv),
-        ctypes.cast(ctypes.c_void_p(int(handler_iface)), ctypes.c_void_p),
+        handler_ptr,
         ctypes.byref(async_op_ptr),
     )
     if hr != 0:
