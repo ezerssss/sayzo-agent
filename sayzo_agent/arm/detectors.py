@@ -176,10 +176,14 @@ def match_whitelist(
     while Chrome has Google Meet open in the background, we attribute the
     match to Zoom.
     """
+    # User-disabled detectors are invisible to matching. Filter once here
+    # so the three passes below don't each repeat the check.
+    active_specs = [s for s in specs if not s.disabled]
+
     holder_names = {h.process_name.lower() for h in mic.holders}
 
     # Pass 1 — desktop apps via direct mic-session hit (Windows).
-    for spec in specs:
+    for spec in active_specs:
         if spec.is_browser:
             continue
         if not spec.process_names:
@@ -199,7 +203,7 @@ def match_whitelist(
         fg_proc = (foreground.process_name or "").lower()
         fg_bundle = (foreground.bundle_id or "").lower()
         running_lower = {p.lower() for p in mic.running_processes}
-        for spec in specs:
+        for spec in active_specs:
             if spec.is_browser:
                 continue
             targets: list[str] = []
@@ -234,7 +238,7 @@ def match_whitelist(
     if _browser_holds_mic(mic, foreground):
         url = foreground.browser_tab_url or ""
         titles = _collect_browser_titles(foreground)
-        for spec in specs:
+        for spec in active_specs:
             if not spec.is_browser:
                 continue
             if _browser_spec_matches(spec, url, titles):

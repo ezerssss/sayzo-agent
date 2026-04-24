@@ -208,6 +208,10 @@ class DetectorSpec(BaseSettings):
       when ``is_browser`` is True. Needed on Windows where we can't cheaply
       read the active-tab URL; the Chrome/Edge window title (e.g. ``Meet -
       abc-defg-hij - Google Chrome``) is the only signal available.
+    - ``disabled`` marks a spec the user has toggled off in the Settings
+      Meeting Apps pane. The matcher skips these so the consent toast
+      doesn't fire — but the spec stays in the list so the user can flip
+      it back on without losing any custom URL patterns / process names.
     """
 
     app_key: str
@@ -217,11 +221,13 @@ class DetectorSpec(BaseSettings):
     is_browser: bool = False
     url_patterns: list[str] = Field(default_factory=list)
     title_patterns: list[str] = Field(default_factory=list)
+    disabled: bool = False
 
 
 def default_detector_specs() -> list[DetectorSpec]:
-    """Ship-with whitelist. Users override via `SAYZO_ARM__DETECTORS` or the
-    settings GUI (whitelist editor deferred to post-v1)."""
+    """Ship-with whitelist. Users edit via Settings → Meeting Apps (which
+    writes the list to ``user_settings.json`` under ``arm.detectors``),
+    or override wholesale via ``SAYZO_ARM__DETECTORS``."""
     return [
         # Desktop meeting apps — detected by process name (Win) or bundle id (Mac)
         # holding an active capture session / mic running system-wide.

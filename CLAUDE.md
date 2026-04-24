@@ -131,7 +131,7 @@ UploadClient (NoopUploadClient until user signs in)
 
 **Detection is mic-holder-based, not window-title-based.** `detectors.match_whitelist()` is pure logic operating on `MicState.holders` (Windows: pycaw WASAPI session enumeration) or `MicState.active + running_processes + foreground` (macOS: `kAudioDevicePropertyDeviceIsRunningSomewhere` + psutil + NSWorkspace). Works for Discord (which never changes window title during calls), survives app updates, mute-tolerant (muted users still have an active capture session).
 
-Default whitelist ships with 21 apps (14 desktop + 7 web) — see `config.py::default_detector_specs()`. Override via `SAYZO_ARM__DETECTORS` env var; a user-facing whitelist editor is deferred to post-v1.
+Default whitelist ships with 21 apps (14 desktop + 7 web) — see `config.py::default_detector_specs()`. Users edit the list via Settings → Meeting Apps (see `gui/settings_window.py::_MeetingAppsPane` + `_AddAppDialog`): toggle off / remove / one-click-add from a live mic-holder picker (desktop) or a pasted meeting URL (web). The Suggested-to-add section is driven by `arm/seen_apps.py`, which records any unmatched mic-holder the watcher observes while disarmed (capped at 20 entries). The in-app edit writes the full list to `user_settings.json` under `arm.detectors`; `SAYZO_ARM__DETECTORS` env var still wins.
 
 ### Session state machine
 
@@ -166,7 +166,8 @@ These are the rules the conversation detector and gate logic encode. Several wer
 - **`conversation.py`** — Pure (no I/O, no models). State machine (IDLE / OPEN / PENDING_CLOSE) + gate. Unit-tested with synthetic VAD events. The most behavior-critical file in the project; treat changes here with care.
 - **`app.py`** — Async orchestrator. Wires ArmController → capture → VAD → detector → heavy-worker pool → sink. `_consume` waits on `arm.armed_event` so frames only flow while armed. All STT/embedding/LLM work runs on a single-worker `ThreadPoolExecutor` so heavy stages never run in parallel and starve the CPU. Capture + VAD run on the asyncio loop.
 - **`arm/controller.py`** — ArmController state machine. Owns stream lifecycle, hotkey confirmations, whitelist consent, PENDING_CLOSE handling, long-meeting check-ins, meeting-ended watcher. Unit-tested with fake capture / VAD / notifier / injected platform queries.
-- **`arm/detectors.py`** — Pure matching logic against `DetectorSpec` list from config. No OS calls.
+- **`arm/detectors.py`** — Pure matching logic against `DetectorSpec` list from config. No OS calls. Skips specs with `disabled=True` (the Meeting Apps pane's off toggle).
+- **`arm/seen_apps.py`** — Persistence for unmatched mic-holders observed by the whitelist watcher. Written to `data_dir/seen_apps.json`. Capped at 20 entries, dedup'd by lower-cased key, scrubbed against the current whitelist on read. Drives the Settings → Meeting Apps "Suggested to add" section.
 - **`arm/platform_win.py` / `arm/platform_mac.py`** — Platform-specific OS queries: Windows uses pycaw for mic-session enumeration + `win32gui` for foreground; macOS uses pyobjc CoreAudio for mic-active bit + NSWorkspace for frontmost + AppleScript (cached 2 s) for active tab URL.
 - **`arm/hotkey.py`** — pynput global hotkey listener. Marshals key-press events from pynput's listener thread onto the arm controller's asyncio loop via `call_soon_threadsafe`. Requires Accessibility permission on macOS (graceful fallback: tray menu still works).
 - **`notify.py`** — Desktop notifier with a dedicated background asyncio loop (eager `__init__`) so interactive consent toasts can await button callbacks. `NoopNotifier.ask_consent` always returns the default, for unit-test clean paths.

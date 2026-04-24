@@ -169,6 +169,7 @@ class Agent:
             vad_mic=self.vad_mic,
             vad_sys=self.vad_sys,
             notifier=self.notifier,
+            data_dir=self.cfg.data_dir,
         )
 
     # ---- pipeline ----------------------------------------------------------

@@ -30,6 +30,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Callable, Literal, Optional
 
 from ..config import ArmConfig
@@ -37,6 +38,7 @@ from ..conversation import ConversationDetector, SessionState
 from ..models import SessionCloseReason
 from ..notify import ConsentResult, DesktopNotifier, Notifier
 from . import detectors as _d
+from . import seen_apps as _seen_apps
 from .detectors import ForegroundInfo, MicState
 from .hotkey import HotkeySource
 
@@ -153,6 +155,9 @@ class ArmController:
         vad_mic,
         vad_sys,
         notifier: Notifier,
+        # Optional path for seen-apps recording (populated from Config.data_dir
+        # by the real Agent; None in tests → recording is a no-op).
+        data_dir: Optional[Path] = None,
         # Optional platform query overrides (for tests).
         get_mic_holders: Optional[Callable[[], list[_d.MicHolder]]] = None,
         is_mic_active: Optional[Callable[[], bool]] = None,
@@ -167,6 +172,13 @@ class ArmController:
         self.vad_mic = vad_mic
         self.vad_sys = vad_sys
         self.notifier = notifier
+        self._data_dir = data_dir
+
+        # Per-session dedup for seen-apps writes. Keyed by lower-cased
+        # process name / bundle id — we write to disk the first time an
+        # unmatched holder appears this session, and skip subsequent polls
+        # even though the record call would dedup anyway (saves disk churn).
+        self._recorded_seen: set[str] = set()
 
         self.state = ArmState.DISARMED
         self.armed_event: asyncio.Event = asyncio.Event()
@@ -581,6 +593,11 @@ class ArmController:
                 match = _d.match_whitelist(self.cfg.detectors, fg, mic)
                 if match is None:
                     last_match_key = None
+                    # Record any unmatched mic-holders so the Settings
+                    # Meeting Apps pane can suggest them. Only writes the
+                    # first time a key appears this session; browsers are
+                    # skipped since those are handled by the Web tab.
+                    self._record_unmatched_holders(mic, fg)
                     continue
                 # One-shot INFO log per match transition so field debugging
                 # doesn't require raising the global log level.
@@ -722,6 +739,79 @@ class ArmController:
         active = bool(self._q_is_mic_active())
         running = self._q_running_procs() or frozenset()
         return MicState(holders=list(holders), active=active, running_processes=running)
+
+    def snapshot_mic_state(self) -> MicState:
+        """Public mic-holder snapshot for the Settings Meeting Apps pane.
+
+        The Settings GUI opens on a worker thread; calling this directly is
+        safe — on Windows the query hops onto the dedicated COM executor,
+        and macOS's CoreAudio bindings are thread-safe for a one-shot read.
+        """
+        return self._snapshot_mic_state()
+
+    def snapshot_foreground(self) -> ForegroundInfo:
+        """Public foreground-info snapshot (matches :meth:`snapshot_mic_state`).
+
+        Used by the Add-app dialog's Desktop tab to suppress browser
+        processes from the live picker — browser-based web meetings are
+        added via the Web tab instead.
+        """
+        return self._snapshot_foreground()
+
+    def _record_unmatched_holders(self, mic: MicState, fg: ForegroundInfo) -> None:
+        """Persist any mic-holders we saw this poll that aren't on the list.
+
+        - No data_dir wired in (tests) → no-op.
+        - Browsers are skipped: they hold the mic for web meetings, but the
+          user-facing fix is to add the site in the Web tab, not add
+          ``chrome.exe`` as a desktop app.
+        - Dedups in-memory per session to avoid writing to disk every 2 s
+          while a long-running unknown meeting app is holding the mic.
+        """
+        if self._data_dir is None:
+            return
+
+        # Windows: direct mic-holder names.
+        for holder in mic.holders:
+            key = (holder.process_name or "").lower()
+            if not key:
+                continue
+            if key in _d.BROWSER_PROCESS_NAMES:
+                continue
+            if key in self._recorded_seen:
+                continue
+            display = _seen_apps._display_name_for_process(holder.process_name)
+            try:
+                _seen_apps.record(
+                    self._data_dir,
+                    key=key,
+                    display_name=display,
+                    whitelist=self.cfg.detectors,
+                    process_name=holder.process_name,
+                )
+            except Exception:
+                log.debug("[arm] seen_apps.record failed", exc_info=True)
+            self._recorded_seen.add(key)
+
+        # macOS: no per-process attribution. Fall back to the foreground
+        # bundle id when the mic is active — our best guess for who's
+        # capturing. Skip if the foreground is a browser.
+        if sys.platform == "darwin" and mic.active and fg.bundle_id:
+            if not fg.is_browser:
+                key = fg.bundle_id.lower()
+                if key and key not in self._recorded_seen:
+                    display = _seen_apps._display_name_for_bundle(fg.bundle_id)
+                    try:
+                        _seen_apps.record(
+                            self._data_dir,
+                            key=key,
+                            display_name=display,
+                            whitelist=self.cfg.detectors,
+                            bundle_id=fg.bundle_id,
+                        )
+                    except Exception:
+                        log.debug("[arm] seen_apps.record failed", exc_info=True)
+                    self._recorded_seen.add(key)
 
     def _snapshot_foreground(self) -> ForegroundInfo:
         """Foreground info enriched with all visible browser window titles.

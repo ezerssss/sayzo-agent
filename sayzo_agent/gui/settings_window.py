@@ -1,4 +1,4 @@
-"""Settings window for the running agent — four panes, tkinter-hosted.
+"""Settings window for the running agent — five panes, tkinter-hosted.
 
 Opened from the tray menu's "Settings..." click. Runs on a worker thread
 hosted by ``_tray_bridge`` in ``__main__.py`` via ``loop.run_in_executor``;
@@ -15,6 +15,9 @@ Panes (left sidebar navigation):
 * **Shortcut** — current global hotkey + click-to-record Change button.
   On Save, calls :meth:`ArmController.rebind_hotkey` and persists via
   ``settings_store``.
+* **Meeting Apps** — whitelist editor. Toggle / remove / add desktop and
+  web meeting apps that Sayzo should auto-suggest recording for. Shows
+  apps Sayzo has seen holding the mic as one-click suggestions.
 * **Permissions** — macOS only. Per-permission rows with Re-request
   buttons wired to ``gui/setup/mac_permissions.py``. Windows shows a
   short "no permissions required" note.
@@ -30,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import subprocess
 import sys
 import threading
@@ -38,16 +42,21 @@ import webbrowser
 from datetime import datetime
 from tkinter import ttk
 from typing import TYPE_CHECKING, Optional
+from urllib.parse import urlparse
 
 from .. import settings_store
+from ..arm import seen_apps as _seen_apps
+from ..arm.detectors import BROWSER_PROCESS_NAMES
+from ..config import DetectorSpec, default_detector_specs
 from . import theme
 from .shortcut_capture import ShortcutCaptureField
-from .widgets import RoundedButton
+from .widgets import RoundedButton, RoundedFrame, SwitchToggle
 from .theme import (
     ACCENT,
     ACCENT_TINT,
     BG,
     BORDER,
+    ERROR,
     INK,
     MUTED,
     PAD_LG,
@@ -57,6 +66,8 @@ from .theme import (
     PAD_XS,
     PAD_XXL,
     SELECTED,
+    SUBTLE,
+    SUCCESS,
     SURFACE,
     apply_sayzo_icon,
     apply_sayzo_theme,
@@ -70,7 +81,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
-PANE_NAMES = ("Shortcut", "Permissions", "Account", "Notifications")
+PANE_NAMES = ("Shortcut", "Meeting Apps", "Permissions", "Account", "Notifications")
 
 
 def open_settings_window(
@@ -103,8 +114,8 @@ def open_settings_window(
 class _SettingsApp:
     """Owns the tk root + the four panes. One instance per open."""
 
-    WINDOW_SIZE = (780, 540)
-    MIN_SIZE = (680, 460)
+    WINDOW_SIZE = (880, 600)
+    MIN_SIZE = (760, 500)
     SIDEBAR_WIDTH = 220
 
     def __init__(
@@ -192,6 +203,7 @@ class _SettingsApp:
 
         self._panes = {
             "Shortcut": _ShortcutPane(self._content_frame, self._cfg, self._arm),
+            "Meeting Apps": _MeetingAppsPane(self._content_frame, self._cfg, self._arm),
             "Permissions": _PermissionsPane(self._content_frame, self._cfg),
             "Account": _AccountPane(self._content_frame, self._cfg),
             "Notifications": _NotificationsPane(self._content_frame, self._cfg),
@@ -749,16 +761,20 @@ class _AccountPane(_Pane):
 
 class _NotificationsPane(_Pane):
     """Master toggle + three sub-toggles. Mutations apply to the live Config
-    and persist to user_settings.json."""
+    and persist to user_settings.json.
+
+    Uses the same ``SwitchToggle`` widget as the Meeting Apps pane so the
+    two control-surfaces feel like the same product.
+    """
 
     def __init__(self, parent: tk.Widget, cfg: "Config") -> None:
         super().__init__(parent)
         self._cfg = cfg
 
-        self._master_var = tk.BooleanVar(value=cfg.notifications_enabled)
-        self._welcome_var = tk.BooleanVar(value=cfg.notify_welcome)
-        self._post_arm_var = tk.BooleanVar(value=cfg.arm.notify_post_arm)
-        self._saved_var = tk.BooleanVar(value=cfg.notify_capture_saved)
+        self._master_switch: Optional[SwitchToggle] = None
+        self._welcome_switch: Optional[SwitchToggle] = None
+        self._post_arm_switch: Optional[SwitchToggle] = None
+        self._saved_switch: Optional[SwitchToggle] = None
 
         ttk.Label(
             self._frame, text="Notifications", style="H1.Sayzo.TLabel",
@@ -769,38 +785,33 @@ class _NotificationsPane(_Pane):
             style="Muted.Sayzo.TLabel",
         ).pack(anchor="w", pady=(PAD_SM, PAD_XL))
 
-        master = ttk.Checkbutton(
+        self._master_switch = self._add_row(
             self._frame,
-            text="Show Sayzo notifications",
-            style="Sayzo.TCheckbutton",
-            variable=self._master_var,
-            command=self._on_toggle,
+            label="Show Sayzo notifications",
+            on=cfg.notifications_enabled,
+            indent=False,
         )
-        master.pack(anchor="w")
 
         sub = ttk.Frame(self._frame, style="Sayzo.TFrame")
-        sub.pack(anchor="w", padx=(PAD_XL, 0), pady=(PAD_SM, PAD_LG))
-        ttk.Checkbutton(
+        sub.pack(fill="x", pady=(PAD_SM, PAD_LG))
+        self._welcome_switch = self._add_row(
             sub,
-            text="Show the welcome message on first launch",
-            style="Sayzo.TCheckbutton",
-            variable=self._welcome_var,
-            command=self._on_toggle,
-        ).pack(anchor="w")
-        ttk.Checkbutton(
+            label="Show the welcome message on first launch",
+            on=cfg.notify_welcome,
+            indent=True,
+        )
+        self._post_arm_switch = self._add_row(
             sub,
-            text="Show “Sayzo is capturing” reminders after I arm",
-            style="Sayzo.TCheckbutton",
-            variable=self._post_arm_var,
-            command=self._on_toggle,
-        ).pack(anchor="w")
-        ttk.Checkbutton(
+            label="Show “Sayzo is capturing” reminders after I arm",
+            on=cfg.arm.notify_post_arm,
+            indent=True,
+        )
+        self._saved_switch = self._add_row(
             sub,
-            text="Show “Conversation saved” when a capture finishes",
-            style="Sayzo.TCheckbutton",
-            variable=self._saved_var,
-            command=self._on_toggle,
-        ).pack(anchor="w")
+            label="Show “Conversation saved” when a capture finishes",
+            on=cfg.notify_capture_saved,
+            indent=True,
+        )
 
         ttk.Label(
             self._frame,
@@ -810,11 +821,37 @@ class _NotificationsPane(_Pane):
             wraplength=480, justify="left",
         ).pack(anchor="w", pady=(PAD_MD, 0))
 
-    def _on_toggle(self) -> None:
-        master = bool(self._master_var.get())
-        welcome = bool(self._welcome_var.get())
-        post_arm = bool(self._post_arm_var.get())
-        saved = bool(self._saved_var.get())
+    def _add_row(
+        self, parent: tk.Widget, *, label: str, on: bool, indent: bool,
+    ) -> SwitchToggle:
+        """Add a single [label ........ switch] row and return the switch
+        so the caller can read its state on persist."""
+        row = tk.Frame(parent, background=BG)
+        row.pack(
+            fill="x",
+            pady=PAD_XS,
+            padx=(PAD_XL if indent else 0, 0),
+        )
+        tk.Label(
+            row, text=label,
+            background=BG, foreground=INK, font=theme.FONT_BODY,
+            anchor="w", justify="left", wraplength=480,
+        ).pack(side="left", fill="x", expand=True)
+        switch = SwitchToggle(
+            row, on=on, command=lambda _v: self._persist(),
+        )
+        switch.pack(side="right")
+        return switch
+
+    def _persist(self) -> None:
+        assert self._master_switch is not None
+        assert self._welcome_switch is not None
+        assert self._post_arm_switch is not None
+        assert self._saved_switch is not None
+        master = self._master_switch.on
+        welcome = self._welcome_switch.on
+        post_arm = self._post_arm_switch.on
+        saved = self._saved_switch.on
 
         self._cfg.notifications_enabled = master
         self._cfg.notify_welcome = welcome
@@ -833,3 +870,1407 @@ class _NotificationsPane(_Pane):
             )
         except Exception:
             log.warning("[settings] persist notifications failed", exc_info=True)
+
+
+# ---- Meeting Apps pane -----------------------------------------------------
+
+
+class _MeetingAppsPane(_Pane):
+    """Whitelist editor. Shows every detector as a row with toggle +
+    remove; offers an Add dialog for desktop apps (live mic-holder picker)
+    and web meetings (URL paste). A Suggested section surfaces unmatched
+    mic-holders Sayzo has observed while disarmed.
+
+    Persistence: the pane writes the full detector list to
+    ``user_settings.json`` under ``arm.detectors``. ``load_config`` merges
+    that onto the defaults, so any env var (``SAYZO_ARM__DETECTORS``) still
+    wins. "Reset to defaults" clears the user's override so the ship-with
+    list reappears.
+    """
+
+    _UNDO_TIMEOUT_MS = 8000
+
+    def __init__(
+        self, parent: tk.Widget, cfg: "Config", arm: "ArmController",
+    ) -> None:
+        super().__init__(parent)
+        self._cfg = cfg
+        self._arm = arm
+
+        # Undo state — used by Reset to defaults so an accidental reset
+        # is recoverable. Toggle is self-undoing (click again) so it
+        # doesn't need the snapshot.
+        self._undo_snapshot: Optional[list[DetectorSpec]] = None
+        self._undo_label: str = ""
+        self._undo_after_id: Optional[str] = None
+
+        # Which section is currently visible — "desktop" or "web". Tabbed
+        # UI so the user sees one section at a time rather than scrolling
+        # through both lists + their identical display names.
+        self._active_section: str = "desktop"
+        self._tab_desktop_btn: Optional[RoundedButton] = None
+        self._tab_web_btn: Optional[RoundedButton] = None
+        self._tabs_row: Optional[tk.Frame] = None
+
+        # Add-app button — rebuilt on section switch so its label reflects
+        # the active tab ("+ Add desktop app" vs "+ Add web meeting"). The
+        # dialog also opens on the matching tab, so the whole control
+        # group reads as one contextual action.
+        self._actions_row: Optional[tk.Frame] = None
+
+        # Scrollable list state.
+        self._list_wrap: Optional[ttk.Frame] = None
+        self._list_canvas: Optional[tk.Canvas] = None
+        self._list_inner: Optional[tk.Frame] = None
+        self._list_window_id: Optional[int] = None
+
+        # Undo bar ref — kept so show/hide just toggles pack() without
+        # rebuilding.
+        self._undo_bar: Optional[tk.Frame] = None
+        self._undo_text_var = tk.StringVar(value="")
+
+        self._build_structure()
+        self._render_list()
+
+    # ---- lifecycle ---------------------------------------------------------
+
+    def show(self) -> None:
+        super().show()
+        # Refresh on show so a detector added via env var or an updated
+        # seen_apps file doesn't show stale.
+        self._render_list()
+
+    def hide(self) -> None:
+        # Cancel any pending undo timer so it doesn't fire on a hidden pane.
+        self._cancel_undo_timer()
+        self._undo_snapshot = None
+        self._set_undo_bar_visible(False)
+        super().hide()
+
+    # ---- one-time structural build ----------------------------------------
+
+    def _build_structure(self) -> None:
+        """Static elements that never rebuild: header, action bar, undo
+        bar (hidden initially), and the scrollable list shell. The list's
+        *contents* re-render on every change via :meth:`_render_list`."""
+        header = ttk.Frame(self._frame, style="Sayzo.TFrame")
+        header.pack(fill="x")
+        ttk.Label(
+            header, text="Meeting Apps", style="H1.Sayzo.TLabel",
+        ).pack(anchor="w")
+        ttk.Label(
+            header,
+            text="Sayzo asks to start coaching when one of these apps is in "
+                 "a meeting. Toggle an app off to stop matching it without "
+                 "losing its settings.",
+            style="Muted.Sayzo.TLabel",
+            wraplength=580, justify="left",
+        ).pack(anchor="w", pady=(PAD_SM, PAD_LG))
+
+        # Section tabs: [Desktop apps] [Web meetings]. These set the
+        # context for the action bar below, so they come first. Same
+        # segmented-button pattern as the Add-app dialog so the two
+        # surfaces feel like the same product.
+        self._tabs_row = tk.Frame(self._frame, background=BG)
+        self._tabs_row.pack(fill="x", pady=(0, PAD_SM))
+        self._render_tab_buttons()
+
+        # Action bar: [+ Add <section>]    [Reset to defaults]. The Add
+        # button's label + target tab tracks the active section so it's
+        # obvious what you're about to add.
+        self._actions_row = tk.Frame(self._frame, background=BG)
+        self._actions_row.pack(fill="x", pady=(0, PAD_MD))
+        self._render_actions_row()
+
+        # Undo bar (hidden until an undoable action fires).
+        self._undo_bar = tk.Frame(
+            self._frame,
+            background=ACCENT_TINT,
+            highlightthickness=1,
+            highlightbackground=ACCENT,
+        )
+        undo_inner = tk.Frame(self._undo_bar, background=ACCENT_TINT)
+        undo_inner.pack(fill="x", padx=PAD_MD, pady=PAD_SM)
+        tk.Label(
+            undo_inner,
+            textvariable=self._undo_text_var,
+            background=ACCENT_TINT,
+            foreground=INK,
+            font=theme.FONT_BODY,
+            anchor="w",
+        ).pack(side="left", fill="x", expand=True)
+        RoundedButton(
+            undo_inner, "Undo",
+            command=self._on_undo,
+            variant="secondary",
+            bg=ACCENT_TINT,
+        ).pack(side="right")
+
+        # Scrollable list area. Canvas + inner frame so ttk buttons can
+        # sit inside (Canvas.create_window does the windowed-widget trick).
+        list_wrap = ttk.Frame(self._frame, style="Sayzo.TFrame")
+        list_wrap.pack(fill="both", expand=True)
+        self._list_wrap = list_wrap
+
+        canvas = tk.Canvas(
+            list_wrap, background=BG, highlightthickness=0, bd=0,
+        )
+        scrollbar = ttk.Scrollbar(
+            list_wrap, orient="vertical", command=canvas.yview,
+            style="Sayzo.Vertical.TScrollbar",
+        )
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y", padx=(PAD_XS, 0))
+
+        inner = tk.Frame(canvas, background=BG)
+        window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _on_inner_configure(_e: tk.Event) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_configure(e: tk.Event) -> None:
+            canvas.itemconfigure(window_id, width=e.width)
+
+        inner.bind("<Configure>", _on_inner_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        # Mouse-wheel only while hovering the list, to avoid swallowing
+        # scroll events from other widgets.
+        def _on_wheel(e: tk.Event) -> None:
+            # Windows: e.delta is ±120 per notch. macOS: smaller, signed.
+            try:
+                canvas.yview_scroll(-int(e.delta / 120) or (-1 if e.delta > 0 else 1), "units")
+            except tk.TclError:
+                pass
+
+        def _bind_wheel(_e: tk.Event) -> None:
+            canvas.bind_all("<MouseWheel>", _on_wheel)
+
+        def _unbind_wheel(_e: tk.Event) -> None:
+            canvas.unbind_all("<MouseWheel>")
+
+        canvas.bind("<Enter>", _bind_wheel)
+        canvas.bind("<Leave>", _unbind_wheel)
+
+        self._list_canvas = canvas
+        self._list_inner = inner
+        self._list_window_id = window_id
+
+    # ---- list re-rendering -------------------------------------------------
+
+    def _render_list(self) -> None:
+        """Rebuild the rows for the active section + the Suggested list.
+
+        Called on first build, on every list mutation (toggle / add / reset),
+        on pane show(), and on section tab switch. Cheap enough to do
+        wholesale — at ~15 rows per section + one frame recreate, render
+        time is <10 ms on any machine that can run the agent.
+        """
+        if self._list_inner is None:
+            return
+        for child in self._list_inner.winfo_children():
+            child.destroy()
+
+        detectors = list(self._cfg.arm.detectors)
+        if self._active_section == "web":
+            visible = [s for s in detectors if s.is_browser]
+            empty_hint = (
+                "No web meetings on your list. Click "
+                "“+ Add app” above to add one from a URL."
+            )
+        else:
+            visible = [s for s in detectors if not s.is_browser]
+            empty_hint = (
+                "No desktop apps on your list. Click "
+                "“+ Add app” above to add one — or start a "
+                "meeting and Sayzo will suggest it automatically."
+            )
+
+        if not visible:
+            tk.Label(
+                self._list_inner, text=empty_hint,
+                background=BG, foreground=MUTED, font=theme.FONT_BODY,
+                anchor="w", justify="left", wraplength=560,
+            ).pack(fill="x", pady=(PAD_SM, 0))
+        else:
+            container = tk.Frame(self._list_inner, background=BG)
+            container.pack(fill="x")
+            for i, spec in enumerate(visible):
+                if i > 0:
+                    tk.Frame(container, background=BORDER, height=1).pack(fill="x")
+                self._build_detector_row(container, spec)
+
+        # Suggested section — only on the Desktop tab (the watcher skips
+        # browsers when recording seen apps, so every suggestion is a
+        # desktop app).
+        if self._active_section == "desktop":
+            suggested = _seen_apps.load(self._cfg.data_dir, detectors)
+            if suggested:
+                make_divider(self._list_inner, pady=PAD_LG)
+                tk.Label(
+                    self._list_inner,
+                    text="Suggested to add",
+                    background=BG, foreground=MUTED, font=theme.FONT_STEP,
+                    anchor="w",
+                ).pack(fill="x", pady=(0, PAD_XS))
+                tk.Label(
+                    self._list_inner,
+                    text="Apps Sayzo saw using your microphone that aren't "
+                         "on your list yet.",
+                    background=BG, foreground=MUTED, font=theme.FONT_SMALL,
+                    anchor="w", wraplength=560, justify="left",
+                ).pack(fill="x", pady=(0, PAD_SM))
+                for seen in suggested[:5]:  # cap UI to top-5 most recent
+                    self._build_suggested_row(self._list_inner, seen)
+
+        # Tail padding so the last row isn't flush against the scrollbar.
+        tk.Frame(self._list_inner, background=BG, height=PAD_XL).pack(fill="x")
+
+    def _build_detector_row(self, parent: tk.Widget, spec: DetectorSpec) -> None:
+        """One detector row: name + detail on the left, switch on the right.
+
+        There used to be a Remove button here too — it's been dropped because
+        the toggle already does the job ("stop matching this app") and
+        having both forced a cognitive decision per row with no real payoff.
+        Clearing the list entirely is handled by Reset to defaults, and
+        accidentally-added custom entries can just be toggled off.
+        """
+        row = tk.Frame(parent, background=BG)
+        row.pack(fill="x")
+
+        body = tk.Frame(row, background=BG)
+        body.pack(fill="x", pady=PAD_SM)
+
+        # Text column (left, takes all available space).
+        text_col = tk.Frame(body, background=BG)
+        text_col.pack(side="left", fill="x", expand=True)
+
+        name_color = INK if not spec.disabled else SUBTLE
+        tk.Label(
+            text_col,
+            text=spec.display_name,
+            background=BG, foreground=name_color,
+            font=theme.FONT_BODY_BOLD, anchor="w",
+        ).pack(anchor="w")
+
+        detail = self._detail_text(spec)
+        if detail:
+            detail_color = MUTED if not spec.disabled else SUBTLE
+            tk.Label(
+                text_col,
+                text=detail,
+                background=BG, foreground=detail_color, font=theme.FONT_SMALL,
+                anchor="w", justify="left", wraplength=460,
+            ).pack(anchor="w", pady=(1, 0))
+
+        SwitchToggle(
+            body,
+            on=not spec.disabled,
+            command=lambda enabled, s=spec: self._on_toggle_switch(s, enabled),
+        ).pack(side="right", padx=(PAD_MD, 0))
+
+    def _build_suggested_row(self, parent: tk.Widget, seen: "_seen_apps.SeenApp") -> None:
+        row = tk.Frame(parent, background=BG)
+        row.pack(fill="x", pady=(PAD_XS, 0))
+
+        body = tk.Frame(row, background=BG)
+        body.pack(fill="x", pady=PAD_XS)
+
+        text_col = tk.Frame(body, background=BG)
+        text_col.pack(side="left", fill="x", expand=True)
+        tk.Label(
+            text_col,
+            text=seen.display_name,
+            background=BG, foreground=INK, font=theme.FONT_BODY_BOLD,
+            anchor="w",
+        ).pack(anchor="w")
+        detail_key = seen.process_name or seen.bundle_id or seen.key
+        tk.Label(
+            text_col,
+            text=detail_key,
+            background=BG, foreground=MUTED, font=theme.FONT_SMALL, anchor="w",
+        ).pack(anchor="w", pady=(1, 0))
+
+        RoundedButton(
+            body, "Dismiss",
+            command=lambda s=seen: self._on_dismiss_suggested(s),
+            variant="ghost",
+            padx=PAD_MD, pady=PAD_XS,
+        ).pack(side="right")
+        RoundedButton(
+            body, "+ Add",
+            command=lambda s=seen: self._on_add_suggested(s),
+            variant="secondary",
+            padx=PAD_MD, pady=PAD_XS,
+        ).pack(side="right", padx=(0, PAD_SM))
+
+    @staticmethod
+    def _detail_text(spec: DetectorSpec) -> str:
+        if spec.is_browser:
+            # For web specs, show the hostname distilled from the first URL
+            # pattern. Regex-y strings aren't friendly — strip the common
+            # regex glyphs so "^https://meet\\.google\\.com/..." reads as
+            # "meet.google.com/…".
+            if spec.url_patterns:
+                return "Web · " + _friendly_url_pattern(spec.url_patterns[0])
+            if spec.title_patterns:
+                return "Web · matches window titles"
+            return "Web"
+        bits: list[str] = []
+        if spec.process_names:
+            bits.append(", ".join(spec.process_names))
+        if spec.bundle_ids and not spec.process_names:
+            bits.append(", ".join(spec.bundle_ids))
+        return ("Desktop · " + bits[0]) if bits else "Desktop"
+
+    # ---- section tabs -----------------------------------------------------
+
+    def _render_tab_buttons(self) -> None:
+        """Build / rebuild the segmented [Desktop apps] [Web meetings]
+        toggle. Called on initial build + on every section switch (the
+        RoundedButton variant is picked at construction time, so we
+        destroy + recreate on flip)."""
+        if self._tabs_row is None:
+            return
+        for child in self._tabs_row.winfo_children():
+            child.destroy()
+        desktop_selected = self._active_section == "desktop"
+        self._tab_desktop_btn = RoundedButton(
+            self._tabs_row, "Desktop apps",
+            command=lambda: self._switch_section("desktop"),
+            variant="primary" if desktop_selected else "secondary",
+            padx=PAD_LG, pady=PAD_SM,
+        )
+        self._tab_desktop_btn.pack(side="left")
+        self._tab_web_btn = RoundedButton(
+            self._tabs_row, "Web meetings",
+            command=lambda: self._switch_section("web"),
+            variant="secondary" if desktop_selected else "primary",
+            padx=PAD_LG, pady=PAD_SM,
+        )
+        self._tab_web_btn.pack(side="left", padx=(PAD_SM, 0))
+
+    def _switch_section(self, section: str) -> None:
+        if section == self._active_section:
+            return
+        self._active_section = section
+        self._render_tab_buttons()
+        self._render_actions_row()
+        self._render_list()
+
+    def _render_actions_row(self) -> None:
+        """Rebuild the [+ Add <section>] [Reset to defaults] bar.
+
+        The Add button's label reflects the active section so that reading
+        left-to-right ("Desktop apps" tab → "+ Add desktop app") telegraphs
+        exactly what the button does.
+        """
+        if self._actions_row is None:
+            return
+        for child in self._actions_row.winfo_children():
+            child.destroy()
+        label = (
+            "+ Add desktop app"
+            if self._active_section == "desktop"
+            else "+ Add web meeting"
+        )
+        RoundedButton(
+            self._actions_row, label,
+            command=self._on_add_clicked,
+            variant="primary",
+        ).pack(side="left")
+        RoundedButton(
+            self._actions_row, "Reset to defaults",
+            command=self._on_reset,
+            variant="ghost",
+        ).pack(side="right")
+
+    # ---- mutation handlers ------------------------------------------------
+
+    def _on_toggle_switch(self, spec: DetectorSpec, enabled: bool) -> None:
+        spec.disabled = not bool(enabled)
+        self._persist()
+        # Re-render to update the label color + detail muting. The switch
+        # widget already shows the new state; the re-render is purely for
+        # the text fade.
+        self._render_list()
+
+    def _on_undo(self) -> None:
+        if self._undo_snapshot is None:
+            return
+        self._cfg.arm.detectors = list(self._undo_snapshot)
+        self._persist()
+        self._cancel_undo_timer()
+        self._undo_snapshot = None
+        self._set_undo_bar_visible(False)
+        self._render_list()
+
+    def _on_reset(self) -> None:
+        self._snapshot_for_undo("Reset to the built-in app list.")
+        # Reset clears the user override — we overwrite with the defaults
+        # and also clear the user_settings entry so ``load_config`` picks
+        # up any future shipped defaults on next launch.
+        self._cfg.arm.detectors = default_detector_specs()
+        self._persist(clear_user_override=True)
+        self._render_list()
+
+    def _on_add_clicked(self) -> None:
+        dialog = _AddAppDialog(
+            self._frame.winfo_toplevel(),
+            cfg=self._cfg,
+            arm=self._arm,
+            existing=list(self._cfg.arm.detectors),
+            initial_tab=self._active_section,
+        )
+        spec = dialog.run()
+        if spec is None:
+            return
+        self._add_detector(spec)
+
+    def _on_add_suggested(self, seen: "_seen_apps.SeenApp") -> None:
+        """Convert a suggested entry into a DetectorSpec and add it."""
+        spec = DetectorSpec(
+            app_key=_unique_app_key(seen.key, [d.app_key for d in self._cfg.arm.detectors]),
+            display_name=seen.display_name or seen.key,
+            process_names=[seen.process_name] if seen.process_name else [],
+            bundle_ids=[seen.bundle_id] if seen.bundle_id else [],
+        )
+        self._add_detector(spec)
+        # Drop the suggestion entry so it doesn't linger after we've
+        # incorporated it.
+        try:
+            _seen_apps.dismiss(self._cfg.data_dir, seen.key)
+        except Exception:
+            log.debug("[settings] seen_apps.dismiss failed", exc_info=True)
+
+    def _on_dismiss_suggested(self, seen: "_seen_apps.SeenApp") -> None:
+        try:
+            _seen_apps.dismiss(self._cfg.data_dir, seen.key)
+        except Exception:
+            log.warning("[settings] seen_apps.dismiss failed", exc_info=True)
+        self._render_list()
+
+    def _add_detector(self, spec: DetectorSpec) -> None:
+        # If a detector with this app_key already exists, replace it (the
+        # Add dialog guards against this too, but this is defensive).
+        existing = [d for d in self._cfg.arm.detectors if d.app_key != spec.app_key]
+        existing.append(spec)
+        self._cfg.arm.detectors = existing
+        self._persist()
+        # Clear any prior dismissal for this app's keys so future
+        # observations accumulate normally if the user later disables /
+        # replaces the detector.
+        for k in (*spec.process_names, *spec.bundle_ids):
+            try:
+                _seen_apps.undismiss(self._cfg.data_dir, k)
+            except Exception:
+                log.debug("[settings] undismiss failed", exc_info=True)
+        self._render_list()
+
+    # ---- persistence / undo timer -----------------------------------------
+
+    def _persist(self, *, clear_user_override: bool = False) -> None:
+        """Write the current detector list to ``user_settings.json``.
+
+        ``clear_user_override=True`` drops the whole ``arm.detectors`` key
+        from the JSON so ``load_config`` falls back to ``default_detector_specs``
+        on next launch. In-memory ``cfg.arm.detectors`` is kept in sync
+        either way.
+        """
+        try:
+            if clear_user_override:
+                # Read-modify-write: load current JSON, drop the key, rewrite.
+                current = settings_store.load(self._cfg.data_dir)
+                arm_block = current.get("arm") if isinstance(current.get("arm"), dict) else {}
+                if isinstance(arm_block, dict) and "detectors" in arm_block:
+                    arm_block.pop("detectors", None)
+                    settings_store.save(
+                        self._cfg.data_dir, {"arm": arm_block},
+                    )
+                return
+            serialized = [d.model_dump() for d in self._cfg.arm.detectors]
+            settings_store.save(
+                self._cfg.data_dir,
+                {"arm": {"detectors": serialized}},
+            )
+        except Exception:
+            log.warning("[settings] persist detectors failed", exc_info=True)
+
+    def _snapshot_for_undo(self, label: str) -> None:
+        self._cancel_undo_timer()
+        # Deep-copy via model_dump/model_validate so mutating cfg.arm.detectors
+        # later doesn't retroactively alter the snapshot.
+        self._undo_snapshot = [
+            DetectorSpec.model_validate(d.model_dump())
+            for d in self._cfg.arm.detectors
+        ]
+        self._undo_label = label
+        self._undo_text_var.set(label)
+        self._set_undo_bar_visible(True)
+        try:
+            self._undo_after_id = self._frame.after(
+                self._UNDO_TIMEOUT_MS, self._expire_undo,
+            )
+        except tk.TclError:
+            self._undo_after_id = None
+
+    def _expire_undo(self) -> None:
+        self._undo_after_id = None
+        self._undo_snapshot = None
+        self._set_undo_bar_visible(False)
+
+    def _cancel_undo_timer(self) -> None:
+        if self._undo_after_id is None:
+            return
+        try:
+            self._frame.after_cancel(self._undo_after_id)
+        except tk.TclError:
+            pass
+        self._undo_after_id = None
+
+    def _set_undo_bar_visible(self, visible: bool) -> None:
+        if self._undo_bar is None:
+            return
+        if visible:
+            # Slot the undo bar between the action row and the list. Using
+            # `before=list_wrap` keeps the visual order stable.
+            try:
+                if self._list_wrap is not None:
+                    self._undo_bar.pack(
+                        fill="x", pady=(0, PAD_MD), before=self._list_wrap,
+                    )
+                else:
+                    self._undo_bar.pack(fill="x", pady=(0, PAD_MD))
+            except tk.TclError:
+                pass
+        else:
+            try:
+                self._undo_bar.pack_forget()
+            except tk.TclError:
+                pass
+
+
+# ---- Add-app dialog -------------------------------------------------------
+
+
+class _AddAppDialog:
+    """Modal dialog for adding a new detector. Two tabs — Desktop and Web —
+    and returns a ``DetectorSpec`` (or None on cancel). Runs its own
+    ``wait_window`` so the parent Settings pane blocks until the dialog
+    closes and only then incorporates the result.
+    """
+
+    _REFRESH_INTERVAL_MS = 2000
+    _DIALOG_SIZE = (720, 640)
+    _DIALOG_MIN = (640, 560)
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        *,
+        cfg: "Config",
+        arm: "ArmController",
+        existing: list[DetectorSpec],
+        initial_tab: str = "desktop",
+    ) -> None:
+        self._cfg = cfg
+        self._arm = arm
+        self._existing = existing
+        self._result: Optional[DetectorSpec] = None
+        # ``initial_tab`` lets callers open the dialog pre-focused on the
+        # tab they're adding from (the Meeting Apps pane passes the
+        # active section), so the user doesn't have to re-pick.
+        self._active_tab = initial_tab if initial_tab in ("desktop", "web") else "desktop"
+        self._refresh_after_id: Optional[str] = None
+
+        self._top = tk.Toplevel(parent)
+        self._top.title("Add a meeting app")
+        self._top.geometry(f"{self._DIALOG_SIZE[0]}x{self._DIALOG_SIZE[1]}")
+        self._top.minsize(*self._DIALOG_MIN)
+        self._top.configure(background=BG)
+        apply_sayzo_icon(self._top)
+        # Modal-ish: transient + grab so the user can't interact with the
+        # underlying Settings window while adding.
+        try:
+            self._top.transient(parent.winfo_toplevel())
+        except tk.TclError:
+            pass
+        self._top.grab_set()
+
+        self._desktop_tab: Optional[tk.Frame] = None
+        self._web_tab: Optional[tk.Frame] = None
+        self._tab_desktop_btn: Optional[RoundedButton] = None
+        self._tab_web_btn: Optional[RoundedButton] = None
+
+        # Desktop state.
+        self._desktop_list_frame: Optional[tk.Frame] = None
+        self._desktop_empty_label: Optional[tk.Label] = None
+        self._manual_name_var = tk.StringVar()
+        self._manual_process_var = tk.StringVar()
+        self._manual_bundle_var = tk.StringVar()
+        self._manual_expanded = False
+        self._manual_body: Optional[tk.Frame] = None
+        self._manual_toggle_btn: Optional[RoundedButton] = None
+        self._desktop_status_var = tk.StringVar(value="")
+
+        # Web state.
+        self._web_url_var = tk.StringVar()
+        self._web_name_var = tk.StringVar()
+        self._web_strict_var = tk.BooleanVar(value=False)
+        self._web_preview_var = tk.StringVar(value="")
+        self._web_status_var = tk.StringVar(value="")
+
+        self._build()
+        # Kick off the desktop live-refresh loop.
+        self._schedule_desktop_refresh(immediate=True)
+
+        # Cancel timer + grab release on close — even if the user hits the
+        # window [X].
+        self._top.protocol("WM_DELETE_WINDOW", self._on_cancel)
+
+    def run(self) -> Optional[DetectorSpec]:
+        self._top.wait_window()
+        return self._result
+
+    # ---- layout ----------------------------------------------------------
+
+    def _build(self) -> None:
+        outer = tk.Frame(self._top, background=BG)
+        outer.pack(fill="both", expand=True, padx=PAD_XL, pady=PAD_XL)
+
+        tk.Label(
+            outer, text="Add a meeting app",
+            background=BG, foreground=INK, font=theme.FONT_H1,
+            anchor="w",
+        ).pack(anchor="w")
+        tk.Label(
+            outer,
+            text="Tell Sayzo which apps or sites count as meetings, so it "
+                 "can offer to capture them.",
+            background=BG, foreground=MUTED, font=theme.FONT_BODY,
+            anchor="w", justify="left", wraplength=560,
+        ).pack(anchor="w", pady=(PAD_XS, PAD_LG))
+
+        # Segmented tab control — two buttons, one primary, one secondary.
+        # Initial variants honour ``_active_tab`` so the caller's preference
+        # lights up the right tab from the first paint.
+        tabs = tk.Frame(outer, background=BG)
+        tabs.pack(anchor="w", pady=(0, PAD_LG))
+        desktop_selected = self._active_tab == "desktop"
+        self._tab_desktop_btn = RoundedButton(
+            tabs, "Desktop app",
+            command=lambda: self._switch_tab("desktop"),
+            variant="primary" if desktop_selected else "secondary",
+            padx=PAD_LG, pady=PAD_SM,
+        )
+        self._tab_desktop_btn.pack(side="left")
+        self._tab_web_btn = RoundedButton(
+            tabs, "Web meeting",
+            command=lambda: self._switch_tab("web"),
+            variant="secondary" if desktop_selected else "primary",
+            padx=PAD_LG, pady=PAD_SM,
+        )
+        self._tab_web_btn.pack(side="left", padx=(PAD_SM, 0))
+
+        # Tab bodies. Each tab is a scrollable canvas so the Web tab's
+        # Display-name field (and the Desktop tab's manual-entry expander)
+        # never fall off the bottom on a smaller window. Only one tab is
+        # packed into the outer frame at a time.
+        self._desktop_tab, desktop_inner = self._make_scrollable_tab(outer)
+        self._web_tab, web_inner = self._make_scrollable_tab(outer)
+        self._build_desktop_tab(desktop_inner)
+        self._build_web_tab(web_inner)
+        if desktop_selected:
+            self._desktop_tab.pack(fill="both", expand=True)
+        else:
+            self._web_tab.pack(fill="both", expand=True)
+
+        # Footer: Cancel / Add.
+        make_divider(outer, pady=PAD_LG)
+        footer = tk.Frame(outer, background=BG)
+        footer.pack(fill="x")
+        RoundedButton(
+            footer, "Cancel",
+            command=self._on_cancel,
+            variant="ghost",
+        ).pack(side="right", padx=(PAD_SM, 0))
+        RoundedButton(
+            footer, "Add app",
+            command=self._on_submit,
+            variant="primary",
+        ).pack(side="right")
+
+    def _make_scrollable_tab(
+        self, parent: tk.Widget,
+    ) -> tuple[tk.Frame, tk.Frame]:
+        """Wrap tab content in a vertical-scroll canvas.
+
+        Returns ``(outer, inner)`` — ``outer`` is what the caller packs /
+        unpacks when switching tabs, ``inner`` is where the tab content
+        actually lives.
+        """
+        outer = tk.Frame(parent, background=BG)
+        canvas = tk.Canvas(outer, background=BG, highlightthickness=0, bd=0)
+        scrollbar = ttk.Scrollbar(
+            outer, orient="vertical", command=canvas.yview,
+            style="Sayzo.Vertical.TScrollbar",
+        )
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y", padx=(PAD_XS, 0))
+
+        inner = tk.Frame(canvas, background=BG)
+        win_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _on_inner_configure(_e: tk.Event) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_configure(e: tk.Event) -> None:
+            canvas.itemconfigure(win_id, width=e.width)
+
+        inner.bind("<Configure>", _on_inner_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        def _on_wheel(e: tk.Event) -> None:
+            try:
+                canvas.yview_scroll(
+                    -int(e.delta / 120) or (-1 if e.delta > 0 else 1),
+                    "units",
+                )
+            except tk.TclError:
+                pass
+
+        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _on_wheel))
+        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+        return outer, inner
+
+    # ---- Desktop tab ----------------------------------------------------
+
+    def _build_desktop_tab(self, parent: tk.Frame) -> None:
+        tk.Label(
+            parent,
+            text="Pick an app that's using your microphone",
+            background=BG, foreground=INK, font=theme.FONT_H3, anchor="w",
+        ).pack(anchor="w")
+        tk.Label(
+            parent,
+            text="Open (or join) your meeting, then click the app below to "
+                 "add it. Sayzo reads the apps currently recording from your "
+                 "microphone — nothing is sent anywhere.",
+            background=BG, foreground=MUTED, font=theme.FONT_SMALL,
+            anchor="w", justify="left", wraplength=560,
+        ).pack(anchor="w", pady=(PAD_XS, PAD_SM))
+
+        # Live list container.
+        self._desktop_list_frame = tk.Frame(parent, background=BG)
+        self._desktop_list_frame.pack(fill="x")
+
+        # Refresh row.
+        refresh_row = tk.Frame(parent, background=BG)
+        refresh_row.pack(fill="x", pady=(PAD_SM, 0))
+        RoundedButton(
+            refresh_row, "Refresh now",
+            command=lambda: self._schedule_desktop_refresh(immediate=True),
+            variant="secondary",
+            padx=PAD_MD, pady=PAD_XS,
+        ).pack(side="left")
+        tk.Label(
+            refresh_row,
+            textvariable=self._desktop_status_var,
+            background=BG, foreground=SUCCESS, font=theme.FONT_SMALL,
+        ).pack(side="left", padx=(PAD_SM, 0))
+
+        make_divider(parent, pady=PAD_LG)
+
+        # Advanced / manual entry.
+        self._manual_toggle_btn = RoundedButton(
+            parent, "▸ Know the app? Add it by name instead",
+            command=self._toggle_manual,
+            variant="ghost",
+            padx=0, pady=PAD_XS,
+        )
+        self._manual_toggle_btn.pack(anchor="w")
+
+        self._manual_body = tk.Frame(parent, background=BG)
+        # (Not packed yet — toggled by _toggle_manual.)
+        self._build_manual_body(self._manual_body)
+
+    def _build_manual_body(self, parent: tk.Frame) -> None:
+        tk.Label(
+            parent,
+            text="Name it",
+            background=BG, foreground=INK, font=theme.FONT_BODY_BOLD, anchor="w",
+        ).pack(anchor="w", pady=(PAD_SM, PAD_XS))
+        tk.Label(
+            parent,
+            text="How this appears in your Meeting Apps list "
+                 "(e.g. “Zoom”, “Team standup”).",
+            background=BG, foreground=MUTED, font=theme.FONT_SMALL,
+            anchor="w", justify="left", wraplength=520,
+        ).pack(anchor="w", pady=(0, PAD_XS))
+        ttk.Entry(
+            parent, textvariable=self._manual_name_var,
+        ).pack(fill="x", pady=(0, PAD_SM))
+
+        if sys.platform == "darwin":
+            tk.Label(
+                parent,
+                text="Bundle identifier (e.g. com.hnc.Discord)",
+                background=BG, foreground=INK, font=theme.FONT_BODY_BOLD, anchor="w",
+            ).pack(anchor="w", pady=(0, PAD_XS))
+            ttk.Entry(
+                parent, textvariable=self._manual_bundle_var,
+            ).pack(fill="x", pady=(0, PAD_XS))
+            tk.Label(
+                parent,
+                text="Find it in macOS: open the app, then Apple menu → "
+                     "System Information → Applications. The bundle id is "
+                     "in the details panel.",
+                background=BG, foreground=MUTED, font=theme.FONT_SMALL,
+                wraplength=520, justify="left", anchor="w",
+            ).pack(anchor="w", pady=(0, PAD_SM))
+        else:
+            tk.Label(
+                parent,
+                text="Process name (e.g. loom.exe)",
+                background=BG, foreground=INK, font=theme.FONT_BODY_BOLD, anchor="w",
+            ).pack(anchor="w", pady=(0, PAD_XS))
+            ttk.Entry(
+                parent, textvariable=self._manual_process_var,
+            ).pack(fill="x", pady=(0, PAD_XS))
+            tk.Label(
+                parent,
+                text="Find it in Task Manager → Details tab. The process "
+                     "name ends in .exe — use the exact filename.",
+                background=BG, foreground=MUTED, font=theme.FONT_SMALL,
+                wraplength=520, justify="left", anchor="w",
+            ).pack(anchor="w", pady=(0, PAD_SM))
+
+    def _toggle_manual(self) -> None:
+        self._manual_expanded = not self._manual_expanded
+        assert self._manual_toggle_btn is not None
+        assert self._manual_body is not None
+        if self._manual_expanded:
+            self._manual_toggle_btn.set_text("▾ Know the app? Add it by name instead")
+            self._manual_body.pack(fill="x", anchor="w")
+        else:
+            self._manual_toggle_btn.set_text("▸ Know the app? Add it by name instead")
+            self._manual_body.pack_forget()
+
+    # ---- Desktop live refresh -----------------------------------------
+
+    def _schedule_desktop_refresh(self, *, immediate: bool = False) -> None:
+        """Fetch the current mic-holder snapshot + re-render the list.
+
+        Runs every :attr:`_REFRESH_INTERVAL_MS` while the dialog is open,
+        independent of the main whitelist watcher's cadence. Skips cleanly
+        if the dialog was closed between schedules.
+        """
+        if not self._top.winfo_exists():
+            return
+        if immediate:
+            # Cancel pending + run now.
+            self._cancel_desktop_refresh()
+            self._render_desktop_list()
+            self._refresh_after_id = self._top.after(
+                self._REFRESH_INTERVAL_MS, self._schedule_desktop_refresh,
+            )
+            return
+        self._render_desktop_list()
+        self._refresh_after_id = self._top.after(
+            self._REFRESH_INTERVAL_MS, self._schedule_desktop_refresh,
+        )
+
+    def _cancel_desktop_refresh(self) -> None:
+        if self._refresh_after_id is None:
+            return
+        try:
+            self._top.after_cancel(self._refresh_after_id)
+        except tk.TclError:
+            pass
+        self._refresh_after_id = None
+
+    def _render_desktop_list(self) -> None:
+        if self._desktop_list_frame is None:
+            return
+        for child in self._desktop_list_frame.winfo_children():
+            child.destroy()
+
+        try:
+            mic = self._arm.snapshot_mic_state()
+            fg = self._arm.snapshot_foreground()
+        except Exception:
+            log.debug("[settings] snapshot failed", exc_info=True)
+            mic = None
+            fg = None
+
+        # Deduped candidates this snapshot.
+        candidates: list[tuple[str, str, bool]] = []  # (key, display, is_bundle_id)
+        seen_keys: set[str] = set()
+
+        if mic is not None:
+            for holder in mic.holders:
+                key = (holder.process_name or "").lower()
+                if not key or key in seen_keys:
+                    continue
+                if key in BROWSER_PROCESS_NAMES:
+                    continue
+                if self._key_already_present(key):
+                    continue
+                seen_keys.add(key)
+                display = _seen_apps._display_name_for_process(holder.process_name)
+                candidates.append((holder.process_name, display, False))
+
+            # macOS fallback: foreground bundle id while mic is active.
+            if sys.platform == "darwin" and mic.active and fg is not None and fg.bundle_id:
+                if not fg.is_browser:
+                    key = fg.bundle_id.lower()
+                    if key not in seen_keys and not self._key_already_present(key):
+                        display = _seen_apps._display_name_for_bundle(fg.bundle_id)
+                        candidates.append((fg.bundle_id, display, True))
+                        seen_keys.add(key)
+
+        if not candidates:
+            # Helpful empty state.
+            self._desktop_empty_label = tk.Label(
+                self._desktop_list_frame,
+                text="No apps are using your microphone right now.\n"
+                     "Start a call in the app you want to add — it will appear here.",
+                background=BG, foreground=MUTED, font=theme.FONT_BODY,
+                justify="left", anchor="w", wraplength=560,
+            )
+            self._desktop_empty_label.pack(anchor="w", pady=(PAD_SM, 0))
+            return
+
+        for raw_key, display, is_bundle_id in candidates:
+            row = tk.Frame(self._desktop_list_frame, background=SURFACE)
+            row.pack(fill="x", pady=(0, PAD_XS))
+
+            body = tk.Frame(row, background=SURFACE)
+            body.pack(fill="x", padx=PAD_MD, pady=PAD_SM)
+
+            text_col = tk.Frame(body, background=SURFACE)
+            text_col.pack(side="left", fill="x", expand=True)
+            tk.Label(
+                text_col, text=display,
+                background=SURFACE, foreground=INK, font=theme.FONT_BODY_BOLD,
+                anchor="w",
+            ).pack(anchor="w")
+            tk.Label(
+                text_col, text=raw_key,
+                background=SURFACE, foreground=MUTED, font=theme.FONT_SMALL,
+                anchor="w",
+            ).pack(anchor="w", pady=(1, 0))
+
+            RoundedButton(
+                body, "+ Add",
+                command=lambda r=raw_key, d=display, b=is_bundle_id: self._submit_desktop_pick(r, d, b),
+                variant="secondary",
+                padx=PAD_MD, pady=PAD_XS,
+                bg=SURFACE,
+            ).pack(side="right")
+
+    def _key_already_present(self, key_lc: str) -> bool:
+        for spec in self._existing:
+            for p in spec.process_names:
+                if p.lower() == key_lc:
+                    return True
+            for b in spec.bundle_ids:
+                if b.lower() == key_lc:
+                    return True
+        return False
+
+    def _submit_desktop_pick(
+        self, raw_key: str, display: str, is_bundle_id: bool,
+    ) -> None:
+        """A one-click add from the live list — build a spec + return."""
+        spec = DetectorSpec(
+            app_key=_unique_app_key(
+                raw_key, [d.app_key for d in self._existing],
+            ),
+            display_name=display or raw_key,
+            process_names=[] if is_bundle_id else [raw_key],
+            bundle_ids=[raw_key] if is_bundle_id else [],
+        )
+        self._result = spec
+        self._close()
+
+    # ---- Web tab --------------------------------------------------------
+
+    def _build_web_tab(self, parent: tk.Frame) -> None:
+        tk.Label(
+            parent,
+            text="Paste a meeting URL",
+            background=BG, foreground=INK, font=theme.FONT_H3, anchor="w",
+        ).pack(anchor="w")
+        tk.Label(
+            parent,
+            text="Copy the URL from the browser tab of a meeting you run "
+                 "regularly. Sayzo will ask to start coaching whenever you "
+                 "open that site.",
+            background=BG, foreground=MUTED, font=theme.FONT_SMALL,
+            anchor="w", justify="left", wraplength=560,
+        ).pack(anchor="w", pady=(PAD_XS, PAD_SM))
+
+        tk.Label(
+            parent, text="URL",
+            background=BG, foreground=INK, font=theme.FONT_BODY_BOLD, anchor="w",
+        ).pack(anchor="w", pady=(PAD_SM, PAD_XS))
+        entry = ttk.Entry(parent, textvariable=self._web_url_var)
+        entry.pack(fill="x")
+        self._web_url_var.trace_add("write", lambda *_: self._refresh_web_preview())
+
+        # Live preview card.
+        preview_card = RoundedFrame(
+            parent, fill=SURFACE, outline=BORDER, outline_width=1,
+            padx=PAD_MD, pady=PAD_SM,
+        )
+        preview_card.pack(fill="x", pady=(PAD_SM, PAD_SM))
+        tk.Label(
+            preview_card.inner,
+            text="Will match:",
+            background=SURFACE, foreground=MUTED, font=theme.FONT_SMALL, anchor="w",
+        ).pack(anchor="w")
+        tk.Label(
+            preview_card.inner,
+            textvariable=self._web_preview_var,
+            background=SURFACE, foreground=INK, font=theme.FONT_BODY_BOLD, anchor="w",
+            wraplength=480, justify="left",
+        ).pack(anchor="w")
+        preview_card.fit()
+        # Remember the card so the preview updater can re-fit after text changes.
+        self._web_preview_card = preview_card
+
+        # Strict toggle.
+        strict_row = tk.Frame(parent, background=BG)
+        strict_row.pack(fill="x", pady=(PAD_SM, PAD_SM))
+        ttk.Checkbutton(
+            strict_row,
+            text="Only match this exact meeting (not every meeting on the site)",
+            variable=self._web_strict_var,
+            style="Sayzo.TCheckbutton",
+            command=self._refresh_web_preview,
+        ).pack(anchor="w")
+
+        # Display name.
+        tk.Label(
+            parent, text="Name it",
+            background=BG, foreground=INK, font=theme.FONT_BODY_BOLD, anchor="w",
+        ).pack(anchor="w", pady=(PAD_SM, PAD_XS))
+        tk.Label(
+            parent,
+            text="How this appears in your Meeting Apps list. Auto-filled "
+                 "from the URL — change it to whatever's easiest to recognize "
+                 "(e.g. “Work standup”, “Client calls”).",
+            background=BG, foreground=MUTED, font=theme.FONT_SMALL,
+            anchor="w", justify="left", wraplength=520,
+        ).pack(anchor="w", pady=(0, PAD_XS))
+        ttk.Entry(parent, textvariable=self._web_name_var).pack(fill="x")
+
+        # Validation status line.
+        tk.Label(
+            parent, textvariable=self._web_status_var,
+            background=BG, foreground=ERROR, font=theme.FONT_SMALL,
+            anchor="w", justify="left", wraplength=560,
+        ).pack(anchor="w", pady=(PAD_SM, 0))
+
+        self._refresh_web_preview()
+
+    def _refresh_web_preview(self) -> None:
+        url = self._web_url_var.get().strip()
+        if not url:
+            self._web_preview_var.set("Paste a URL above to see what it'll match.")
+            if getattr(self, "_web_preview_card", None) is not None:
+                try:
+                    self._web_preview_card.fit()
+                except tk.TclError:
+                    pass
+            return
+        parsed = _parse_meeting_url(url)
+        if parsed is None:
+            self._web_preview_var.set("⚠️  That doesn't look like a meeting URL.")
+        else:
+            host, path = parsed
+            if self._web_strict_var.get() and path:
+                self._web_preview_var.set(f"{host}{path} — this exact meeting only")
+            else:
+                self._web_preview_var.set(f"{host}/… — any meeting on this site")
+            # Auto-fill display name the first time (don't clobber user edits).
+            if not self._web_name_var.get().strip():
+                self._web_name_var.set(_display_name_from_host(host))
+        # Resize the preview card so wrapping text fits.
+        if getattr(self, "_web_preview_card", None) is not None:
+            try:
+                self._web_preview_card.fit()
+            except tk.TclError:
+                pass
+
+    # ---- tab switching --------------------------------------------------
+
+    def _switch_tab(self, tab: str) -> None:
+        if tab == self._active_tab:
+            return
+        self._active_tab = tab
+        assert self._desktop_tab is not None and self._web_tab is not None
+        assert self._tab_desktop_btn is not None and self._tab_web_btn is not None
+        # Visual selected/unselected: swap RoundedButton variants. The
+        # widget recreates the background image on variant switch, so we
+        # destroy and re-create the button.
+        desktop_selected = tab == "desktop"
+        self._rebuild_tab_buttons(desktop_selected)
+        if desktop_selected:
+            self._web_tab.pack_forget()
+            self._desktop_tab.pack(fill="both", expand=True)
+        else:
+            self._desktop_tab.pack_forget()
+            self._web_tab.pack(fill="both", expand=True)
+
+    def _rebuild_tab_buttons(self, desktop_selected: bool) -> None:
+        # RoundedButton doesn't expose a "change variant" method, so we
+        # destroy + recreate. Cheap.
+        assert self._tab_desktop_btn is not None and self._tab_web_btn is not None
+        parent = self._tab_desktop_btn.master
+        self._tab_desktop_btn.destroy()
+        self._tab_web_btn.destroy()
+        self._tab_desktop_btn = RoundedButton(
+            parent, "Desktop app",
+            command=lambda: self._switch_tab("desktop"),
+            variant="primary" if desktop_selected else "secondary",
+            padx=PAD_LG, pady=PAD_SM,
+        )
+        self._tab_desktop_btn.pack(side="left")
+        self._tab_web_btn = RoundedButton(
+            parent, "Web meeting",
+            command=lambda: self._switch_tab("web"),
+            variant="secondary" if desktop_selected else "primary",
+            padx=PAD_LG, pady=PAD_SM,
+        )
+        self._tab_web_btn.pack(side="left", padx=(PAD_SM, 0))
+
+    # ---- submit / cancel ------------------------------------------------
+
+    def _on_submit(self) -> None:
+        if self._active_tab == "desktop":
+            self._submit_manual()
+        else:
+            self._submit_web()
+
+    def _submit_manual(self) -> None:
+        """Validate + build a spec from the manual entry fields."""
+        name = self._manual_name_var.get().strip()
+        proc = self._manual_process_var.get().strip()
+        bundle = self._manual_bundle_var.get().strip()
+        if not name:
+            self._desktop_status_var.set("Please enter a display name.")
+            if not self._manual_expanded:
+                self._toggle_manual()
+            return
+        if sys.platform == "darwin" and not bundle:
+            self._desktop_status_var.set("Please enter a bundle identifier.")
+            if not self._manual_expanded:
+                self._toggle_manual()
+            return
+        if sys.platform != "darwin" and not proc:
+            self._desktop_status_var.set("Please enter a process name.")
+            if not self._manual_expanded:
+                self._toggle_manual()
+            return
+        key_material = bundle or proc
+        if self._key_already_present(key_material.lower()):
+            self._desktop_status_var.set(
+                f"“{key_material}” is already on your list.",
+            )
+            return
+        self._result = DetectorSpec(
+            app_key=_unique_app_key(
+                key_material, [d.app_key for d in self._existing],
+            ),
+            display_name=name,
+            process_names=[proc] if proc else [],
+            bundle_ids=[bundle] if bundle else [],
+        )
+        self._close()
+
+    def _submit_web(self) -> None:
+        url = self._web_url_var.get().strip()
+        parsed = _parse_meeting_url(url)
+        if parsed is None:
+            self._web_status_var.set("That doesn't look like a meeting URL — it should start with https:// and have a site and a meeting path.")
+            return
+        host, path = parsed
+        name = self._web_name_var.get().strip() or _display_name_from_host(host)
+        strict = bool(self._web_strict_var.get())
+        pattern = _url_pattern(host, path, strict=strict)
+        key_seed = host + (path if strict else "")
+        spec = DetectorSpec(
+            app_key=_unique_app_key(
+                key_seed, [d.app_key for d in self._existing],
+            ),
+            display_name=name,
+            is_browser=True,
+            url_patterns=[pattern],
+        )
+        self._result = spec
+        self._close()
+
+    def _on_cancel(self) -> None:
+        self._result = None
+        self._close()
+
+    def _close(self) -> None:
+        self._cancel_desktop_refresh()
+        try:
+            self._top.grab_release()
+        except tk.TclError:
+            pass
+        try:
+            self._top.destroy()
+        except tk.TclError:
+            pass
+
+
+# ---- shared URL / key helpers ---------------------------------------------
+
+
+_APP_KEY_STRIP = re.compile(r"[^a-z0-9]+")
+_APP_KEY_TRIM_SUFFIXES = (".exe", ".app")
+_APP_KEY_TRIM_PREFIXES = ("com.", "org.", "us.", "io.", "net.", "co.")
+
+
+def _unique_app_key(seed: str, taken: list[str]) -> str:
+    """Return a stable, sluggy ``app_key`` derived from ``seed``.
+
+    App keys are used for cooldown bucketing and must be unique across the
+    whitelist. Strips common executable / bundle-id prefixes + suffixes so
+    ``loom.exe`` → ``loom`` and ``com.hnc.Discord`` → ``discord``. On
+    collision, appends ``-2``, ``-3``, etc.
+    """
+    s = seed.lower().strip()
+    for suffix in _APP_KEY_TRIM_SUFFIXES:
+        if s.endswith(suffix):
+            s = s[: -len(suffix)]
+            break
+    for prefix in _APP_KEY_TRIM_PREFIXES:
+        if s.startswith(prefix):
+            s = s[len(prefix):]
+            break
+    base = _APP_KEY_STRIP.sub("-", s).strip("-") or "custom"
+    if base not in taken:
+        return base
+    i = 2
+    while f"{base}-{i}" in taken:
+        i += 1
+    return f"{base}-{i}"
+
+
+def _parse_meeting_url(url: str) -> Optional[tuple[str, str]]:
+    """Extract ``(host, path)`` from a user-pasted meeting URL.
+
+    Returns ``None`` if the URL doesn't have both a netloc and a non-empty
+    path — we don't want to match the root domain of a big site like
+    ``chrome.google.com`` as "every page on Google is a meeting".
+    """
+    if not url:
+        return None
+    # Allow bare ``meet.google.com/abc-defg-hij`` (no scheme).
+    if "://" not in url:
+        url = "https://" + url
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return None
+    host = (parsed.hostname or "").lower()
+    if not host or "." not in host:
+        return None
+    path = parsed.path or ""
+    if not path or path == "/":
+        return None
+    # Strip trailing slash for consistent regex building.
+    if path.endswith("/"):
+        path = path.rstrip("/")
+    return host, path
+
+
+def _url_pattern(host: str, path: str, *, strict: bool) -> str:
+    """Build a URL regex that matches ``host/path`` (or the whole host
+    section when ``strict=False``).
+
+    Strict matches the exact meeting room (single room users). Non-strict
+    matches any path under the first path segment — e.g. Google Meet's
+    ``meet.google.com/abc-defg-hij`` becomes ``^https://meet\\.google\\.com/``
+    so every room on the site counts.
+    """
+    host_re = re.escape(host)
+    if strict:
+        path_re = re.escape(path)
+        return rf"^https://{host_re}{path_re}"
+    # Non-strict: anchor to the host, accept any path.
+    return rf"^https://{host_re}/"
+
+
+def _display_name_from_host(host: str) -> str:
+    """Guess a display name from a hostname — used to pre-fill the web
+    tab's name field.
+
+    ``meet.google.com`` → ``Google Meet``; ``zoom.us`` → ``Zoom``;
+    ``whereby.com`` → ``Whereby``. Falls back to the middle hostname label
+    for unknown sites.
+    """
+    known = {
+        "meet.google.com": "Google Meet",
+        "teams.microsoft.com": "Microsoft Teams",
+        "teams.live.com": "Microsoft Teams",
+        "zoom.us": "Zoom",
+        "whereby.com": "Whereby",
+        "meet.jit.si": "Jitsi Meet",
+        "8x8.vc": "8x8 Meet",
+    }
+    h = host.lower()
+    if h in known:
+        return known[h]
+    for k, v in known.items():
+        if h.endswith("." + k) or h.endswith(k):
+            return v
+    parts = [p for p in h.split(".") if p not in ("www", "app", "meet")]
+    if len(parts) >= 2:
+        base = parts[-2]  # site-ish label for 3+ label hosts
+    elif len(parts) == 1:
+        base = parts[0]   # short host like "tryclassroom.app"
+    else:
+        return h
+    return base[:1].upper() + base[1:]
+
+
+def _friendly_url_pattern(pattern: str) -> str:
+    """Strip regex glyphs from a URL pattern for display.
+
+    The stored patterns look like ``^https://meet\\.google\\.com/``; users
+    shouldn't have to read regex. Returns ``meet.google.com/…``. Best-effort
+    — unrecognised patterns fall back to the raw string so we never render
+    garbage.
+    """
+    out = pattern
+    # Strip the anchor + scheme.
+    for prefix in ("^https://", "^http://", "https://", "http://", "^"):
+        if out.startswith(prefix):
+            out = out[len(prefix):]
+            break
+    # ``[^/]+`` in subdomain position (between scheme and next ``\.``) → ``*``.
+    out = re.sub(r"\[\^/\]\+(?=\\?\.)", "*", out)
+    # Remaining char classes (with quantifier) → ellipsis.
+    out = re.sub(r"\[[^\]]+\][+*]?(?:\{\d+,?\d*\})?", "…", out)
+    # Bare quantifier (no preceding class) → ellipsis.
+    out = re.sub(r"\{\d+,?\d*\}", "…", out)
+    # Escaped punctuation → literal.
+    out = out.replace("\\.", ".").replace("\\-", "-").replace("\\/", "/")
+    # ``.+`` / ``.*`` / ``\\d+`` / ``\\w+`` → ellipsis.
+    out = out.replace(".+", "…").replace(".*", "…")
+    out = re.sub(r"\\[dws]\+", "…", out)
+    # Trailing regex anchor ``$`` and trailing slash.
+    out = out.rstrip("$").rstrip("/")
+    # Collapse adjacent ellipses.
+    out = re.sub(r"(?:…[-/]?){2,}", "…", out)
+    if not out:
+        return pattern
+    return out

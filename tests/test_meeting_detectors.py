@@ -15,10 +15,22 @@ from sayzo_agent.arm.detectors import (
     arm_app_still_holding_mic,
     match_whitelist,
 )
-from sayzo_agent.config import default_detector_specs
+from sayzo_agent.config import DetectorSpec, default_detector_specs
 
 
 SPECS = default_detector_specs()
+
+
+def _specs_with(app_key: str, **overrides) -> list[DetectorSpec]:
+    """Return a defaults list where the spec with ``app_key`` has been patched."""
+    out: list[DetectorSpec] = []
+    for s in default_detector_specs():
+        if s.app_key == app_key:
+            patched = s.model_copy(update=overrides)
+            out.append(patched)
+        else:
+            out.append(s)
+    return out
 
 
 # ---- Zoom ---------------------------------------------------------------
@@ -284,3 +296,47 @@ def test_arm_app_browser_released_when_tab_navigated_away():
     )
     mic = MicState(holders=[MicHolder("chrome.exe", 1111)])
     assert arm_app_still_holding_mic("gmeet", SPECS, mic, fg) is False
+
+
+# ---- disabled flag -----------------------------------------------------
+
+
+def test_disabled_desktop_spec_does_not_match():
+    """A spec with ``disabled=True`` is invisible to ``match_whitelist`` —
+    toggling an app off in Settings suppresses future consent toasts
+    without losing the spec's process names / URL patterns."""
+    specs = _specs_with("zoom", disabled=True)
+    fg = ForegroundInfo(process_name="zoom.exe")
+    mic = MicState(holders=[MicHolder("zoom.exe", 1234)])
+    assert match_whitelist(specs, fg, mic) is None
+
+
+def test_disabled_browser_spec_does_not_match():
+    specs = _specs_with("gmeet", disabled=True)
+    fg = ForegroundInfo(
+        process_name="chrome.exe",
+        is_browser=True,
+        browser_tab_url="https://meet.google.com/abc-defg-hij",
+    )
+    mic = MicState(holders=[MicHolder("chrome.exe", 1111)])
+    assert match_whitelist(specs, fg, mic) is None
+
+
+def test_disabled_spec_does_not_affect_other_apps():
+    """Disabling Zoom doesn't stop a Discord voice call from matching."""
+    specs = _specs_with("zoom", disabled=True)
+    fg = ForegroundInfo(process_name="Discord.exe")
+    mic = MicState(holders=[MicHolder("Discord.exe", 5555)])
+    r = match_whitelist(specs, fg, mic)
+    assert r is not None
+    assert r.app_key == "discord"
+
+
+def test_arm_app_still_holding_ignores_disabled_flag():
+    """Session-lifecycle check is *not* affected by the disabled flag: if
+    the user disables Zoom mid-session, the current session should keep
+    going, not get cut short by the meeting-ended watcher."""
+    specs = _specs_with("zoom", disabled=True)
+    fg = ForegroundInfo(process_name="zoom.exe")
+    mic = MicState(holders=[MicHolder("zoom.exe", 1234)])
+    assert arm_app_still_holding_mic("zoom", specs, mic, fg) is True

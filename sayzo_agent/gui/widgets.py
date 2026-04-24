@@ -440,3 +440,188 @@ class RoundedFrame(tk.Canvas):
             return
         self._outline = color
         self.fit()
+
+
+# ---------------------------------------------------------------------------
+# SwitchToggle — iOS-style on/off pill. Used in the Meeting Apps settings
+# pane where a checkbox read as "part of a form" rather than "this app is
+# on/off right now". The pill visual makes the toggle's meaning obvious at
+# a glance.
+# ---------------------------------------------------------------------------
+
+
+class SwitchToggle(tk.Canvas):
+    """Anti-aliased pill switch.
+
+    - ``on=True``  → track filled with ``ACCENT``, thumb slid right.
+    - ``on=False`` → track filled with ``BORDER_STRONG``, thumb slid left.
+
+    The widget takes focus (keyboard space / enter toggles it) and draws a
+    subtle focus ring. Click anywhere on the widget to toggle. The
+    ``command`` callback fires after state flips with the new bool value.
+    """
+
+    _TRACK_W = 40
+    _TRACK_H = 22
+    _THUMB_MARGIN = 2
+
+    def __init__(
+        self,
+        parent: tk.Widget,
+        *,
+        on: bool = False,
+        command: Optional[Callable[[bool], None]] = None,
+        bg: Optional[str] = None,
+        state: str = "normal",
+    ) -> None:
+        self._on = bool(on)
+        self._command = command
+        self._bg = bg if bg is not None else BG
+        self._state = "disabled" if state == "disabled" else "normal"
+        self._focused = False
+        self._hover = False
+        self._image_cache: dict[tuple[bool, str, bool], ImageTk.PhotoImage] = {}
+
+        super().__init__(
+            parent,
+            width=self._TRACK_W,
+            height=self._TRACK_H,
+            background=self._bg,
+            highlightthickness=0,
+            bd=0,
+            cursor="arrow" if self._state == "disabled" else "hand2",
+            takefocus=1,
+        )
+
+        self._render()
+
+        self.bind("<Button-1>", self._on_click)
+        self.bind("<Return>", self._on_activate)
+        self.bind("<space>", self._on_activate)
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<FocusIn>", self._on_focus_in)
+        self.bind("<FocusOut>", self._on_focus_out)
+
+    # ---- public API ----------------------------------------------------
+
+    @property
+    def on(self) -> bool:
+        return self._on
+
+    def set(self, on: bool) -> None:
+        if bool(on) == self._on:
+            return
+        self._on = bool(on)
+        self._render()
+
+    def configure(self, **kwargs) -> None:  # type: ignore[override]
+        state = kwargs.pop("state", None)
+        super().configure(**kwargs)
+        if state is not None:
+            self._state = "disabled" if state == "disabled" else "normal"
+            super().configure(
+                cursor="arrow" if self._state == "disabled" else "hand2",
+            )
+            self._image_cache.clear()
+            self._render()
+
+    # ---- events --------------------------------------------------------
+
+    def _on_click(self, _e: tk.Event) -> None:
+        if self._state == "disabled":
+            return
+        self.focus_set()
+        self._toggle()
+
+    def _on_activate(self, _e: tk.Event) -> str:
+        if self._state == "disabled":
+            return "break"
+        self._toggle()
+        return "break"
+
+    def _on_enter(self, _e: tk.Event) -> None:
+        self._hover = True
+        self._render()
+
+    def _on_leave(self, _e: tk.Event) -> None:
+        self._hover = False
+        self._render()
+
+    def _on_focus_in(self, _e: tk.Event) -> None:
+        self._focused = True
+        self._render()
+
+    def _on_focus_out(self, _e: tk.Event) -> None:
+        self._focused = False
+        self._render()
+
+    def _toggle(self) -> None:
+        self._on = not self._on
+        self._render()
+        if self._command is not None:
+            try:
+                self._command(self._on)
+            except Exception:
+                log.warning("[SwitchToggle] command raised", exc_info=True)
+
+    # ---- rendering -----------------------------------------------------
+
+    def _track_color(self) -> str:
+        if self._state == "disabled":
+            return "#e5e7eb" if self._on else "#f3f4f6"
+        if self._on:
+            return ACCENT if not self._hover else ACCENT_HOVER
+        return BORDER_STRONG if not self._hover else MUTED
+
+    def _track_image(self) -> ImageTk.PhotoImage:
+        key = (self._on, self._track_color(), self._hover)
+        cached = self._image_cache.get(key)
+        if cached is not None:
+            return cached
+        w, h = self._TRACK_W, self._TRACK_H
+        radius = h // 2
+        img = _render_rounded_rect(
+            w, h, radius,
+            fill=self._track_color(),
+            outline=None,
+            outline_width=0,
+            bg=self._bg,
+        )
+        photo = ImageTk.PhotoImage(img)
+        self._image_cache[key] = photo
+        return photo
+
+    def _render(self) -> None:
+        self.delete("all")
+        w, h = self._TRACK_W, self._TRACK_H
+
+        # Track.
+        self.create_image(0, 0, anchor="nw", image=self._track_image())
+
+        # Thumb — a white circle sliding left/right.
+        thumb_d = h - 2 * self._THUMB_MARGIN
+        if self._on:
+            thumb_x = w - self._THUMB_MARGIN - thumb_d
+        else:
+            thumb_x = self._THUMB_MARGIN
+        self.create_oval(
+            thumb_x, self._THUMB_MARGIN,
+            thumb_x + thumb_d, self._THUMB_MARGIN + thumb_d,
+            fill="#ffffff",
+            outline="",
+        )
+
+        # Focus ring — subtle rounded outline around the track when focused.
+        if self._focused and self._state != "disabled":
+            ring_img = _render_rounded_rect(
+                w, h, h // 2,
+                fill=None,
+                outline=ACCENT_RING,
+                outline_width=2,
+                bg=self._bg,
+            )
+            ring_photo = ImageTk.PhotoImage(ring_img)
+            # Store on self so tkinter doesn't GC it mid-render.
+            self._focus_photo = ring_photo
+            self.create_image(0, 0, anchor="nw", image=ring_photo)

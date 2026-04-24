@@ -300,6 +300,40 @@ def apply_sayzo_theme(root: tk.Tk) -> ttk.Style:
     # ---- separators ---------------------------------------------------
     style.configure("Sayzo.TSeparator", background=BORDER)
 
+    # ---- scrollbars ---------------------------------------------------
+    # Thin flat scrollbar — no bulky arrow buttons, matches the slate
+    # palette. Clam exposes enough style options for this; native themes
+    # on Windows/macOS ignore half of these so we rely on the "clam" base
+    # theme being set above.
+    style.layout(
+        "Sayzo.Vertical.TScrollbar",
+        [(
+            "Vertical.Scrollbar.trough",
+            {"sticky": "ns", "children": [(
+                "Vertical.Scrollbar.thumb",
+                {"expand": "1", "sticky": "nswe"},
+            )]},
+        )],
+    )
+    style.configure(
+        "Sayzo.Vertical.TScrollbar",
+        gripcount=0,
+        background=BORDER_STRONG,
+        troughcolor=SURFACE,
+        bordercolor=SURFACE,
+        lightcolor=SURFACE,
+        darkcolor=SURFACE,
+        arrowcolor=SURFACE,  # unused given the layout, but belt-and-braces
+        relief="flat",
+        borderwidth=0,
+        arrowsize=0,
+        width=10,
+    )
+    style.map(
+        "Sayzo.Vertical.TScrollbar",
+        background=[("active", MUTED), ("pressed", MUTED)],
+    )
+
     # ---- notebook (unused for now but set so Onboarding can adopt) ---
     style.configure("Sayzo.TNotebook", background=BG, borderwidth=0)
     style.configure(
