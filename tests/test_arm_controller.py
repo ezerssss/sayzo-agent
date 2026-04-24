@@ -110,7 +110,7 @@ def _make_controller(
         "meeting_ended_toast_timeout_secs": 0.1,
         "whitelist_arm_release_grace_secs": 0.03,
         "meeting_ended_snooze_secs": 0.05,
-        "cooldown_after_decline_secs": 1800.0,
+        "decline_release_grace_secs": 0.05,
         "cooldown_after_session_secs": 600.0,
         "long_meeting_checkin_marks_secs": [3600.0],
         "detectors": default_detector_specs(),
@@ -322,8 +322,13 @@ async def test_whitelist_match_fires_consent_and_arms_on_yes():
     await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
 
 
-async def test_whitelist_decline_sets_cooldown():
+async def test_whitelist_decline_suppresses_until_app_releases_mic():
+    """Decline → session-based suppression: stays quiet while the app is
+    still holding the mic; clears once the app releases for grace_secs."""
     notifier = FakeNotifier()
+    # Only one "no" in the script — subsequent toasts would also auto-"no",
+    # but the point is we should NOT see subsequent toasts for zoom while
+    # zoom is still holding the mic.
     notifier.consent_script = ["no"]
     ctrl, _, *_ = _make_controller(
         notifier=notifier,
@@ -334,7 +339,84 @@ async def test_whitelist_decline_sets_cooldown():
     await asyncio.sleep(0.15)
     assert ctrl.state == ArmState.DISARMED
     import time
+    # Declined → active suppression, regardless of wall-clock time.
     assert ctrl._cooldowns.active("zoom", time.monotonic()) is True
+    # And specifically: tracked in the session-based slot, not the timed one.
+    assert "zoom" in ctrl._cooldowns.declined_release_at
+    # No second toast fired despite zoom still holding the mic for many polls.
+    zoom_toasts = [c for c in notifier.consent_calls
+                   if "Zoom" in c.get("body", "")]
+    assert len(zoom_toasts) == 1
+
+    ctrl._whitelist_task.cancel()
+    try:
+        await ctrl._whitelist_task
+    except asyncio.CancelledError:
+        pass
+
+
+async def test_whitelist_decline_clears_when_app_releases_mic():
+    """Decline → app releases mic → grace elapses → fresh toast fires on
+    next match (new session)."""
+    notifier = FakeNotifier()
+    # First toast: user declines. Second toast (after re-acquire): user accepts.
+    notifier.consent_script = ["no", "yes"]
+    ctrl, _, *_ = _make_controller(
+        notifier=notifier,
+        mic_holders=[MicHolder("zoom.exe", 1234)],
+    )
+    ctrl._loop = asyncio.get_running_loop()
+    ctrl._whitelist_task = asyncio.create_task(ctrl._run_whitelist_watcher())
+    # Let the first toast fire + decline land.
+    await asyncio.sleep(0.05)
+    assert ctrl.state == ArmState.DISARMED
+    assert "zoom" in ctrl._cooldowns.declined_release_at
+    # Zoom releases the mic (user left the meeting).
+    ctrl._q_mic_holders = lambda: []
+    # Wait long enough for decline_release_grace_secs (0.05) to elapse
+    # across a few polls.
+    await asyncio.sleep(0.2)
+    assert "zoom" not in ctrl._cooldowns.declined_release_at
+    # Zoom re-acquires the mic (user joined a new meeting).
+    ctrl._q_mic_holders = lambda: [MicHolder("zoom.exe", 5678)]
+    # Let the second toast fire + accept land.
+    await asyncio.sleep(0.2)
+    assert ctrl.state == ArmState.ARMED
+
+    ctrl._whitelist_task.cancel()
+    try:
+        await ctrl._whitelist_task
+    except asyncio.CancelledError:
+        pass
+    await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
+
+
+async def test_whitelist_decline_stays_active_while_app_flaps():
+    """Brief mic dips during a declined session (e.g. muted for a moment)
+    must not prematurely clear the decline — the app has to be continuously
+    off the mic for the full grace window."""
+    notifier = FakeNotifier()
+    notifier.consent_script = ["no"]
+    ctrl, _, *_ = _make_controller(
+        notifier=notifier,
+        mic_holders=[MicHolder("zoom.exe", 1234)],
+        cfg_overrides={
+            "poll_interval_secs": 0.01,
+            "decline_release_grace_secs": 0.15,  # longer than a flap
+        },
+    )
+    ctrl._loop = asyncio.get_running_loop()
+    ctrl._whitelist_task = asyncio.create_task(ctrl._run_whitelist_watcher())
+    await asyncio.sleep(0.05)
+    assert "zoom" in ctrl._cooldowns.declined_release_at
+    # Brief "not holding" blip.
+    ctrl._q_mic_holders = lambda: []
+    await asyncio.sleep(0.05)
+    # Re-acquire before grace elapses.
+    ctrl._q_mic_holders = lambda: [MicHolder("zoom.exe", 1234)]
+    await asyncio.sleep(0.1)
+    # Still suppressed — the flap didn't count as a session end.
+    assert "zoom" in ctrl._cooldowns.declined_release_at
 
     ctrl._whitelist_task.cancel()
     try:

@@ -73,15 +73,71 @@ class ArmReason:
 
 @dataclass
 class _Cooldowns:
-    """Per-app cooldown timestamps (monotonic seconds). Key = app_key."""
+    """Per-app suppression state for the whitelist watcher.
+
+    Two independent mechanisms, both keyed by ``app_key``:
+
+    - ``entries`` — timed cooldown. Suppress until a monotonic deadline.
+      Used after a natural session close so we don't immediately re-prompt
+      for the same app while it's still holding the mic.
+    - ``declined_release_at`` — session-based suppression. When the user
+      declines or ignores a consent toast, we record the app as declined
+      and clear it only once the app releases the mic for
+      ``decline_release_grace_secs`` continuous seconds. Leaving + rejoining
+      a meeting counts as a new session, so a fresh prompt fires.
+
+    ``active`` returns True if EITHER mechanism is currently suppressing
+    the app; the watcher calls it before showing a toast.
+    """
     entries: dict[str, float] = field(default_factory=dict)
+    # Value = monotonic time when the current "not holding" streak started,
+    # or None if the app is currently still holding the mic (streak hasn't
+    # started yet). Presence of the key = declined state.
+    declined_release_at: dict[str, Optional[float]] = field(default_factory=dict)
 
     def active(self, app_key: str, now: float) -> bool:
+        if app_key in self.declined_release_at:
+            return True
         until = self.entries.get(app_key, 0.0)
         return now < until
 
     def set(self, app_key: str, until_mono: float) -> None:
+        """Set a timed cooldown until the given monotonic time."""
         self.entries[app_key] = until_mono
+
+    def mark_declined(self, app_key: str) -> None:
+        """Mark the app as declined. Cleared by ``tick_session`` once the
+        app releases the mic for long enough."""
+        # Start with None — no release streak yet (app is still holding).
+        self.declined_release_at[app_key] = None
+
+    def tick_session(
+        self,
+        app_key: str,
+        now_mono: float,
+        *,
+        holding_mic: bool,
+        release_grace_secs: float,
+    ) -> bool:
+        """Per-poll update for session-based suppression.
+
+        Returns True if the decline state was just cleared this call.
+        """
+        if app_key not in self.declined_release_at:
+            return False
+        if holding_mic:
+            # App still holding — reset any release streak.
+            self.declined_release_at[app_key] = None
+            return False
+        streak_start = self.declined_release_at[app_key]
+        if streak_start is None:
+            # First poll where the app isn't holding — start the streak.
+            self.declined_release_at[app_key] = now_mono
+            return False
+        if now_mono - streak_start >= release_grace_secs:
+            del self.declined_release_at[app_key]
+            return True
+        return False
 
 
 class ArmController:
@@ -489,7 +545,6 @@ class ArmController:
         )
         try:
             last_match_key: Optional[str] = None
-            last_debug_dump = 0.0
             while not self._stop.is_set():
                 try:
                     await asyncio.sleep(self.cfg.poll_interval_secs)
@@ -503,25 +558,30 @@ class ArmController:
                 except Exception:
                     log.debug("[arm] whitelist snapshot failed", exc_info=True)
                     continue
-                # One INFO-level dump per minute while disarmed so the log
-                # shows whether the watcher is actually seeing capture
-                # sessions, foreground info, etc. Critical for diagnosing
-                # "I'm in a call and no toast fired" in the field.
                 now_mono = time.monotonic()
-                if now_mono - last_debug_dump >= 60.0:
-                    last_debug_dump = now_mono
-                    holder_names = [h.process_name for h in mic.holders]
-                    log.info(
-                        "[arm] watcher poll: holders=%s fg_proc=%s is_browser=%s "
-                        "browser_windows=%d",
-                        holder_names or "[]", fg.process_name, fg.is_browser,
-                        len(fg.browser_window_titles),
+                # Tick the session-based decline tracker for every declined
+                # app. Clearing happens when the app has been off the mic
+                # for decline_release_grace_secs continuous seconds —
+                # "leaving the meeting counts as a new session".
+                for app_key in list(self._cooldowns.declined_release_at.keys()):
+                    holding = _d.arm_app_still_holding_mic(
+                        app_key, self.cfg.detectors, mic, fg,
                     )
+                    cleared = self._cooldowns.tick_session(
+                        app_key, now_mono,
+                        holding_mic=holding,
+                        release_grace_secs=self.cfg.decline_release_grace_secs,
+                    )
+                    if cleared:
+                        log.info(
+                            "[arm] decline cleared for %s (mic released — "
+                            "fresh prompt on next match)",
+                            app_key,
+                        )
                 match = _d.match_whitelist(self.cfg.detectors, fg, mic)
                 if match is None:
                     last_match_key = None
                     continue
-                now = time.monotonic()
                 # One-shot INFO log per match transition so field debugging
                 # doesn't require raising the global log level.
                 if match.app_key != last_match_key:
@@ -530,9 +590,9 @@ class ArmController:
                         match.display_name, match.app_key, match.source,
                     )
                     last_match_key = match.app_key
-                if self._cooldowns.active(match.app_key, now):
+                if self._cooldowns.active(match.app_key, now_mono):
                     log.debug(
-                        "[arm] whitelist match for %s suppressed by cooldown",
+                        "[arm] whitelist match for %s suppressed",
                         match.app_key,
                     )
                     continue
@@ -559,10 +619,10 @@ class ArmController:
                         )
                     )
                 else:
-                    self._cooldowns.set(
-                        match.app_key,
-                        time.monotonic() + self.cfg.cooldown_after_decline_secs,
-                    )
+                    # Decline / timeout → session-based suppression. Clears
+                    # once the app releases the mic; the hotkey still works
+                    # as a manual opt-in in the meantime.
+                    self._cooldowns.mark_declined(match.app_key)
         except asyncio.CancelledError:
             raise
         except Exception:
