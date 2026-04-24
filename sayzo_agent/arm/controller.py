@@ -346,70 +346,105 @@ class ArmController:
 
     async def _confirm_and_arm(self) -> None:
         """Show the start-confirmation toast. On Yes / double-tap, arm."""
-        loop = self._loop or asyncio.get_running_loop()
-        self._loop = loop
-        fut: asyncio.Future[None] = loop.create_future()
-        self._hotkey_confirmation_yes = fut
-
-        result = await asyncio.gather(
-            self._ask_consent(
-                "Start recording?",
-                "Sayzo will capture this conversation so we can coach you on it.",
-                "Yes, start", "Cancel",
-                timeout_secs=self.cfg.hotkey_confirm_timeout_secs,
-                default_on_timeout="no",
-            ),
-            self._wait_or_timeout(fut, self.cfg.hotkey_confirm_timeout_secs),
-            return_exceptions=True,
-        )
-        self._hotkey_confirmation_yes = None
-        toast_result, fast_path_ok = result
-        if fast_path_ok is True or toast_result == "yes":
+        if await self._race_confirm_with_double_tap(
+            "Start recording?",
+            "Sayzo will capture this conversation so we can coach you on it.",
+            "Yes, start", "Cancel",
+        ):
             await self._arm_internal(ArmReason(source="hotkey"))
-        # else: "no" / "timeout" / exceptions → stay disarmed
 
     async def _disarm_with_confirm(self) -> None:
         """Show the stop-confirmation toast. On Yes / double-tap, disarm."""
+        if await self._race_confirm_with_double_tap(
+            "Stop recording?",
+            "We'll save what we've captured so far.",
+            "Yes, stop", "Keep going",  # default = Keep going
+        ):
+            await self._disarm_internal(SessionCloseReason.HOTKEY_END)
+
+    async def _race_confirm_with_double_tap(
+        self, title: str, body: str, yes_label: str, no_label: str,
+    ) -> bool:
+        """Show a confirmation toast while also watching for a double-tap
+        on the hotkey. Returns True on either "yes click" OR "double-tap";
+        False on "no click" / timeout / error.
+
+        We race the two paths with ``FIRST_COMPLETED`` so the transition
+        fires the moment the user decides — not after the full
+        ``hotkey_confirm_timeout_secs`` elapses. A prior version used
+        ``asyncio.gather`` which waited for BOTH branches, making the arm /
+        disarm land up to 10 s after the button click (user report: "the
+        tray icon does not automatically say we are capturing").
+        """
         loop = self._loop or asyncio.get_running_loop()
         self._loop = loop
         fut: asyncio.Future[None] = loop.create_future()
         self._hotkey_confirmation_yes = fut
 
-        result = await asyncio.gather(
-            self._ask_consent(
-                "Stop recording?",
-                "We'll save what we've captured so far.",
-                "Yes, stop", "Keep going",
-                timeout_secs=self.cfg.hotkey_confirm_timeout_secs,
-                default_on_timeout="no",  # default = Keep going
-            ),
-            self._wait_or_timeout(fut, self.cfg.hotkey_confirm_timeout_secs),
-            return_exceptions=True,
-        )
-        self._hotkey_confirmation_yes = None
-        toast_result, fast_path_ok = result
-        if fast_path_ok is True or toast_result == "yes":
-            await self._disarm_internal(SessionCloseReason.HOTKEY_END)
-        # else: stay armed
-
-    async def _wait_or_timeout(self, fut: asyncio.Future, timeout: float) -> bool:
+        toast_task = asyncio.ensure_future(self._ask_consent(
+            title, body, yes_label, no_label,
+            timeout_secs=self.cfg.hotkey_confirm_timeout_secs,
+            default_on_timeout="no",
+        ))
         try:
-            await asyncio.wait_for(fut, timeout=timeout)
-            return True
-        except (asyncio.TimeoutError, asyncio.CancelledError):
-            return False
+            done, pending = await asyncio.wait(
+                {toast_task, fut},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            self._hotkey_confirmation_yes = None
+
+        yes = False
+        if fut in done:
+            yes = True
+        elif toast_task in done:
+            try:
+                yes = toast_task.result() == "yes"
+            except Exception:
+                yes = False
+        # Release the still-pending branch. Cancelling ``toast_task`` here
+        # only unblocks US; the OS toast continues until its own internal
+        # timeout, and the notifier's executor thread sits on the sync
+        # ``ask_consent`` until then. That's bounded (<= timeout + 5 s) so
+        # we don't worry about leaking it.
+        for task in pending:
+            task.cancel()
+        return yes
 
     # ---- arm / disarm internals -------------------------------------------
 
     async def _arm_internal(self, reason: ArmReason) -> None:
         """Transition DISARMED → ARMED.
 
-        Opens both capture streams, resets VAD + detector epoch, flips the
-        armed_event, fires the post-arm guidance toast, and starts the
-        background watchers.
+        Flips state + fires the tray callback FIRST so the menu label and
+        icon reflect "Recording" within milliseconds of the caller's
+        decision, then opens both capture streams. Stream open can take
+        50-500 ms on WASAPI / CoreAudio, and hiding the whole transition
+        behind it meant the tray label lagged the user's Yes click by that
+        amount (user report: "the tray icon does not automatically say we
+        are capturing"). If stream open fails, we roll the state flip
+        back below.
         """
         if self.state == ArmState.ARMED:
             return
+
+        # Fresh-start invariant: VAD counter + detector epoch rewind so the
+        # next frame behaves as the first frame of a cold-started source.
+        # Done before flipping armed_event so _consume doesn't process any
+        # in-flight frame against stale VAD state.
+        try:
+            self.vad_mic.reset()
+            self.vad_sys.reset()
+            self.detector.reset_source_epochs()
+        except Exception:
+            log.exception("[arm] reset_source_epochs failed (non-fatal)")
+
+        self.state = ArmState.ARMED
+        self._reason = reason
+        self.armed_event.set()
+        log.info("[arm] ARMED (reason=%s app=%s)", reason.source, reason.app_key or "-")
+        self._fire_state_change()
+
         try:
             await self.mic.start()
             await self.sys.start()
@@ -424,6 +459,13 @@ class ArmController:
                 await self.sys.stop()
             except Exception:
                 pass
+            # Roll back the optimistic state flip. Tray briefly flashed
+            # "Recording" — acceptable for this rare case; the error toast
+            # plus the revert make the failure unambiguous.
+            self.state = ArmState.DISARMED
+            self._reason = None
+            self.armed_event.clear()
+            self._fire_state_change()
             self.notifier.notify(
                 "Couldn't start capturing",
                 "Sayzo couldn't access your microphone or speakers. "
@@ -431,23 +473,11 @@ class ArmController:
             )
             return
 
-        # Fresh-start invariant: VAD counter + detector epoch rewind so the
-        # next frame behaves as the first frame of a cold-started source.
-        try:
-            self.vad_mic.reset()
-            self.vad_sys.reset()
-            self.detector.reset_source_epochs()
-        except Exception:
-            log.exception("[arm] reset_source_epochs failed (non-fatal)")
-
-        self.state = ArmState.ARMED
-        self._reason = reason
-        self.armed_event.set()
-        log.info("[arm] ARMED (reason=%s app=%s)", reason.source, reason.app_key or "-")
-        self._fire_state_change()
-
-        # Post-arm guidance toast (non-interactive). Skipped when the
-        # Notifications pane's "Sayzo is capturing" sub-toggle is off.
+        # Post-arm guidance toast AFTER streams confirmed open, so we
+        # don't tell the user we're capturing while the mic driver is
+        # still coming up (and they might start speaking into a silent
+        # window). Skipped when the Notifications pane's "Sayzo is
+        # capturing" sub-toggle is off.
         if self.cfg.notify_post_arm:
             self.notifier.notify(
                 "Sayzo is capturing",
@@ -472,8 +502,16 @@ class ArmController:
         *,
         show_post_toast: bool = False,
     ) -> None:
-        """Transition ARMED → DISARMED. Closes any open session with
-        ``close_reason``, stops streams, cancels background watchers."""
+        """Transition ARMED → DISARMED.
+
+        Flips state + fires the tray callback FIRST so the menu label
+        updates within milliseconds of the user's Yes click. Stopping the
+        system-audio thread joins with up to ~500 ms of in-flight batch
+        read; blocking the tray update behind that felt sluggish on
+        Windows. Clearing ``armed_event`` before the actual stream stops
+        means ``_consume`` stops pulling immediately — any frames still
+        arriving until the streams close sit in the queue unconsumed.
+        """
         if self.state == ArmState.DISARMED:
             return
         # Force-close any session in flight (OPEN or PENDING_CLOSE). This
@@ -491,15 +529,6 @@ class ArmController:
         self._checkin_task = None
         self._meeting_ended_task = None
 
-        try:
-            await self.mic.stop()
-        except Exception:
-            log.exception("[arm] mic.stop failed")
-        try:
-            await self.sys.stop()
-        except Exception:
-            log.exception("[arm] sys.stop failed")
-
         # Per-app cooldown so the whitelist watcher doesn't re-prompt for
         # the same app immediately after a natural session end.
         prev = self._reason
@@ -515,6 +544,15 @@ class ArmController:
         self.armed_event.clear()
         log.info("[arm] DISARMED (reason=%s)", close_reason.value)
         self._fire_state_change()
+
+        try:
+            await self.mic.stop()
+        except Exception:
+            log.exception("[arm] mic.stop failed")
+        try:
+            await self.sys.stop()
+        except Exception:
+            log.exception("[arm] sys.stop failed")
 
     # ---- detector hook ----------------------------------------------------
 
