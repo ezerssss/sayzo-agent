@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import platform
 import re
 import subprocess
 import sys
@@ -44,11 +45,13 @@ from tkinter import ttk
 from typing import TYPE_CHECKING, Optional
 from urllib.parse import urlparse
 
-from .. import settings_store
+from .. import __version__, settings_store
 from ..arm import seen_apps as _seen_apps
 from ..arm.detectors import BROWSER_PROCESS_NAMES
 from ..config import DetectorSpec, default_detector_specs
+from ..update import UpdateInfo, check as _update_check
 from . import theme
+from .fs import open_folder
 from .shortcut_capture import ShortcutCaptureField
 from .widgets import RoundedButton, RoundedFrame, SwitchToggle
 from .theme import (
@@ -81,7 +84,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
-PANE_NAMES = ("Shortcut", "Meeting Apps", "Permissions", "Account", "Notifications")
+PANE_NAMES = ("Shortcut", "Meeting Apps", "Permissions", "Account", "Notifications", "About")
 
 
 def open_settings_window(
@@ -207,6 +210,7 @@ class _SettingsApp:
             "Permissions": _PermissionsPane(self._content_frame, self._cfg),
             "Account": _AccountPane(self._content_frame, self._cfg),
             "Notifications": _NotificationsPane(self._content_frame, self._cfg),
+            "About": _AboutPane(self._content_frame, self._cfg),
         }
         self._select_pane(PANE_NAMES[0])
 
@@ -870,6 +874,284 @@ class _NotificationsPane(_Pane):
             )
         except Exception:
             log.warning("[settings] persist notifications failed", exc_info=True)
+
+
+# ---- About pane ------------------------------------------------------------
+
+
+class _AboutPane(_Pane):
+    """Description + version + manual update check + disk locations + support.
+
+    Update check reuses :func:`sayzo_agent.update.check` on a worker thread
+    (same pattern as ``_AccountPane``'s PKCE flow: ``threading.Thread`` +
+    ``asyncio.run`` + ``self._frame.after(0, ...)`` to marshal results back
+    onto the Tk main thread). Auto-download/install is explicitly out of
+    scope — if a newer version exists we just open the installer URL in the
+    user's browser and let them reinstall manually.
+    """
+
+    SUPPORT_URL = "https://sayzo.app/support"
+    WEBAPP_FALLBACK_URL = "https://sayzo.app"
+
+    def __init__(self, parent: tk.Widget, cfg: "Config") -> None:
+        super().__init__(parent)
+        self._cfg = cfg
+
+        # Update-check state machine:
+        #   "idle"      — fresh pane, no check yet. Shows "Check for updates".
+        #   "checking"  — worker in flight. Shows "Checking…" + disabled button.
+        #   "latest"    — up to date. Shows "✓ You're on the latest version".
+        #   "available" — newer version on manifest. Shows version + Download.
+        #   "error"     — network / parse failure. Shows "Couldn't check…".
+        self._check_state: str = "idle"
+        self._update_info: Optional[UpdateInfo] = None
+
+        self._inner = ttk.Frame(self._frame, style="Sayzo.TFrame")
+        self._inner.pack(fill="both", expand=True)
+
+        # These sub-frames are swapped in-place when the check state changes
+        # so transitions don't reflow the whole pane.
+        self._check_button_container: Optional[ttk.Frame] = None
+        self._status_row: Optional[ttk.Frame] = None
+
+        self._render()
+
+    def show(self) -> None:
+        # Rebuild on every show so Captures/Logs paths reflect a
+        # SAYZO_DATA_DIR change or a freshly-created data dir. Reset the
+        # update-check state too — a stale "available" chip from a previous
+        # visit would mislead the user if they upgraded between visits.
+        self._check_state = "idle"
+        self._update_info = None
+        self._rebuild()
+        super().show()
+
+    def _rebuild(self) -> None:
+        for child in self._inner.winfo_children():
+            child.destroy()
+        self._check_button_container = None
+        self._status_row = None
+        self._render()
+
+    def _render(self) -> None:
+        ttk.Label(
+            self._inner, text="About Sayzo", style="H1.Sayzo.TLabel",
+        ).pack(anchor="w")
+        ttk.Label(
+            self._inner,
+            text="Sayzo listens only when you say so — it captures meetings "
+                 "on your machine and turns them into personalized speaking "
+                 "drills in the Sayzo web app.",
+            style="Muted.Sayzo.TLabel",
+            wraplength=480, justify="left",
+        ).pack(anchor="w", pady=(PAD_SM, PAD_XL))
+
+        # --- Version + update-check ------------------------------------
+        version_row = ttk.Frame(self._inner, style="Sayzo.TFrame")
+        version_row.pack(fill="x")
+        ttk.Label(
+            version_row, text="Version", style="Muted.Sayzo.TLabel", width=18,
+        ).pack(side="left")
+        ttk.Label(
+            version_row, text=__version__, style="Sayzo.TLabel",
+        ).pack(side="left")
+
+        self._check_button_container = ttk.Frame(
+            version_row, style="Sayzo.TFrame",
+        )
+        self._check_button_container.pack(side="left", padx=(PAD_MD, 0))
+
+        self._status_row = ttk.Frame(self._inner, style="Sayzo.TFrame")
+        self._status_row.pack(fill="x", anchor="w", pady=(PAD_SM, 0))
+
+        self._render_update_state()
+
+        make_divider(self._inner, pady=PAD_XL)
+
+        # --- Captures + logs ------------------------------------------
+        self._render_path_row(
+            "Captures",
+            self._cfg.captures_dir,
+            [("Open captures folder",
+              lambda: self._open_path(self._cfg.captures_dir))],
+        )
+        self._render_path_row(
+            "Logs",
+            self._cfg.logs_dir,
+            [
+                ("Open logs folder",
+                 lambda: self._open_path(self._cfg.logs_dir)),
+                ("Copy diagnostics", self._copy_diagnostics),
+            ],
+        )
+
+        make_divider(self._inner, pady=PAD_XL)
+
+        # --- Footer links ---------------------------------------------
+        actions = ttk.Frame(self._inner, style="Sayzo.TFrame")
+        actions.pack(anchor="w")
+        webapp = (
+            self._cfg.auth.effective_server_url or self.WEBAPP_FALLBACK_URL
+        )
+        RoundedButton(
+            actions, "Open web app",
+            command=lambda u=webapp: webbrowser.open(u),
+            variant="secondary",
+        ).pack(side="left")
+        RoundedButton(
+            actions, "Report an issue",
+            command=lambda: webbrowser.open(self.SUPPORT_URL),
+            variant="secondary",
+        ).pack(side="left", padx=(PAD_SM, 0))
+
+    # ---- update-check render + worker -----------------------------------
+
+    def _render_update_state(self) -> None:
+        assert self._check_button_container is not None
+        assert self._status_row is not None
+        for w in self._check_button_container.winfo_children():
+            w.destroy()
+        for w in self._status_row.winfo_children():
+            w.destroy()
+
+        if self._check_state == "checking":
+            ttk.Label(
+                self._status_row, text="Checking…",
+                style="Muted.Sayzo.TLabel",
+            ).pack(anchor="w")
+            return
+
+        trigger_label = {
+            "idle": "Check for updates",
+            "latest": "Check again",
+            "available": "Check again",
+            "error": "Try again",
+        }[self._check_state]
+        RoundedButton(
+            self._check_button_container, trigger_label,
+            command=self._start_check, variant="secondary",
+        ).pack(side="left")
+
+        if self._check_state == "latest":
+            ttk.Label(
+                self._status_row,
+                text="✓ You're on the latest version.",
+                style="Muted.Sayzo.TLabel",
+            ).pack(anchor="w")
+        elif self._check_state == "available" and self._update_info is not None:
+            info = self._update_info
+            ttk.Label(
+                self._status_row,
+                text=f"Version {info.version} is available.",
+                style="Sayzo.TLabel",
+            ).pack(anchor="w")
+            RoundedButton(
+                self._status_row,
+                f"Download Sayzo {info.version}",
+                command=lambda u=info.url: webbrowser.open(u),
+                variant="primary",
+            ).pack(anchor="w", pady=(PAD_SM, 0))
+        elif self._check_state == "error":
+            ttk.Label(
+                self._status_row,
+                text="Couldn't check right now. Please try again.",
+                style="Muted.Sayzo.TLabel",
+            ).pack(anchor="w")
+
+    def _start_check(self) -> None:
+        self._check_state = "checking"
+        self._update_info = None
+        self._render_update_state()
+
+        def worker() -> None:
+            try:
+                info = asyncio.run(_update_check(__version__))
+            except Exception:
+                log.warning("[about] update check failed", exc_info=True)
+                self._frame.after(0, self._on_check_error)
+                return
+            self._frame.after(0, self._on_check_done, info)
+
+        threading.Thread(
+            target=worker, name="about-update-check", daemon=True,
+        ).start()
+
+    def _on_check_done(self, info: Optional[UpdateInfo]) -> None:
+        if info is None:
+            self._check_state = "latest"
+        else:
+            self._check_state = "available"
+            self._update_info = info
+        # The pane may have been navigated away from; guard the render.
+        if self._status_row is not None and self._check_button_container is not None:
+            try:
+                self._render_update_state()
+            except tk.TclError:
+                pass
+
+    def _on_check_error(self) -> None:
+        self._check_state = "error"
+        if self._status_row is not None and self._check_button_container is not None:
+            try:
+                self._render_update_state()
+            except tk.TclError:
+                pass
+
+    # ---- path rows + helpers --------------------------------------------
+
+    def _render_path_row(
+        self,
+        label: str,
+        path,
+        buttons: list[tuple[str, "callable"]],
+    ) -> None:
+        row = ttk.Frame(self._inner, style="Sayzo.TFrame")
+        row.pack(fill="x", pady=(0, PAD_SM))
+        ttk.Label(
+            row, text=label, style="Muted.Sayzo.TLabel", width=18,
+        ).pack(side="left", anchor="n")
+        col = ttk.Frame(row, style="Sayzo.TFrame")
+        col.pack(side="left", fill="x", expand=True)
+        ttk.Label(
+            col, text=str(path), style="Small.Sayzo.TLabel",
+            wraplength=460, justify="left",
+        ).pack(anchor="w")
+        btn_row = ttk.Frame(col, style="Sayzo.TFrame")
+        btn_row.pack(anchor="w", pady=(PAD_XS, 0))
+        for i, (btn_label, cmd) in enumerate(buttons):
+            pad = (0, PAD_SM) if i < len(buttons) - 1 else (0, 0)
+            RoundedButton(
+                btn_row, btn_label, command=cmd, variant="secondary",
+            ).pack(side="left", padx=pad)
+
+    def _open_path(self, path) -> None:
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            log.warning("[about] mkdir failed for %s", path, exc_info=True)
+        open_folder(path)
+
+    def _copy_diagnostics(self) -> None:
+        from ..auth.store import TokenStore
+        try:
+            signed_in = TokenStore(self._cfg.auth_path).has_tokens()
+        except Exception:
+            signed_in = False
+        blob = "\n".join([
+            f"Sayzo Agent {__version__}",
+            f"Platform:  {sys.platform} ({platform.platform()})",
+            f"Python:    {sys.version.split()[0]}",
+            f"Data dir:  {self._cfg.data_dir}",
+            f"Captures:  {self._cfg.captures_dir}",
+            f"Logs:      {self._cfg.logs_dir}",
+            f"Signed in: {'yes' if signed_in else 'no'}",
+        ])
+        try:
+            self._frame.clipboard_clear()
+            self._frame.clipboard_append(blob)
+            self._frame.update()
+        except tk.TclError:
+            log.warning("[about] clipboard write failed", exc_info=True)
 
 
 # ---- Meeting Apps pane -----------------------------------------------------

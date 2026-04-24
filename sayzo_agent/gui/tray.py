@@ -49,6 +49,8 @@ from pathlib import Path
 
 from PIL import Image
 
+from .fs import open_folder
+
 log = logging.getLogger(__name__)
 
 # Tray icon size (pixels). pystray rescales as needed for the host OS, so we
@@ -187,17 +189,6 @@ def _make_icon(status: Status) -> Image.Image:
 # Tray icon (pystray)
 # ---------------------------------------------------------------------------
 
-def _open_folder(path: Path) -> None:
-    """Open a folder in the platform's file manager."""
-    p = str(path)
-    if sys.platform == "win32":
-        os.startfile(p)
-    elif sys.platform == "darwin":
-        subprocess.Popen(["open", p])
-    else:
-        subprocess.Popen(["xdg-open", p])
-
-
 def _mac_unload_launchd_agent() -> None:
     """Ask launchd to stop supervising the agent before we exit.
 
@@ -332,7 +323,7 @@ class TrayIcon:
 
         def on_open_captures(icon, item):
             self.captures_dir.mkdir(parents=True, exist_ok=True)
-            _open_folder(self.captures_dir)
+            open_folder(self.captures_dir)
 
         def on_quit(icon, item):
             _mac_unload_launchd_agent()
