@@ -112,17 +112,22 @@ def _render_rounded_rect(
     """Render a rounded rectangle via Pillow at a supersampled resolution
     then downsample with ``LANCZOS`` for smooth antialiased edges.
 
-    Transparent fill / outline positions fall back to the canvas bg so the
-    downsampled image composites cleanly onto the tkinter canvas.
+    When ``fill`` is a color, the area outside the rounded shape is filled
+    with ``bg`` so the downsampled image composites cleanly onto the host
+    tkinter canvas without jagged corners. When ``fill`` is ``None`` the
+    entire image is transparent apart from the outline stroke — required
+    for the focus ring, which is drawn on top of an already-rendered
+    button and must let the button show through its interior.
     """
-    # Supersample canvas for AA.
     W, H, R = w * _SS, h * _SS, r * _SS
-    # Start from the canvas bg so corners outside the rounded shape blend
-    # into the host surface (white by default, SURFACE on the sidebar).
-    img = Image.new("RGBA", (W, H), _hex_to_rgba(bg))
+    if fill is None:
+        img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        fill_rgba: Optional[tuple[int, int, int, int]] = None
+    else:
+        img = Image.new("RGBA", (W, H), _hex_to_rgba(bg))
+        fill_rgba = _hex_to_rgba(fill)
     draw = ImageDraw.Draw(img)
 
-    fill_rgba = _hex_to_rgba(fill) if fill else _hex_to_rgba(bg)
     outline_rgba = _hex_to_rgba(outline) if outline else None
 
     draw.rounded_rectangle(
