@@ -52,6 +52,16 @@ _REQUEST_TIMEOUT_SECS = 5.0
 _CONNECT_TIMEOUT_SECS = 1.5
 
 
+# IPC method names. Both ``IPCServer.register`` and ``IPCClient.call`` route
+# requests by string, so a typo on either side becomes a silent
+# ``unknown method`` response at runtime instead of a TypeError at import.
+# These constants make the contract explicit; Phase 4 adds more entries.
+class Methods:
+    PING = "ping"
+    INVALIDATE_TOKEN_CACHE = "invalidate_token_cache"
+    REBIND_HOTKEY = "rebind_hotkey"
+
+
 class IPCError(Exception):
     """Raised when the IPC server returned an explicit error response."""
 
@@ -229,13 +239,25 @@ class IPCClient:
     def __init__(self, data_dir: Path) -> None:
         self._data_dir = data_dir
         self._next_id = 0
+        self._cached_port: Optional[int] = None
 
     def _read_port(self) -> int:
+        """Return the agent's IPC port, cached across calls.
+
+        The port file is read from disk at most once per healthy connection
+        — re-reading on every call would add 10–20 µs of stat+read+parse
+        overhead in Phase 4's mic-holder polling. Cache is invalidated by
+        ``call`` on ``ConnectionRefusedError`` so an agent that restarted
+        and bound a different port is picked up automatically.
+        """
+        if self._cached_port is not None:
+            return self._cached_port
         path = _port_file(self._data_dir)
         try:
-            return int(path.read_text(encoding="utf-8").strip())
+            self._cached_port = int(path.read_text(encoding="utf-8").strip())
         except (FileNotFoundError, ValueError, OSError) as e:
             raise IPCNotConnected(f"agent IPC port file unreadable: {e}")
+        return self._cached_port
 
     def call(self, method: str, **params: Any) -> Any:
         """Send a request and return the result (or raise ``IPCError``).
@@ -260,6 +282,9 @@ class IPCClient:
             try:
                 sock.connect((_LOOPBACK_HOST, port))
             except (ConnectionRefusedError, TimeoutError, OSError) as e:
+                # Drop the cached port — the agent may have restarted and
+                # bound a new one. Next call's _read_port() picks up fresh.
+                self._cached_port = None
                 raise IPCNotConnected(f"agent not reachable on :{port}: {e}")
 
             sock.settimeout(_REQUEST_TIMEOUT_SECS)

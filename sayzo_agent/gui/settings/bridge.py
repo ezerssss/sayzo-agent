@@ -18,6 +18,7 @@ import json
 import logging
 import platform
 import sys
+import threading
 import webbrowser
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Optional
@@ -27,7 +28,7 @@ from sayzo_agent.config import Config
 from sayzo_agent.gui.common import hotkey as hotkey_helpers
 from sayzo_agent.gui.common.login import LoginCoordinator
 from sayzo_agent.gui.fs import open_folder
-from sayzo_agent.gui.settings.ipc import IPCClient, IPCError, IPCNotConnected
+from sayzo_agent.gui.settings.ipc import IPCClient, IPCError, IPCNotConnected, Methods
 
 if TYPE_CHECKING:
     import webview
@@ -264,7 +265,7 @@ class Bridge:
         except Exception:
             log.warning("[settings.bridge] sign_out failed", exc_info=True)
             return {"signed_out": False}
-        self._ipc.call_quiet("invalidate_token_cache")
+        self._ipc.call_quiet(Methods.INVALIDATE_TOKEN_CACHE)
         return {"signed_out": True}
 
     # ------------------------------------------------------------------
@@ -308,7 +309,7 @@ class Bridge:
         if result.get("error") is not None:
             return result
         try:
-            ipc_result = self._ipc.call("rebind_hotkey", binding=binding)
+            ipc_result = self._ipc.call(Methods.REBIND_HOTKEY, binding=binding)
         except IPCNotConnected:
             return result
         except IPCError as e:

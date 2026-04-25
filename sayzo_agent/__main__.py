@@ -695,10 +695,10 @@ def service(force_setup: bool) -> None:
         # this with mic-holder + detector mutation methods. The server is
         # started before the agent's main loop so a Settings window opened
         # immediately after `service` boots can connect.
-        from .gui.settings.ipc import IPCServer
+        from .gui.settings.ipc import IPCServer, Methods
 
         ipc_server = IPCServer(cfg.data_dir)
-        ipc_server.register("ping", lambda: "pong")
+        ipc_server.register(Methods.PING, lambda: "pong")
 
         def _ipc_invalidate_token_cache() -> None:
             try:
@@ -710,8 +710,8 @@ def service(force_setup: bool) -> None:
             err = agent.arm.rebind_hotkey(binding)
             return {"error": err}
 
-        ipc_server.register("invalidate_token_cache", _ipc_invalidate_token_cache)
-        ipc_server.register("rebind_hotkey", _ipc_rebind_hotkey)
+        ipc_server.register(Methods.INVALIDATE_TOKEN_CACHE, _ipc_invalidate_token_cache)
+        ipc_server.register(Methods.REBIND_HOTKEY, _ipc_rebind_hotkey)
 
         try:
             await ipc_server.start()
