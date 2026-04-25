@@ -182,6 +182,13 @@ def _load_comtypes_symbols():
         "{41D949AB-9862-444A-80F6-C261334DA5EB}"
     )
     IID_IAudioClient = GUID("{1CB9AD4C-DBFA-4c32-B178-C2F568A703B2}")
+    # IAgileObject — marker interface (no methods) signalling that the COM
+    # object is safe to invoke from any apartment without a proxy. Without
+    # this, ActivateAudioInterfaceAsync rejects our completion handler
+    # with E_ILLEGAL_METHOD_CALL (0x8000000E) up-front because Windows
+    # delivers the callback from an arbitrary system thread and refuses to
+    # set up cross-apartment marshaling for an MTA-classic-COM object.
+    IID_IAgileObject = GUID("{94EA2B94-E9CC-49E0-C0FF-EE64CA8F5B90}")
 
     class IActivateAudioInterfaceAsyncOperation(IUnknown):
         _iid_ = IID_IActivateAudioInterfaceAsyncOperation
@@ -206,6 +213,10 @@ def _load_comtypes_symbols():
             ),
         ]
 
+    class IAgileObject(IUnknown):
+        _iid_ = IID_IAgileObject
+        _methods_: list = []  # marker — no methods of its own
+
     return {
         "comtypes": comtypes,
         "IUnknown": IUnknown,
@@ -214,6 +225,7 @@ def _load_comtypes_symbols():
         "IID_IAudioClient": IID_IAudioClient,
         "IActivateAudioInterfaceAsyncOperation": IActivateAudioInterfaceAsyncOperation,
         "IActivateAudioInterfaceCompletionHandler": IActivateAudioInterfaceCompletionHandler,
+        "IAgileObject": IAgileObject,
     }
 
 
@@ -228,7 +240,15 @@ def _make_completion_handler(syms, done_event: threading.Event, result_box: dict
     from comtypes import COMObject  # type: ignore[import-not-found]
 
     class _Handler(COMObject):
-        _com_interfaces_ = [syms["IActivateAudioInterfaceCompletionHandler"]]
+        # IAgileObject is a marker — its presence in ``_com_interfaces_``
+        # tells comtypes to succeed QueryInterface(IID_IAgileObject), which
+        # is what ActivateAudioInterfaceAsync probes to confirm the handler
+        # can be called from any thread without proxying. See the IID_…
+        # comment in ``_load_comtypes_symbols`` for the full rationale.
+        _com_interfaces_ = [
+            syms["IActivateAudioInterfaceCompletionHandler"],
+            syms["IAgileObject"],
+        ]
 
         def ActivateCompleted(self, activateOperation):
             try:

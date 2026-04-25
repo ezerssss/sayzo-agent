@@ -701,6 +701,19 @@ def service(force_setup: bool) -> None:
         # that point.
         settings_open = threading.Event()
 
+        # Dedicated single-worker executor for the Settings tkinter window.
+        # Tcl is thread-affine: opening Settings via the default asyncio
+        # executor (32+ workers) means each invocation can land on a
+        # different thread. Tcl tolerates being on ONE non-main thread, but
+        # rotating across threads triggers ``Tcl_Panic`` (BREAKPOINT crash
+        # 0x80000003 in tcl86t.dll, observed in field event-viewer logs on
+        # v1.7.2). Pinning to one worker avoids that entirely — every
+        # Settings open re-uses the same Tcl interpreter thread.
+        from concurrent.futures import ThreadPoolExecutor as _SettingsExec
+        settings_executor = _SettingsExec(
+            max_workers=1, thread_name_prefix="sayzo-settings",
+        )
+
         def _open_settings() -> None:
             try:
                 from .gui.settings_window import open_settings_window
@@ -752,7 +765,7 @@ def service(force_setup: bool) -> None:
                     tray_state.settings_event.clear()
                     if not settings_open.is_set():
                         settings_open.set()
-                        loop.run_in_executor(None, _open_settings)
+                        loop.run_in_executor(settings_executor, _open_settings)
                 # Belt-and-braces poll sync in case the callback ever fails
                 # to fire (e.g. state changed before the callback was wired).
                 _sync_arm_state_to_tray()
@@ -888,6 +901,10 @@ def service(force_setup: bool) -> None:
         pass
     finally:
         tray.stop()
+        try:
+            settings_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
         remove_pid(cfg.pid_path)
         log.warning("sayzo-agent service stopped")
 
