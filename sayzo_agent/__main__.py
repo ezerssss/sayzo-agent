@@ -724,6 +724,45 @@ def service(force_setup: bool) -> None:
             finally:
                 settings_open.clear()
 
+        def _use_pywebview_settings() -> bool:
+            return os.environ.get("SAYZO_USE_PYWEBVIEW_SETTINGS", "0").lower() not in (
+                "0", "", "false", "no", "off",
+            )
+
+        def _settings_subprocess_argv() -> list[str]:
+            """Build ``argv`` for ``sayzo-agent settings``.
+
+            Frozen builds ship a single binary that already routes ``settings``
+            via Click. Dev runs use ``python -m sayzo_agent settings`` so the
+            entry point is found inside the venv without relying on the
+            console-script shim being on PATH.
+            """
+            if getattr(sys, "frozen", False):
+                return [sys.executable, "settings"]
+            return [sys.executable, "-m", "sayzo_agent", "settings"]
+
+        async def _spawn_settings_subprocess(open_flag: threading.Event) -> None:
+            """Run ``sayzo-agent settings`` and clear the open-flag on exit.
+
+            Errors here are non-fatal: the agent must keep ticking even if
+            the Settings window failed to spawn (missing assets, OS-level
+            spawn failure). The user can retry from the tray menu.
+            """
+            argv = _settings_subprocess_argv()
+            log.info("[tray] spawning Settings subprocess: %s", argv)
+            try:
+                proc = await asyncio.create_subprocess_exec(*argv)
+                await proc.wait()
+                if proc.returncode != 0:
+                    log.warning(
+                        "[tray] settings subprocess exited with code %s",
+                        proc.returncode,
+                    )
+            except Exception:
+                log.warning("[tray] failed to spawn settings subprocess", exc_info=True)
+            finally:
+                open_flag.clear()
+
         def _sync_arm_state_to_tray() -> None:
             """Push ArmController.state → TrayState immediately.
 
@@ -758,14 +797,28 @@ def service(force_setup: bool) -> None:
                 if tray_state.arm_toggle_event.is_set():
                     tray_state.arm_toggle_event.clear()
                     asyncio.create_task(agent.arm.arm_from_tray())
-                # Settings... — open the tkinter settings window on a worker
-                # thread so the asyncio loop keeps ticking. Reentrancy guard
-                # ensures a double-click doesn't create a second window.
+                # Settings... — opens the Settings window. Two dispatch paths:
+                #
+                #   * SAYZO_USE_PYWEBVIEW_SETTINGS=1 (default off during the
+                #     migration): spawn the new pywebview Settings as a
+                #     ``sayzo-agent settings`` subprocess. The subprocess
+                #     owns its own main thread, which is what Cocoa needs on
+                #     macOS — pystray holds the agent's main thread, so an
+                #     in-process pywebview can't run there.
+                #
+                #   * Default: keep the legacy tkinter window on a dedicated
+                #     single-worker executor so Tcl's thread affinity stays
+                #     happy on Windows. Reentrancy guard prevents two roots.
                 if tray_state.settings_event.is_set():
                     tray_state.settings_event.clear()
                     if not settings_open.is_set():
                         settings_open.set()
-                        loop.run_in_executor(settings_executor, _open_settings)
+                        if _use_pywebview_settings():
+                            asyncio.create_task(
+                                _spawn_settings_subprocess(settings_open)
+                            )
+                        else:
+                            loop.run_in_executor(settings_executor, _open_settings)
                 # Belt-and-braces poll sync in case the callback ever fails
                 # to fire (e.g. state changed before the callback was wired).
                 _sync_arm_state_to_tray()
@@ -907,6 +960,37 @@ def service(force_setup: bool) -> None:
             pass
         remove_pid(cfg.pid_path)
         log.warning("sayzo-agent service stopped")
+
+
+@cli.command()
+@click.option(
+    "--pane",
+    default=None,
+    help="Open the Settings window with this pane selected (e.g. Account, About).",
+)
+def settings(pane: str | None) -> None:
+    """Open the Settings window in a dedicated pywebview process.
+
+    Spawned by the tray menu's "Settings…" click when
+    ``SAYZO_USE_PYWEBVIEW_SETTINGS=1``. Exits 0 when the window closes;
+    exits 0 immediately (with a log line) if another Settings window
+    already holds the cross-process lock.
+    """
+    cfg = load_config()
+    _setup_logging("INFO", debug=cfg.debug)
+    log = logging.getLogger("settings")
+
+    from .gui.settings.lockfile import SettingsLock
+    from .gui.settings.window import SettingsWindow
+
+    with SettingsLock(cfg.data_dir) as lock:
+        if not lock.acquired:
+            log.warning("another Settings window is already open — exiting")
+            return
+        try:
+            SettingsWindow(cfg, pane=pane).run_blocking()
+        except Exception:
+            log.exception("settings window crashed")
 
 
 if __name__ == "__main__":

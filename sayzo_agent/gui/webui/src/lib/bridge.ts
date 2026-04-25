@@ -42,54 +42,68 @@ export type AccessibilityOpenResult = {
   opened: boolean;
 };
 
+// Named interface so other modules (e.g. lib/settings-bridge.ts) can merge
+// extra Settings-only methods via TypeScript declaration merging — both
+// surfaces live on the same `window.pywebview.api` object at runtime.
 declare global {
+  interface SayzoPywebviewApi {
+    get_status(): Promise<SetupStatus>;
+    get_config_snapshot(): Promise<ConfigSnapshot>;
+    start_login(): Promise<{ started: boolean }>;
+    cancel_login(): Promise<{ cancelled: boolean }>;
+    start_model_download(): Promise<{ started: boolean }>;
+
+    // Per-permission prompts (one screen each).
+    prompt_mic_permission(): Promise<PermissionResult>;
+    prompt_audio_capture_permission(): Promise<PermissionResult>;
+    prompt_notification_permission(): Promise<PermissionResult>;
+    prompt_automation_permission(): Promise<AutomationPromptResult>;
+
+    // Settings deep-links.
+    open_mic_settings(): Promise<null>;
+    open_audio_capture_settings(): Promise<null>;
+    open_notification_settings(): Promise<null>;
+    open_accessibility_settings(): Promise<AccessibilityOpenResult>;
+
+    // Hotkey (persisted to user_settings.json).
+    get_hotkey(): Promise<HotkeyState>;
+    validate_hotkey(binding: string): Promise<HotkeyValidation>;
+    save_hotkey(binding: string): Promise<HotkeySaveResult>;
+
+    mark_permissions_onboarded(): Promise<null>;
+    finish(): Promise<null>;
+    quit_app(): Promise<null>;
+  }
+
   interface Window {
-    pywebview: {
-      api: {
-        get_status(): Promise<SetupStatus>;
-        get_config_snapshot(): Promise<ConfigSnapshot>;
-        start_login(): Promise<{ started: boolean }>;
-        cancel_login(): Promise<{ cancelled: boolean }>;
-        start_model_download(): Promise<{ started: boolean }>;
-
-        // Per-permission prompts (one screen each).
-        prompt_mic_permission(): Promise<PermissionResult>;
-        prompt_audio_capture_permission(): Promise<PermissionResult>;
-        prompt_notification_permission(): Promise<PermissionResult>;
-        prompt_automation_permission(): Promise<AutomationPromptResult>;
-
-        // Settings deep-links.
-        open_mic_settings(): Promise<null>;
-        open_audio_capture_settings(): Promise<null>;
-        open_notification_settings(): Promise<null>;
-        open_accessibility_settings(): Promise<AccessibilityOpenResult>;
-
-        // Hotkey (persisted to user_settings.json).
-        get_hotkey(): Promise<HotkeyState>;
-        validate_hotkey(binding: string): Promise<HotkeyValidation>;
-        save_hotkey(binding: string): Promise<HotkeySaveResult>;
-
-        mark_permissions_onboarded(): Promise<null>;
-        finish(): Promise<null>;
-        quit_app(): Promise<null>;
-      };
-    };
+    pywebview: { api: SayzoPywebviewApi };
   }
 }
 
 // Wait until the pywebview JS bridge is fully populated. On macOS's cocoa
 // backend, `window.pywebview.api` can exist as an empty object before the
-// individual Python methods are bound — so we poll for a specific method
-// (`get_status`) rather than trusting the object's mere existence. We also
-// listen for the `pywebviewready` event as a secondary trigger, and bail
-// with a hard error after 10s so a truly broken bridge surfaces instead of
-// hanging the UI forever.
+// individual Python methods are bound — so we poll for *some* function being
+// present rather than trusting the object's mere existence. The check is
+// bridge-agnostic on purpose: the same bundle hosts both the setup wizard
+// (Python `Bridge` in gui/setup/bridge.py) and the Settings window (Python
+// `Bridge` in gui/settings/bridge.py), and the two expose different methods
+// — there is no single method name common to both. We also listen for the
+// `pywebviewready` event as a secondary trigger, and bail with a hard error
+// after 10s so a truly broken bridge surfaces instead of hanging the UI.
 export function whenReady(): Promise<void> {
   return new Promise((resolve, reject) => {
     const deadline = Date.now() + 10_000;
 
-    const isReady = () =>
-      typeof window.pywebview?.api?.get_status === "function";
+    const isReady = () => {
+      const api = window.pywebview?.api as unknown as
+        | Record<string, unknown>
+        | undefined;
+      if (api == null) return false;
+      for (const key in api) {
+        if (typeof api[key] === "function") return true;
+      }
+      return false;
+    };
 
     if (isReady()) {
       resolve();

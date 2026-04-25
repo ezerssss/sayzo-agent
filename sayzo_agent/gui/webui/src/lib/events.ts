@@ -20,6 +20,15 @@ export type SayzoEvent =
   | { type: "login_done" }
   | { type: "login_error"; message: string }
   | { type: "login_cancelled" }
+  // Settings — About pane update check.
+  | {
+      type: "update_result";
+      has_update: boolean;
+      version?: string;
+      url?: string;
+      notes?: string;
+    }
+  | { type: "update_error"; message: string }
   | { type: "status_updated"; status: unknown }; // future-proof
 
 type Listener = (evt: SayzoEvent) => void;
