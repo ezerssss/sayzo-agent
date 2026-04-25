@@ -31,6 +31,29 @@ export type Diagnostics = {
   text: string;
 };
 
+export type NotificationFlags = {
+  master: boolean;
+  welcome: boolean;
+  post_arm: boolean;
+  capture_saved: boolean;
+};
+
+export type NotificationKey = keyof NotificationFlags;
+
+export type PermissionRow = {
+  key: string;
+  label: string;
+  description: string;
+};
+
+export type PermissionResult = {
+  granted: boolean | null;
+};
+
+export type PermissionOpenResult = {
+  opened: boolean;
+};
+
 // ---- Settings-only window.pywebview.api surface --------------------------
 // Augments the `SayzoPywebviewApi` interface declared in `lib/bridge.ts`.
 // Both surfaces live on the same `window.pywebview.api` object at runtime;
@@ -54,6 +77,18 @@ declare global {
 
     // About.
     check_for_update(): Promise<{ checking: boolean }>;
+
+    // Notifications.
+    get_notifications(): Promise<NotificationFlags>;
+    set_notification(
+      key: NotificationKey,
+      value: boolean,
+    ): Promise<{ saved: boolean; error?: string }>;
+
+    // Permissions.
+    get_permissions(): Promise<PermissionRow[]>;
+    request_permission(key: string): Promise<PermissionResult>;
+    open_permission_settings(key: string): Promise<PermissionOpenResult>;
   }
 }
 
@@ -103,6 +138,28 @@ export const settingsBridge = {
   async checkForUpdate() {
     await whenReady();
     return window.pywebview.api.check_for_update();
+  },
+
+  async getNotifications() {
+    await whenReady();
+    return window.pywebview.api.get_notifications();
+  },
+  async setNotification(key: NotificationKey, value: boolean) {
+    await whenReady();
+    return window.pywebview.api.set_notification(key, value);
+  },
+
+  async getPermissions() {
+    await whenReady();
+    return window.pywebview.api.get_permissions();
+  },
+  async requestPermission(key: string) {
+    await whenReady();
+    return window.pywebview.api.request_permission(key);
+  },
+  async openPermissionSettings(key: string) {
+    await whenReady();
+    return window.pywebview.api.open_permission_settings(key);
   },
 
   async finish() {

@@ -22,7 +22,7 @@ import webbrowser
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Optional
 
-from sayzo_agent import __version__
+from sayzo_agent import __version__, settings_store
 from sayzo_agent.config import Config
 from sayzo_agent.gui.common.login import LoginCoordinator
 from sayzo_agent.gui.fs import open_folder
@@ -34,6 +34,72 @@ log = logging.getLogger(__name__)
 
 SUPPORT_URL = "https://sayzo.app/support"
 WEBAPP_FALLBACK_URL = "https://sayzo.app"
+
+# Per-platform permission row definitions. Empty list on Windows; macOS
+# gets the four TCC-gated permissions Sayzo actually depends on. Driving
+# the UI from data here means adding a future permission is one tuple,
+# one dispatch branch in ``request_permission``, and (if not already in
+# ``mac_permissions``) one helper.
+_MAC_PERMISSION_ROWS: tuple[dict[str, str], ...] = (
+    {
+        "key": "mic",
+        "label": "Microphone",
+        "description": "Needed to hear your voice during meetings.",
+    },
+    {
+        "key": "audio_capture",
+        "label": "System Audio Recording",
+        "description": "Needed to transcribe the other side of the conversation.",
+    },
+    {
+        "key": "accessibility",
+        "label": "Accessibility",
+        "description": "Lets the global shortcut work when another app is focused.",
+    },
+    {
+        "key": "automation",
+        "label": "Automation (browsers)",
+        "description": "Lets Sayzo read the current tab's URL to detect web meetings.",
+    },
+)
+
+# Direct deep-links for permissions that aren't grant-by-probe (Accessibility
+# + Automation can only be toggled by the user in System Settings, no
+# programmatic flow). ``mac_permissions`` already owns mic / audio-capture /
+# notifications deep-links so we reuse those.
+_MAC_PERMISSION_DEEPLINKS: dict[str, str] = {
+    "accessibility": (
+        "x-apple.systempreferences:com.apple.preference.security"
+        "?Privacy_Accessibility"
+    ),
+    "automation": (
+        "x-apple.systempreferences:com.apple.preference.security"
+        "?Privacy_Automation"
+    ),
+}
+
+# Maps the wire-level notification key (used by React) to the nested
+# ``settings_store`` patch and the live ``Config`` attribute path. Keeping
+# the routing as data lets ``set_notification`` stay a single, validated
+# method instead of a switch with one branch per flag.
+_NOTIFICATION_KEYS: dict[str, dict] = {
+    "master": {
+        "store_patch": lambda v: {"notifications_enabled": v},
+        "cfg_attr": ("notifications_enabled",),
+    },
+    "welcome": {
+        "store_patch": lambda v: {"notify_welcome": v},
+        "cfg_attr": ("notify_welcome",),
+    },
+    "post_arm": {
+        "store_patch": lambda v: {"arm": {"notify_post_arm": v}},
+        "cfg_attr": ("arm", "notify_post_arm"),
+    },
+    "capture_saved": {
+        "store_patch": lambda v: {"notify_capture_saved": v},
+        "cfg_attr": ("notify_capture_saved",),
+    },
+}
 
 
 class Bridge:
@@ -214,6 +280,120 @@ class Bridge:
             daemon=True,
         ).start()
         return {"checking": True}
+
+    # ------------------------------------------------------------------
+    # JS-callable methods — Notifications
+    # ------------------------------------------------------------------
+
+    def get_notifications(self) -> dict[str, bool]:
+        """Read the four notification flags from the live ``Config`` overlay."""
+        return {
+            "master": bool(self._cfg.notifications_enabled),
+            "welcome": bool(self._cfg.notify_welcome),
+            "post_arm": bool(self._cfg.arm.notify_post_arm),
+            "capture_saved": bool(self._cfg.notify_capture_saved),
+        }
+
+    def set_notification(self, key: str, value: bool) -> dict[str, Any]:
+        """Persist a single notification flag.
+
+        Mutates ``self._cfg`` so subsequent reads in this subprocess are
+        consistent and writes the change to ``user_settings.json``. The
+        running agent process keeps its in-memory ``Config`` until restart;
+        Phase 3's IPC layer will let us nudge it to reload sooner.
+        """
+        spec = _NOTIFICATION_KEYS.get(key)
+        if spec is None:
+            return {"saved": False, "error": f"unknown notification key: {key}"}
+
+        coerced = bool(value)
+        attrs = spec["cfg_attr"]
+        target: Any = self._cfg
+        for a in attrs[:-1]:
+            target = getattr(target, a)
+        try:
+            setattr(target, attrs[-1], coerced)
+        except Exception:
+            log.debug("[settings.bridge] cfg mutation failed for %s", key, exc_info=True)
+
+        try:
+            settings_store.save(self._cfg.data_dir, spec["store_patch"](coerced))
+        except Exception:
+            log.warning(
+                "[settings.bridge] persist notification %s failed", key, exc_info=True,
+            )
+            return {"saved": False, "error": "couldn't write user_settings.json"}
+        return {"saved": True}
+
+    # ------------------------------------------------------------------
+    # JS-callable methods — Permissions
+    # ------------------------------------------------------------------
+
+    def get_permissions(self) -> list[dict[str, str]]:
+        """Per-platform permission rows. Empty list on Windows."""
+        if sys.platform != "darwin":
+            return []
+        return [dict(row) for row in _MAC_PERMISSION_ROWS]
+
+    def request_permission(self, key: str) -> dict[str, Any]:
+        """Fire the macOS TCC prompt for ``key``.
+
+        Mic + audio_capture perform a one-shot probe the OS intercepts to
+        surface the dialog. Accessibility + automation have no programmatic
+        grant — ``request_permission`` returns ``granted=null`` and the
+        React caller falls back to ``open_permission_settings``.
+        """
+        if sys.platform != "darwin":
+            return {"granted": None}
+
+        try:
+            from sayzo_agent.gui.setup import mac_permissions
+        except Exception:
+            log.warning("[settings.bridge] mac_permissions import failed", exc_info=True)
+            return {"granted": None}
+
+        if key == "mic":
+            return {"granted": mac_permissions.prompt_microphone()}
+        if key == "audio_capture":
+            return {"granted": mac_permissions.prompt_audio_capture()}
+        if key == "notifications":
+            return {"granted": mac_permissions.prompt_notifications()}
+        return {"granted": None}
+
+    def open_permission_settings(self, key: str) -> dict[str, bool]:
+        """Open System Settings to the relevant Privacy & Security sub-pane.
+
+        macOS-only. Returns ``{"opened": False}`` on Windows so React can
+        treat the call as a no-op without a platform branch.
+        """
+        if sys.platform != "darwin":
+            return {"opened": False}
+
+        try:
+            from sayzo_agent.gui.setup import mac_permissions
+        except Exception:
+            log.warning("[settings.bridge] mac_permissions import failed", exc_info=True)
+            return {"opened": False}
+
+        try:
+            if key == "mic":
+                mac_permissions.open_mic_settings()
+            elif key == "audio_capture":
+                mac_permissions.open_audio_capture_settings()
+            elif key == "notifications":
+                mac_permissions.open_notification_settings()
+            elif key in _MAC_PERMISSION_DEEPLINKS:
+                import subprocess as _sp
+                _sp.Popen(["open", _MAC_PERMISSION_DEEPLINKS[key]])
+            else:
+                return {"opened": False}
+        except Exception:
+            log.warning(
+                "[settings.bridge] open_permission_settings %s failed",
+                key, exc_info=True,
+            )
+            return {"opened": False}
+        return {"opened": True}
 
     # ------------------------------------------------------------------
     # JS-callable methods — Lifecycle

@@ -3,11 +3,18 @@ import { settingsBridge } from "../lib/settings-bridge";
 import { Alert } from "../components/ui/Alert";
 import { AccountPane } from "./AccountPane";
 import { AboutPane } from "./AboutPane";
+import { NotificationsPane } from "./NotificationsPane";
+import { PermissionsPane } from "./PermissionsPane";
 
-// Phase 1 ships Account + About. The remaining panes (Shortcut, Meeting Apps,
-// Permissions, Notifications) are added in subsequent phases of the
-// settings-pywebview-migration plan.
-const PANE_NAMES = ["Account", "About"] as const;
+// Sidebar order will grow: Shortcut + Meeting Apps land in Phase 3-4. For
+// now the four panes that don't depend on the IPC layer ship together;
+// order matches the legacy tkinter Settings so muscle memory carries over.
+const PANE_NAMES = [
+  "Permissions",
+  "Account",
+  "Notifications",
+  "About",
+] as const;
 type PaneName = (typeof PANE_NAMES)[number];
 
 function normalizePane(s: string | null | undefined): PaneName | null {
@@ -80,7 +87,9 @@ export function SettingsApp() {
       <Sidebar active={active} onSelect={setActive} />
       <div className="flex-1 overflow-y-auto">
         <div className="mx-auto max-w-2xl px-10 py-10">
+          {active === "Permissions" && <PermissionsPane />}
           {active === "Account" && <AccountPane />}
+          {active === "Notifications" && <NotificationsPane />}
           {active === "About" && <AboutPane />}
         </div>
       </div>
