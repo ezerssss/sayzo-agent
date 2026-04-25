@@ -63,9 +63,26 @@ def save(data_dir: Path, patch: dict[str, Any]) -> None:
     path = settings_path(data_dir)
     current = load(data_dir)
     merged = _merge(current, patch)
+    _write(path, merged, data_dir)
+
+
+def replace(data_dir: Path, document: dict[str, Any]) -> None:
+    """Overwrite the entire user-settings document atomically.
+
+    Use this when a merge is the wrong semantics — most commonly to
+    *delete* a nested key (Settings → Meeting Apps → Reset clears
+    ``arm.detectors`` so the shipping defaults reappear; merge-based
+    saves can't represent a deletion since missing keys mean
+    "preserve"). Passes the document through verbatim, so callers are
+    responsible for read-modify-write.
+    """
+    _write(settings_path(data_dir), document, data_dir)
+
+
+def _write(path: Path, document: dict[str, Any], data_dir: Path) -> None:
     data_dir.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(merged, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.write_text(json.dumps(document, indent=2, sort_keys=True), encoding="utf-8")
     os.replace(tmp, path)
 
 

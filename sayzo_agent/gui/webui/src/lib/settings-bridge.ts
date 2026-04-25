@@ -54,6 +54,84 @@ export type PermissionOpenResult = {
   opened: boolean;
 };
 
+// ---- Meeting Apps --------------------------------------------------------
+
+export type DetectorKind = "desktop" | "web";
+
+export type DetectorSummary = {
+  app_key: string;
+  display_name: string;
+  kind: DetectorKind;
+  detail: string;
+  is_browser: boolean;
+  process_names: string[];
+  bundle_ids: string[];
+  url_patterns: string[];
+  title_patterns: string[];
+  disabled: boolean;
+};
+
+export type SeenAppSummary = {
+  key: string;
+  display_name: string;
+  process_name: string | null;
+  bundle_id: string | null;
+};
+
+export type MicHolderSnapshot = {
+  process_name: string;
+  pid: number;
+};
+
+export type MicStateSnapshot = {
+  holders: MicHolderSnapshot[];
+  active: boolean;
+  running_processes: string[];
+};
+
+export type ForegroundSnapshot = {
+  process_name?: string | null;
+  bundle_id?: string | null;
+  window_title?: string | null;
+  browser_tab_url?: string | null;
+  browser_tab_title?: string | null;
+  is_browser?: boolean;
+  browser_window_titles?: string[];
+  browser_window_urls?: string[];
+};
+
+// Result shapes use a nullable `error` plus optional success fields rather
+// than a discriminated union: TypeScript's narrowing on `if (result.error)`
+// gets fragile when the error branch overlaps with `string`, and the bridge
+// already guarantees the success fields are populated whenever `error` is
+// null. Callers handle `null` first, then read the optional fields.
+export type ParsedMeetingUrl = {
+  error: string | null;
+  host?: string;
+  path?: string;
+  display_name?: string;
+};
+
+export type BuiltUrlPattern = {
+  error: string | null;
+  pattern?: string;
+};
+
+// New-spec input shape — Python validates via `DetectorSpec.model_validate`,
+// so any field on `DetectorSummary` is acceptable here. The required pair is
+// `app_key` + `display_name`; everything else has a sensible default in
+// pydantic.
+export type DetectorSpecInput = {
+  app_key: string;
+  display_name: string;
+  is_browser?: boolean;
+  process_names?: string[];
+  bundle_ids?: string[];
+  url_patterns?: string[];
+  title_patterns?: string[];
+  disabled?: boolean;
+};
+
 // ---- Settings-only window.pywebview.api surface --------------------------
 // Augments the `SayzoPywebviewApi` interface declared in `lib/bridge.ts`.
 // Both surfaces live on the same `window.pywebview.api` object at runtime;
@@ -89,6 +167,33 @@ declare global {
     get_permissions(): Promise<PermissionRow[]>;
     request_permission(key: string): Promise<PermissionResult>;
     open_permission_settings(key: string): Promise<PermissionOpenResult>;
+
+    // Meeting Apps.
+    list_detectors(): Promise<DetectorSummary[]>;
+    toggle_detector(
+      app_key: string,
+      enabled: boolean,
+    ): Promise<{ saved: boolean; error?: string }>;
+    remove_detector(
+      app_key: string,
+    ): Promise<{ removed: boolean; saved?: boolean; error?: string }>;
+    add_detector(
+      spec: DetectorSpecInput,
+    ): Promise<{ added: boolean; saved?: boolean; error?: string }>;
+    reset_detectors(): Promise<{ reset: boolean; error?: string }>;
+    list_seen_apps(): Promise<SeenAppSummary[]>;
+    dismiss_seen_app(app_key: string): Promise<{ dismissed: boolean }>;
+    snapshot_mic_state(): Promise<MicStateSnapshot>;
+    snapshot_foreground(): Promise<ForegroundSnapshot>;
+    parse_meeting_url(url: string): Promise<ParsedMeetingUrl>;
+    build_url_pattern(
+      host: string,
+      path: string,
+      strict: boolean,
+    ): Promise<BuiltUrlPattern>;
+    make_app_key(seed: string): Promise<string>;
+    friendly_url_pattern(pattern: string): Promise<string>;
+    is_browser_process(process_name: string): Promise<boolean>;
   }
 }
 
@@ -173,6 +278,63 @@ export const settingsBridge = {
   async openPermissionSettings(key: string) {
     await whenReady();
     return window.pywebview.api.open_permission_settings(key);
+  },
+
+  async listDetectors() {
+    await whenReady();
+    return window.pywebview.api.list_detectors();
+  },
+  async toggleDetector(appKey: string, enabled: boolean) {
+    await whenReady();
+    return window.pywebview.api.toggle_detector(appKey, enabled);
+  },
+  async removeDetector(appKey: string) {
+    await whenReady();
+    return window.pywebview.api.remove_detector(appKey);
+  },
+  async addDetector(spec: DetectorSpecInput) {
+    await whenReady();
+    return window.pywebview.api.add_detector(spec);
+  },
+  async resetDetectors() {
+    await whenReady();
+    return window.pywebview.api.reset_detectors();
+  },
+  async listSeenApps() {
+    await whenReady();
+    return window.pywebview.api.list_seen_apps();
+  },
+  async dismissSeenApp(appKey: string) {
+    await whenReady();
+    return window.pywebview.api.dismiss_seen_app(appKey);
+  },
+  async snapshotMicState() {
+    await whenReady();
+    return window.pywebview.api.snapshot_mic_state();
+  },
+  async snapshotForeground() {
+    await whenReady();
+    return window.pywebview.api.snapshot_foreground();
+  },
+  async parseMeetingUrl(url: string) {
+    await whenReady();
+    return window.pywebview.api.parse_meeting_url(url);
+  },
+  async buildUrlPattern(host: string, path: string, strict: boolean) {
+    await whenReady();
+    return window.pywebview.api.build_url_pattern(host, path, strict);
+  },
+  async makeAppKey(seed: string) {
+    await whenReady();
+    return window.pywebview.api.make_app_key(seed);
+  },
+  async friendlyUrlPattern(pattern: string) {
+    await whenReady();
+    return window.pywebview.api.friendly_url_pattern(pattern);
+  },
+  async isBrowserProcess(processName: string) {
+    await whenReady();
+    return window.pywebview.api.is_browser_process(processName);
   },
 
   async finish() {

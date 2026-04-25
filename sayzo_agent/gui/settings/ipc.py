@@ -55,11 +55,15 @@ _CONNECT_TIMEOUT_SECS = 1.5
 # IPC method names. Both ``IPCServer.register`` and ``IPCClient.call`` route
 # requests by string, so a typo on either side becomes a silent
 # ``unknown method`` response at runtime instead of a TypeError at import.
-# These constants make the contract explicit; Phase 4 adds more entries.
+# These constants make the contract explicit.
 class Methods:
     PING = "ping"
     INVALIDATE_TOKEN_CACHE = "invalidate_token_cache"
     REBIND_HOTKEY = "rebind_hotkey"
+    # Phase 4 — Meeting Apps pane.
+    SNAPSHOT_MIC_STATE = "snapshot_mic_state"
+    SNAPSHOT_FOREGROUND = "snapshot_foreground"
+    RELOAD_DETECTORS = "reload_detectors"
 
 
 class IPCError(Exception):

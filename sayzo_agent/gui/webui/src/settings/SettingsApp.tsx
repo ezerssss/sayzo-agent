@@ -3,14 +3,16 @@ import { settingsBridge } from "../lib/settings-bridge";
 import { Alert } from "../components/ui/Alert";
 import { AccountPane } from "./AccountPane";
 import { AboutPane } from "./AboutPane";
+import { MeetingAppsPane } from "./MeetingAppsPane";
 import { NotificationsPane } from "./NotificationsPane";
 import { PermissionsPane } from "./PermissionsPane";
 import { ShortcutPane } from "./ShortcutPane";
 
 // Sidebar order matches the legacy tkinter Settings so muscle memory
-// carries over. Meeting Apps lands in Phase 4.
+// carries over.
 const PANE_NAMES = [
   "Shortcut",
+  "Meeting Apps",
   "Permissions",
   "Account",
   "Notifications",
@@ -89,6 +91,7 @@ export function SettingsApp() {
       <div className="flex-1 overflow-y-auto">
         <div className="mx-auto max-w-2xl px-10 py-10">
           {active === "Shortcut" && <ShortcutPane />}
+          {active === "Meeting Apps" && <MeetingAppsPane />}
           {active === "Permissions" && <PermissionsPane />}
           {active === "Account" && <AccountPane />}
           {active === "Notifications" && <NotificationsPane />}

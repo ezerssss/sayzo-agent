@@ -710,8 +710,43 @@ def service(force_setup: bool) -> None:
             err = agent.arm.rebind_hotkey(binding)
             return {"error": err}
 
+        def _ipc_snapshot_mic_state() -> dict:
+            # Shaped to match React's MicStateSnapshot type. ``holders`` is
+            # the only field the Add-app dialog actually reads on Windows;
+            # macOS leans on ``active`` + foreground bundle id (separate
+            # method) since CoreAudio has no per-process attribution.
+            state = agent.arm.snapshot_mic_state()
+            return {
+                "holders": [
+                    {"process_name": h.process_name, "pid": h.pid}
+                    for h in state.holders
+                ],
+                "active": state.active,
+                "running_processes": sorted(state.running_processes),
+            }
+
+        def _ipc_snapshot_foreground() -> dict:
+            fg = agent.arm.snapshot_foreground()
+            return {
+                "process_name": fg.process_name,
+                "bundle_id": fg.bundle_id,
+                "window_title": fg.window_title,
+                "browser_tab_url": fg.browser_tab_url,
+                "browser_tab_title": fg.browser_tab_title,
+                "is_browser": fg.is_browser,
+                "browser_window_titles": list(fg.browser_window_titles),
+                "browser_window_urls": list(fg.browser_window_urls),
+            }
+
+        def _ipc_reload_detectors() -> dict:
+            ok = agent.arm.reload_detectors()
+            return {"reloaded": ok}
+
         ipc_server.register(Methods.INVALIDATE_TOKEN_CACHE, _ipc_invalidate_token_cache)
         ipc_server.register(Methods.REBIND_HOTKEY, _ipc_rebind_hotkey)
+        ipc_server.register(Methods.SNAPSHOT_MIC_STATE, _ipc_snapshot_mic_state)
+        ipc_server.register(Methods.SNAPSHOT_FOREGROUND, _ipc_snapshot_foreground)
+        ipc_server.register(Methods.RELOAD_DETECTORS, _ipc_reload_detectors)
 
         try:
             await ipc_server.start()

@@ -24,7 +24,10 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Optional
 
 from sayzo_agent import __version__, settings_store
-from sayzo_agent.config import Config
+from sayzo_agent.arm import seen_apps as _seen_apps
+from sayzo_agent.arm.detectors import BROWSER_PROCESS_NAMES
+from sayzo_agent.config import Config, DetectorSpec, default_detector_specs
+from sayzo_agent.gui.common import detectors as detector_helpers
 from sayzo_agent.gui.common import hotkey as hotkey_helpers
 from sayzo_agent.gui.common.login import LoginCoordinator
 from sayzo_agent.gui.fs import open_folder
@@ -433,6 +436,234 @@ class Bridge:
         return {"opened": True}
 
     # ------------------------------------------------------------------
+    # JS-callable methods — Meeting Apps
+    # ------------------------------------------------------------------
+
+    def list_detectors(self) -> list[dict[str, Any]]:
+        """Return every detector in stored order, serialised for React.
+
+        Reads from ``self._cfg.arm.detectors`` (the in-process snapshot
+        loaded at subprocess start). Reads stay local — only mutations
+        nudge the live agent — so this is fast enough to call on every
+        pane render without polling concerns.
+        """
+        out: list[dict[str, Any]] = []
+        for spec in self._cfg.arm.detectors:
+            out.append(self._serialize_spec(spec))
+        return out
+
+    def toggle_detector(self, app_key: str, enabled: bool) -> dict[str, Any]:
+        """Flip a detector's ``disabled`` flag in place + persist."""
+        target = self._find_spec(app_key)
+        if target is None:
+            return {"saved": False, "error": f"unknown detector: {app_key}"}
+        target.disabled = not bool(enabled)
+        return self._persist_and_nudge()
+
+    def remove_detector(self, app_key: str) -> dict[str, Any]:
+        """Drop a detector from the list + persist."""
+        before = len(self._cfg.arm.detectors)
+        self._cfg.arm.detectors = [
+            s for s in self._cfg.arm.detectors if s.app_key != app_key
+        ]
+        if len(self._cfg.arm.detectors) == before:
+            return {"removed": False, "error": f"unknown detector: {app_key}"}
+        return self._persist_and_nudge(extra={"removed": True})
+
+    def add_detector(self, spec: dict[str, Any]) -> dict[str, Any]:
+        """Append a new detector built from ``spec``.
+
+        ``spec`` is a JSON-friendly DetectorSpec shape (the React side
+        constructs it from the Add-app dialog). Replaces any existing
+        spec with the same ``app_key`` so a re-add doesn't duplicate.
+        """
+        if not isinstance(spec, dict):
+            return {"added": False, "error": "spec must be an object"}
+        try:
+            new_spec = DetectorSpec.model_validate(spec)
+        except Exception as e:
+            return {"added": False, "error": f"invalid spec: {e}"}
+        self._cfg.arm.detectors = [
+            s for s in self._cfg.arm.detectors if s.app_key != new_spec.app_key
+        ]
+        self._cfg.arm.detectors.append(new_spec)
+        # If the user previously dismissed this app from the suggested
+        # list, undo that — they've changed their mind.
+        for k in (*new_spec.process_names, *new_spec.bundle_ids):
+            try:
+                _seen_apps.undismiss(self._cfg.data_dir, k)
+            except Exception:
+                log.debug("[settings.bridge] undismiss failed", exc_info=True)
+        return self._persist_and_nudge(extra={"added": True})
+
+    def reset_detectors(self) -> dict[str, Any]:
+        """Clear the user override so the shipping list reappears.
+
+        Drops the ``arm.detectors`` key from ``user_settings.json`` so
+        ``load_config`` (next agent boot) and ``ArmController.reload_detectors``
+        (right now) both fall back to ``default_detector_specs``. Uses
+        ``settings_store.replace`` rather than ``save`` because merge
+        semantics can't represent a deletion — a missing key in the patch
+        means "preserve", not "delete".
+        """
+        self._cfg.arm.detectors = default_detector_specs()
+        try:
+            current = settings_store.load(self._cfg.data_dir)
+        except Exception:
+            current = {}
+        arm_block = current.get("arm") if isinstance(current.get("arm"), dict) else {}
+        if isinstance(arm_block, dict) and "detectors" in arm_block:
+            arm_block.pop("detectors", None)
+            current["arm"] = arm_block
+            try:
+                settings_store.replace(self._cfg.data_dir, current)
+            except Exception:
+                log.warning("[settings.bridge] reset_detectors persist failed", exc_info=True)
+                return {"reset": False, "error": "couldn't write user_settings.json"}
+        # Nudge the agent regardless: even if no key was on disk, the
+        # in-process cfg may have been mutated and the agent's notion of
+        # the list could now be stale.
+        self._ipc.call_quiet(Methods.RELOAD_DETECTORS)
+        return {"reset": True}
+
+    def list_seen_apps(self) -> list[dict[str, Any]]:
+        """Return the suggested-to-add list (mic-holders Sayzo has seen
+        but aren't on the whitelist yet).
+
+        The on-disk file is scrubbed against the current detector list
+        on read, so any app that was already added via this dialog won't
+        re-appear here.
+        """
+        try:
+            seen = _seen_apps.load(self._cfg.data_dir, self._cfg.arm.detectors)
+        except Exception:
+            log.debug("[settings.bridge] seen_apps.load failed", exc_info=True)
+            return []
+        return [
+            {
+                "key": s.key,
+                "display_name": s.display_name,
+                "process_name": s.process_name,
+                "bundle_id": s.bundle_id,
+            }
+            for s in seen
+        ]
+
+    def dismiss_seen_app(self, app_key: str) -> dict[str, Any]:
+        """Permanently dismiss a suggestion so it doesn't bubble up again."""
+        try:
+            _seen_apps.dismiss(self._cfg.data_dir, app_key)
+        except Exception:
+            log.warning("[settings.bridge] seen_apps.dismiss failed", exc_info=True)
+            return {"dismissed": False}
+        return {"dismissed": True}
+
+    def snapshot_mic_state(self) -> dict[str, Any]:
+        """Live mic-holder snapshot, polled by the Add-app dialog.
+
+        Round-trips to the live agent over IPC so the snapshot reflects
+        what the agent's whitelist watcher would see right now. When the
+        agent isn't running we degrade to an empty snapshot — the user
+        sees the "no apps holding the mic" hint without a hard error.
+        """
+        try:
+            result = self._ipc.call(Methods.SNAPSHOT_MIC_STATE)
+        except IPCNotConnected:
+            return {"holders": [], "active": False, "running_processes": []}
+        except IPCError:
+            log.debug("[settings.bridge] snapshot_mic_state failed", exc_info=True)
+            return {"holders": [], "active": False, "running_processes": []}
+        if not isinstance(result, dict):
+            return {"holders": [], "active": False, "running_processes": []}
+        return result
+
+    def snapshot_foreground(self) -> dict[str, Any]:
+        """Live foreground-info snapshot. macOS Add-app dialog uses this
+        to pick up the bundle id of the frontmost app while the mic is
+        active (the platform has no per-process mic attribution)."""
+        try:
+            result = self._ipc.call(Methods.SNAPSHOT_FOREGROUND)
+        except IPCNotConnected:
+            return {}
+        except IPCError:
+            log.debug("[settings.bridge] snapshot_foreground failed", exc_info=True)
+            return {}
+        if not isinstance(result, dict):
+            return {}
+        return result
+
+    def parse_meeting_url(self, url: str) -> dict[str, Any]:
+        """Validate + preview a pasted meeting URL.
+
+        Mirrors the legacy tkinter Add-app dialog's web tab: returns the
+        fields React needs to render the live preview card and pre-fill
+        the display-name field. ``error`` is non-null when the URL can't
+        be parsed; the dialog disables Submit until that clears.
+        """
+        if not isinstance(url, str):
+            return {"error": "url must be a string"}
+        parsed = detector_helpers.parse_meeting_url(url)
+        if parsed is None:
+            return {"error": "not_a_url"}
+        host, path = parsed
+        return {
+            "error": None,
+            "host": host,
+            "path": path,
+            "display_name": detector_helpers.display_name_from_host(host),
+        }
+
+    def build_url_pattern(self, host: str, path: str, strict: bool) -> dict[str, Any]:
+        """Compose the regex stored on the spec from ``parse_meeting_url`` parts.
+
+        Kept on the Python side so the regex shape stays a Python concern
+        — React just sends the user's choices and gets back the spec
+        fragment to embed in ``add_detector(spec)``.
+        """
+        if not isinstance(host, str) or not host:
+            return {"error": "host required"}
+        if strict and not path:
+            return {"error": "strict_needs_path"}
+        pattern = detector_helpers.url_pattern(host, path or "", strict=bool(strict))
+        return {"error": None, "pattern": pattern}
+
+    def make_app_key(self, seed: str) -> str:
+        """Slugify ``seed`` against the current detector list.
+
+        Public so the React Add-app flow can build a spec with a
+        guaranteed-unique key without round-tripping back through the
+        bridge twice (once for parsing, once for slug). Falls back to
+        ``"custom"`` if the slug normalises to empty.
+        """
+        if not isinstance(seed, str):
+            seed = ""
+        taken = [d.app_key for d in self._cfg.arm.detectors]
+        return detector_helpers.unique_app_key(seed, taken)
+
+    def friendly_url_pattern(self, pattern: str) -> str:
+        """Turn a stored URL regex back into something readable.
+
+        Used by the Meeting Apps list to render Web detectors as
+        ``meet.google.com/…`` instead of ``^https://meet\\.google\\.com/``.
+        """
+        if not isinstance(pattern, str):
+            return ""
+        return detector_helpers.friendly_url_pattern(pattern)
+
+    def is_browser_process(self, process_name: str) -> bool:
+        """True if ``process_name`` is one of the known browser executables.
+
+        The Add-app dialog suppresses browsers from the live mic-holder
+        picker (web meetings belong on the Web tab, not as desktop apps).
+        Lifted to the bridge so the React side doesn't have to maintain
+        a parallel list — the source of truth stays in
+        :mod:`sayzo_agent.arm.detectors`.
+        """
+        if not isinstance(process_name, str):
+            return False
+        return process_name.lower() in BROWSER_PROCESS_NAMES
+
+    # ------------------------------------------------------------------
     # JS-callable methods — Lifecycle
     # ------------------------------------------------------------------
 
@@ -447,6 +678,78 @@ class Bridge:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _serialize_spec(spec: DetectorSpec) -> dict[str, Any]:
+        """Pydantic model → React-friendly dict.
+
+        Adds two derived fields React doesn't want to recompute:
+        ``kind`` (``"desktop"`` | ``"web"``, mirroring the section tab in
+        the Meeting Apps pane) and ``detail`` (the muted second-line text
+        already used by the legacy tkinter row — hostname for web specs,
+        process / bundle list for desktop specs).
+        """
+        kind = "web" if spec.is_browser else "desktop"
+        if spec.is_browser:
+            if spec.url_patterns:
+                detail = "Web · " + detector_helpers.friendly_url_pattern(spec.url_patterns[0])
+            elif spec.title_patterns:
+                detail = "Web · matches window titles"
+            else:
+                detail = "Web"
+        else:
+            bits: list[str] = []
+            if spec.process_names:
+                bits.append(", ".join(spec.process_names))
+            elif spec.bundle_ids:
+                bits.append(", ".join(spec.bundle_ids))
+            detail = ("Desktop · " + bits[0]) if bits else "Desktop"
+        return {
+            "app_key": spec.app_key,
+            "display_name": spec.display_name,
+            "kind": kind,
+            "detail": detail,
+            "is_browser": spec.is_browser,
+            "process_names": list(spec.process_names),
+            "bundle_ids": list(spec.bundle_ids),
+            "url_patterns": list(spec.url_patterns),
+            "title_patterns": list(spec.title_patterns),
+            "disabled": bool(spec.disabled),
+        }
+
+    def _find_spec(self, app_key: str) -> Optional[DetectorSpec]:
+        for s in self._cfg.arm.detectors:
+            if s.app_key == app_key:
+                return s
+        return None
+
+    def _persist_and_nudge(self, *, extra: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+        """Write the current detector list to ``user_settings.json`` and
+        ask the live agent to reload.
+
+        The disk write is the source of truth — even if the IPC nudge
+        fails (agent not running) the change survives, and the agent
+        picks it up on next boot via ``load_config``. When the agent IS
+        running, the nudge keeps the live whitelist in sync without
+        waiting for a service restart.
+        """
+        try:
+            serialised = [d.model_dump() for d in self._cfg.arm.detectors]
+            settings_store.save(
+                self._cfg.data_dir, {"arm": {"detectors": serialised}},
+            )
+        except Exception:
+            log.warning("[settings.bridge] persist detectors failed", exc_info=True)
+            base: dict[str, Any] = {"saved": False, "error": "couldn't write user_settings.json"}
+            if extra:
+                base.update(extra)
+            return base
+
+        self._ipc.call_quiet(Methods.RELOAD_DETECTORS)
+        out: dict[str, Any] = {"saved": True}
+        if extra:
+            out.update(extra)
+        return out
 
     def _has_tokens(self) -> bool:
         from sayzo_agent.auth.store import TokenStore

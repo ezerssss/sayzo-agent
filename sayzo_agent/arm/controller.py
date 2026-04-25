@@ -293,6 +293,54 @@ class ArmController:
             self.cfg.hotkey = new_binding
         return err
 
+    def reload_detectors(self) -> bool:
+        """Re-read ``arm.detectors`` from ``user_settings.json`` and
+        replace the in-memory list.
+
+        Called over IPC from the Settings Meeting Apps pane after it
+        mutates the on-disk JSON. The whitelist watcher reads
+        ``self.cfg.detectors`` lazily on every poll, so the new list takes
+        effect on the next tick (≤ ``poll_interval_secs``) — no need to
+        bounce the watcher. A missing ``arm.detectors`` key is treated as
+        "user cleared their override"; we restore the shipping defaults
+        so behaviour matches a fresh install.
+
+        Returns True on success, False when the on-disk JSON couldn't be
+        read or validated. ``data_dir`` not configured (legacy tests)
+        returns False without mutating state.
+        """
+        if self._data_dir is None:
+            return False
+        from .. import settings_store
+        from ..config import DetectorSpec, default_detector_specs
+
+        try:
+            user = settings_store.load(self._data_dir)
+        except Exception:
+            log.warning("[arm] reload_detectors: settings_store.load failed", exc_info=True)
+            return False
+
+        arm_block = user.get("arm") if isinstance(user.get("arm"), dict) else {}
+        raw = arm_block.get("detectors") if isinstance(arm_block, dict) else None
+
+        if raw is None:
+            self.cfg.detectors = default_detector_specs()
+            log.info("[arm] reload_detectors: override cleared, restored defaults")
+            return True
+        if not isinstance(raw, list):
+            return False
+        try:
+            new_list = [
+                DetectorSpec.model_validate(d)
+                for d in raw if isinstance(d, dict)
+            ]
+        except Exception:
+            log.warning("[arm] reload_detectors: validation failed", exc_info=True)
+            return False
+        self.cfg.detectors = new_list
+        log.info("[arm] reload_detectors: %d specs", len(new_list))
+        return True
+
     def set_state_change_callback(self, cb: Optional[Callable[[], None]]) -> None:
         """Register a callback invoked after every ARMED<->DISARMED flip.
 
