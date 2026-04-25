@@ -10,7 +10,6 @@ window simply returns control to the subprocess shell).
 from __future__ import annotations
 
 import logging
-import sys
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlencode
@@ -18,6 +17,7 @@ from urllib.parse import urlencode
 import webview
 
 from sayzo_agent.config import Config
+from sayzo_agent.gui.common.assets import icon_path, webui_index_path
 from sayzo_agent.gui.settings.bridge import Bridge
 
 log = logging.getLogger(__name__)
@@ -25,35 +25,6 @@ log = logging.getLogger(__name__)
 WINDOW_TITLE = "Sayzo — Settings"
 WINDOW_SIZE = (920, 640)
 WINDOW_MIN_SIZE = (760, 520)
-
-
-def _webui_index_path() -> Path:
-    """Resolve the path to ``index.html`` in dev and frozen builds.
-
-    Frozen: ``<sys._MEIPASS>/sayzo_agent/gui/webui/dist/index.html``
-    Dev:    ``<repo>/sayzo_agent/gui/webui/dist/index.html``
-    """
-    if getattr(sys, "frozen", False):
-        base = Path(sys._MEIPASS) / "sayzo_agent" / "gui" / "webui" / "dist"  # type: ignore[attr-defined]
-    else:
-        base = Path(__file__).resolve().parent.parent / "webui" / "dist"
-    return base / "index.html"
-
-
-def _icon_path() -> Optional[Path]:
-    """Same logo asset the setup window uses — keeps taskbar/dock branding consistent."""
-    if getattr(sys, "frozen", False):
-        base = Path(sys._MEIPASS) / "installer" / "assets"  # type: ignore[attr-defined]
-    else:
-        base = Path(__file__).resolve().parent.parent.parent.parent / "installer" / "assets"
-    if sys.platform == "win32":
-        ico = base / "logo.ico"
-        if ico.exists():
-            return ico
-    png = base / "logo.png"
-    if png.exists():
-        return png
-    return None
 
 
 def _settings_url(index: Path, *, pane: Optional[str]) -> str:
@@ -86,7 +57,7 @@ class SettingsWindow:
         self._bridge = Bridge(cfg, initial_pane=pane)
 
     def run_blocking(self) -> None:
-        index = _webui_index_path()
+        index = webui_index_path()
         if not index.exists():
             log.error(
                 "[settings] UI assets missing at %s — skipping window", index
@@ -110,9 +81,9 @@ class SettingsWindow:
         self._bridge._attach_window(window)
 
         icon_arg: dict = {}
-        icon_path = _icon_path()
-        if icon_path is not None:
-            icon_arg["icon"] = str(icon_path)
+        icon = icon_path()
+        if icon is not None:
+            icon_arg["icon"] = str(icon)
 
         # webview.start() blocks until the window is destroyed (close button
         # or bridge.finish() call). debug=True opens the devtools panel —

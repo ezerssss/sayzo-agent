@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { settingsBridge, AccountStatus } from "../lib/settings-bridge";
 import { subscribe, SayzoEvent } from "../lib/events";
+import { useCopyToClipboard } from "../lib/useCopyToClipboard";
 import { Button } from "../components/ui/Button";
 
 // Local UI state for the signed-out branch — mirrors the tkinter Account
@@ -25,7 +26,6 @@ function formatSignedInSince(iso: string | null): string {
 export function AccountPane() {
   const [status, setStatus] = useState<AccountStatus | null>(null);
   const [ui, setUi] = useState<SignInState>({ kind: "idle" });
-  const [copied, setCopied] = useState(false);
 
   async function refreshStatus() {
     try {
@@ -101,16 +101,6 @@ export function AccountPane() {
     }
   }
 
-  async function handleCopyUrl(url: string) {
-    try {
-      await navigator.clipboard.writeText(url);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 2000);
-    } catch {
-      // No clipboard API → user can still see the URL; do nothing.
-    }
-  }
-
   if (status == null) {
     return <div className="text-sm text-ink-muted">Loading account…</div>;
   }
@@ -126,10 +116,8 @@ export function AccountPane() {
       ) : (
         <SignedOutBody
           ui={ui}
-          copied={copied}
           onSignIn={handleSignIn}
           onCancel={handleCancel}
-          onCopyUrl={handleCopyUrl}
           onTryAgain={handleSignIn}
         />
       )}
@@ -184,21 +172,19 @@ function SignedInBody({ status, onSignOut }: SignedInBodyProps) {
 
 interface SignedOutBodyProps {
   ui: SignInState;
-  copied: boolean;
   onSignIn: () => void;
   onCancel: () => void;
-  onCopyUrl: (url: string) => void;
   onTryAgain: () => void;
 }
 
 function SignedOutBody({
   ui,
-  copied,
   onSignIn,
   onCancel,
-  onCopyUrl,
   onTryAgain,
 }: SignedOutBodyProps) {
+  const { copied, copy } = useCopyToClipboard();
+
   if (ui.kind === "pending") {
     const secs = ui.secondsRemaining;
     return (
@@ -230,7 +216,7 @@ function SignedOutBody({
           <Button
             variant="secondary"
             disabled={!ui.loginUrl}
-            onClick={() => ui.loginUrl && onCopyUrl(ui.loginUrl)}
+            onClick={() => ui.loginUrl && void copy(ui.loginUrl)}
           >
             {copied ? "Copied!" : "Copy"}
           </Button>

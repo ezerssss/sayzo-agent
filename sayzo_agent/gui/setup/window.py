@@ -9,12 +9,11 @@ or exit.
 from __future__ import annotations
 
 import logging
-import sys
-from pathlib import Path
 
 import webview
 
 from sayzo_agent.config import Config
+from sayzo_agent.gui.common.assets import icon_path, webui_index_path
 from sayzo_agent.gui.setup.bridge import Bridge, SetupResult
 
 log = logging.getLogger(__name__)
@@ -22,41 +21,6 @@ log = logging.getLogger(__name__)
 WINDOW_TITLE = "Sayzo Agent — Setup"
 WINDOW_SIZE = (720, 560)
 WINDOW_MIN_SIZE = (640, 480)
-
-
-def _webui_index_path() -> Path:
-    """Resolve the path to ``index.html`` in dev and frozen builds.
-
-    Frozen: ``<sys._MEIPASS>/sayzo_agent/gui/webui/dist/index.html``
-    Dev:    ``<repo>/sayzo_agent/gui/webui/dist/index.html``
-    """
-    if getattr(sys, "frozen", False):
-        base = Path(sys._MEIPASS) / "sayzo_agent" / "gui" / "webui" / "dist"  # type: ignore[attr-defined]
-    else:
-        # __file__ is .../sayzo_agent/gui/setup/window.py — climb to gui/.
-        base = Path(__file__).resolve().parent.parent / "webui" / "dist"
-    return base / "index.html"
-
-
-def _icon_path() -> Path | None:
-    """Pick the Sayzo logo to pass to pywebview.
-
-    On Windows .ico renders sharper in the taskbar; elsewhere we use PNG.
-    Returns None if no asset is bundled.
-    """
-    if getattr(sys, "frozen", False):
-        base = Path(sys._MEIPASS) / "installer" / "assets"  # type: ignore[attr-defined]
-    else:
-        # gui/setup/window.py — climb to repo root.
-        base = Path(__file__).resolve().parent.parent.parent.parent / "installer" / "assets"
-    if sys.platform == "win32":
-        ico = base / "logo.ico"
-        if ico.exists():
-            return ico
-    png = base / "logo.png"
-    if png.exists():
-        return png
-    return None
 
 
 class SetupWindow:
@@ -67,7 +31,7 @@ class SetupWindow:
         self._bridge = Bridge(cfg)
 
     def run_blocking(self) -> SetupResult:
-        index = _webui_index_path()
+        index = webui_index_path()
         if not index.exists():
             log.error(
                 "first-run UI assets missing at %s — skipping setup window", index
@@ -98,9 +62,9 @@ class SetupWindow:
         # Sayzo in dev previews (in production the NSIS-installed shortcut
         # provides the icon via its AUMID).
         icon_arg: dict = {}
-        icon_path = _icon_path()
-        if icon_path is not None:
-            icon_arg["icon"] = str(icon_path)
+        icon = icon_path()
+        if icon is not None:
+            icon_arg["icon"] = str(icon)
         webview.start(debug=self._cfg.debug, **icon_arg)
 
         log.info("setup window closed: result=%s", self._bridge.result.value)

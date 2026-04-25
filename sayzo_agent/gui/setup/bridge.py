@@ -14,11 +14,12 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
 
 from sayzo_agent import settings_store
 from sayzo_agent.arm.hotkey import humanize_binding, validate_binding
 from sayzo_agent.config import Config
+from sayzo_agent.gui.common.login import LoginCoordinator
 from sayzo_agent.gui.setup.detect import detect_setup
 
 if TYPE_CHECKING:
@@ -58,15 +59,6 @@ class SetupResult(enum.Enum):
     QUIT = "quit"
 
 
-class _ActiveLogin:
-    """Book-keeping for an in-flight PKCE login so a second start_login
-    call can cancel and supersede the first."""
-
-    def __init__(self) -> None:
-        self.cancel_event = threading.Event()
-        self.thread: threading.Thread | None = None
-
-
 class Bridge:
     """JS-side API. Constructed once per :class:`SetupWindow` lifetime."""
 
@@ -76,12 +68,9 @@ class Bridge:
         # clicking the Done button) is treated as user cancellation.
         self._result: SetupResult = SetupResult.QUIT
         self._window: "webview.Window | None" = None
-        self._event_listeners: list[Callable[[dict[str, Any]], None]] = []
-        # Re-entry guard for the PKCE flow. Set by start_login; cleared
-        # when the worker exits. cancel_login and a second start_login
-        # both signal the existing worker's cancel_event.
-        self._active_login: _ActiveLogin | None = None
-        self._active_login_lock = threading.Lock()
+        self._login = LoginCoordinator(
+            cfg, self._push_event, thread_name="setup-login",
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle (called from SetupWindow, not from JS). The setter is
@@ -151,35 +140,13 @@ class Bridge:
         Safe to call again while a previous flow is pending — the
         earlier attempt is cancelled first so state doesn't clash.
         """
-        with self._active_login_lock:
-            prior = self._active_login
-            if prior is not None:
-                prior.cancel_event.set()
-                # Don't join here — would block pywebview's JS bridge
-                # call. The worker observes the cancel flag on its next
-                # poll (<= 0.5 s) and cleans up.
-            active = _ActiveLogin()
-            self._active_login = active
-
-        t = threading.Thread(
-            target=self._login_worker,
-            args=(active,),
-            name="setup-login",
-            daemon=True,
-        )
-        active.thread = t
-        t.start()
+        self._login.start()
         return {"started": True}
 
     def cancel_login(self) -> dict[str, Any]:
         """Cancel an in-flight PKCE login. Emits ``login_cancelled`` when
         the worker observes the flag. No-op if nothing is pending."""
-        with self._active_login_lock:
-            active = self._active_login
-        if active is None:
-            return {"cancelled": False}
-        active.cancel_event.set()
-        return {"cancelled": True}
+        return {"cancelled": self._login.cancel()}
 
     def start_model_download(self) -> dict[str, Any]:
         """Kick off the LLM weights download on a worker thread.
@@ -387,47 +354,6 @@ class Bridge:
     # ------------------------------------------------------------------
     # Worker-thread implementations
     # ------------------------------------------------------------------
-
-    def _login_worker(self, active: _ActiveLogin) -> None:
-        import asyncio
-
-        from sayzo_agent.auth.exceptions import AuthenticationCancelled
-
-        def on_url(url: str) -> None:
-            self._push_event({"type": "login_url", "url": url})
-
-        def on_tick(secs: int) -> None:
-            self._push_event({"type": "login_tick", "seconds_remaining": secs})
-
-        try:
-            # Imported lazily so the bridge module can be imported in tests
-            # without dragging in the full CLI module.
-            from sayzo_agent.__main__ import _do_login
-
-            asyncio.run(
-                _do_login(
-                    self._cfg,
-                    quiet=True,
-                    cancel_event=active.cancel_event,
-                    on_url_ready=on_url,
-                    on_tick=on_tick,
-                )
-            )
-        except AuthenticationCancelled:
-            log.info("login cancelled by user")
-            self._push_event({"type": "login_cancelled"})
-            return
-        except Exception as e:
-            log.warning("login failed", exc_info=True)
-            self._push_event({"type": "login_error", "message": str(e)})
-            return
-        finally:
-            # Clear the active-login slot so the next start_login doesn't
-            # try to cancel us (we're already done).
-            with self._active_login_lock:
-                if self._active_login is active:
-                    self._active_login = None
-        self._push_event({"type": "login_done"})
 
     def _download_worker(self) -> None:
         import time

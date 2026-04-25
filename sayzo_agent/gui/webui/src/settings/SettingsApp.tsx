@@ -13,10 +13,7 @@ type PaneName = (typeof PANE_NAMES)[number];
 function normalizePane(s: string | null | undefined): PaneName | null {
   if (s == null) return null;
   const lower = s.toLowerCase();
-  for (const name of PANE_NAMES) {
-    if (name.toLowerCase() === lower) return name;
-  }
-  return null;
+  return PANE_NAMES.find((n) => n.toLowerCase() === lower) ?? null;
 }
 
 export function SettingsApp() {

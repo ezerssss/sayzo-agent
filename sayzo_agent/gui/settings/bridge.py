@@ -1,9 +1,9 @@
 """JS-callable Python API exposed to the Settings pywebview window.
 
-Mirrors :mod:`sayzo_agent.gui.setup.bridge` in shape — methods on this class
-are reachable from React as ``window.pywebview.api.<method_name>``. Long-
-running work spawns a background thread and pushes events back to JS via
-``window.evaluate_js`` so the bridge call itself returns immediately.
+Methods on this class are reachable from React as
+``window.pywebview.api.<method_name>``. Long-running work delegates to a
+helper that pushes events back to JS via ``window.evaluate_js`` so the
+bridge call itself returns immediately.
 
 Settings runs in its own subprocess (see ``gui/settings/window.py``); this
 bridge therefore reads token state, version constants, and config from disk
@@ -18,14 +18,13 @@ import json
 import logging
 import platform
 import sys
-import threading
 import webbrowser
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from sayzo_agent import __version__
 from sayzo_agent.config import Config
+from sayzo_agent.gui.common.login import LoginCoordinator
 from sayzo_agent.gui.fs import open_folder
 
 if TYPE_CHECKING:
@@ -37,15 +36,6 @@ SUPPORT_URL = "https://sayzo.app/support"
 WEBAPP_FALLBACK_URL = "https://sayzo.app"
 
 
-class _ActiveLogin:
-    """Book-keeping for an in-flight PKCE login so a second start_login can
-    cancel and supersede the first. Mirrors ``setup.bridge._ActiveLogin``."""
-
-    def __init__(self) -> None:
-        self.cancel_event = threading.Event()
-        self.thread: Optional[threading.Thread] = None
-
-
 class Bridge:
     """JS-side API. Constructed once per :class:`SettingsWindow` lifetime."""
 
@@ -53,9 +43,9 @@ class Bridge:
         self._cfg = cfg
         self._initial_pane = initial_pane
         self._window: "Optional[webview.Window]" = None
-        self._event_listeners: list[Callable[[dict[str, Any]], None]] = []
-        self._active_login: Optional[_ActiveLogin] = None
-        self._active_login_lock = threading.Lock()
+        self._login = LoginCoordinator(
+            cfg, self._push_event, thread_name="settings-login",
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle (called from SettingsWindow, not from JS).
@@ -185,30 +175,11 @@ class Bridge:
         Safe to call again while a previous flow is pending — the earlier
         attempt is cancelled first so state doesn't clash.
         """
-        with self._active_login_lock:
-            prior = self._active_login
-            if prior is not None:
-                prior.cancel_event.set()
-            active = _ActiveLogin()
-            self._active_login = active
-
-        t = threading.Thread(
-            target=self._login_worker,
-            args=(active,),
-            name="settings-login",
-            daemon=True,
-        )
-        active.thread = t
-        t.start()
+        self._login.start()
         return {"started": True}
 
     def cancel_login(self) -> dict[str, Any]:
-        with self._active_login_lock:
-            active = self._active_login
-        if active is None:
-            return {"cancelled": False}
-        active.cancel_event.set()
-        return {"cancelled": True}
+        return {"cancelled": self._login.cancel()}
 
     def sign_out(self) -> dict[str, Any]:
         """Delete the on-disk token file.
@@ -278,43 +249,6 @@ class Bridge:
     # ------------------------------------------------------------------
     # Worker-thread implementations
     # ------------------------------------------------------------------
-
-    def _login_worker(self, active: _ActiveLogin) -> None:
-        import asyncio
-
-        from sayzo_agent.auth.exceptions import AuthenticationCancelled
-
-        def on_url(url: str) -> None:
-            self._push_event({"type": "login_url", "url": url})
-
-        def on_tick(secs: int) -> None:
-            self._push_event({"type": "login_tick", "seconds_remaining": secs})
-
-        try:
-            from sayzo_agent.__main__ import _do_login
-
-            asyncio.run(
-                _do_login(
-                    self._cfg,
-                    quiet=True,
-                    cancel_event=active.cancel_event,
-                    on_url_ready=on_url,
-                    on_tick=on_tick,
-                )
-            )
-        except AuthenticationCancelled:
-            log.info("[settings.bridge] login cancelled")
-            self._push_event({"type": "login_cancelled"})
-            return
-        except Exception as e:
-            log.warning("[settings.bridge] login failed", exc_info=True)
-            self._push_event({"type": "login_error", "message": str(e)})
-            return
-        finally:
-            with self._active_login_lock:
-                if self._active_login is active:
-                    self._active_login = None
-        self._push_event({"type": "login_done"})
 
     def _update_check_worker(self) -> None:
         import asyncio

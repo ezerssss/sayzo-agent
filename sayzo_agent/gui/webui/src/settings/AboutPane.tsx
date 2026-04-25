@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { settingsBridge, AboutInfo } from "../lib/settings-bridge";
 import { subscribe, SayzoEvent } from "../lib/events";
+import { useCopyToClipboard } from "../lib/useCopyToClipboard";
 import { Button } from "../components/ui/Button";
 
 type CheckState =
@@ -10,10 +11,18 @@ type CheckState =
   | { kind: "available"; version: string; url: string }
   | { kind: "error" };
 
+const CHECK_LABELS: Record<CheckState["kind"], string> = {
+  idle: "Check for updates",
+  checking: "Checking…",
+  latest: "Check again",
+  available: "Check again",
+  error: "Try again",
+};
+
 export function AboutPane() {
   const [info, setInfo] = useState<AboutInfo | null>(null);
   const [check, setCheck] = useState<CheckState>({ kind: "idle" });
-  const [copied, setCopied] = useState(false);
+  const { copied, copy } = useCopyToClipboard();
 
   useEffect(() => {
     let cancelled = false;
@@ -56,12 +65,9 @@ export function AboutPane() {
   async function handleCopyDiagnostics() {
     try {
       const { text } = await settingsBridge.getDiagnostics();
-      await navigator.clipboard.writeText(text);
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 2000);
+      await copy(text);
     } catch {
-      // Clipboard access can fail in obscure pywebview backend states; the
-      // user can still re-trigger from the menu, so swallow silently.
+      // getDiagnostics failed — leave the button as-is.
     }
   }
 
@@ -71,14 +77,7 @@ export function AboutPane() {
     );
   }
 
-  const checkLabel =
-    check.kind === "checking"
-      ? "Checking…"
-      : check.kind === "latest" || check.kind === "available"
-        ? "Check again"
-        : check.kind === "error"
-          ? "Try again"
-          : "Check for updates";
+  const checkLabel = CHECK_LABELS[check.kind];
 
   return (
     <div>
