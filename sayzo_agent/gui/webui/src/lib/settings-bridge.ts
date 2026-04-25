@@ -149,6 +149,19 @@ export const settingsBridge = {
     return window.pywebview.api.set_notification(key, value);
   },
 
+  async getHotkey() {
+    await whenReady();
+    return window.pywebview.api.get_hotkey();
+  },
+  async validateHotkey(binding: string) {
+    await whenReady();
+    return window.pywebview.api.validate_hotkey(binding);
+  },
+  async saveHotkey(binding: string) {
+    await whenReady();
+    return window.pywebview.api.save_hotkey(binding);
+  },
+
   async getPermissions() {
     await whenReady();
     return window.pywebview.api.get_permissions();

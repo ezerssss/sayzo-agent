@@ -5,11 +5,12 @@ import { AccountPane } from "./AccountPane";
 import { AboutPane } from "./AboutPane";
 import { NotificationsPane } from "./NotificationsPane";
 import { PermissionsPane } from "./PermissionsPane";
+import { ShortcutPane } from "./ShortcutPane";
 
-// Sidebar order will grow: Shortcut + Meeting Apps land in Phase 3-4. For
-// now the four panes that don't depend on the IPC layer ship together;
-// order matches the legacy tkinter Settings so muscle memory carries over.
+// Sidebar order matches the legacy tkinter Settings so muscle memory
+// carries over. Meeting Apps lands in Phase 4.
 const PANE_NAMES = [
+  "Shortcut",
   "Permissions",
   "Account",
   "Notifications",
@@ -24,7 +25,7 @@ function normalizePane(s: string | null | undefined): PaneName | null {
 }
 
 export function SettingsApp() {
-  const [active, setActive] = useState<PaneName>("Account");
+  const [active, setActive] = useState<PaneName>("Shortcut");
   const [ready, setReady] = useState(false);
   const [globalError, setGlobalError] = useState<string | null>(null);
 
@@ -87,6 +88,7 @@ export function SettingsApp() {
       <Sidebar active={active} onSelect={setActive} />
       <div className="flex-1 overflow-y-auto">
         <div className="mx-auto max-w-2xl px-10 py-10">
+          {active === "Shortcut" && <ShortcutPane />}
           {active === "Permissions" && <PermissionsPane />}
           {active === "Account" && <AccountPane />}
           {active === "Notifications" && <NotificationsPane />}

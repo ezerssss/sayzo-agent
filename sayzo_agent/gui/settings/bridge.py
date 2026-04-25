@@ -24,8 +24,10 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from sayzo_agent import __version__, settings_store
 from sayzo_agent.config import Config
+from sayzo_agent.gui.common import hotkey as hotkey_helpers
 from sayzo_agent.gui.common.login import LoginCoordinator
 from sayzo_agent.gui.fs import open_folder
+from sayzo_agent.gui.settings.ipc import IPCClient, IPCError, IPCNotConnected
 
 if TYPE_CHECKING:
     import webview
@@ -112,6 +114,10 @@ class Bridge:
         self._login = LoginCoordinator(
             cfg, self._push_event, thread_name="settings-login",
         )
+        # Lazy connection to the live agent for state-mutating calls. When
+        # the agent isn't running, every call_quiet returns None and the
+        # wrapping bridge methods degrade to file-only behaviour.
+        self._ipc = IPCClient(cfg.data_dir)
 
     # ------------------------------------------------------------------
     # Lifecycle (called from SettingsWindow, not from JS).
@@ -248,19 +254,17 @@ class Bridge:
         return {"cancelled": self._login.cancel()}
 
     def sign_out(self) -> dict[str, Any]:
-        """Delete the on-disk token file.
-
-        The live agent's ``TokenStore`` may still hold a cached copy of the
-        old tokens until its next miss; the live agent is expected to pick
-        up the change on its next ``get_valid_token`` call (Phase 2 will add
-        an IPC nudge to invalidate the cache eagerly).
-        """
+        """Delete the on-disk token file and nudge the live agent to drop
+        its cached copy. The cache nudge is best-effort — when the agent
+        isn't running there's no cache to invalidate, so a missing IPC
+        connection is silent."""
         from sayzo_agent.auth.store import TokenStore
         try:
             TokenStore(self._cfg.auth_path).clear()
         except Exception:
             log.warning("[settings.bridge] sign_out failed", exc_info=True)
             return {"signed_out": False}
+        self._ipc.call_quiet("invalidate_token_cache")
         return {"signed_out": True}
 
     # ------------------------------------------------------------------
@@ -280,6 +284,38 @@ class Bridge:
             daemon=True,
         ).start()
         return {"checking": True}
+
+    # ------------------------------------------------------------------
+    # JS-callable methods — Shortcut
+    # ------------------------------------------------------------------
+
+    def get_hotkey(self) -> dict[str, Any]:
+        return hotkey_helpers.get_hotkey(self._cfg)
+
+    def validate_hotkey(self, binding: str) -> dict[str, Any]:
+        return hotkey_helpers.validate_hotkey(binding)
+
+    def save_hotkey(self, binding: str) -> dict[str, Any]:
+        """Persist + live-rebind. The disk save runs first; if it succeeds,
+        we nudge the live ``ArmController`` over IPC so the new combo takes
+        effect without a service restart. The IPC step is best-effort:
+        when the agent isn't running, disk save alone is enough — the new
+        binding is picked up on next agent boot. When the agent IS running
+        and rebind fails (binding already in use, pynput rejection), that
+        error overrides the disk-save success since the user expects the
+        new combo to start working immediately."""
+        result = hotkey_helpers.save_hotkey(self._cfg, binding)
+        if result.get("error") is not None:
+            return result
+        try:
+            ipc_result = self._ipc.call("rebind_hotkey", binding=binding)
+        except IPCNotConnected:
+            return result
+        except IPCError as e:
+            return {"error": str(e)}
+        if isinstance(ipc_result, dict) and ipc_result.get("error"):
+            return {"error": ipc_result["error"]}
+        return result
 
     # ------------------------------------------------------------------
     # JS-callable methods — Notifications

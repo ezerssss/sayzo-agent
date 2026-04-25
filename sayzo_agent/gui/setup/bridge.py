@@ -16,9 +16,8 @@ import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from sayzo_agent import settings_store
-from sayzo_agent.arm.hotkey import humanize_binding, validate_binding
 from sayzo_agent.config import Config
+from sayzo_agent.gui.common import hotkey as hotkey_helpers
 from sayzo_agent.gui.common.login import LoginCoordinator
 from sayzo_agent.gui.setup.detect import detect_setup
 
@@ -281,37 +280,13 @@ class Bridge:
     # ---- Hotkey (persisted to user_settings.json) -------------------
 
     def get_hotkey(self) -> dict[str, Any]:
-        """Return the saved hotkey (or the default if none) plus its
-        human-readable form for display."""
-        raw = settings_store.load(self._cfg.data_dir)
-        binding = raw.get("arm", {}).get("hotkey") or self._cfg.arm.hotkey
-        return {"binding": binding, "display": humanize_binding(binding)}
+        return hotkey_helpers.get_hotkey(self._cfg)
 
     def validate_hotkey(self, binding: str) -> dict[str, Any]:
-        """Run the shared validator (rejects bare keys, OS-reserved combos).
-
-        Returns ``{"error": null}`` on success or ``{"error": "..."}``.
-        The React capture widget calls this before saving so the user gets
-        the exact same error text the tkinter widget used to show.
-        """
-        err = validate_binding(binding)
-        return {"error": err}
+        return hotkey_helpers.validate_hotkey(binding)
 
     def save_hotkey(self, binding: str) -> dict[str, Any]:
-        """Persist the binding to ``user_settings.json``. Validated first
-        so we don't write garbage — a failed save returns the error and
-        leaves disk state untouched."""
-        err = validate_binding(binding)
-        if err is not None:
-            return {"error": err}
-        try:
-            settings_store.save(
-                self._cfg.data_dir, {"arm": {"hotkey": binding}},
-            )
-        except OSError as e:
-            log.warning("failed to save hotkey to settings", exc_info=True)
-            return {"error": f"Couldn't save: {e}"}
-        return {"error": None, "display": humanize_binding(binding)}
+        return hotkey_helpers.save_hotkey(self._cfg, binding)
 
     # ---- Setup-completion marker ------------------------------------
 

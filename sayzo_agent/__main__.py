@@ -688,6 +688,36 @@ def service(force_setup: bool) -> None:
         if sys.platform == "win32":
             signal.signal(signal.SIGBREAK, lambda *_: _handle_stop())
 
+        # IPC server for the Settings subprocess. Registers just the methods
+        # whose effect requires the live in-process agent (token-store cache
+        # invalidation, hotkey rebinding); pure-data reads continue to go
+        # through the file-based settings_store directly. Phase 4 extends
+        # this with mic-holder + detector mutation methods. The server is
+        # started before the agent's main loop so a Settings window opened
+        # immediately after `service` boots can connect.
+        from .gui.settings.ipc import IPCServer
+
+        ipc_server = IPCServer(cfg.data_dir)
+        ipc_server.register("ping", lambda: "pong")
+
+        def _ipc_invalidate_token_cache() -> None:
+            try:
+                store.invalidate_cache()
+            except Exception:
+                log.debug("[ipc] invalidate_token_cache failed", exc_info=True)
+
+        def _ipc_rebind_hotkey(binding: str) -> dict:
+            err = agent.arm.rebind_hotkey(binding)
+            return {"error": err}
+
+        ipc_server.register("invalidate_token_cache", _ipc_invalidate_token_cache)
+        ipc_server.register("rebind_hotkey", _ipc_rebind_hotkey)
+
+        try:
+            await ipc_server.start()
+        except Exception:
+            log.warning("[ipc] server failed to start — Settings will fall back to file-only paths", exc_info=True)
+
         # Bridge the tray thread with the asyncio loop: poll for user clicks
         # on the Arm/Stop / Settings... / Quit menu items, and push the
         # ArmController's state back to the tray so labels and tooltip stay
@@ -888,7 +918,10 @@ def service(force_setup: bool) -> None:
 
         asyncio.create_task(_tray_bridge())
         asyncio.create_task(_update_check())
-        await agent.run()
+        try:
+            await agent.run()
+        finally:
+            await ipc_server.stop()
 
     try:
         if sys.platform == "darwin":
