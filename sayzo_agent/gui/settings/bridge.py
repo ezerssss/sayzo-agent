@@ -25,7 +25,6 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from sayzo_agent import __version__, settings_store
 from sayzo_agent.arm import seen_apps as _seen_apps
-from sayzo_agent.arm.detectors import BROWSER_PROCESS_NAMES
 from sayzo_agent.config import Config, DetectorSpec, default_detector_specs
 from sayzo_agent.gui.common import detectors as detector_helpers
 from sayzo_agent.gui.common import hotkey as hotkey_helpers
@@ -595,10 +594,10 @@ class Bridge:
     def parse_meeting_url(self, url: str) -> dict[str, Any]:
         """Validate + preview a pasted meeting URL.
 
-        Mirrors the legacy tkinter Add-app dialog's web tab: returns the
-        fields React needs to render the live preview card and pre-fill
-        the display-name field. ``error`` is non-null when the URL can't
-        be parsed; the dialog disables Submit until that clears.
+        Returns the fields React needs to render the live preview card
+        and pre-fill the display-name field. ``error`` is non-null when
+        the URL can't be parsed; the dialog disables Submit until that
+        clears.
         """
         if not isinstance(url, str):
             return {"error": "url must be a string"}
@@ -640,29 +639,6 @@ class Bridge:
         taken = [d.app_key for d in self._cfg.arm.detectors]
         return detector_helpers.unique_app_key(seed, taken)
 
-    def friendly_url_pattern(self, pattern: str) -> str:
-        """Turn a stored URL regex back into something readable.
-
-        Used by the Meeting Apps list to render Web detectors as
-        ``meet.google.com/…`` instead of ``^https://meet\\.google\\.com/``.
-        """
-        if not isinstance(pattern, str):
-            return ""
-        return detector_helpers.friendly_url_pattern(pattern)
-
-    def is_browser_process(self, process_name: str) -> bool:
-        """True if ``process_name`` is one of the known browser executables.
-
-        The Add-app dialog suppresses browsers from the live mic-holder
-        picker (web meetings belong on the Web tab, not as desktop apps).
-        Lifted to the bridge so the React side doesn't have to maintain
-        a parallel list — the source of truth stays in
-        :mod:`sayzo_agent.arm.detectors`.
-        """
-        if not isinstance(process_name, str):
-            return False
-        return process_name.lower() in BROWSER_PROCESS_NAMES
-
     # ------------------------------------------------------------------
     # JS-callable methods — Lifecycle
     # ------------------------------------------------------------------
@@ -685,9 +661,9 @@ class Bridge:
 
         Adds two derived fields React doesn't want to recompute:
         ``kind`` (``"desktop"`` | ``"web"``, mirroring the section tab in
-        the Meeting Apps pane) and ``detail`` (the muted second-line text
-        already used by the legacy tkinter row — hostname for web specs,
-        process / bundle list for desktop specs).
+        the Meeting Apps pane) and ``detail`` (the muted second-line
+        text — hostname for web specs, process / bundle list for desktop
+        specs).
         """
         kind = "web" if spec.is_browser else "desktop"
         if spec.is_browser:

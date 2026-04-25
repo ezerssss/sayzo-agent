@@ -1,14 +1,9 @@
 """Shared detector / URL helpers for the Meeting Apps surfaces.
 
 The Settings Meeting Apps pane and the Add-app dialog both need the same
-URL parsing, ``app_key`` slug generation, and friendly-display helpers that
-the legacy tkinter ``settings_window.py`` carried inline. Lifted here so
-the pywebview Settings bridge can use them without dragging tkinter
-imports — and so the setup wizard (or any future surface) can reuse them
-as the migration progresses.
-
-Pure logic, no I/O, no GUI deps. Tested transitively via the Settings
-bridge tests; the original behaviour is preserved verbatim.
+URL parsing, ``app_key`` slug generation, and friendly-display helpers.
+Pure logic, no I/O, no GUI deps — directly importable from the bridge or
+any future surface that needs to compose / validate detector specs.
 """
 from __future__ import annotations
 

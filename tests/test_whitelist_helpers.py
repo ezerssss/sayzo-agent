@@ -9,12 +9,12 @@ import re
 
 import pytest
 
-from sayzo_agent.gui.settings_window import (
-    _display_name_from_host,
-    _friendly_url_pattern,
-    _parse_meeting_url,
-    _unique_app_key,
-    _url_pattern,
+from sayzo_agent.gui.common.detectors import (
+    display_name_from_host as _display_name_from_host,
+    friendly_url_pattern as _friendly_url_pattern,
+    parse_meeting_url as _parse_meeting_url,
+    unique_app_key as _unique_app_key,
+    url_pattern as _url_pattern,
 )
 
 

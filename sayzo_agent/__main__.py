@@ -715,10 +715,19 @@ def service(force_setup: bool) -> None:
             # the only field the Add-app dialog actually reads on Windows;
             # macOS leans on ``active`` + foreground bundle id (separate
             # method) since CoreAudio has no per-process attribution.
+            #
+            # ``is_browser`` is computed here so the polling React side
+            # doesn't need an extra IPC roundtrip per row to filter
+            # browsers out of the desktop-app picker.
+            from .arm.detectors import BROWSER_PROCESS_NAMES
             state = agent.arm.snapshot_mic_state()
             return {
                 "holders": [
-                    {"process_name": h.process_name, "pid": h.pid}
+                    {
+                        "process_name": h.process_name,
+                        "pid": h.pid,
+                        "is_browser": h.process_name.lower() in BROWSER_PROCESS_NAMES,
+                    }
                     for h in state.holders
                 ],
                 "active": state.active,
@@ -760,39 +769,10 @@ def service(force_setup: bool) -> None:
         from .arm import ArmState
         from .gui.tray import Status as TrayStatus
 
-        # One-at-a-time guard — a user double-clicking Settings... shouldn't
-        # spin up two tk roots in parallel. tkinter's mainloop returns when
-        # the window closes; the flag is cleared from the worker thread at
-        # that point.
+        # One-at-a-time guard so a user double-clicking Settings... doesn't
+        # spawn two pywebview subprocesses. Cleared when the subprocess
+        # exits (window closed by user / crash).
         settings_open = threading.Event()
-
-        # Dedicated single-worker executor for the Settings tkinter window.
-        # Tcl is thread-affine: opening Settings via the default asyncio
-        # executor (32+ workers) means each invocation can land on a
-        # different thread. Tcl tolerates being on ONE non-main thread, but
-        # rotating across threads triggers ``Tcl_Panic`` (BREAKPOINT crash
-        # 0x80000003 in tcl86t.dll, observed in field event-viewer logs on
-        # v1.7.2). Pinning to one worker avoids that entirely — every
-        # Settings open re-uses the same Tcl interpreter thread.
-        from concurrent.futures import ThreadPoolExecutor as _SettingsExec
-        settings_executor = _SettingsExec(
-            max_workers=1, thread_name_prefix="sayzo-settings",
-        )
-
-        def _open_settings() -> None:
-            try:
-                from .gui.settings_window import open_settings_window
-
-                open_settings_window(cfg, agent.arm)
-            except Exception:
-                log.warning("[tray] settings window crashed", exc_info=True)
-            finally:
-                settings_open.clear()
-
-        def _use_pywebview_settings() -> bool:
-            return os.environ.get("SAYZO_USE_PYWEBVIEW_SETTINGS", "0").lower() not in (
-                "0", "", "false", "no", "off",
-            )
 
         def _settings_subprocess_argv() -> list[str]:
             """Build ``argv`` for ``sayzo-agent settings``.
@@ -862,28 +842,18 @@ def service(force_setup: bool) -> None:
                 if tray_state.arm_toggle_event.is_set():
                     tray_state.arm_toggle_event.clear()
                     asyncio.create_task(agent.arm.arm_from_tray())
-                # Settings... — opens the Settings window. Two dispatch paths:
-                #
-                #   * SAYZO_USE_PYWEBVIEW_SETTINGS=1 (default off during the
-                #     migration): spawn the new pywebview Settings as a
-                #     ``sayzo-agent settings`` subprocess. The subprocess
-                #     owns its own main thread, which is what Cocoa needs on
-                #     macOS — pystray holds the agent's main thread, so an
-                #     in-process pywebview can't run there.
-                #
-                #   * Default: keep the legacy tkinter window on a dedicated
-                #     single-worker executor so Tcl's thread affinity stays
-                #     happy on Windows. Reentrancy guard prevents two roots.
+                # Settings... — spawn ``sayzo-agent settings`` as a
+                # subprocess. The subprocess owns its own main thread, which
+                # is what Cocoa needs on macOS (pystray holds the agent's
+                # main thread, so an in-process pywebview can't run there)
+                # and avoids Tcl thread-affinity surprises on Windows.
                 if tray_state.settings_event.is_set():
                     tray_state.settings_event.clear()
                     if not settings_open.is_set():
                         settings_open.set()
-                        if _use_pywebview_settings():
-                            asyncio.create_task(
-                                _spawn_settings_subprocess(settings_open)
-                            )
-                        else:
-                            loop.run_in_executor(settings_executor, _open_settings)
+                        asyncio.create_task(
+                            _spawn_settings_subprocess(settings_open)
+                        )
                 # Belt-and-braces poll sync in case the callback ever fails
                 # to fire (e.g. state changed before the callback was wired).
                 _sync_arm_state_to_tray()
@@ -1022,10 +992,6 @@ def service(force_setup: bool) -> None:
         pass
     finally:
         tray.stop()
-        try:
-            settings_executor.shutdown(wait=False, cancel_futures=True)
-        except Exception:
-            pass
         remove_pid(cfg.pid_path)
         log.warning("sayzo-agent service stopped")
 
@@ -1039,10 +1005,9 @@ def service(force_setup: bool) -> None:
 def settings(pane: str | None) -> None:
     """Open the Settings window in a dedicated pywebview process.
 
-    Spawned by the tray menu's "Settings…" click when
-    ``SAYZO_USE_PYWEBVIEW_SETTINGS=1``. Exits 0 when the window closes;
-    exits 0 immediately (with a log line) if another Settings window
-    already holds the cross-process lock.
+    Spawned by the tray menu's "Settings…" click. Exits 0 when the window
+    closes; exits 0 immediately (with a log line) if another Settings
+    window already holds the cross-process lock.
     """
     cfg = load_config()
     _setup_logging("INFO", debug=cfg.debug)

@@ -7,9 +7,12 @@ import {
   MicHolderSnapshot,
 } from "../lib/settings-bridge";
 import { Button } from "../components/ui/Button";
-import { cn } from "../lib/cn";
+import { SegmentedTab } from "../components/ui/SegmentedTab";
 
 const POLL_INTERVAL_MS = 2000;
+
+const INPUT_CLASS =
+  "mt-2 w-full rounded-md border border-ink-border bg-white px-3 py-2 text-sm text-ink focus:border-accent focus:outline-none";
 
 interface Props {
   initialTab: DetectorKind;
@@ -51,12 +54,12 @@ export function AddAppDialog({ initialTab, existing, onClose, onAdded }: Props) 
             to capture them.
           </p>
           <div className="mt-5 inline-flex gap-2">
-            <DialogTab
+            <SegmentedTab
               label="Desktop app"
               selected={tab === "desktop"}
               onClick={() => setTab("desktop")}
             />
-            <DialogTab
+            <SegmentedTab
               label="Web meeting"
               selected={tab === "web"}
               onClick={() => setTab("web")}
@@ -81,30 +84,6 @@ export function AddAppDialog({ initialTab, existing, onClose, onAdded }: Props) 
         </div>
       </div>
     </div>
-  );
-}
-
-interface DialogTabProps {
-  label: string;
-  selected: boolean;
-  onClick: () => void;
-}
-
-function DialogTab({ label, selected, onClick }: DialogTabProps) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={cn(
-        "rounded-md px-4 py-2 text-sm font-medium transition-colors",
-        "focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2",
-        selected
-          ? "bg-accent text-white focus-visible:ring-accent-ring"
-          : "bg-white text-ink border border-ink-border hover:bg-gray-50 focus-visible:ring-ink-border",
-      )}
-    >
-      {label}
-    </button>
   );
 }
 
@@ -147,6 +126,11 @@ function DesktopTab({ existing, onAdded }: DesktopProps) {
     };
   }, []);
 
+  // Set of process names + bundle ids already on the user's whitelist. Used
+  // by both the live picker (suppress already-added rows) and the manual
+  // submit (reject duplicates). Memoised so the 2 s poll doesn't rebuild it.
+  const taken = useMemo(() => takenKeys(existing), [existing]);
+
   // Live mic-holder picker — polled every 2 s while the dialog is open. Same
   // cadence as the legacy tkinter dialog. The bridge degrades to an empty
   // snapshot when the agent isn't reachable, so a stopped service shows the
@@ -158,24 +142,17 @@ function DesktopTab({ existing, onAdded }: DesktopProps) {
         settingsBridge.snapshotForeground(),
       ]);
 
-      const taken = new Set<string>();
-      for (const spec of existing) {
-        for (const p of spec.process_names) taken.add(p.toLowerCase());
-        for (const b of spec.bundle_ids) taken.add(b.toLowerCase());
-      }
-
       const seen = new Set<string>();
       const next: DesktopCandidate[] = [];
 
       for (const h of mic.holders) {
         const key = (h.process_name ?? "").toLowerCase();
         if (!key || seen.has(key) || taken.has(key)) continue;
-        const isBrowser = await settingsBridge.isBrowserProcess(h.process_name);
-        if (isBrowser) continue;
+        if (h.is_browser) continue;
         seen.add(key);
         next.push({
           rawKey: h.process_name,
-          display: prettyProcess(h.process_name),
+          display: prettyName(h.process_name, "process"),
           isBundleId: false,
         });
       }
@@ -188,7 +165,7 @@ function DesktopTab({ existing, onAdded }: DesktopProps) {
         if (!seen.has(key) && !taken.has(key)) {
           next.push({
             rawKey: fg.bundle_id,
-            display: prettyBundleId(fg.bundle_id),
+            display: prettyName(fg.bundle_id, "bundle"),
             isBundleId: true,
           });
           seen.add(key);
@@ -199,13 +176,19 @@ function DesktopTab({ existing, onAdded }: DesktopProps) {
     } catch {
       setCandidates([]);
     }
-  }, [existing, platform]);
+  }, [taken, platform]);
 
+  // Ref-based interval: the poll fires every POLL_INTERVAL_MS but always
+  // calls the *latest* `refresh`. A naive `setInterval(refresh, ...)` would
+  // capture the closure at install time and miss updates when `existing`
+  // (and thus `taken`) changes mid-dialog.
+  const refreshRef = useRef(refresh);
+  refreshRef.current = refresh;
   useEffect(() => {
-    void refresh();
-    const id = window.setInterval(() => void refresh(), POLL_INTERVAL_MS);
+    void refreshRef.current();
+    const id = window.setInterval(() => void refreshRef.current(), POLL_INTERVAL_MS);
     return () => window.clearInterval(id);
-  }, [refresh]);
+  }, []);
 
   const handlePick = useCallback(
     async (c: DesktopCandidate) => {
@@ -247,13 +230,7 @@ function DesktopTab({ existing, onAdded }: DesktopProps) {
       return;
     }
     const seedKey = bundle || proc;
-    const seedKeyLc = seedKey.toLowerCase();
-    const taken = new Set<string>();
-    for (const spec of existing) {
-      for (const p of spec.process_names) taken.add(p.toLowerCase());
-      for (const b of spec.bundle_ids) taken.add(b.toLowerCase());
-    }
-    if (taken.has(seedKeyLc)) {
+    if (taken.has(seedKey.toLowerCase())) {
       setError(`“${seedKey}” is already on your list.`);
       return;
     }
@@ -270,7 +247,7 @@ function DesktopTab({ existing, onAdded }: DesktopProps) {
     } else {
       setError(result.error ?? "Couldn't add app.");
     }
-  }, [existing, manualBundle, manualName, manualProcess, onAdded, platform]);
+  }, [taken, manualBundle, manualName, manualProcess, onAdded, platform]);
 
   return (
     <div>
@@ -345,7 +322,7 @@ function DesktopTab({ existing, onAdded }: DesktopProps) {
               type="text"
               value={manualName}
               onChange={(e) => setManualName(e.target.value)}
-              className="mt-2 w-full rounded-md border border-ink-border bg-white px-3 py-2 text-sm text-ink focus:border-accent focus:outline-none"
+              className={INPUT_CLASS}
             />
           </div>
 
@@ -358,7 +335,7 @@ function DesktopTab({ existing, onAdded }: DesktopProps) {
                 type="text"
                 value={manualBundle}
                 onChange={(e) => setManualBundle(e.target.value)}
-                className="mt-2 w-full rounded-md border border-ink-border bg-white px-3 py-2 text-sm text-ink focus:border-accent focus:outline-none"
+                className={INPUT_CLASS}
               />
               <p className="mt-1 text-xs leading-relaxed text-ink-muted">
                 Find it in macOS: open the app, then Apple menu → System
@@ -375,7 +352,7 @@ function DesktopTab({ existing, onAdded }: DesktopProps) {
                 type="text"
                 value={manualProcess}
                 onChange={(e) => setManualProcess(e.target.value)}
-                className="mt-2 w-full rounded-md border border-ink-border bg-white px-3 py-2 text-sm text-ink focus:border-accent focus:outline-none"
+                className={INPUT_CLASS}
               />
               <p className="mt-1 text-xs leading-relaxed text-ink-muted">
                 Find it in Task Manager → Details tab. The process name ends
@@ -422,6 +399,10 @@ function WebTab({ existing, onAdded }: WebProps) {
   // Re-parse on every URL change. Bridge round-trip is cheap; we don't
   // bother debouncing. The parse result feeds three derived UI bits:
   // preview text, prefilled display name, submit guard.
+  //
+  // ``name`` deliberately isn't a dep: keystrokes in the Name field
+  // shouldn't trigger another URL parse. The auto-fill uses the setter's
+  // callback form so it can read the latest name without re-subscribing.
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -445,8 +426,9 @@ function WebTab({ existing, onAdded }: WebProps) {
           setHost(result.host);
           setPath(result.path ?? "");
           setParseError(null);
-          if (!userEditedName.current && !name.trim() && result.display_name) {
-            setName(result.display_name);
+          const suggested = result.display_name;
+          if (suggested && !userEditedName.current) {
+            setName((cur) => (cur.trim() ? cur : suggested));
           }
         }
       } catch {
@@ -460,17 +442,12 @@ function WebTab({ existing, onAdded }: WebProps) {
     return () => {
       cancelled = true;
     };
-  }, [url, name]);
+  }, [url]);
 
-  const previewText = useMemo(() => {
-    if (!url.trim()) return "Paste a URL above to see what it'll match.";
-    if (host == null) return "⚠️  That doesn't look like a meeting URL.";
-    if (strict && !path) {
-      return "⚠️  Strict match needs a path — paste a full meeting URL, or uncheck “Only match this exact meeting”.";
-    }
-    if (strict) return `${host}${path} — this exact meeting only`;
-    return `${host}/… — any meeting on this site`;
-  }, [host, path, strict, url]);
+  const previewText = useMemo(
+    () => buildPreviewText(url, host, path, strict),
+    [host, path, strict, url],
+  );
 
   const handleSubmit = useCallback(async () => {
     setSubmitError(null);
@@ -532,7 +509,7 @@ function WebTab({ existing, onAdded }: WebProps) {
           value={url}
           onChange={(e) => setUrl(e.target.value)}
           placeholder="https://meet.google.com/abc-defg-hij"
-          className="mt-2 w-full rounded-md border border-ink-border bg-white px-3 py-2 text-sm text-ink focus:border-accent focus:outline-none"
+          className={INPUT_CLASS}
         />
       </div>
 
@@ -569,7 +546,7 @@ function WebTab({ existing, onAdded }: WebProps) {
             userEditedName.current = true;
             setName(e.target.value);
           }}
-          className="mt-2 w-full rounded-md border border-ink-border bg-white px-3 py-2 text-sm text-ink focus:border-accent focus:outline-none"
+          className={INPUT_CLASS}
         />
       </div>
 
@@ -597,28 +574,54 @@ function WebTab({ existing, onAdded }: WebProps) {
 
 // ---- Display name heuristics ---------------------------------------------
 
-// Lightweight equivalents to seen_apps._display_name_for_process /
+// Lightweight equivalent of seen_apps._display_name_for_process /
 // _display_name_for_bundle. Kept JS-side so the live picker doesn't have
 // to round-trip per-row to format the label.
-function prettyProcess(proc: string): string {
-  const stem = proc.includes(".") ? proc.split(".").slice(0, -1).join(".") : proc;
+//
+// kind="process" treats the input as ``loom.exe`` and drops the .exe stem;
+// kind="bundle" treats it as ``com.hnc.Discord`` and keeps only the trailing
+// label.
+function prettyName(raw: string, kind: "process" | "bundle"): string {
+  let stem: string;
+  if (kind === "bundle") {
+    const parts = raw.split(".");
+    stem = parts.length > 0 ? parts[parts.length - 1] : raw;
+  } else {
+    stem = raw.includes(".") ? raw.split(".").slice(0, -1).join(".") : raw;
+  }
   const cleaned = stem.replace(/[-_]/g, " ").trim();
-  if (!cleaned) return proc;
+  if (!cleaned) return raw;
   if (cleaned.includes(" ")) {
     return cleaned.replace(/\b\w/g, (m) => m.toUpperCase());
   }
   return cleaned[0].toUpperCase() + cleaned.slice(1);
 }
 
-function prettyBundleId(bundleId: string): string {
-  const parts = bundleId.split(".");
-  const tail = parts.length > 0 ? parts[parts.length - 1] : bundleId;
-  const cleaned = tail.replace(/[-_]/g, " ").trim();
-  if (!cleaned) return bundleId;
-  if (cleaned.includes(" ")) {
-    return cleaned.replace(/\b\w/g, (m) => m.toUpperCase());
+function buildPreviewText(
+  url: string,
+  host: string | null,
+  path: string,
+  strict: boolean,
+): string {
+  if (!url.trim()) return "Paste a URL above to see what it'll match.";
+  if (host == null) return "⚠️  That doesn't look like a meeting URL.";
+  if (strict && !path) {
+    return "⚠️  Strict match needs a path — paste a full meeting URL, or uncheck “Only match this exact meeting”.";
   }
-  return cleaned[0].toUpperCase() + cleaned.slice(1);
+  if (strict) return `${host}${path} — this exact meeting only`;
+  return `${host}/… — any meeting on this site`;
+}
+
+// Build a Set of process-name + bundle-id keys (lower-cased) already on
+// the user's whitelist. Shared between the live picker (suppress
+// already-added rows) and manual submit (reject duplicates).
+function takenKeys(specs: DetectorSummary[]): Set<string> {
+  const out = new Set<string>();
+  for (const spec of specs) {
+    for (const p of spec.process_names) out.add(p.toLowerCase());
+    for (const b of spec.bundle_ids) out.add(b.toLowerCase());
+  }
+  return out;
 }
 
 // MicHolderSnapshot import is referenced only via the bridge type wiring.

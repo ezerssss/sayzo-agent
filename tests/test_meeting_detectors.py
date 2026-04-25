@@ -344,9 +344,9 @@ def test_arm_app_still_holding_ignores_disabled_flag():
 
 # ---- user-added URL detectors (Settings → Web tab) ---------------------
 #
-# These mirror the spec shape produced by ``_submit_web`` in
-# ``gui/settings_window.py``: ``is_browser=True`` + ``url_patterns`` only,
-# NO ``title_patterns``. Before v1.5.0 the foreground tab URL was always
+# These mirror the spec shape the Settings Add-app dialog produces for the
+# Web tab: ``is_browser=True`` + ``url_patterns`` only, NO
+# ``title_patterns``. Before v1.5.0 the foreground tab URL was always
 # ``None`` on Windows (no UIA read), so these specs could never match and
 # custom URLs pasted in Settings silently did nothing. With
 # ``platform_win.get_browser_tab_url`` populating ``browser_tab_url`` +

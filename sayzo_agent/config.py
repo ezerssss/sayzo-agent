@@ -372,9 +372,9 @@ class ArmConfig(BaseSettings):
     """
 
     # Global hotkey binding. Users can change this via the Settings GUI (see
-    # sayzo_agent.gui.settings_window) or the onboarding walkthrough. Values
-    # are written to data_dir/user_settings.json and overlaid onto this
-    # default at load time; SAYZO_ARM__HOTKEY env var still wins.
+    # sayzo_agent.gui.settings) or the setup wizard. Values are written to
+    # data_dir/user_settings.json and overlaid onto this default at load
+    # time; SAYZO_ARM__HOTKEY env var still wins.
     hotkey: str = "ctrl+alt+s"
 
     # How often the whitelist watcher polls foreground + mic-holders while

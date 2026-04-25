@@ -81,6 +81,10 @@ export type SeenAppSummary = {
 export type MicHolderSnapshot = {
   process_name: string;
   pid: number;
+  // Pre-computed by the agent so the polling Add-app dialog doesn't need
+  // an extra IPC round-trip per row to filter browsers out of the
+  // desktop-app picker.
+  is_browser: boolean;
 };
 
 export type MicStateSnapshot = {
@@ -192,8 +196,6 @@ declare global {
       strict: boolean,
     ): Promise<BuiltUrlPattern>;
     make_app_key(seed: string): Promise<string>;
-    friendly_url_pattern(pattern: string): Promise<string>;
-    is_browser_process(process_name: string): Promise<boolean>;
   }
 }
 
@@ -327,14 +329,6 @@ export const settingsBridge = {
   async makeAppKey(seed: string) {
     await whenReady();
     return window.pywebview.api.make_app_key(seed);
-  },
-  async friendlyUrlPattern(pattern: string) {
-    await whenReady();
-    return window.pywebview.api.friendly_url_pattern(pattern);
-  },
-  async isBrowserProcess(processName: string) {
-    await whenReady();
-    return window.pywebview.api.is_browser_process(processName);
   },
 
   async finish() {

@@ -7,6 +7,7 @@ import {
   SeenAppSummary,
 } from "../lib/settings-bridge";
 import { Button } from "../components/ui/Button";
+import { SegmentedTab } from "../components/ui/SegmentedTab";
 import { Switch } from "../components/ui/Switch";
 import { cn } from "../lib/cn";
 import { AddAppDialog } from "./AddAppDialog";
@@ -29,18 +30,12 @@ export function MeetingAppsPane() {
   const [undo, setUndo] = useState<UndoSnapshot | null>(null);
 
   const refresh = useCallback(async () => {
-    try {
-      const list = await settingsBridge.listDetectors();
-      setDetectors(list);
-    } catch {
-      setDetectors([]);
-    }
-    try {
-      const s = await settingsBridge.listSeenApps();
-      setSeen(s);
-    } catch {
-      setSeen([]);
-    }
+    const [listResult, seenResult] = await Promise.allSettled([
+      settingsBridge.listDetectors(),
+      settingsBridge.listSeenApps(),
+    ]);
+    setDetectors(listResult.status === "fulfilled" ? listResult.value : []);
+    setSeen(seenResult.status === "fulfilled" ? seenResult.value : []);
   }, []);
 
   useEffect(() => {
@@ -201,12 +196,12 @@ export function MeetingAppsPane() {
 
       {/* Section tabs — Desktop apps / Web meetings, segmented style. */}
       <div className="mt-6 inline-flex gap-2">
-        <SectionTab
+        <SegmentedTab
           label="Desktop apps"
           selected={section === "desktop"}
           onClick={() => setSection("desktop")}
         />
-        <SectionTab
+        <SegmentedTab
           label="Web meetings"
           selected={section === "web"}
           onClick={() => setSection("web")}
@@ -290,30 +285,6 @@ export function MeetingAppsPane() {
         />
       )}
     </div>
-  );
-}
-
-interface SectionTabProps {
-  label: string;
-  selected: boolean;
-  onClick: () => void;
-}
-
-function SectionTab({ label, selected, onClick }: SectionTabProps) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={cn(
-        "rounded-md px-4 py-2 text-sm font-medium transition-colors",
-        "focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2",
-        selected
-          ? "bg-accent text-white focus-visible:ring-accent-ring"
-          : "bg-white text-ink border border-ink-border hover:bg-gray-50 focus-visible:ring-ink-border",
-      )}
-    >
-      {label}
-    </button>
   );
 }
 
