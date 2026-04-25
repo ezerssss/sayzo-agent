@@ -156,6 +156,47 @@ class _PROPVARIANT(ctypes.Structure):
 _VT_BLOB = 65
 
 
+class _WAVEFORMATEX(ctypes.Structure):
+    """WAVEFORMATEX (mmreg.h) — passed to IAudioClient::Initialize.
+
+    For process loopback we MUST construct this ourselves: the loopback
+    client doesn't implement ``GetMixFormat`` (returns E_NOTIMPL), and
+    Initialize requires a fixed format anyway. Microsoft's
+    ``ApplicationLoopback`` sample uses 32-bit float, 2-channel, 48 kHz —
+    we mirror that exactly so we have a known-good combo.
+    """
+
+    _fields_ = [
+        ("wFormatTag", wintypes.WORD),
+        ("nChannels", wintypes.WORD),
+        ("nSamplesPerSec", wintypes.DWORD),
+        ("nAvgBytesPerSec", wintypes.DWORD),
+        ("nBlockAlign", wintypes.WORD),
+        ("wBitsPerSample", wintypes.WORD),
+        ("cbSize", wintypes.WORD),
+    ]
+
+
+def _make_loopback_waveformat(rate: int = 48000, channels: int = 2) -> _WAVEFORMATEX:
+    """Build the fixed WAVEFORMATEX the process-loopback client requires.
+
+    ``rate`` must be 44100 or 48000; ``channels`` 1 or 2; bits-per-sample
+    is fixed at 32 (Float32). Per MSDN: any other combination is rejected
+    by ``IAudioClient::Initialize`` with E_INVALIDARG.
+    """
+    bits_per_sample = 32
+    block_align = channels * bits_per_sample // 8
+    return _WAVEFORMATEX(
+        wFormatTag=_WAVE_FORMAT_IEEE_FLOAT,
+        nChannels=channels,
+        nSamplesPerSec=rate,
+        nAvgBytesPerSec=rate * block_align,
+        nBlockAlign=block_align,
+        wBitsPerSample=bits_per_sample,
+        cbSize=0,
+    )
+
+
 # ---------------------------------------------------------------------------
 # COM interface definitions (pure comtypes — no pycaw helpers here because
 # pycaw doesn't wrap ActivateAudioInterfaceAsync / process-loopback APIs).
@@ -461,35 +502,15 @@ class ProcessLoopbackCapture:
         # promptly.
         buffer_duration_hns = 200 * _REFTIMES_PER_MS
 
-        # GetMixFormat → WAVEFORMATEX*. We accept whatever native format
-        # WASAPI wants to deliver and resample at batch boundaries.
-        try:
-            mix_format_ptr = audio_client.GetMixFormat()
-        except Exception:
-            log.exception("[proc-loopback] GetMixFormat failed pid=%d", pid)
-            return
-
-        # Pull native rate + channel count out of the format pointer. Fields
-        # (per mmreg.h WAVEFORMATEX): [wFormatTag u16, nChannels u16,
-        # nSamplesPerSec u32, nAvgBytesPerSec u32, nBlockAlign u16,
-        # wBitsPerSample u16, cbSize u16].
-        wf_ptr = ctypes.cast(mix_format_ptr, ctypes.POINTER(ctypes.c_uint8))
-        native_rate = int.from_bytes(bytes(wf_ptr[4:8]), "little")
-        n_channels = int.from_bytes(bytes(wf_ptr[2:4]), "little")
-        bits_per_sample = int.from_bytes(bytes(wf_ptr[14:16]), "little")
-        if bits_per_sample != 32:
-            log.warning(
-                "[proc-loopback] unexpected bits_per_sample=%d for pid=%d "
-                "(process loopback normally delivers 32-bit float); "
-                "proceeding but may misinterpret frames",
-                bits_per_sample, pid,
-            )
-        if native_rate <= 0 or n_channels <= 0:
-            log.error(
-                "[proc-loopback] invalid mix format pid=%d rate=%d ch=%d",
-                pid, native_rate, n_channels,
-            )
-            return
+        # Process-loopback clients don't implement ``GetMixFormat`` — calling
+        # it returns E_NOTIMPL (0x80004001 / "Not implemented"). The SDK
+        # documents this: process loopback delivers a fixed format that the
+        # CALLER must build. Microsoft's ApplicationLoopback sample uses
+        # Float32 / 2-channel / 48 kHz; we mirror that exactly for a
+        # known-good combo, then resample to the pipeline target like before.
+        native_rate = 48000
+        n_channels = 2
+        wfx = _make_loopback_waveformat(rate=native_rate, channels=n_channels)
 
         try:
             audio_client.Initialize(
@@ -497,7 +518,7 @@ class ProcessLoopbackCapture:
                 _AUDCLNT_STREAMFLAGS_LOOPBACK | _AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
                 buffer_duration_hns,
                 0,
-                mix_format_ptr,
+                ctypes.byref(wfx),
                 None,
             )
         except Exception:

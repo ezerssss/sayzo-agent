@@ -769,11 +769,6 @@ def service(force_setup: bool) -> None:
         from .arm import ArmState
         from .gui.tray import Status as TrayStatus
 
-        # One-at-a-time guard so a user double-clicking Settings... doesn't
-        # spawn two pywebview subprocesses. Cleared when the subprocess
-        # exits (window closed by user / crash).
-        settings_open = threading.Event()
-
         def _settings_subprocess_argv() -> list[str]:
             """Build ``argv`` for ``sayzo-agent settings``.
 
@@ -786,27 +781,116 @@ def service(force_setup: bool) -> None:
                 return [sys.executable, "settings"]
             return [sys.executable, "-m", "sayzo_agent", "settings"]
 
-        async def _spawn_settings_subprocess(open_flag: threading.Event) -> None:
-            """Run ``sayzo-agent settings`` and clear the open-flag on exit.
+        class _SettingsLauncher:
+            """Manage a single pre-warmed ``sayzo-agent settings --idle``
+            subprocess across the agent's lifetime.
 
-            Errors here are non-fatal: the agent must keep ticking even if
-            the Settings window failed to spawn (missing assets, OS-level
-            spawn failure). The user can retry from the tray menu.
+            Spawned at agent boot, the subprocess holds a hidden pywebview
+            window — paying the Python startup + WebView2 init cost up front
+            so the tray's Settings... click drops to an instant ``show``.
+            On the user's window-close (X button) the subprocess hides
+            instead of destroying, so the next click is also instant.
+
+            The agent owns the lifecycle: ``quit()`` is called in shutdown
+            to guarantee no orphan Settings process survives the agent.
+            EOF on the subprocess's stdin pipe (i.e. our process dies
+            without sending quit) triggers the same teardown on the child.
             """
-            argv = _settings_subprocess_argv()
-            log.info("[tray] spawning Settings subprocess: %s", argv)
-            try:
-                proc = await asyncio.create_subprocess_exec(*argv)
-                await proc.wait()
-                if proc.returncode != 0:
-                    log.warning(
-                        "[tray] settings subprocess exited with code %s",
-                        proc.returncode,
+
+            def __init__(self) -> None:
+                self._proc: asyncio.subprocess.Process | None = None
+                self._lock = asyncio.Lock()
+
+            async def start(self) -> None:
+                """Spawn the idle subprocess. No-op if already running."""
+                if self._proc is not None and self._proc.returncode is None:
+                    return
+                argv = _settings_subprocess_argv() + ["--idle"]
+                log.info("[settings] pre-spawning idle subprocess: %s", argv)
+                try:
+                    self._proc = await asyncio.create_subprocess_exec(
+                        *argv, stdin=asyncio.subprocess.PIPE,
                     )
-            except Exception:
-                log.warning("[tray] failed to spawn settings subprocess", exc_info=True)
-            finally:
-                open_flag.clear()
+                except Exception:
+                    log.warning(
+                        "[settings] failed to pre-spawn idle subprocess",
+                        exc_info=True,
+                    )
+                    self._proc = None
+
+            async def show(self) -> None:
+                """Make the Settings window visible.
+
+                Respawns the subprocess first if it died (manual kill, OOM,
+                crash) so a one-time failure doesn't permanently break the
+                tray menu's Settings click.
+                """
+                async with self._lock:
+                    await self._send(b"show\n")
+
+            async def _send(self, payload: bytes) -> None:
+                if self._proc is None or self._proc.returncode is not None:
+                    await self.start()
+                if self._proc is None or self._proc.stdin is None:
+                    return
+                try:
+                    self._proc.stdin.write(payload)
+                    await self._proc.stdin.drain()
+                    return
+                except (BrokenPipeError, ConnectionResetError):
+                    log.info("[settings] pipe broken — respawning")
+                self._proc = None
+                await self.start()
+                if self._proc is None or self._proc.stdin is None:
+                    return
+                try:
+                    self._proc.stdin.write(payload)
+                    await self._proc.stdin.drain()
+                except Exception:
+                    log.warning("[settings] resend failed", exc_info=True)
+
+            async def quit(self) -> None:
+                """Tell the subprocess to destroy its window and exit.
+
+                Bounded total: 3 s graceful + 2 s after terminate before
+                kill. Called from shutdown paths so the agent never leaves
+                an orphan Settings process behind.
+                """
+                async with self._lock:
+                    proc = self._proc
+                    self._proc = None
+                    if proc is None or proc.returncode is not None:
+                        return
+                    log.info("[settings] sending quit to idle subprocess")
+                    try:
+                        if proc.stdin is not None:
+                            proc.stdin.write(b"quit\n")
+                            await proc.stdin.drain()
+                            proc.stdin.close()
+                    except Exception:
+                        pass
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=3.0)
+                        return
+                    except asyncio.TimeoutError:
+                        log.warning(
+                            "[settings] subprocess didn't quit in 3 s — terminating",
+                        )
+                    try:
+                        proc.terminate()
+                    except ProcessLookupError:
+                        return
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=2.0)
+                    except asyncio.TimeoutError:
+                        log.warning("[settings] terminate didn't take — killing")
+                        try:
+                            proc.kill()
+                        except ProcessLookupError:
+                            pass
+
+        settings_launcher = _SettingsLauncher()
+        await settings_launcher.start()
 
         def _sync_arm_state_to_tray() -> None:
             """Push ArmController.state → TrayState immediately.
@@ -842,18 +926,17 @@ def service(force_setup: bool) -> None:
                 if tray_state.arm_toggle_event.is_set():
                     tray_state.arm_toggle_event.clear()
                     asyncio.create_task(agent.arm.arm_from_tray())
-                # Settings... — spawn ``sayzo-agent settings`` as a
-                # subprocess. The subprocess owns its own main thread, which
-                # is what Cocoa needs on macOS (pystray holds the agent's
-                # main thread, so an in-process pywebview can't run there)
-                # and avoids Tcl thread-affinity surprises on Windows.
+                # Settings... — show the pre-warmed Settings subprocess.
+                # The subprocess was spawned at agent boot and holds a
+                # hidden pywebview window; ``show`` makes it visible
+                # without paying the Python+WebView2 startup cost again.
+                # The subprocess owns its own main thread, which is what
+                # Cocoa needs on macOS (pystray holds the agent's main
+                # thread, so an in-process pywebview can't run there) and
+                # avoids Tcl thread-affinity surprises on Windows.
                 if tray_state.settings_event.is_set():
                     tray_state.settings_event.clear()
-                    if not settings_open.is_set():
-                        settings_open.set()
-                        asyncio.create_task(
-                            _spawn_settings_subprocess(settings_open)
-                        )
+                    asyncio.create_task(settings_launcher.show())
                 # Belt-and-braces poll sync in case the callback ever fails
                 # to fire (e.g. state changed before the callback was wired).
                 _sync_arm_state_to_tray()
@@ -926,6 +1009,11 @@ def service(force_setup: bool) -> None:
         try:
             await agent.run()
         finally:
+            # Shut the Settings subprocess down before the IPC server so
+            # its in-flight bridge calls can resolve cleanly (and so we
+            # don't leave an orphan pywebview process if SIGKILL fires
+            # later in the macOS force-exit path).
+            await settings_launcher.quit()
             await ipc_server.stop()
 
     try:
@@ -1002,7 +1090,17 @@ def service(force_setup: bool) -> None:
     default=None,
     help="Open the Settings window with this pane selected (e.g. Account, About).",
 )
-def settings(pane: str | None) -> None:
+@click.option(
+    "--idle",
+    is_flag=True,
+    default=False,
+    help=(
+        "Pre-warm mode: open the window hidden, hide on user close, accept "
+        "show/hide/quit commands on stdin. Spawned by the agent at startup so "
+        "the tray's Settings... click feels instant."
+    ),
+)
+def settings(pane: str | None, idle: bool) -> None:
     """Open the Settings window in a dedicated pywebview process.
 
     Spawned by the tray menu's "Settings…" click. Exits 0 when the window
@@ -1021,7 +1119,7 @@ def settings(pane: str | None) -> None:
             log.warning("another Settings window is already open — exiting")
             return
         try:
-            SettingsWindow(cfg, pane=pane).run_blocking()
+            SettingsWindow(cfg, pane=pane, idle=idle).run_blocking()
         except Exception:
             log.exception("settings window crashed")
 
