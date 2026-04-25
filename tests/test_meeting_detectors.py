@@ -485,6 +485,46 @@ def test_gmeet_match_carries_browser_holder_pid():
     assert r.target_pids == (1111,)
 
 
+# ---- exclude_app_keys (decline-doesn't-mask, v1.8.2) -------------------
+
+
+def test_exclude_app_keys_skips_first_match_finds_next():
+    """Browser has both Meet and ChatGPT URLs visible. Excluding gmeet
+    must let chatgpt-com (a custom user spec) be found instead — without
+    this, a declined gmeet match in a background tab would shadow the
+    foreground chatgpt-com match for the rest of the browser session."""
+    custom = DetectorSpec(
+        app_key="chatgpt-com", display_name="ChatGPT", is_browser=True,
+        url_patterns=[r"^https://chatgpt\.com/"],
+    )
+    specs = default_detector_specs() + [custom]
+    fg = ForegroundInfo(
+        process_name="chrome.exe", is_browser=True,
+        browser_tab_url="https://chatgpt.com/c/abc",
+        browser_window_urls=(
+            "https://chatgpt.com/c/abc",
+            "https://meet.google.com/aaa-bbbb-ccc",
+        ),
+    )
+    mic = MicState(holders=[MicHolder("chrome.exe", 1234)])
+
+    # Without exclusion: gmeet wins (default order, matches via background
+    # browser_window_urls).
+    r = match_whitelist(specs, fg, mic)
+    assert r is not None and r.app_key == "gmeet"
+
+    # With gmeet excluded: chatgpt-com wins via the foreground tab URL.
+    r = match_whitelist(specs, fg, mic, exclude_app_keys=frozenset({"gmeet"}))
+    assert r is not None and r.app_key == "chatgpt-com"
+
+
+def test_exclude_app_keys_returns_none_when_only_match_is_excluded():
+    fg = ForegroundInfo(process_name="zoom.exe")
+    mic = MicState(holders=[MicHolder("zoom.exe", 1234)])
+    r = match_whitelist(SPECS, fg, mic, exclude_app_keys=frozenset({"zoom"}))
+    assert r is None
+
+
 def test_macos_proxy_match_has_empty_target_pids():
     """macOS proxy path can't attribute PIDs inline (``mic.holders=[]``);
     the ArmController resolves them via a platform helper before arming.

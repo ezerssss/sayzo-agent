@@ -108,6 +108,21 @@ class _Cooldowns:
         until = self.entries.get(app_key, 0.0)
         return now < until
 
+    def suppressed_keys(self, now_mono: float) -> frozenset[str]:
+        """Union of declined app_keys + currently-active timed cooldowns.
+
+        Passed to ``match_whitelist(exclude_app_keys=…)`` so the watcher
+        skips suppressed specs entirely instead of finding the first match,
+        seeing it's suppressed, and giving up — which let a declined
+        background gmeet tab mask a foreground chatgpt-com match (user
+        report 2026-04-25).
+        """
+        keys = set(self.declined_release_at.keys())
+        for app_key, until in self.entries.items():
+            if now_mono < until:
+                keys.add(app_key)
+        return frozenset(keys)
+
     def set(self, app_key: str, until_mono: float) -> None:
         """Set a timed cooldown until the given monotonic time."""
         self.entries[app_key] = until_mono
@@ -709,7 +724,16 @@ class ArmController:
                             "fresh prompt on next match)",
                             app_key,
                         )
-                match = _d.match_whitelist(self.cfg.detectors, fg, mic)
+                # Skip suppressed app_keys directly inside match_whitelist
+                # so a declined gmeet (still "holding" via background tab)
+                # can't shadow a chatgpt-com match in the foreground —
+                # without this filter the watcher would find gmeet first,
+                # see it's suppressed, and silently bail for the whole poll.
+                suppressed = self._cooldowns.suppressed_keys(now_mono)
+                match = _d.match_whitelist(
+                    self.cfg.detectors, fg, mic,
+                    exclude_app_keys=suppressed,
+                )
                 if match is None:
                     last_match_key = None
                     # Record any unmatched mic-holders so the Settings
@@ -726,12 +750,6 @@ class ArmController:
                         match.display_name, match.app_key, match.source,
                     )
                     last_match_key = match.app_key
-                if self._cooldowns.active(match.app_key, now_mono):
-                    log.debug(
-                        "[arm] whitelist match for %s suppressed",
-                        match.app_key,
-                    )
-                    continue
                 log.info("[arm] firing consent toast for %s", match.app_key)
                 # Show consent toast.
                 result = await self._ask_consent(

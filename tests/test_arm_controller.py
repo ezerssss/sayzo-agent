@@ -18,7 +18,7 @@ import pytest
 
 from sayzo_agent.arm.controller import ArmController, ArmReason, ArmState
 from sayzo_agent.arm.detectors import ForegroundInfo, MicHolder, MicState
-from sayzo_agent.config import ArmConfig, ConversationConfig, default_detector_specs
+from sayzo_agent.config import ArmConfig, ConversationConfig, DetectorSpec, default_detector_specs
 from sayzo_agent.conversation import ConversationDetector
 from sayzo_agent.models import SessionCloseReason, SpeechSegment
 
@@ -458,6 +458,68 @@ async def test_whitelist_decline_clears_when_app_releases_mic():
     # Let the second toast fire + accept land.
     await asyncio.sleep(0.2)
     assert ctrl.state == ArmState.ARMED
+
+    ctrl._whitelist_task.cancel()
+    try:
+        await ctrl._whitelist_task
+    except asyncio.CancelledError:
+        pass
+    await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
+
+
+async def test_decline_in_browser_does_not_mask_other_browser_match():
+    """v1.8.2: a declined gmeet match in a background tab must NOT shadow
+    a chatgpt-com match in the foreground tab. Pre-fix the watcher would
+    find gmeet first (default detector order, matches via background
+    browser_window_urls), see it's suppressed, and bail for the whole
+    poll — leaving ChatGPT silently uncaptured. With ``exclude_app_keys``
+    plumbed in, gmeet is skipped entirely and chatgpt-com fires its toast.
+    """
+    notifier = FakeNotifier()
+    notifier.consent_script = ["no", "yes"]  # decline gmeet, accept chatgpt
+
+    custom = DetectorSpec(
+        app_key="chatgpt-com", display_name="ChatGPT", is_browser=True,
+        url_patterns=[r"^https://chatgpt\.com/"],
+    )
+
+    fg_meet = ForegroundInfo(
+        process_name="chrome.exe", is_browser=True,
+        browser_tab_url="https://meet.google.com/aaa-bbb-ccc",
+    )
+    ctrl, _, _, sys_cap, *_ = _make_controller(
+        notifier=notifier,
+        mic_holders=[MicHolder("chrome.exe", 1111)],
+        foreground=fg_meet,
+        cfg_overrides={
+            "detectors": default_detector_specs() + [custom],
+        },
+    )
+    ctrl._loop = asyncio.get_running_loop()
+    ctrl._whitelist_task = asyncio.create_task(ctrl._run_whitelist_watcher())
+
+    # First toast fires for gmeet; user declines.
+    await asyncio.sleep(0.05)
+    assert "gmeet" in ctrl._cooldowns.declined_release_at
+    assert ctrl.state == ArmState.DISARMED
+
+    # User switches focus to the chatgpt tab; Meet still in background.
+    fg_chatgpt = ForegroundInfo(
+        process_name="chrome.exe", is_browser=True,
+        browser_tab_url="https://chatgpt.com/c/abc",
+        browser_window_urls=(
+            "https://chatgpt.com/c/abc",
+            "https://meet.google.com/aaa-bbb-ccc",
+        ),
+    )
+    ctrl._q_foreground = lambda: fg_chatgpt
+
+    # Second toast must fire for chatgpt-com despite gmeet still matching
+    # via background_window_urls.
+    await asyncio.sleep(0.2)
+    assert ctrl.state == ArmState.ARMED
+    assert ctrl._reason is not None
+    assert ctrl._reason.app_key == "chatgpt-com"
 
     ctrl._whitelist_task.cancel()
     try:

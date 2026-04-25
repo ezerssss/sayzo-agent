@@ -204,6 +204,8 @@ def match_whitelist(
     specs: list[DetectorSpec],
     foreground: ForegroundInfo,
     mic: MicState,
+    *,
+    exclude_app_keys: frozenset[str] = frozenset(),
 ) -> Optional[MatchResult]:
     """Return the first high-confidence match across ``specs``, or None.
 
@@ -216,10 +218,21 @@ def match_whitelist(
     from ``mic.holders``. macOS paths leave it empty here; the
     ArmController resolves PIDs via a platform helper (psutil +
     NSWorkspace) before arming. Empty tuple ⇒ endpoint-wide capture.
+
+    ``exclude_app_keys`` lets the caller skip specs that are currently
+    suppressed (decline-release pending, or post-session timed cooldown).
+    Without this, a declined ``gmeet`` match in a background browser
+    window would mask a ``chatgpt-com`` match in the foreground tab —
+    the watcher only looks at the first match per poll, so the next
+    valid match never gets a chance to fire its consent toast.
     """
     # User-disabled detectors are invisible to matching. Filter once here
-    # so the three passes below don't each repeat the check.
-    active_specs = [s for s in specs if not s.disabled]
+    # so the three passes below don't each repeat the check. Same goes
+    # for caller-supplied suppressions (declined / cooled-down apps).
+    active_specs = [
+        s for s in specs
+        if not s.disabled and s.app_key not in exclude_app_keys
+    ]
 
     holder_names = {h.process_name.lower() for h in mic.holders}
 
