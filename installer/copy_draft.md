@@ -34,17 +34,16 @@ One window, one walkthrough. No second tkinter step after it closes — everythi
 - Upper-left: Sayzo logo + "Sayzo"
 - Each step shows a numeric indicator (`01` / `02` / …).
 
-### macOS flow — 9 screens
+### macOS flow — 8 screens
 
 1. Welcome (sign-in)
 2. Download model
 3. Microphone
 4. Audio Capture
-5. Accessibility
-6. Automation (browsers)
-7. Notifications
-8. Shortcut
-9. Done
+5. Accessibility (covers global hotkey AND web meeting detection)
+6. Notifications
+7. Shortcut
+8. Done
 
 ### Windows flow — 5 screens
 
@@ -71,37 +70,41 @@ One window, one walkthrough. No second tkinter step after it closes — everythi
 
 ### Screen 03 — Microphone (macOS only)
 
-- Title: **Sayzo needs to hear you**
-- Body: *"We'll only record when you ask — either with your keyboard shortcut, or after you say yes to an on-screen prompt. This permission just lets Sayzo open the microphone at that moment."*
-- Buttons: **Cancel** / **Skip for now** / **Grant**
-- On Grant: triggers the macOS Microphone TCC dialog by briefly opening a `sounddevice.InputStream` (see `mac_permissions.prompt_microphone`). Advance is user-initiated — pressing Continue after the system dialog resolves.
-- If denied: status text reads *"Access was denied. Open System Settings to change your mind, then come back and press Grant again."* and the button changes to **Open Settings**.
+- Title (**APPROVED**): **Microphone access**
+- Body (**APPROVED**): *"Sayzo uses your mic only when you start a conversation — with your keyboard shortcut, or by accepting a prompt on screen."*
+- Buttons: **Cancel** / **Allow**
+- On Allow: triggers the macOS Microphone TCC dialog by briefly opening a `sounddevice.InputStream` (see `mac_permissions.prompt_microphone`). Advance is user-initiated — pressing Continue after the system dialog resolves.
+- Granted state (**APPROVED**): *"All set! Your conversations are ready to become personalized speaking drills."*
+- Denied state (**APPROVED**): *"Looks like macOS blocked the mic. Open System Settings, turn it on for Sayzo, then come back."* — button changes to **Open Settings**.
+- No Skip option: mic access is required to use Sayzo.
 
 ### Screen 04 — Audio Capture (macOS only)
 
-- Title: **And the other side of your meetings**
-- Body (**APPROVED**): *"So Sayzo can hear the other person in your meetings, not just you."*
-- Buttons: **Cancel** / **Skip for now** / **Grant**
-- On Grant: spawns the pre-compiled audio-tap Swift helper, which triggers the Audio Capture TCC dialog via `AudioHardwareCreateProcessTap`.
-- Denied state (**APPROVED**): *"Sayzo can't record system audio. Turn it on in System Settings, then come back."*
+- Title (**APPROVED**): **System audio access**
+- Body (**APPROVED**): *"Sayzo captures audio from your meetings — like Zoom, Meet, or Teams — so it can transcribe the full conversation, not just your side."*
+- Buttons: **Cancel** / **Allow**
+- On Allow: spawns the pre-compiled audio-tap Swift helper, which triggers the Audio Capture TCC dialog via `AudioHardwareCreateProcessTap`.
+- Granted state (**APPROVED**): *"All set! Your drills will now use the whole meeting — not just your side."*
+- Denied state (**APPROVED**): *"Looks like macOS blocked system audio. Open System Settings, turn it on for Sayzo, then come back."*
+- No Skip option: system audio access is required for drills to capture full meeting context.
 
 ### Screen 05 — Accessibility (macOS only)
 
-- Title (**APPROVED**): **Let the shortcut work anywhere**
-- Body (**APPROVED**): *"Without this, your shortcut only works when Sayzo is focused. You can always grant it later from System Settings."*
-- Buttons: **Cancel** / **Skip for now** / **Open System Settings**
-- On Open: deep-link to `x-apple.systempreferences:…Privacy_Accessibility`. Follow-up copy (**APPROVED**): *"Find **Sayzo** under Accessibility, turn it on, then come back and press Continue."*
+- Title (**APPROVED**): **Accessibility access**
+- Body (**APPROVED**): *"Lets your keyboard shortcut start Sayzo from any app, and helps Sayzo notice when you're in a web meeting (Meet, Zoom web, Teams web). Only the shortcut you picked wakes Sayzo up — anything else you type goes nowhere near it."*
+- Buttons: **Cancel** / **Open System Settings** (no Skip — required to use Sayzo)
+- Pre-open body (idle state):
+  - *"What Sayzo can do with this: watch for the one shortcut you set, and read the title of your active browser tab (e.g. 'Meet — abc-defg-hij') to detect when you've joined a web meeting. Page contents, what you type into pages, your browsing history — none of it crosses over."*
+  - *"Without this on, your shortcut won't work outside the Sayzo window and Sayzo can't auto-prompt for browser meetings — so we won't move you forward until it's set."*
+- On Open: deep-link to `x-apple.systempreferences:…Privacy_Accessibility`, screen flips to **Waiting for Accessibility…** state with a pulsing dot. Sayzo is **not** pre-populated in the list (macOS gates the entry behind a manual add), so the follow-up copy walks the user through the +-button flow:
+  - *"Sayzo isn't in the Accessibility list yet — macOS keeps that gate locked, so even Sayzo can't toggle it on for you. Add it once and we'll detect it automatically."*
+  - Numbered steps: 1) Click the **+** button under the list. 2) Pick **Sayzo** from your Applications folder, then click Open. 3) Toggle **Sayzo** on. We'll spot it within a second or two and unlock Continue.
+- Verification: setup window polls `AXIsProcessTrusted()` every 1.5s once the user has clicked Open Settings. The Continue button stays hidden until the call returns True — there is no "trust me, I clicked Allow" advance path.
+- Granted state (**APPROVED**): *"All set! Your shortcut works anywhere, and Sayzo can spot browser meetings."*
 
-### Screen 06 — Automation (macOS only)
+> **Why no separate Automation screen.** v1 used `osascript` to read browser tab URLs, which forced the macOS Automation TCC dialog (*"Sayzo wants to control your browser"*) — alarming wording for a coaching app, especially around work browsers with sensitive content. v2 reads browser **window titles** via `AXUIElementCopyAttributeValue`, which is gated by the **same** Accessibility permission already required for the global hotkey. No second dialog ever appears. Detection precision is preserved by combining title-regex matching with the existing mic-holder filter (`detectors._browser_holds_mic`).
 
-- Title: **Know when you're in a web meeting**
-- Body (**APPROVED**): *"So Sayzo can tell you're in Google Meet or Teams, instead of just browsing. Only the tab's URL — never what's on the page."*
-- Buttons: **Cancel** / **Skip for now** / **Grant (per browser)**
-- On Grant: fires one throwaway AppleScript per installed browser (Chrome, Safari, Edge, Arc, Brave), each producing an Automation TCC dialog.
-- Follow-up copy (**APPROVED**): *"macOS will ask once per browser. Click OK on each prompt ({browsers}), then press Continue."*
-- Empty state (**APPROVED**): *"No supported browsers found. You can skip this step."*
-
-### Screen 07 — Notifications (both platforms, different copy)
+### Screen 06 — Notifications (both platforms, different copy)
 
 - Title (macOS, **APPROVED**): **Let Sayzo send you notifications**
 - Title (Windows, **APPROVED**): **Check your notification settings**
@@ -114,7 +117,7 @@ One window, one walkthrough. No second tkinter step after it closes — everythi
 - Granted sub-body (**APPROVED**): *"All set."*
 - Denied sub-body (**APPROVED**): *"Notifications are blocked. Open Settings to turn them on, then try again."*
 
-### Screen 08 — Shortcut (both)
+### Screen 07 — Shortcut (both)
 
 - Title: **Last thing — pick your shortcut**
 - Body (**APPROVED**): *"This is the key you press when you want Sayzo to start or stop a capture. It's the main way you tell Sayzo to record. You can change it anytime from Settings."*
@@ -123,7 +126,7 @@ One window, one walkthrough. No second tkinter step after it closes — everythi
 - Error (OS-reserved combo): *"That shortcut is used by the OS for {clipboard copy / app switcher / …}. Please pick another."*
 - Buttons: **Cancel** / **Continue** (disabled while saving)
 
-### Screen 09 — Done (both)
+### Screen 08 — Done (both)
 
 - Title: **You're all set**
 - Body (**APPROVED**): *"Press {hotkey} to start a capture, or say yes when Sayzo spots a meeting. That's it — nothing records until you say so."*

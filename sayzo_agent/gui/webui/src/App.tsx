@@ -6,7 +6,6 @@ import { Download } from "./screens/Download";
 import { Microphone } from "./screens/Microphone";
 import { AudioCapture } from "./screens/AudioCapture";
 import { Accessibility } from "./screens/Accessibility";
-import { Automation } from "./screens/Automation";
 import { Notifications } from "./screens/Notifications";
 import { Shortcut } from "./screens/Shortcut";
 import { Done } from "./screens/Done";
@@ -17,8 +16,12 @@ import { Alert } from "./components/ui/Alert";
 // e.g. when the install was cancelled mid-flow and re-opened. Everything
 // after that is a straight walk to the Done screen.
 //
-// macOS (9): welcome → download → microphone → audio-capture →
-//            accessibility → automation → notifications → shortcut → done
+// macOS (8): welcome → download → microphone → audio-capture →
+//            accessibility → notifications → shortcut → done
+//   (Accessibility doubles as the gate for the global hotkey AND the
+//   AX-based web meeting detector — there's no separate Automation
+//   screen, since reading browser tab URLs would force the scary
+//   "Sayzo wants to control your browser" TCC dialog.)
 // Windows (5): welcome → download → notifications → shortcut → done
 type Screen =
   | "loading"
@@ -27,7 +30,6 @@ type Screen =
   | "microphone"
   | "audio-capture"
   | "accessibility"
-  | "automation"
   | "notifications"
   | "shortcut"
   | "done";
@@ -40,7 +42,6 @@ function sequenceFor(platform: string): Screen[] {
       "microphone",
       "audio-capture",
       "accessibility",
-      "automation",
       "notifications",
       "shortcut",
       "done",
@@ -73,7 +74,12 @@ export function App() {
   const [screen, setScreen] = useState<Screen>("loading");
   const [status, setStatus] = useState<SetupStatus | null>(null);
   const [config, setConfig] = useState<ConfigSnapshot | null>(null);
-  const [hotkeyDisplay, setHotkeyDisplay] = useState("Ctrl+Alt+S");
+  // Initialised empty; populated by the same Promise.all that fetches
+  // status + config below. The loading guard at the bottom of this
+  // component blocks rendering until status/config are set, and React
+  // batches the three setStates so hotkeyDisplay arrives at the same
+  // commit — the empty default never reaches a child screen.
+  const [hotkeyDisplay, setHotkeyDisplay] = useState("");
   const [globalError, setGlobalError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -198,14 +204,6 @@ export function App() {
     case "accessibility":
       return (
         <Accessibility
-          step={step!}
-          onNext={advance}
-          onCancel={handleCancel}
-        />
-      );
-    case "automation":
-      return (
-        <Automation
           step={step!}
           onNext={advance}
           onCancel={handleCancel}

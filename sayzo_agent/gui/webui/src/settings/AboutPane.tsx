@@ -3,6 +3,7 @@ import { settingsBridge, AboutInfo } from "../lib/settings-bridge";
 import { subscribe, SayzoEvent } from "../lib/events";
 import { useCopyToClipboard } from "../lib/useCopyToClipboard";
 import { Button } from "../components/ui/Button";
+import logoUrl from "../assets/logo.png";
 
 type CheckState =
   | { kind: "idle" }
@@ -81,14 +82,26 @@ export function AboutPane() {
 
   return (
     <div>
-      <h1 className="text-2xl font-semibold tracking-tight text-ink">
-        About Sayzo
-      </h1>
-      <p className="mt-3 max-w-md text-sm leading-relaxed text-ink-muted">
-        Sayzo listens only when you say so — it captures meetings on your
-        machine and turns them into personalized speaking drills in the Sayzo
-        web app.
-      </p>
+      {/* Brand hero — mirrors the centered logo + tagline treatment on
+          sayzo.app's login page so the desktop app feels like one product
+          with the web. Left-aligned here (matches the rest of the Settings
+          panes), but visually prominent as the splash for this view. */}
+      <section className="flex items-center gap-5 rounded-2xl border border-ink-border bg-gradient-to-br from-white to-blue-50/40 p-6">
+        <img
+          src={logoUrl}
+          alt=""
+          className="h-20 w-20 shrink-0 drop-shadow-sm"
+        />
+        <div className="min-w-0">
+          <h1 className="text-2xl font-semibold tracking-tight text-ink">
+            Sayzo
+          </h1>
+          <p className="mt-1.5 max-w-sm text-sm leading-relaxed text-ink-muted">
+            Your English coach &mdash; tuned to how you actually speak.
+            Sayzo turns your real meetings into personalized speaking drills.
+          </p>
+        </div>
+      </section>
 
       {/* Version + update-check */}
       <section className="mt-8">

@@ -10,6 +10,7 @@ type SaveState =
 
 export function ShortcutPane() {
   const [binding, setBinding] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [save, setSave] = useState<SaveState>({ kind: "idle" });
 
   useEffect(() => {
@@ -18,8 +19,11 @@ export function ShortcutPane() {
       try {
         const h = await settingsBridge.getHotkey();
         if (!cancelled) setBinding(h.binding);
-      } catch {
-        if (!cancelled) setBinding("ctrl+alt+s");
+      } catch (e) {
+        // Don't fall back to the default binding here — that would silently
+        // misrepresent the user's actual saved shortcut. Surface the error
+        // so they can retry or check the agent log instead.
+        if (!cancelled) setLoadError(String(e));
       }
     })();
     return () => {
@@ -45,6 +49,13 @@ export function ShortcutPane() {
     }
   }
 
+  if (loadError != null) {
+    return (
+      <div className="text-sm text-red-700">
+        Couldn't load your shortcut. {loadError}
+      </div>
+    );
+  }
   if (binding == null) {
     return <div className="text-sm text-ink-muted">Loading shortcut…</div>;
   }

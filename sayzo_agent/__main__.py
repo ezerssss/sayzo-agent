@@ -752,7 +752,12 @@ def service(force_setup: bool) -> None:
     from .app import Agent
     from .notify import APP_AUMID, DesktopNotifier, NoopNotifier
 
-    tray_state = TrayState()
+    # Seed the tray with the user's actual hotkey at construction. The
+    # TrayState dataclass field has a default of "Ctrl+Alt+S" for tests,
+    # but the live agent must reflect whatever's in user_settings.json so
+    # the menu/tooltip don't briefly flash the default before
+    # _sync_arm_state_to_tray runs.
+    tray_state = TrayState(hotkey_display=humanize_binding(cfg.arm.hotkey))
     tray = TrayIcon(tray_state, cfg.captures_dir)
 
     notifier = DesktopNotifier(app_name=APP_AUMID) if cfg.notifications_enabled else NoopNotifier()
@@ -796,6 +801,17 @@ def service(force_setup: bool) -> None:
 
         def _ipc_rebind_hotkey(binding: str) -> dict:
             err = agent.arm.rebind_hotkey(binding)
+            if err is None:
+                # Push the new binding into the tray immediately rather
+                # than waiting up to 500 ms for the next _tray_bridge tick.
+                # Without this, users who change their hotkey in Settings
+                # see the old binding lingering in the tray menu / tooltip
+                # until the polling loop catches up — long enough that
+                # they assume the change didn't apply.
+                tray_state.set_hotkey_display(
+                    humanize_binding(agent.arm.current_hotkey)
+                )
+                tray.update()
             return {"error": err}
 
         def _ipc_snapshot_mic_state() -> dict:
@@ -989,10 +1005,19 @@ def service(force_setup: bool) -> None:
             finishes — not up to 0.5 s later. Without this the user saw
             "right-click menu still says Start recording" right after
             arming.
+
+            Also re-seeds the hotkey display from ``agent.arm.current_hotkey``
+            so a user with a custom binding (loaded from
+            ``user_settings.json`` at boot) doesn't see the dataclass
+            default ``"Ctrl+Alt+S"`` flash in the menu before
+            ``_tray_bridge``'s first poll catches up.
             """
             cur = agent.arm.state
             tray_state.set_status(
                 TrayStatus.ARMED if cur == ArmState.ARMED else TrayStatus.DISARMED
+            )
+            tray_state.set_hotkey_display(
+                humanize_binding(agent.arm.current_hotkey)
             )
             tray.update()
 
@@ -1031,6 +1056,12 @@ def service(force_setup: bool) -> None:
                 cur_hotkey = agent.arm.current_hotkey
                 if cur_hotkey != last_hotkey:
                     tray_state.set_hotkey_display(humanize_binding(cur_hotkey))
+                    # On Linux/GTK pystray's menu is long-lived; without an
+                    # explicit update_menu() the new label sits in
+                    # TrayState but doesn't surface until the next icon
+                    # repaint. Windows / macOS rebuild on each menu open
+                    # via the callable text, so this is a no-op there.
+                    tray.update()
                     last_hotkey = cur_hotkey
 
         # Best-effort update check. Surfaces "Download Sayzo vX.Y.Z" in the

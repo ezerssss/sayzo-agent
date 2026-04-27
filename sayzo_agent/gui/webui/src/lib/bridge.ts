@@ -34,12 +34,12 @@ export type HotkeySaveResult = {
   display?: string;
 };
 
-export type AutomationPromptResult = {
-  prompted: string[]; // short labels of browsers we hit
-};
-
 export type AccessibilityOpenResult = {
   opened: boolean;
+};
+
+export type AccessibilityTrustedResult = {
+  trusted: boolean;
 };
 
 // Named interface so other modules (e.g. lib/settings-bridge.ts) can merge
@@ -57,13 +57,15 @@ declare global {
     prompt_mic_permission(): Promise<PermissionResult>;
     prompt_audio_capture_permission(): Promise<PermissionResult>;
     prompt_notification_permission(): Promise<PermissionResult>;
-    prompt_automation_permission(): Promise<AutomationPromptResult>;
 
     // Settings deep-links.
     open_mic_settings(): Promise<null>;
     open_audio_capture_settings(): Promise<null>;
     open_notification_settings(): Promise<null>;
     open_accessibility_settings(): Promise<AccessibilityOpenResult>;
+
+    // Accessibility verification (polled by setup window after deep-link).
+    check_accessibility_trusted(): Promise<AccessibilityTrustedResult>;
 
     // Hotkey (persisted to user_settings.json).
     get_hotkey(): Promise<HotkeyState>;
@@ -173,10 +175,6 @@ export const bridge = {
     await whenReady();
     return window.pywebview.api.prompt_notification_permission();
   },
-  async promptAutomationPermission() {
-    await whenReady();
-    return window.pywebview.api.prompt_automation_permission();
-  },
   async openMicSettings() {
     await whenReady();
     return window.pywebview.api.open_mic_settings();
@@ -192,6 +190,10 @@ export const bridge = {
   async openAccessibilitySettings() {
     await whenReady();
     return window.pywebview.api.open_accessibility_settings();
+  },
+  async checkAccessibilityTrusted() {
+    await whenReady();
+    return window.pywebview.api.check_accessibility_trusted();
   },
 
   // Hotkey.

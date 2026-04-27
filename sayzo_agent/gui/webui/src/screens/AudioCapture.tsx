@@ -15,7 +15,7 @@ type State = "idle" | "pending" | "granted" | "denied";
 export function AudioCapture({ step, onNext, onCancel }: Props) {
   const [state, setState] = useState<State>("idle");
 
-  async function handleGrant() {
+  async function handleAllow() {
     setState("pending");
     try {
       const { granted } = await bridge.promptAudioCapturePermission();
@@ -28,15 +28,12 @@ export function AudioCapture({ step, onNext, onCancel }: Props) {
   return (
     <Layout
       step={step}
-      title="And the other side of your meetings"
-      subtitle="So Sayzo can hear the other person in your meetings, not just you."
+      title="System audio access"
+      subtitle="Sayzo captures audio from your meetings — like Zoom, Meet, or Teams — so it can transcribe the full conversation, not just your side."
       footer={
         <>
           <Button variant="ghost" onClick={onCancel}>
             Cancel
-          </Button>
-          <Button variant="ghost" onClick={onNext}>
-            Skip for now
           </Button>
           {state === "granted" ? (
             <Button onClick={onNext}>Continue</Button>
@@ -48,8 +45,8 @@ export function AudioCapture({ step, onNext, onCancel }: Props) {
               Open Settings
             </Button>
           ) : (
-            <Button onClick={handleGrant} disabled={state === "pending"}>
-              {state === "pending" ? "Requesting…" : "Grant"}
+            <Button onClick={handleAllow} disabled={state === "pending"}>
+              {state === "pending" ? "Requesting…" : "Allow"}
             </Button>
           )}
         </>
@@ -58,15 +55,16 @@ export function AudioCapture({ step, onNext, onCancel }: Props) {
       {state === "granted" && (
         <div className="flex items-center gap-2 text-sm font-medium text-green-700">
           <CheckCircle2 className="h-4 w-4" />
-          System audio capture granted
+          All set! Your drills will now use the whole meeting — not just
+          your side.
         </div>
       )}
       {state === "denied" && (
         <div className="flex items-start gap-2 text-sm text-red-700">
           <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
           <span>
-            Sayzo can't record system audio. Turn it on in System Settings,
-            then come back.
+            Looks like macOS blocked system audio. Open System Settings, turn
+            it on for Sayzo, then come back.
           </span>
         </div>
       )}

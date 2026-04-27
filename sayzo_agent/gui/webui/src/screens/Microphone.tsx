@@ -15,7 +15,7 @@ type State = "idle" | "pending" | "granted" | "denied";
 export function Microphone({ step, onNext, onCancel }: Props) {
   const [state, setState] = useState<State>("idle");
 
-  async function handleGrant() {
+  async function handleAllow() {
     setState("pending");
     try {
       const { granted } = await bridge.promptMicPermission();
@@ -28,15 +28,12 @@ export function Microphone({ step, onNext, onCancel }: Props) {
   return (
     <Layout
       step={step}
-      title="Sayzo needs to hear you"
-      subtitle="We'll only record when you ask — either with your keyboard shortcut, or after you say yes to an on-screen prompt. This permission just lets Sayzo open the microphone at that moment."
+      title="Microphone access"
+      subtitle="Sayzo uses your mic only when you start a conversation — with your keyboard shortcut, or by accepting a prompt on screen."
       footer={
         <>
           <Button variant="ghost" onClick={onCancel}>
             Cancel
-          </Button>
-          <Button variant="ghost" onClick={onNext}>
-            Skip for now
           </Button>
           {state === "granted" ? (
             <Button onClick={onNext}>Continue</Button>
@@ -45,8 +42,8 @@ export function Microphone({ step, onNext, onCancel }: Props) {
               Open Settings
             </Button>
           ) : (
-            <Button onClick={handleGrant} disabled={state === "pending"}>
-              {state === "pending" ? "Requesting…" : "Grant"}
+            <Button onClick={handleAllow} disabled={state === "pending"}>
+              {state === "pending" ? "Requesting…" : "Allow"}
             </Button>
           )}
         </>
@@ -55,15 +52,16 @@ export function Microphone({ step, onNext, onCancel }: Props) {
       {state === "granted" && (
         <div className="flex items-center gap-2 text-sm font-medium text-green-700">
           <CheckCircle2 className="h-4 w-4" />
-          Microphone access granted
+          All set! Your conversations are ready to become personalized
+          speaking drills.
         </div>
       )}
       {state === "denied" && (
         <div className="flex items-start gap-2 text-sm text-red-700">
           <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
           <span>
-            Sayzo can't access your microphone. Turn it on in System Settings,
-            then come back.
+            Looks like macOS blocked the mic. Open System Settings, turn it on
+            for Sayzo, then come back.
           </span>
         </div>
       )}

@@ -255,30 +255,70 @@ class TrayIcon:
         self._run()
 
     def update(self) -> None:
-        """Refresh the icon/tooltip if the status changed. Call from any thread.
+        """Refresh the icon, tooltip, and menu labels. Call from any thread.
 
-        On macOS, icon/title mutation touches AppKit objects which is only
-        safe on the main thread. We skip cross-thread mutation there; the
-        menu text callbacks still re-evaluate dynamically when the menu is
-        opened, so arm/disarm labels stay correct.
+        Always rebuilds the menu — pystray's macOS backend evaluates
+        ``MenuItem.text`` callables **once** at menu-construction time
+        (``initWithTitle_action_keyEquivalent_`` in ``pystray/_darwin.py``
+        sets a fixed string), so dynamic labels like the arm/stop hotkey
+        only refresh when ``update_menu()`` actually re-runs the
+        callable. The earlier short-circuit ("text re-evaluates on menu
+        open") was wrong on macOS — confirmed by reading the pystray
+        source — and produced the bug where the tray menu kept showing
+        the default hotkey after the user changed it in Settings.
+
+        Threading:
+
+        - **Windows** — pystray's right-click handler rebuilds the popup
+          fresh, so ``update_menu`` is technically a no-op for *menu*
+          purposes; we still call it for the icon/tooltip mutation paths.
+        - **Linux/GTK** — long-lived menu, ``update_menu`` is required.
+        - **macOS** — NSStatusItem / NSMenu / NSMenuItem mutation has to
+          happen on the AppKit main thread. Pystray's ``run_main`` is
+          blocked in ``NSApp.run()`` on that thread, so we marshal via
+          ``PyObjCTools.AppHelper.callAfter`` (which posts onto NSApp's
+          runloop). Calling Cocoa methods from asyncio's background
+          thread directly would crash or silently corrupt state.
         """
         if self._icon is None:
             return
         status, error_msg = self.state.get_status()
-        if status == self._current_status:
-            return
+        status_changed = status != self._current_status
         self._current_status = status
+
         if sys.platform == "darwin":
-            # AppKit NSMenu mutation must happen on main thread; we're on
-            # asyncio's background thread here. The menu item's `text`
-            # callback re-evaluates on each menu open, so labels still
-            # refresh — just via pystray's own menu-rebuild path instead.
+            try:
+                from PyObjCTools.AppHelper import (  # type: ignore[import-not-found]
+                    callAfter,
+                )
+            except Exception:
+                log.debug("[tray] PyObjCTools unavailable", exc_info=True)
+                return
+
+            def _refresh_on_main_thread() -> None:
+                # All three touch NSObjects → main thread only.
+                try:
+                    self._icon.title = self._tooltip_for(status, error_msg)
+                except Exception:
+                    log.debug("[tray] title set failed", exc_info=True)
+                try:
+                    self._icon.update_menu()
+                except Exception:
+                    log.debug("[tray] update_menu failed", exc_info=True)
+                if status_changed:
+                    try:
+                        self._icon.icon = _make_icon(status)
+                    except Exception:
+                        log.debug("[tray] icon set failed", exc_info=True)
+
+            callAfter(_refresh_on_main_thread)
             return
-        self._icon.icon = _make_icon(status)
+
+        # Windows / Linux: direct call. Pystray handles its own internal
+        # threading on these backends.
+        if status_changed:
+            self._icon.icon = _make_icon(status)
         self._icon.title = self._tooltip_for(status, error_msg)
-        # Pystray on Windows is a no-op (menu is rebuilt on each right-
-        # click), but on Linux/GTK the native menu is long-lived and needs
-        # this kick so callable `text`/`visible` get re-evaluated.
         try:
             self._icon.update_menu()
         except Exception:

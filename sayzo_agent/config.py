@@ -333,6 +333,10 @@ def default_detector_specs() -> list[DetectorSpec]:
                 r"teams\.microsoft\.com/.+/l/meetup-join/",
                 r"teams\.microsoft\.com/_#/conversations/.+/meeting",
             ],
+            # Teams web titles channels and pages with " | Microsoft Teams"
+            # — paired with the mic-holder filter (browser actively using
+            # the mic), this is precise enough to only fire during calls.
+            title_patterns=[r"\| Microsoft Teams\b"],
         ),
         DetectorSpec(
             app_key="zoom_web", display_name="Zoom", is_browser=True,
@@ -347,18 +351,22 @@ def default_detector_specs() -> list[DetectorSpec]:
         DetectorSpec(
             app_key="webex_web", display_name="Webex", is_browser=True,
             url_patterns=[r"^https://[^/]+\.webex\.com/(meet|wbxmjs|webappng)/"],
+            title_patterns=[r"(?i)\b(?:cisco )?webex\b"],
         ),
         DetectorSpec(
             app_key="whereby", display_name="Whereby", is_browser=True,
             url_patterns=[r"^https://whereby\.com/[^/]+"],
+            title_patterns=[r"(?i)\bwhereby\b"],
         ),
         DetectorSpec(
             app_key="jitsi", display_name="Jitsi Meet", is_browser=True,
             url_patterns=[r"^https://meet\.jit\.si/[^/]+"],
+            title_patterns=[r"(?i)\bjitsi\s*meet\b"],
         ),
         DetectorSpec(
             app_key="8x8", display_name="8x8 Meet", is_browser=True,
             url_patterns=[r"^https://8x8\.vc/[^/]+"],
+            title_patterns=[r"(?i)\b8x8\s*meet\b"],
         ),
     ]
 

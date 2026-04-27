@@ -7,6 +7,7 @@ import { MeetingAppsPane } from "./MeetingAppsPane";
 import { NotificationsPane } from "./NotificationsPane";
 import { PermissionsPane } from "./PermissionsPane";
 import { ShortcutPane } from "./ShortcutPane";
+import logoUrl from "../assets/logo.png";
 
 // Sidebar order matches the legacy tkinter Settings so muscle memory
 // carries over.
@@ -110,11 +111,14 @@ interface SidebarProps {
 function Sidebar({ active, onSelect }: SidebarProps) {
   return (
     <nav className="w-56 shrink-0 border-r border-ink-border bg-gray-50">
-      <div className="px-5 pt-8 pb-6">
-        <div className="text-base font-semibold tracking-tight text-ink">
-          Sayzo
+      <div className="flex items-center gap-3 px-5 pt-8 pb-6">
+        <img src={logoUrl} alt="" className="h-9 w-9 shrink-0" />
+        <div className="min-w-0">
+          <div className="text-base font-semibold leading-tight tracking-tight text-ink">
+            Sayzo
+          </div>
+          <div className="text-xs text-ink-muted">Settings</div>
         </div>
-        <div className="text-xs text-ink-muted">Settings</div>
       </div>
       <ul className="px-2">
         {PANE_NAMES.map((name) => (

@@ -7,14 +7,25 @@ Exports mirror ``platform_win.py``:
 - ``get_running_processes()`` → set of psutil-visible process names / bundle
   ids (for the macOS proxy path in the matcher).
 - ``get_foreground_info()`` → frontmost bundle id + (if browser) active tab
-  URL via AppleScript. AppleScript is cached for 2 s per browser.
+  title via the Accessibility API. Cached for 2 s per browser.
+- ``get_browser_window_titles()`` → titles of every visible browser window
+  across all running browsers, also via Accessibility.
 - ``get_mic_holders()`` → always ``[]`` on macOS; we can't attribute
   mic-in-use to a specific process cheaply. Kept for interface symmetry.
+
+**Why AX, not AppleScript:** earlier versions read browser tab URLs via
+``osascript`` which forced macOS to fire the Automation TCC dialog
+("Sayzo wants to control your browser") — alarming wording for a coaching
+app, since the OS has no softer phrasing for "read which page is open."
+Switching to ``AXUIElementCopyAttributeValue`` reuses the Accessibility
+permission already required for the global hotkey, so no additional TCC
+prompt ever appears. AX returns the window title (e.g. ``"Meet -
+abc-defg-hij - Google Chrome"``) which the matcher's ``title_patterns``
+regexes already handle the same way they do on Windows.
 """
 from __future__ import annotations
 
 import logging
-import subprocess
 import sys
 import time
 from typing import Optional
@@ -36,10 +47,10 @@ _BROWSER_BUNDLES = {
     "com.vivaldi.Vivaldi": "Vivaldi",
 }
 
-# URL cache per browser so polling every 2 s doesn't spawn an osascript for
-# every sample. {bundle_id: (url, timestamp)}
-_URL_CACHE: dict[str, tuple[Optional[str], float]] = {}
-_URL_CACHE_TTL_SECS = 2.0
+# Title cache per browser bundle so polling every 2 s doesn't re-walk the
+# AX tree on every sample. {bundle_id: (titles, timestamp)}
+_TITLES_CACHE: dict[str, tuple[list[str], float]] = {}
+_TITLES_CACHE_TTL_SECS = 2.0
 
 
 def get_mic_holders() -> list[MicHolder]:
@@ -132,26 +143,136 @@ def resolve_pids_for_spec(spec: "DetectorSpec") -> tuple[int, ...]:
     return tuple(sorted(pids))
 
 
-def get_browser_window_titles() -> list[str]:
-    """macOS: no cheap way to enumerate all browser window titles.
+def _pids_for_bundle(bundle_id: str) -> list[int]:
+    """Return PIDs of every running process matching ``bundle_id``.
 
-    Per-window Apple Events (``get title of every window of application …``)
-    would require Automation permission per-browser and would slow the
-    watcher poll to hundreds of ms. For v1 we rely on the foreground
-    browser's tab URL/title already populated in ``get_foreground_info``;
-    the matcher's title-pattern path still works when the user is focused
-    on the browser. Returns empty otherwise.
+    Used by the AX title reader to walk every browser instance the user
+    has open (a single Chrome session can have multiple windows under one
+    PID, but profile-isolated launches show up as multiple PIDs).
     """
-    return []
+    pids: list[int] = []
+    try:
+        from AppKit import NSWorkspace  # type: ignore[import-not-found]
+        ws = NSWorkspace.sharedWorkspace()
+        for app in ws.runningApplications():
+            try:
+                bid = app.bundleIdentifier()
+                if bid and str(bid) == bundle_id:
+                    pid = int(app.processIdentifier() or 0)
+                    if pid > 0:
+                        pids.append(pid)
+            except Exception:
+                continue
+    except Exception:
+        log.debug(
+            "[arm.mac] PID lookup for %s failed", bundle_id, exc_info=True
+        )
+    return pids
+
+
+def _get_browser_titles_fresh(bundle_id: str) -> list[str]:
+    """Walk a browser's AX tree to read every visible window's title.
+
+    Uses ``AXUIElementCopyAttributeValue`` against ``kAXWindowsAttribute`` /
+    ``kAXTitleAttribute``. The Accessibility TCC permission already required
+    for the global hotkey listener (``pynput`` ⇒ ``CGEventTap``) covers this
+    call too — no separate Automation prompt fires.
+
+    If Accessibility isn't granted, the AX call returns
+    ``kAXErrorAPIDisabled`` (-25211) silently — no dialog, no exception. We
+    treat any error as "no titles" so the matcher falls through to
+    title-pattern misses. Same fallback path Windows takes when
+    UIAutomation can't read a particular tab.
+    """
+    pids = _pids_for_bundle(bundle_id)
+    if not pids:
+        return []
+
+    try:
+        from ApplicationServices import (  # type: ignore[import-not-found]
+            AXUIElementCreateApplication,
+            AXUIElementCopyAttributeValue,
+            kAXWindowsAttribute,
+            kAXTitleAttribute,
+        )
+    except Exception:
+        log.debug(
+            "[arm.mac] ApplicationServices AX bindings unavailable",
+            exc_info=True,
+        )
+        return []
+
+    titles: list[str] = []
+    for pid in pids:
+        try:
+            app_ref = AXUIElementCreateApplication(pid)
+        except Exception:
+            continue
+        try:
+            err, windows = AXUIElementCopyAttributeValue(
+                app_ref, kAXWindowsAttribute, None
+            )
+        except Exception:
+            continue
+        if err != 0 or not windows:
+            continue
+        for window in windows:
+            try:
+                err, title = AXUIElementCopyAttributeValue(
+                    window, kAXTitleAttribute, None
+                )
+            except Exception:
+                continue
+            if err != 0 or not title:
+                continue
+            try:
+                title_str = str(title).strip()
+            except Exception:
+                continue
+            if title_str:
+                titles.append(title_str)
+    return titles
+
+
+def _get_browser_titles_cached(bundle_id: str) -> list[str]:
+    now = time.monotonic()
+    entry = _TITLES_CACHE.get(bundle_id)
+    if entry is not None and (now - entry[1]) < _TITLES_CACHE_TTL_SECS:
+        return entry[0]
+    titles = _get_browser_titles_fresh(bundle_id)
+    _TITLES_CACHE[bundle_id] = (titles, now)
+    return titles
+
+
+def get_browser_window_titles() -> list[str]:
+    """Aggregate titles from every running browser via the Accessibility API.
+
+    Mirrors the Windows ``platform_win.get_browser_window_titles``
+    behaviour so ``ForegroundInfo.browser_window_titles`` is populated even
+    when the user has Alt+Tab'd away from the browser holding the mic.
+    Returns ``[]`` when Accessibility isn't granted or pyobjc bindings
+    aren't loadable — the matcher gracefully degrades to "no title-pattern
+    match available".
+    """
+    if sys.platform != "darwin":
+        return []
+    titles: list[str] = []
+    seen: set[str] = set()
+    for bundle_id in _BROWSER_BUNDLES:
+        for t in _get_browser_titles_cached(bundle_id):
+            if t in seen:
+                continue
+            seen.add(t)
+            titles.append(t)
+    return titles
 
 
 def get_browser_window_urls() -> list[str]:
-    """macOS: stub. The foreground browser's active-tab URL is already
-    populated on ``ForegroundInfo.browser_tab_url`` via AppleScript in
-    ``get_foreground_info``. Enumerating URLs of every window of every
-    browser would require the same per-browser Automation permission plus
-    multiple osascript spawns per poll — deferred until a macOS user
-    reports an Alt+Tab-equivalent mis-match.
+    """macOS no longer reads tab URLs (would require the Automation TCC
+    dialog "Sayzo wants to control your browser", which we explicitly
+    avoid). Title-based matching via ``get_browser_window_titles`` plus
+    ``DetectorSpec.title_patterns`` covers web meeting detection on macOS.
+    Always returns ``[]``.
     """
     return []
 
@@ -247,7 +368,7 @@ def get_running_processes() -> frozenset[str]:
 
 
 def get_foreground_info() -> ForegroundInfo:
-    """Frontmost bundle id + (for browsers) active tab URL."""
+    """Frontmost bundle id + (for browsers) frontmost window title via AX."""
     if sys.platform != "darwin":
         return ForegroundInfo()
     try:
@@ -268,61 +389,19 @@ def get_foreground_info() -> ForegroundInfo:
         return ForegroundInfo()
 
     is_browser = bool(bundle_id and bundle_id in _BROWSER_BUNDLES)
-    url: Optional[str] = None
+    tab_title: Optional[str] = None
     if is_browser and bundle_id:
-        url = _get_browser_url_cached(bundle_id)
+        # AX returns windows in z-order — the frontmost one first.
+        cached = _get_browser_titles_cached(bundle_id)
+        tab_title = cached[0] if cached else None
 
     return ForegroundInfo(
         process_name=proc_name,
         bundle_id=bundle_id,
         window_title=None,
-        browser_tab_url=url,
-        browser_tab_title=None,
+        browser_tab_url=None,
+        browser_tab_title=tab_title,
         is_browser=is_browser,
     )
 
 
-def _get_browser_url_cached(bundle_id: str) -> Optional[str]:
-    now = time.monotonic()
-    entry = _URL_CACHE.get(bundle_id)
-    if entry is not None and (now - entry[1]) < _URL_CACHE_TTL_SECS:
-        return entry[0]
-    url = _get_browser_url_fresh(bundle_id)
-    _URL_CACHE[bundle_id] = (url, now)
-    return url
-
-
-def _get_browser_url_fresh(bundle_id: str) -> Optional[str]:
-    """Run an AppleScript to read the active tab URL. Timeout 500 ms.
-
-    Returns None on error — the Automation permission might not be granted,
-    the browser might be in a state without a front window, or the browser
-    might not support AppleScript (Firefox). Callers handle None as
-    "no URL available, fall back to title-regex matching".
-    """
-    app_name = _BROWSER_BUNDLES.get(bundle_id)
-    if not app_name:
-        return None
-
-    if bundle_id == "com.apple.Safari":
-        script = (
-            f'tell application "{app_name}" to get URL of current tab of front window'
-        )
-    else:
-        # Chrome / Edge / Brave / Arc / Opera / Vivaldi all accept this shape.
-        script = (
-            f'tell application "{app_name}" to get URL of active tab of front window'
-        )
-    try:
-        proc = subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True, text=True, timeout=0.5,
-        )
-    except Exception:
-        log.debug("[arm.mac] osascript spawn failed", exc_info=True)
-        return None
-    if proc.returncode != 0:
-        log.debug("[arm.mac] osascript non-zero: %r", proc.stderr)
-        return None
-    url = proc.stdout.strip()
-    return url or None

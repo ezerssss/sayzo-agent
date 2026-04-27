@@ -10,10 +10,8 @@ from __future__ import annotations
 
 import enum
 import logging
-import subprocess
 import sys
 import threading
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from sayzo_agent.config import Config
@@ -26,29 +24,11 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-# Deep-link into the Accessibility pane — without this, the global hotkey
-# can't register while another app is focused on macOS.
-_MAC_ACCESSIBILITY_DEEPLINK = (
-    "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
-)
-
 # Marker file written when the user completes the full first-run flow. Must
 # match _PERMISSIONS_MARKER_NAME in detect.py. Kept for back-compat with
 # detect.py's gate logic; the name is historical, it now signals "user
 # completed the whole setup", not just the permissions step.
 _PERMISSIONS_MARKER_NAME = ".permissions_onboarded_v1"
-
-# Bundle paths + AppleScript application names for the Automation consent
-# loop. Each installed browser surfaces its own TCC prompt the first time
-# we run an AppleScript against it.
-_BROWSER_APPLESCRIPTS: list[tuple[str, str, str]] = [
-    # (bundle path, AppleScript application name, short label for logs)
-    ("/Applications/Google Chrome.app", "Google Chrome", "chrome"),
-    ("/Applications/Safari.app", "Safari", "safari"),
-    ("/Applications/Microsoft Edge.app", "Microsoft Edge", "edge"),
-    ("/Applications/Arc.app", "Arc", "arc"),
-    ("/Applications/Brave Browser.app", "Brave Browser", "brave"),
-]
 
 
 class SetupResult(enum.Enum):
@@ -214,68 +194,41 @@ class Bridge:
 
             win_permissions.open_notification_settings()
 
-    # ---- Accessibility (macOS — needed for global hotkey) -----------
+    # ---- Accessibility (macOS — needed for global hotkey + AX-based
+    # web meeting detection) -----------------------------------------
 
     def open_accessibility_settings(self) -> dict[str, Any]:
         """Deep-link into System Settings → Privacy & Security → Accessibility.
 
         macOS has no programmatic grant for Accessibility — the user must
-        drag the Sayzo app into the allow-list manually. We return
-        ``{"opened": True}`` on a best-effort spawn, ``{"opened": False}``
-        otherwise, so the frontend can flip its state accordingly.
+        click the + button under the list and add Sayzo manually. We
+        return ``{"opened": True}`` on a best-effort spawn,
+        ``{"opened": False}`` otherwise, so the frontend can flip its
+        state accordingly.
         """
         if sys.platform != "darwin":
             return {"opened": False}
+        from sayzo_agent.gui.setup import mac_permissions
+
         try:
-            subprocess.Popen(["open", _MAC_ACCESSIBILITY_DEEPLINK])
+            mac_permissions.open_accessibility_settings()
             return {"opened": True}
         except OSError as e:
             log.warning("failed to open Accessibility settings: %s", e)
             return {"opened": False}
 
-    # ---- Automation (macOS — per-browser tab-URL read) ---------------
+    def check_accessibility_trusted(self) -> dict[str, Any]:
+        """Return whether Sayzo currently has Accessibility permission.
 
-    def prompt_automation_permission(self) -> dict[str, Any]:
-        """Fire one throwaway AppleScript per installed browser so the OS
-        surfaces the Automation TCC dialog for each.
-
-        Returns ``{"prompted": [...]}`` listing the short labels of the
-        browsers we actually hit. Empty list = no browsers installed from
-        the supported set. Spawns run in a worker thread so the bridge call
-        returns immediately — the TCC dialogs queue up serially.
+        Polled by the setup window after deep-linking the user to System
+        Settings. Wraps ``AXIsProcessTrusted()`` — cheap, never prompts.
+        Always ``{"trusted": False}`` on non-darwin.
         """
         if sys.platform != "darwin":
-            return {"prompted": []}
-        threading.Thread(
-            target=self._automation_worker,
-            name="setup-automation",
-            daemon=True,
-        ).start()
-        prompted = [
-            label for path, _app, label in _BROWSER_APPLESCRIPTS
-            if Path(path).exists()
-        ]
-        return {"prompted": prompted}
+            return {"trusted": False}
+        from sayzo_agent.gui.setup import mac_permissions
 
-    def _automation_worker(self) -> None:
-        for path, app_name, label in _BROWSER_APPLESCRIPTS:
-            if not Path(path).exists():
-                continue
-            script = (
-                f'tell application "{app_name}" to '
-                "get URL of active tab of front window"
-            )
-            try:
-                subprocess.run(
-                    ["osascript", "-e", script],
-                    capture_output=True,
-                    timeout=3.0,
-                )
-            except subprocess.TimeoutExpired:
-                log.debug("[bridge] automation probe timed out for %s", label)
-            except OSError:
-                log.debug("[bridge] osascript missing", exc_info=True)
-                return
+        return {"trusted": mac_permissions.is_accessibility_trusted()}
 
     # ---- Hotkey (persisted to user_settings.json) -------------------
 

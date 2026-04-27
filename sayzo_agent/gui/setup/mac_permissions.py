@@ -40,6 +40,9 @@ _AUDIO_CAPTURE_DEEPLINK = (
 _NOTIFICATIONS_DEEPLINK = (
     "x-apple.systempreferences:com.apple.Notifications-Settings.extension"
 )
+_ACCESSIBILITY_DEEPLINK = (
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+)
 
 # Lazy DesktopNotifierSync singleton. Repeated construction is expensive and
 # pointless — the backend binding is stateless across calls once built.
@@ -193,3 +196,40 @@ def open_audio_capture_settings() -> None:
 
 def open_notification_settings() -> None:
     _open(_NOTIFICATIONS_DEEPLINK)
+
+
+def open_accessibility_settings() -> None:
+    _open(_ACCESSIBILITY_DEEPLINK)
+
+
+def is_accessibility_trusted() -> bool:
+    """Return True if Sayzo currently has Accessibility permission.
+
+    Wraps ``AXIsProcessTrusted()`` (cheap, ~microseconds, never prompts).
+    Used by the setup window's Accessibility screen to verify the user
+    actually toggled the permission on after we deep-linked them to System
+    Settings — without this check we'd auto-advance them on a hopeful
+    "I clicked Open Settings" signal even when they never flipped the
+    switch.
+
+    Returns False on non-darwin and on any binding failure (so the GUI
+    keeps polling rather than silently passing on a bad import).
+    """
+    if sys.platform != "darwin":
+        return False
+    try:
+        from ApplicationServices import (  # type: ignore[import-not-found]
+            AXIsProcessTrusted,
+        )
+    except Exception:
+        log.debug(
+            "[mac_permissions] AXIsProcessTrusted unavailable", exc_info=True
+        )
+        return False
+    try:
+        return bool(AXIsProcessTrusted())
+    except Exception:
+        log.debug(
+            "[mac_permissions] AXIsProcessTrusted call failed", exc_info=True
+        )
+        return False
