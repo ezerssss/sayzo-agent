@@ -210,7 +210,7 @@ class Bridge:
         """
         signed_in = self._has_tokens()
         text = "\n".join([
-            f"Sayzo Agent {__version__}",
+            f"Sayzo {__version__}",
             f"Platform:  {sys.platform} ({platform.platform()})",
             f"Python:    {sys.version.split()[0]}",
             f"Data dir:  {self._cfg.data_dir}",

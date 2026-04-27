@@ -130,7 +130,7 @@ export function Welcome({ onSignedIn, onCancel }: Props) {
       {uiState === "idle" && (
         <p className="mt-4 text-xs leading-relaxed text-ink-muted">
           Prefer not to sign in right now? Click <strong>Quit</strong>. You
-          can reopen Sayzo Agent from your Applications folder anytime to
+          can reopen Sayzo from your Applications folder anytime to
           finish signing in.
         </p>
       )}

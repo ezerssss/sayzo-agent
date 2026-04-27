@@ -156,37 +156,35 @@ class _PROPVARIANT(ctypes.Structure):
 _VT_BLOB = 65
 
 
-class _WAVEFORMATEX(ctypes.Structure):
-    """WAVEFORMATEX (mmreg.h) — passed to IAudioClient::Initialize.
+def _make_loopback_waveformat(rate: int = 48000, channels: int = 2):
+    """Build the fixed WAVEFORMATEX the process-loopback client requires.
 
     For process loopback we MUST construct this ourselves: the loopback
     client doesn't implement ``GetMixFormat`` (returns E_NOTIMPL), and
     Initialize requires a fixed format anyway. Microsoft's
     ``ApplicationLoopback`` sample uses 32-bit float, 2-channel, 48 kHz —
     we mirror that exactly so we have a known-good combo.
-    """
-
-    _fields_ = [
-        ("wFormatTag", wintypes.WORD),
-        ("nChannels", wintypes.WORD),
-        ("nSamplesPerSec", wintypes.DWORD),
-        ("nAvgBytesPerSec", wintypes.DWORD),
-        ("nBlockAlign", wintypes.WORD),
-        ("wBitsPerSample", wintypes.WORD),
-        ("cbSize", wintypes.WORD),
-    ]
-
-
-def _make_loopback_waveformat(rate: int = 48000, channels: int = 2) -> _WAVEFORMATEX:
-    """Build the fixed WAVEFORMATEX the process-loopback client requires.
 
     ``rate`` must be 44100 or 48000; ``channels`` 1 or 2; bits-per-sample
     is fixed at 32 (Float32). Per MSDN: any other combination is rejected
     by ``IAudioClient::Initialize`` with E_INVALIDARG.
+
+    Constructed via pycaw's ``WAVEFORMATEX`` (identical layout to the
+    Windows SDK struct) so ``ctypes.byref(wfx)`` satisfies pycaw's
+    ``IAudioClient.Initialize`` signature, which expects
+    ``POINTER(WAVEFORMATEX)`` keyed on pycaw's class identity. Constructing
+    a private ``ctypes.Structure`` with the same fields raises
+    ``ctypes.ArgumentError: expected LP_WAVEFORMATEX instance instead of
+    pointer to _WAVEFORMATEX`` because comtypes checks type identity, not
+    binary layout.
     """
+    # Import locally so module import doesn't fail on platforms without
+    # pycaw (it's win32-only via marker in pyproject.toml).
+    from pycaw.api.audioclient.depend import WAVEFORMATEX  # type: ignore[import-not-found]
+
     bits_per_sample = 32
     block_align = channels * bits_per_sample // 8
-    return _WAVEFORMATEX(
+    return WAVEFORMATEX(
         wFormatTag=_WAVE_FORMAT_IEEE_FLOAT,
         nChannels=channels,
         nSamplesPerSec=rate,
@@ -223,6 +221,7 @@ def _load_comtypes_symbols():
         "{41D949AB-9862-444A-80F6-C261334DA5EB}"
     )
     IID_IAudioClient = GUID("{1CB9AD4C-DBFA-4c32-B178-C2F568A703B2}")
+    IID_IAudioCaptureClient = GUID("{C8ADBD64-E71E-48a0-A4DE-185C395CD317}")
     # IAgileObject — marker interface (no methods) signalling that the COM
     # object is safe to invoke from any apartment without a proxy. Without
     # this, ActivateAudioInterfaceAsync rejects our completion handler
@@ -258,15 +257,58 @@ def _load_comtypes_symbols():
         _iid_ = IID_IAgileObject
         _methods_: list = []  # marker — no methods of its own
 
+    # IAudioCaptureClient — the interface IAudioClient::GetService(IID_IAudioCaptureClient)
+    # gives us. pycaw doesn't ship this one (it only wraps IAudioClient +
+    # ISimpleAudioVolume + IChannelAudioVolume), and comtypes' generic
+    # IUnknown only exposes AddRef/QueryInterface/Release — so without this
+    # declaration, ``capture_client.GetNextPacketSize()`` raises
+    # ``AttributeError`` on the very first iteration of the capture loop.
+    class IAudioCaptureClient(IUnknown):
+        _iid_ = IID_IAudioCaptureClient
+        _methods_ = [
+            # HRESULT GetBuffer(
+            #     BYTE   **ppData,
+            #     UINT32  *pNumFramesToRead,
+            #     DWORD   *pdwFlags,
+            #     UINT64  *pu64DevicePosition,
+            #     UINT64  *pu64QPCPosition);
+            COMMETHOD(
+                [],
+                comtypes.HRESULT,
+                "GetBuffer",
+                (["out"], ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte)), "ppData"),
+                (["out"], ctypes.POINTER(wintypes.DWORD), "pNumFramesToRead"),
+                (["out"], ctypes.POINTER(wintypes.DWORD), "pdwFlags"),
+                (["out"], ctypes.POINTER(ctypes.c_uint64), "pu64DevicePosition"),
+                (["out"], ctypes.POINTER(ctypes.c_uint64), "pu64QPCPosition"),
+            ),
+            # HRESULT ReleaseBuffer(UINT32 NumFramesRead);
+            COMMETHOD(
+                [],
+                comtypes.HRESULT,
+                "ReleaseBuffer",
+                (["in"], wintypes.DWORD, "NumFramesRead"),
+            ),
+            # HRESULT GetNextPacketSize(UINT32 *pNumFramesInNextPacket);
+            COMMETHOD(
+                [],
+                comtypes.HRESULT,
+                "GetNextPacketSize",
+                (["out"], ctypes.POINTER(wintypes.DWORD), "pNumFramesInNextPacket"),
+            ),
+        ]
+
     return {
         "comtypes": comtypes,
         "IUnknown": IUnknown,
         "S_OK": S_OK,
         "GUID": GUID,
         "IID_IAudioClient": IID_IAudioClient,
+        "IID_IAudioCaptureClient": IID_IAudioCaptureClient,
         "IActivateAudioInterfaceAsyncOperation": IActivateAudioInterfaceAsyncOperation,
         "IActivateAudioInterfaceCompletionHandler": IActivateAudioInterfaceCompletionHandler,
         "IAgileObject": IAgileObject,
+        "IAudioCaptureClient": IAudioCaptureClient,
     }
 
 
@@ -445,7 +487,25 @@ class ProcessLoopbackCapture:
         try:
             try:
                 import comtypes  # type: ignore[import-not-found]
-                comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
+                # Importing comtypes on a fresh thread auto-inits it to STA
+                # (sys.coinit_flags defaults to COINIT_APARTMENTTHREADED). Our
+                # explicit MTA call then trips RPC_E_CHANGED_MODE (0x80010106
+                # / signed -2147417850) and the whole capture aborts. STA is
+                # actually fine for our usage — each worker thread owns one
+                # IAudioClient (no concurrent calls from this thread) and the
+                # completion handler is IAgileObject so it can be dispatched
+                # from any apartment. So: try MTA, accept "already inited"
+                # silently, raise on any other COM init failure.
+                _RPC_E_CHANGED_MODE = -2147417850  # 0x80010106 as signed int
+                try:
+                    comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
+                except OSError as e:
+                    if getattr(e, "winerror", 0) != _RPC_E_CHANGED_MODE:
+                        raise
+                    log.debug(
+                        "[proc-loopback] thread already CoInit'd (likely STA from "
+                        "comtypes auto-init); continuing without re-init pid=%d", pid,
+                    )
             except Exception:
                 log.exception("[proc-loopback] CoInitializeEx failed for pid=%d", pid)
                 return
@@ -473,7 +533,7 @@ class ProcessLoopbackCapture:
             ready.set()
 
             try:
-                self._capture_loop(audio_client, pid)
+                self._capture_loop(audio_client, pid, syms)
             except Exception:
                 log.exception("[proc-loopback] capture loop crashed for pid=%d", pid)
             finally:
@@ -488,13 +548,17 @@ class ProcessLoopbackCapture:
             # full activation timeout.
             ready.set()
 
-    def _capture_loop(self, audio_client, pid: int) -> None:
+    def _capture_loop(self, audio_client, pid: int, syms: dict) -> None:
         """Drain the IAudioCaptureClient until ``_stop`` is set.
 
         Reads native-rate float32 frames, accumulates them into resample
         batches (same 25-frame window as endpoint capture), resamples to
         pipeline rate, and enqueues mono pipeline frames with per-frame
         monotonic timestamps.
+
+        ``syms`` is the COM symbol map from ``_load_comtypes_symbols`` —
+        we need ``IAudioCaptureClient`` from it to QueryInterface the bare
+        ``IUnknown`` that ``IAudioClient::GetService`` returns.
         """
         # Initialize in shared / event-driven / loopback mode with a 200 ms
         # buffer. 200 ms gives plenty of headroom for the GIL + resampling
@@ -525,8 +589,24 @@ class ProcessLoopbackCapture:
             log.exception("[proc-loopback] Initialize failed pid=%d", pid)
             return
 
-        # Event handle for the event-driven mode.
+        # Event handle for the event-driven mode. Set argtypes/restype
+        # explicitly: HANDLE is a pointer (8 B on x64) but Python's bare
+        # ctypes.windll.kernel32.* defaults restype to c_int (4 B), which
+        # silently truncates handle values above 2^31. Bool args also need
+        # to round-trip cleanly through wintypes.BOOL.
         kernel32 = ctypes.windll.kernel32
+        kernel32.CreateEventW.argtypes = [
+            ctypes.c_void_p,    # lpEventAttributes
+            wintypes.BOOL,      # bManualReset
+            wintypes.BOOL,      # bInitialState
+            wintypes.LPCWSTR,   # lpName
+        ]
+        kernel32.CreateEventW.restype = wintypes.HANDLE
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
         event_handle = kernel32.CreateEventW(None, False, False, None)
         if not event_handle:
             log.error("[proc-loopback] CreateEventW failed pid=%d", pid)
@@ -539,12 +619,28 @@ class ProcessLoopbackCapture:
             kernel32.CloseHandle(event_handle)
             return
 
+        # IAudioClient::GetService returns a bare ``POINTER(IUnknown)``
+        # (per pycaw's signature). The IUnknown wrapper only exposes
+        # AddRef/QueryInterface/Release — calling
+        # ``GetNextPacketSize/GetBuffer/ReleaseBuffer`` on it raises
+        # AttributeError. We have to QueryInterface for the real
+        # ``IAudioCaptureClient`` type defined in ``_load_comtypes_symbols``.
         try:
-            from comtypes import GUID  # type: ignore[import-not-found]
-            IID_IAudioCaptureClient = GUID("{C8ADBD64-E71E-48a0-A4DE-185C395CD317}")
-            capture_client_ptr = audio_client.GetService(IID_IAudioCaptureClient)
+            capture_client_iunk = audio_client.GetService(syms["IID_IAudioCaptureClient"])
         except Exception:
             log.exception("[proc-loopback] GetService(IAudioCaptureClient) failed pid=%d", pid)
+            kernel32.CloseHandle(event_handle)
+            return
+        if capture_client_iunk is None:
+            log.error("[proc-loopback] GetService returned NULL pid=%d", pid)
+            kernel32.CloseHandle(event_handle)
+            return
+        try:
+            capture_client_ptr = capture_client_iunk.QueryInterface(syms["IAudioCaptureClient"])
+        except Exception:
+            log.exception(
+                "[proc-loopback] QueryInterface(IAudioCaptureClient) failed pid=%d", pid,
+            )
             kernel32.CloseHandle(event_handle)
             return
 

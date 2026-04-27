@@ -18,7 +18,7 @@ from sayzo_agent.gui.setup.bridge import Bridge, SetupResult
 
 log = logging.getLogger(__name__)
 
-WINDOW_TITLE = "Sayzo Agent — Setup"
+WINDOW_TITLE = "Sayzo — Setup"
 WINDOW_SIZE = (720, 560)
 WINDOW_MIN_SIZE = (640, 480)
 

@@ -18,7 +18,7 @@ export function Layout({ step, title, subtitle, children, footer }: Props) {
           S
         </div>
         <span className="text-sm font-medium tracking-tight text-ink">
-          Sayzo Agent
+          Sayzo
         </span>
       </header>
 

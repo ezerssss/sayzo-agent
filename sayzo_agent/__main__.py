@@ -199,6 +199,94 @@ def test_capture(seconds: int, dump_wav: bool) -> None:
     asyncio.run(_run())
 
 
+@cli.command("test-process-loopback", hidden=True)
+@click.option("--pid", type=int, required=True, help="Target process PID (and its child process tree).")
+@click.option("--seconds", default=10, help="How long to capture before stopping.")
+@click.option("--dump-wav", is_flag=True, help="Save captured audio as test_proc_loopback.wav for listening.")
+def test_process_loopback(pid: int, seconds: int, dump_wav: bool) -> None:
+    """Smoke-test the Windows WASAPI Process Loopback capture path.
+
+    Activates ``ProcessLoopbackCapture`` against a single PID, drains its
+    queue for ``--seconds`` seconds, then reports frame count + RMS so
+    you can verify the COM/ctypes path end-to-end without rebuilding the
+    full installer. Use this to iterate on ``system_win_process.py`` --
+    it exercises ActivateAudioInterfaceAsync, IAudioClient::Initialize,
+    and IAudioCaptureClient::GetBuffer in the exact configuration the
+    agent uses, but in <1 s of dev-loop time.
+
+    Example:
+
+        sayzo-agent test-process-loopback --pid 1448 --seconds 5 --dump-wav
+    """
+    if sys.platform != "win32":
+        click.echo("ERROR: WASAPI process loopback is Windows-only.", err=True)
+        sys.exit(2)
+
+    cfg = load_config()
+    _setup_logging(cfg.log_level, debug=True)
+
+    async def _run() -> None:
+        from .capture.system_win_process import ProcessLoopbackCapture, is_supported
+        import numpy as np
+
+        if not is_supported():
+            click.echo("ERROR: this Windows build is too old (need 10.0.19041+).", err=True)
+            sys.exit(2)
+
+        cap = ProcessLoopbackCapture(
+            target_pids=(pid,),
+            sample_rate=cfg.capture.sample_rate,
+            frame_ms=cfg.capture.frame_ms,
+        )
+        click.echo(f"[smoke] starting process-loopback capture pid={pid} for {seconds}s")
+        try:
+            await cap.start()
+        except Exception as exc:
+            click.echo(f"ERROR: capture.start() raised {type(exc).__name__}: {exc}", err=True)
+            sys.exit(1)
+
+        frames: list[np.ndarray] = []
+        end = asyncio.get_running_loop().time() + seconds
+        n = 0
+        while asyncio.get_running_loop().time() < end:
+            try:
+                _ts, frame = await asyncio.wait_for(cap.queue.get(), timeout=0.1)
+            except asyncio.TimeoutError:
+                continue
+            n += 1
+            frames.append(frame)
+
+        await cap.stop()
+
+        if not frames:
+            click.echo(
+                f"[smoke] FAIL — captured 0 frames in {seconds}s. "
+                "Either the COM activation path is broken or the target process "
+                "is genuinely silent. Check log lines above for the failing call."
+            )
+            sys.exit(1)
+
+        audio = np.concatenate(frames)
+        rms = float(np.sqrt(np.mean(audio.astype(np.float32) ** 2)))
+        peak = float(np.max(np.abs(audio)))
+        click.echo(
+            f"[smoke] OK — {n} frames, {len(audio)} samples "
+            f"({len(audio) / cfg.capture.sample_rate:.2f}s), rms={rms:.4f}, peak={peak:.4f}"
+        )
+        if rms < 1e-5:
+            click.echo(
+                "[smoke] WARN — rms is near-zero. Capture activated but the "
+                "stream is silent; double-check the target PID is actually playing audio."
+            )
+
+        if dump_wav:
+            from .capture.replay import save_wav
+            save_wav(audio, cfg.capture.sample_rate, "test_proc_loopback.wav")
+            click.echo("[smoke] wrote test_proc_loopback.wav — open it in any player to verify.")
+
+    asyncio.run(_run())
+
+
 @cli.command(hidden=True)
 @click.argument("audio_file", type=click.Path(exists=True))
 @click.option("--speed", default=1.0, help="Playback speed multiplier. 0 = as fast as possible.")
@@ -356,8 +444,8 @@ def first_run(ctx: click.Context) -> None:
     signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
 
     console.print()
-    console.print("[bold cyan]  Sayzo Agent Setup[/]")
-    console.print("[cyan]  =================[/]")
+    console.print("[bold cyan]  Sayzo Setup[/]")
+    console.print("[cyan]  ===========[/]")
     console.print()
 
     # Step 1: Download model
@@ -430,15 +518,15 @@ def first_run(ctx: click.Context) -> None:
 
     console.print()
     if is_running(cfg.pid_path):
-        console.print("  [green]Sayzo Agent is already running.[/]")
+        console.print("  [green]Sayzo is already running.[/]")
     elif sys.platform == "darwin" and mac_plist.exists():
         # launchd owns the service on installed macOS; the installer script
         # runs `launchctl load` immediately after first-run returns. Spawning
         # our own subprocess here would race it for the pidfile and leak the
         # detached service's stderr to the installer terminal.
-        console.print("  [green]Sayzo Agent is configured to start automatically.[/]")
+        console.print("  [green]Sayzo is configured to start automatically.[/]")
     else:
-        console.print("  Starting Sayzo Agent...")
+        console.print("  Starting Sayzo...")
         import subprocess
         exe = sys.executable
         popen_kwargs = {
@@ -460,7 +548,7 @@ def first_run(ctx: click.Context) -> None:
             subprocess.Popen([exe, "service"], **popen_kwargs)
         else:
             subprocess.Popen([exe, "-m", "sayzo_agent", "service"], **popen_kwargs)
-        console.print("  [green]Sayzo Agent is now running in the background.[/]")
+        console.print("  [green]Sayzo is now running in the background.[/]")
 
     console.print()
     console.print("  [bold green]Setup complete![/]")

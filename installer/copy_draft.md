@@ -30,8 +30,8 @@ One window, one walkthrough. No second tkinter step after it closes — everythi
 
 ### Shared chrome
 
-- Window title: **Sayzo Agent — Setup**
-- Upper-left: S-mark + "Sayzo Agent"
+- Window title: **Sayzo — Setup**
+- Upper-left: Sayzo logo + "Sayzo"
 - Each step shows a numeric indicator (`01` / `02` / …).
 
 ### macOS flow — 9 screens
