@@ -103,10 +103,19 @@ async def _do_login(
         click.echo("Login successful.")
 
 
-@click.group()
+@click.group(invoke_without_command=True)
 @click.version_option(package_name="sayzo-agent")
-def cli() -> None:
+@click.pass_context
+def cli(ctx: click.Context) -> None:
     """Sayzo local listening agent."""
+    # No subcommand → user double-clicked Sayzo.app from /Applications (or
+    # ran the bundled exe with no args). LSUIElement=True hides the Dock
+    # icon, so without this dispatch click would silently print --help to
+    # a non-existent stdout and exit, leaving the user staring at nothing.
+    # Defaulting to `service` runs the setup-gate + tray; its pidfile check
+    # cleanly no-ops when launchd already has the service alive.
+    if ctx.invoked_subcommand is None:
+        ctx.invoke(service)
 
 
 @cli.command(hidden=True)
