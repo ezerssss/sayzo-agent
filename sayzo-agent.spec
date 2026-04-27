@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller spec for Sayzo Agent.
+"""PyInstaller spec for Sayzo.
 
 Build:
     pyinstaller sayzo-agent.spec
@@ -344,7 +344,7 @@ coll = COLLECT(
 if sys.platform == "darwin":
     app = BUNDLE(
         coll,
-        name="Sayzo Agent.app",
+        name="Sayzo.app",
         icon=app_icon,
         bundle_identifier="com.sayzo.agent",
         info_plist={

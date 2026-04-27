@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sayzo Agent — macOS one-liner installer (dev / power-user path)
+# Sayzo — macOS one-liner installer (dev / power-user path)
 # Usage: curl -fsSL https://sayzo.app/releases/macos/install.sh | bash
 #
 # Downloads the DMG and copies the .app into /Applications. The launchd
@@ -11,9 +11,9 @@
 set -euo pipefail
 
 ARCH=$(uname -m)  # x86_64 or arm64
-DMG_NAME="Sayzo-Agent.dmg"
+DMG_NAME="Sayzo.dmg"
 DOWNLOAD_URL="https://sayzo.app/releases/macos/${DMG_NAME}"
-APP_NAME="Sayzo Agent"
+APP_NAME="Sayzo"
 APP_PATH="/Applications/${APP_NAME}.app"
 TMPDIR_INSTALL=$(mktemp -d)
 
@@ -26,14 +26,14 @@ cleanup() {
 trap cleanup EXIT
 
 echo ""
-echo "  Sayzo Agent Installer"
-echo "  ====================="
+echo "  Sayzo Installer"
+echo "  ==============="
 echo ""
 
 # -----------------------------------------------------------------------
 # Download DMG
 # -----------------------------------------------------------------------
-echo "  Downloading Sayzo Agent (${ARCH})..."
+echo "  Downloading Sayzo (${ARCH})..."
 DMG_PATH="${TMPDIR_INSTALL}/${DMG_NAME}"
 if ! curl -fSL -o "$DMG_PATH" "$DOWNLOAD_URL"; then
     echo "  Download failed." >&2
@@ -74,12 +74,12 @@ echo "  Installed to ${APP_PATH}"
 SAYZO_BIN="${APP_PATH}/Contents/MacOS/sayzo-agent"
 if [ -x "$SAYZO_BIN" ]; then
     echo ""
-    echo "  Opening Sayzo Agent..."
+    echo "  Opening Sayzo..."
     nohup "$SAYZO_BIN" service --force-setup >/tmp/sayzo-agent-bootstrap.log 2>&1 &
     disown
 else
     echo "  Warning: could not find $SAYZO_BIN" >&2
-    echo "  Try opening Sayzo Agent from Applications manually." >&2
+    echo "  Try opening Sayzo from Applications manually." >&2
 fi
 
 echo ""

@@ -220,7 +220,7 @@ class Bridge:
         """Deep-link into System Settings → Privacy & Security → Accessibility.
 
         macOS has no programmatic grant for Accessibility — the user must
-        drag the Sayzo Agent app into the allow-list manually. We return
+        drag the Sayzo app into the allow-list manually. We return
         ``{"opened": True}`` on a best-effort spawn, ``{"opened": False}``
         otherwise, so the frontend can flip its state accordingly.
         """

@@ -81,7 +81,7 @@ Either way, every session that survives the pipeline is saved locally first and 
 - `notify(title, body)` — fire-and-forget toast (capture saved, post-arm guidance, stream-open error, welcome).
 - `ask_consent(title, body, yes_label, no_label, timeout_secs, default_on_timeout) -> "yes" | "no" | "timeout"` — interactive toast with two action buttons, used by the ArmController for all consent flows (whitelist, hotkey start/stop confirmation, end-of-meeting confirmation, check-in, meeting-ended).
 
-Toggle all non-consent toasts with `SAYZO_NOTIFICATIONS_ENABLED=0`. Consent + end-of-meeting toasts are always on (they're how the user decides what gets captured). AUMID (`"Sayzo.Agent"`, set in `installer/windows/sayzo-agent.nsi` and passed to `DesktopNotifier(app_name="Sayzo")`) is required on Windows 10 for WinRT toasts + buttons to render. macOS needs a signed bundle with `CFBundleIdentifier = com.sayzo.agent` (already set in `sayzo-agent.spec`) for NSUserNotification action buttons.
+Toggle all non-consent toasts with `SAYZO_NOTIFICATIONS_ENABLED=0`. Consent + end-of-meeting toasts are always on (they're how the user decides what gets captured). AUMID (`"Sayzo"`, set in `installer/windows/sayzo-agent.nsi` and passed to `DesktopNotifier(app_name="Sayzo")`) is required on Windows 10 for WinRT toasts + buttons to render. macOS needs a signed bundle with `CFBundleIdentifier = com.sayzo.agent` (already set in `sayzo-agent.spec`) for NSUserNotification action buttons.
 
 ### Heartbeat log
 

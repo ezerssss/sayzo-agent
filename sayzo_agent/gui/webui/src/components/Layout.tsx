@@ -1,4 +1,5 @@
 import { ReactNode } from "react";
+import logoUrl from "../assets/logo.png";
 
 // Single-column setup window chrome. Logo + step number top-left, content
 // below. Matches the marketing site's "minimal, structure-first" feel.
@@ -13,10 +14,8 @@ interface Props {
 export function Layout({ step, title, subtitle, children, footer }: Props) {
   return (
     <div className="flex min-h-full flex-col px-10 py-12">
-      <header className="mb-12 flex items-center gap-3">
-        <div className="flex h-7 w-7 items-center justify-center rounded-full bg-ink text-xs font-semibold text-white">
-          S
-        </div>
+      <header className="mb-12 flex items-center gap-2.5">
+        <img src={logoUrl} alt="" className="h-8 w-8" />
         <span className="text-sm font-medium tracking-tight text-ink">
           Sayzo
         </span>

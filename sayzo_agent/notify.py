@@ -40,7 +40,7 @@ ConsentResult = Literal["yes", "no", "timeout"]
 # (see ``installer/windows/sayzo-agent.nsi``) — otherwise WinRT toasts
 # silently fail to render on Windows 10. On macOS this is the display name
 # attributed to the notification. Any drift is a silent regression.
-APP_AUMID = "Sayzo.Agent"
+APP_AUMID = "Sayzo"
 
 
 class Notifier(Protocol):
@@ -91,8 +91,8 @@ class DesktopNotifier:
     logged, never propagated.
 
     ``app_name`` must match the AUMID set on the Start Menu shortcut by the
-    NSIS installer ("Sayzo.Agent") for WinRT toasts to appear at all on
-    Windows 10; on macOS it's the display name attributed to the notification.
+    NSIS installer ("Sayzo") for WinRT toasts to appear at all on Windows 10;
+    on macOS it's the display name attributed to the notification.
     Interactive button callbacks work on both WinRT (Windows 10+) and
     NSUserNotification (macOS) back-ends.
     """

@@ -30,7 +30,7 @@ _MIC_OPEN_SETTLE_SECS = 0.1
 # x-apple.systempreferences URIs for the three Privacy & Security sub-panes
 # we care about. There's no public Audio Capture sub-pane URI, so the tap
 # deep-link still lands on the general Privacy & Security screen on modern
-# macOS — the user scrolls to find Sayzo Agent under "Audio Capture".
+# macOS — the user scrolls to find Sayzo under "Audio Capture".
 _MIC_DEEPLINK = (
     "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
 )
@@ -58,7 +58,7 @@ def _get_notifier():
         try:
             from desktop_notifier.sync import DesktopNotifierSync
 
-            _NOTIFIER = DesktopNotifierSync(app_name="Sayzo.Agent")
+            _NOTIFIER = DesktopNotifierSync(app_name="Sayzo")
         except Exception:
             _NOTIFIER_INIT_FAILED = True
             log.warning(

@@ -90,7 +90,7 @@ One window, one walkthrough. No second tkinter step after it closes — everythi
 - Title (**APPROVED**): **Let the shortcut work anywhere**
 - Body (**APPROVED**): *"Without this, your shortcut only works when Sayzo is focused. You can always grant it later from System Settings."*
 - Buttons: **Cancel** / **Skip for now** / **Open System Settings**
-- On Open: deep-link to `x-apple.systempreferences:…Privacy_Accessibility`. Follow-up copy (**APPROVED**): *"Find **Sayzo Agent** under Accessibility, turn it on, then come back and press Continue."*
+- On Open: deep-link to `x-apple.systempreferences:…Privacy_Accessibility`. Follow-up copy (**APPROVED**): *"Find **Sayzo** under Accessibility, turn it on, then come back and press Continue."*
 
 ### Screen 06 — Automation (macOS only)
 
@@ -110,7 +110,7 @@ One window, one walkthrough. No second tkinter step after it closes — everythi
 - Buttons: **Cancel** / **Skip for now** / **Grant** (macOS) or **Check setting** (Windows)
 - Pending label: **Asking…** (macOS) / **Checking…** (Windows)
 - Sub-body (pre-grant, macOS, **APPROVED**): *"macOS will ask once. Click Allow so you don't miss the meeting prompts."*
-- Sub-body (pre-grant, Windows, **APPROVED**): *"Make sure Sayzo Agent is enabled under Settings → System → Notifications."*
+- Sub-body (pre-grant, Windows, **APPROVED**): *"Make sure Sayzo is enabled under Settings → System → Notifications."*
 - Granted sub-body (**APPROVED**): *"All set."*
 - Denied sub-body (**APPROVED**): *"Notifications are blocked. Open Settings to turn them on, then try again."*
 

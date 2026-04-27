@@ -1,4 +1,4 @@
-# Sayzo Agent — Windows one-liner installer (dev / power-user path)
+# Sayzo — Windows one-liner installer (dev / power-user path)
 # Usage: irm https://sayzo.app/releases/windows/install.ps1 | iex
 #
 # Downloads the NSIS installer and runs it silently. The NSIS finish page
@@ -9,14 +9,14 @@
 $ErrorActionPreference = "Stop"
 
 $arch = if ([System.Environment]::Is64BitOperatingSystem) { "x64" } else { "x86" }
-$installerName = "sayzo-agent-setup.exe"
+$installerName = "sayzo-setup.exe"
 $downloadUrl = "https://sayzo.app/releases/windows/${installerName}"
 $tempDir = Join-Path $env:TEMP "sayzo-install"
 $installerPath = Join-Path $tempDir $installerName
 
 Write-Host ""
-Write-Host "  Sayzo Agent Installer" -ForegroundColor Cyan
-Write-Host "  =====================" -ForegroundColor Cyan
+Write-Host "  Sayzo Installer" -ForegroundColor Cyan
+Write-Host "  ===============" -ForegroundColor Cyan
 Write-Host ""
 
 # Create temp directory.
@@ -25,7 +25,7 @@ if (-not (Test-Path $tempDir)) {
 }
 
 # Download installer.
-Write-Host "  Downloading Sayzo Agent..." -ForegroundColor White
+Write-Host "  Downloading Sayzo..." -ForegroundColor White
 try {
     Invoke-WebRequest -Uri $downloadUrl -OutFile $installerPath -UseBasicParsing
 } catch {
@@ -51,16 +51,16 @@ Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
 # doesn't fire — we have to launch the service ourselves. --force-setup
 # tells it to open the setup GUI even if prior-install state looks complete,
 # giving terminal-install users the same UX as the GUI-install path.
-$servicePath = Join-Path $env:ProgramFiles "Sayzo\Agent\sayzo-agent-service.exe"
+$servicePath = Join-Path $env:ProgramFiles "Sayzo\sayzo-agent-service.exe"
 if (Test-Path $servicePath) {
     Write-Host "  Opening setup window..." -ForegroundColor Cyan
     Start-Process -FilePath $servicePath -ArgumentList "service", "--force-setup"
 } else {
     Write-Host "  Warning: could not find $servicePath" -ForegroundColor Yellow
-    Write-Host "  Launch Sayzo Agent from the Start Menu to complete setup." -ForegroundColor Yellow
+    Write-Host "  Launch Sayzo from the Start Menu to complete setup." -ForegroundColor Yellow
 }
 
 Write-Host ""
 Write-Host "  Done! Complete setup in the window that appears." -ForegroundColor Green
-Write-Host "  Sayzo Agent will then start automatically on every login." -ForegroundColor Green
+Write-Host "  Sayzo will then start automatically on every login." -ForegroundColor Green
 Write-Host ""

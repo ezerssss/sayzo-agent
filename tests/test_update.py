@@ -81,11 +81,11 @@ _GOOD_MANIFEST = {
     "released_at": "2026-04-25T10:00:00Z",
     "notes": "Quiet the STT hallucination on idle.",
     "windows": {
-        "url": "https://sayzo.app/releases/windows/sayzo-agent-setup.exe",
+        "url": "https://sayzo.app/releases/windows/sayzo-setup.exe",
         "sha256": "deadbeef",
     },
     "macos": {
-        "url": "https://sayzo.app/releases/macos/Sayzo-Agent.dmg",
+        "url": "https://sayzo.app/releases/macos/Sayzo.dmg",
         "sha256": "cafebabe",
     },
 }
@@ -133,7 +133,7 @@ async def test_check_returns_update_when_newer(monkeypatch: pytest.MonkeyPatch) 
         info = await check("0.1.0", client=client, url="https://example.com/latest.json")
     assert info == UpdateInfo(
         version="0.1.1",
-        url="https://sayzo.app/releases/windows/sayzo-agent-setup.exe",
+        url="https://sayzo.app/releases/windows/sayzo-setup.exe",
         notes="Quiet the STT hallucination on idle.",
     )
 

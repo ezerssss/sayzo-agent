@@ -72,7 +72,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: windows-installer
-          path: installer/windows/sayzo-agent-setup.exe
+          path: installer/windows/sayzo-setup.exe
 
   # -----------------------------------------------------------------------
   # macOS
@@ -136,26 +136,26 @@ jobs:
         run: |
           codesign --deep --force --options runtime \
             --sign "$APPLE_DEVELOPER_ID" \
-            "dist/Sayzo Agent.app"
+            "dist/Sayzo.app"
 
       - name: Create DMG
         run: |
-          rm -f "dist/Sayzo-Agent.dmg"
-          hdiutil create -volname "Sayzo Agent" \
-            -srcfolder "dist/Sayzo Agent.app" \
+          rm -f "dist/Sayzo.dmg"
+          hdiutil create -volname "Sayzo" \
+            -srcfolder "dist/Sayzo.app" \
             -ov -format UDZO \
-            "dist/Sayzo-Agent.dmg" || \
-          (sleep 2 && hdiutil create -volname "Sayzo Agent" \
-            -srcfolder "dist/Sayzo Agent.app" \
+            "dist/Sayzo.dmg" || \
+          (sleep 2 && hdiutil create -volname "Sayzo" \
+            -srcfolder "dist/Sayzo.app" \
             -ov -format UDZO \
-            "dist/Sayzo-Agent.dmg")
+            "dist/Sayzo.dmg")
 
       - name: Sign DMG
         if: env.APPLE_DEVELOPER_ID != ''
         env:
           APPLE_DEVELOPER_ID: ${{ secrets.APPLE_DEVELOPER_ID }}
         run: |
-          codesign --sign "$APPLE_DEVELOPER_ID" dist/Sayzo-Agent.dmg
+          codesign --sign "$APPLE_DEVELOPER_ID" dist/Sayzo.dmg
 
       - name: Notarize
         if: env.APPLE_ID != ''
@@ -164,18 +164,18 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         run: |
-          xcrun notarytool submit dist/Sayzo-Agent.dmg \
+          xcrun notarytool submit dist/Sayzo.dmg \
             --apple-id "$APPLE_ID" \
             --team-id "$APPLE_TEAM_ID" \
             --password "$APPLE_APP_PASSWORD" \
             --wait
-          xcrun stapler staple dist/Sayzo-Agent.dmg
+          xcrun stapler staple dist/Sayzo.dmg
 
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v4
         with:
           name: macos-installer
-          path: dist/Sayzo-Agent.dmg
+          path: dist/Sayzo.dmg
 
   # -----------------------------------------------------------------------
   # Deploy to droplet — waits for both builds, then scp's binaries + scripts.
@@ -215,12 +215,12 @@ jobs:
           HOST: ${{ secrets.DROPLET_HOST }}
         run: |
           scp -i ~/.ssh/deploy_key \
-            artifacts/windows/sayzo-agent-setup.exe \
+            artifacts/windows/sayzo-setup.exe \
             installer/install.ps1 \
             root@"$HOST":/var/www/sayzo/releases/windows/
 
           scp -i ~/.ssh/deploy_key \
-            artifacts/macos/Sayzo-Agent.dmg \
+            artifacts/macos/Sayzo.dmg \
             installer/install.sh \
             root@"$HOST":/var/www/sayzo/releases/macos/
 
@@ -234,8 +234,8 @@ jobs:
           COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
         run: |
           VERSION=$(python3 -c 'import tomllib;print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')
-          WIN_SHA=$(sha256sum artifacts/windows/sayzo-agent-setup.exe | cut -d' ' -f1)
-          MAC_SHA=$(sha256sum artifacts/macos/Sayzo-Agent.dmg | cut -d' ' -f1)
+          WIN_SHA=$(sha256sum artifacts/windows/sayzo-setup.exe | cut -d' ' -f1)
+          MAC_SHA=$(sha256sum artifacts/macos/Sayzo.dmg | cut -d' ' -f1)
           RELEASED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           # Sanitize notes for JSON embedding: first line only, strip quotes
           # and backslashes. Commit messages are untrusted input at this scale.
@@ -246,11 +246,11 @@ jobs:
             "released_at": "$RELEASED_AT",
             "notes": "$NOTES",
             "windows": {
-              "url": "https://sayzo.app/releases/windows/sayzo-agent-setup.exe",
+              "url": "https://sayzo.app/releases/windows/sayzo-setup.exe",
               "sha256": "$WIN_SHA"
             },
             "macos": {
-              "url": "https://sayzo.app/releases/macos/Sayzo-Agent.dmg",
+              "url": "https://sayzo.app/releases/macos/Sayzo.dmg",
               "sha256": "$MAC_SHA"
             }
           }

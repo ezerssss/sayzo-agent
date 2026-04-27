@@ -1,4 +1,4 @@
-; Sayzo Agent NSIS Installer
+; Sayzo NSIS Installer
 ; Installs the PyInstaller bundle, creates auto-start Task Scheduler entry,
 ; and registers with Add/Remove Programs.
 
@@ -16,7 +16,7 @@
 ; Configuration
 ; ---------------------------------------------------------------------------
 
-!define PRODUCT_NAME "Sayzo Agent"
+!define PRODUCT_NAME "Sayzo"
 !define PRODUCT_PUBLISHER "Sayzo"
 ; PRODUCT_VERSION is normally injected by CI via `makensis /DPRODUCT_VERSION=$VERSION ...`
 ; where $VERSION is read from pyproject.toml (the single source of truth for Phase A
@@ -27,11 +27,11 @@
 !endif
 !define PRODUCT_EXE "sayzo-agent.exe"
 !define SERVICE_EXE "sayzo-agent-service.exe"
-!define INSTALL_DIR "$PROGRAMFILES64\Sayzo\Agent"
+!define INSTALL_DIR "$PROGRAMFILES64\Sayzo"
 !define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}"
 
 Name "${PRODUCT_NAME} ${PRODUCT_VERSION}"
-OutFile "sayzo-agent-setup.exe"
+OutFile "sayzo-setup.exe"
 InstallDir "${INSTALL_DIR}"
 RequestExecutionLevel admin
 SetCompressor /SOLID lzma
@@ -54,7 +54,7 @@ UninstallIcon "..\..\installer\assets\logo.ico"
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_INSTFILES
 
-; Finish page with a "Launch Sayzo Agent" checkbox that runs the windowless
+; Finish page with a "Launch Sayzo" checkbox that runs the windowless
 ; service exe (console=False per sayzo-agent.spec). The service detects
 ; missing setup signals and opens its own first-run GUI if needed — that's
 ; the whole point of the GUI installer path. See ~/.claude/plans/i-created-a-memory-quizzical-cosmos.md.
@@ -66,7 +66,7 @@ UninstallIcon "..\..\installer\assets\logo.ico"
 ; verdict — users get visual confirmation right after install even if they
 ; had prior-install state from a previous CLI run.
 !define MUI_FINISHPAGE_RUN_PARAMETERS "service --force-setup"
-!define MUI_FINISHPAGE_RUN_TEXT "Launch Sayzo Agent"
+!define MUI_FINISHPAGE_RUN_TEXT "Launch Sayzo"
 !insertmacro MUI_PAGE_FINISH
 
 !insertmacro MUI_UNPAGE_CONFIRM
@@ -86,7 +86,7 @@ Section "Install"
     ; File /r and the install aborts with files half-replaced. Idempotent —
     ; both commands exit non-zero on "task/process not found" and we ignore
     ; the return. The Task Scheduler task itself is re-created below with /F.
-    nsExec::ExecToLog 'schtasks /End /TN "Sayzo Agent"'
+    nsExec::ExecToLog 'schtasks /End /TN "Sayzo"'
     nsExec::ExecToLog 'taskkill /IM sayzo-agent-service.exe /F'
     nsExec::ExecToLog 'taskkill /IM sayzo-agent.exe /F'
 
@@ -137,7 +137,7 @@ Section "Install"
     ; /SC ONLOGON: trigger at user login
     ; /RL HIGHEST: run with highest privileges (needed for WASAPI on some systems)
     ; /F: force overwrite if exists
-    nsExec::ExecToLog 'schtasks /Create /TN "Sayzo Agent" /TR "\"$INSTDIR\${SERVICE_EXE}\" service" /SC ONLOGON /RL HIGHEST /F'
+    nsExec::ExecToLog 'schtasks /Create /TN "Sayzo" /TR "\"$INSTDIR\${SERVICE_EXE}\" service" /SC ONLOGON /RL HIGHEST /F'
 
     ; Start Menu shortcut — also uses the windowless exe so clicking it doesn't
     ; pop a terminal. The console exe stays available on PATH for CLI use.
@@ -150,7 +150,7 @@ Section "Install"
     ; shortcut, so this is required for desktop-notifier to show anything on
     ; Win10. Must match the `app_name` passed to DesktopNotifier() in
     ; sayzo_agent/__main__.py. Plugin is vendored under nsis-plugins/.
-    ApplicationID::Set "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME}.lnk" "Sayzo.Agent"
+    ApplicationID::Set "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME}.lnk" "Sayzo"
     Pop $0
 
     ; Write uninstall information to registry.
@@ -172,8 +172,8 @@ SectionEnd
 
 Section "Uninstall"
     ; Stop the running agent.
-    nsExec::ExecToLog 'schtasks /End /TN "Sayzo Agent"'
-    nsExec::ExecToLog 'schtasks /Delete /TN "Sayzo Agent" /F'
+    nsExec::ExecToLog 'schtasks /End /TN "Sayzo"'
+    nsExec::ExecToLog 'schtasks /Delete /TN "Sayzo" /F'
 
     ; Remove PATH entry.
     ReadRegStr $0 HKCU "Environment" "Path"

@@ -96,7 +96,7 @@ export function Notifications({ step, platform, onNext, onCancel }: Props) {
             <p className="text-sm leading-relaxed text-ink-muted">
               {isMac
                 ? "macOS will ask once. Click Allow so you don't miss the meeting prompts."
-                : "Make sure Sayzo Agent is enabled under Settings → System → Notifications."}
+                : "Make sure Sayzo is enabled under Settings → System → Notifications."}
             </p>
           )}
         </div>

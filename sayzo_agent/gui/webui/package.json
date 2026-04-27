@@ -4,7 +4,9 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
+    "predev": "python ../../../scripts/sync_brand_assets.py",
     "dev": "vite",
+    "prebuild": "python ../../../scripts/sync_brand_assets.py",
     "build": "vite build",
     "typecheck": "tsc --noEmit",
     "preview": "vite preview"

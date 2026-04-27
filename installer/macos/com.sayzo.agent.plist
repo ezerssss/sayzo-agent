@@ -8,7 +8,7 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Applications/Sayzo Agent.app/Contents/MacOS/sayzo-agent</string>
+        <string>/Applications/Sayzo.app/Contents/MacOS/sayzo-agent</string>
         <string>service</string>
     </array>
 

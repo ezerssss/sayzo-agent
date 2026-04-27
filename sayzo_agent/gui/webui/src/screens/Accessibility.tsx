@@ -44,7 +44,7 @@ export function Accessibility({ step, onNext, onCancel }: Props) {
     >
       {opened && (
         <p className="text-sm leading-relaxed text-ink-muted">
-          Find <strong>Sayzo Agent</strong> under Accessibility, turn it on,
+          Find <strong>Sayzo</strong> under Accessibility, turn it on,
           then come back and press Continue.
         </p>
       )}

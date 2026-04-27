@@ -43,7 +43,7 @@ def _get_notifier():
         try:
             from desktop_notifier.sync import DesktopNotifierSync
 
-            _NOTIFIER = DesktopNotifierSync(app_name="Sayzo.Agent")
+            _NOTIFIER = DesktopNotifierSync(app_name="Sayzo")
         except Exception:
             _NOTIFIER_INIT_FAILED = True
             log.warning(

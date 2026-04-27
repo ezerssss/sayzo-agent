@@ -20,7 +20,7 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 LAUNCH_AGENT_LABEL = "com.sayzo.agent"
-LAUNCH_AGENT_PROGRAM = "/Applications/Sayzo Agent.app/Contents/MacOS/sayzo-agent"
+LAUNCH_AGENT_PROGRAM = "/Applications/Sayzo.app/Contents/MacOS/sayzo-agent"
 
 # Verbatim from installer/macos/com.sayzo.agent.plist. Kept as a Python
 # string so the running .app can write it without depending on the source
