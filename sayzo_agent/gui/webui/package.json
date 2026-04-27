@@ -6,6 +6,8 @@
   "scripts": {
     "predev": "python ../../../scripts/sync_brand_assets.py",
     "dev": "vite",
+    "predev:mock": "python ../../../scripts/sync_brand_assets.py",
+    "dev:mock": "vite --mode mock",
     "prebuild": "python ../../../scripts/sync_brand_assets.py",
     "build": "vite build",
     "typecheck": "tsc --noEmit",

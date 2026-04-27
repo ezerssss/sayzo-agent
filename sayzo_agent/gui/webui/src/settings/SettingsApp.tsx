@@ -3,6 +3,7 @@ import { settingsBridge } from "../lib/settings-bridge";
 import { Alert } from "../components/ui/Alert";
 import { AccountPane } from "./AccountPane";
 import { AboutPane } from "./AboutPane";
+import { CapturesPane } from "./CapturesPane";
 import { MeetingAppsPane } from "./MeetingAppsPane";
 import { NotificationsPane } from "./NotificationsPane";
 import { PermissionsPane } from "./PermissionsPane";
@@ -10,10 +11,12 @@ import { ShortcutPane } from "./ShortcutPane";
 import logoUrl from "../assets/logo.png";
 
 // Sidebar order matches the legacy tkinter Settings so muscle memory
-// carries over.
+// carries over. "Captures" sits next to Meeting Apps since both deal with
+// what Sayzo records.
 const PANE_NAMES = [
   "Shortcut",
   "Meeting Apps",
+  "Captures",
   "Permissions",
   "Account",
   "Notifications",
@@ -27,10 +30,13 @@ function normalizePane(s: string | null | undefined): PaneName | null {
   return PANE_NAMES.find((n) => n.toLowerCase() === lower) ?? null;
 }
 
+const SIDEBAR_REFRESH_MS = 5_000;
+
 export function SettingsApp() {
   const [active, setActive] = useState<PaneName>("Shortcut");
   const [ready, setReady] = useState(false);
   const [globalError, setGlobalError] = useState<string | null>(null);
+  const [inProgressCount, setInProgressCount] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -66,6 +72,32 @@ export function SettingsApp() {
     };
   }, []);
 
+  // Poll the in-progress count for the sidebar dot. Cheap (one IPC call +
+  // dir scan) and the result is just a number, so we keep it separate from
+  // CapturesPane's own polling instead of plumbing shared state.
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = async () => {
+      try {
+        const list = await settingsBridge.listCaptures();
+        if (cancelled) return;
+        const count = list.filter((c) => c.bucket === "in_progress").length;
+        setInProgressCount(count);
+      } catch {
+        // Silent — the user already sees the empty/error state inside the
+        // Captures pane if listing is broken; no need to double-notify.
+      }
+    };
+    void refresh();
+    const id = window.setInterval(() => {
+      void refresh();
+    }, SIDEBAR_REFRESH_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, []);
+
   if (globalError) {
     return (
       <div className="p-10">
@@ -88,11 +120,16 @@ export function SettingsApp() {
 
   return (
     <div className="flex h-full">
-      <Sidebar active={active} onSelect={setActive} />
+      <Sidebar
+        active={active}
+        onSelect={setActive}
+        inProgressCount={inProgressCount}
+      />
       <div className="flex-1 overflow-y-auto">
         <div className="mx-auto max-w-2xl px-10 py-10">
           {active === "Shortcut" && <ShortcutPane />}
           {active === "Meeting Apps" && <MeetingAppsPane />}
+          {active === "Captures" && <CapturesPane />}
           {active === "Permissions" && <PermissionsPane />}
           {active === "Account" && <AccountPane />}
           {active === "Notifications" && <NotificationsPane />}
@@ -106,9 +143,10 @@ export function SettingsApp() {
 interface SidebarProps {
   active: PaneName;
   onSelect: (p: PaneName) => void;
+  inProgressCount: number;
 }
 
-function Sidebar({ active, onSelect }: SidebarProps) {
+function Sidebar({ active, onSelect, inProgressCount }: SidebarProps) {
   return (
     <nav className="w-56 shrink-0 border-r border-ink-border bg-gray-50">
       <div className="flex items-center gap-3 px-5 pt-8 pb-6">
@@ -127,6 +165,7 @@ function Sidebar({ active, onSelect }: SidebarProps) {
             label={name}
             selected={active === name}
             onClick={() => onSelect(name)}
+            inProgress={name === "Captures" && inProgressCount > 0}
           />
         ))}
       </ul>
@@ -138,9 +177,15 @@ interface SidebarItemProps {
   label: string;
   selected: boolean;
   onClick: () => void;
+  inProgress?: boolean;
 }
 
-function SidebarItem({ label, selected, onClick }: SidebarItemProps) {
+function SidebarItem({
+  label,
+  selected,
+  onClick,
+  inProgress,
+}: SidebarItemProps) {
   return (
     <li>
       <button
@@ -159,7 +204,14 @@ function SidebarItem({ label, selected, onClick }: SidebarItemProps) {
             className="absolute left-0 top-1/2 h-5 w-0.5 -translate-y-1/2 rounded-full bg-accent"
           />
         )}
-        <span className="ml-2">{label}</span>
+        <span className="ml-2 flex-1">{label}</span>
+        {inProgress && (
+          <span
+            aria-label="Captures in progress"
+            title="Sayzo is working on something"
+            className="ml-2 inline-flex h-2 w-2 shrink-0 animate-pulse rounded-full bg-blue-500"
+          />
+        )}
       </button>
     </li>
   );

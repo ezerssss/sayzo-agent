@@ -64,6 +64,10 @@ class Methods:
     SNAPSHOT_MIC_STATE = "snapshot_mic_state"
     SNAPSHOT_FOREGROUND = "snapshot_foreground"
     RELOAD_DETECTORS = "reload_detectors"
+    # Captures pane — surfaces in-flight sessions and lets the Settings
+    # subprocess kick the upload retry sweep when the user hits "Try again".
+    SNAPSHOT_PROCESSING_CAPTURES = "snapshot_processing_captures"
+    NUDGE_UPLOAD_RETRY = "nudge_upload_retry"
 
 
 class IPCError(Exception):

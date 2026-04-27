@@ -5,6 +5,7 @@ import asyncio
 import logging
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import Optional
@@ -156,6 +157,10 @@ class Agent:
         self._captures_discarded: int = 0
         self._echo_segments_dropped: int = 0
         self._echo_secs_dropped: float = 0.0
+        # Settings → Captures pane reads this via IPC. Keys are the proc_id
+        # (also reused as the eventual on-disk record id), values describe
+        # what's currently being processed for the user-facing list.
+        self._processing_state: dict[str, dict] = {}
 
         # Armed-only model: the ArmController owns mic + system stream
         # lifecycle (start on arm, stop on disarm), hotkey confirmations,
@@ -324,6 +329,55 @@ class Agent:
             self._sweep_in_progress = False
 
     async def _process_session(self, buffers: SessionBuffers) -> None:
+        """Public entry — registers an in-progress row for the Captures pane,
+        then runs the actual pipeline. The proc_id is reused as the eventual
+        record id so the in-progress row swaps cleanly to the on-disk row."""
+        proc_id = uuid.uuid4().hex[:12]
+        started_iso = (
+            buffers.started_at.isoformat()
+            if hasattr(buffers.started_at, "isoformat")
+            else str(buffers.started_at)
+        )
+        self._processing_state[proc_id] = {
+            "label": "Sayzo is analyzing this",
+            "started_at": started_iso,
+            "duration_secs": round(buffers.elapsed(), 1),
+        }
+        try:
+            await self._process_session_inner(buffers, proc_id)
+        finally:
+            self._processing_state.pop(proc_id, None)
+
+    async def _write_dropped_async(
+        self,
+        buffers: SessionBuffers,
+        reason: str,
+        proc_id: str,
+        extra: dict | None = None,
+    ) -> None:
+        """Persist a tiny no-audio stub so the user can see this session was
+        skipped in the Captures pane. Failures are logged, never raised."""
+        loop = asyncio.get_running_loop()
+        ended_at = buffers.started_at + timedelta(seconds=buffers.elapsed())
+        try:
+            await loop.run_in_executor(
+                self._executor,
+                lambda: self.sink.write_dropped(
+                    buffers.started_at,
+                    ended_at,
+                    reason,
+                    extra=extra,
+                    rec_id=proc_id,
+                ),
+            )
+        except Exception:
+            log.warning(
+                "[session] failed to write dropped stub (%s)", reason, exc_info=True
+            )
+
+    async def _process_session_inner(
+        self, buffers: SessionBuffers, proc_id: str
+    ) -> None:
         loop = asyncio.get_running_loop()
         sr = self.cfg.capture.sample_rate
 
@@ -367,6 +421,15 @@ class Agent:
         if not gate.passed:
             log.info("[session] DISCARDED (failed cheap gate)")
             self._captures_discarded += 1
+            await self._write_dropped_async(
+                buffers,
+                "gate_failed",
+                proc_id,
+                extra={
+                    "gate_reason": gate.reason,
+                    "mic_total": round(gate.mic_total, 2),
+                },
+            )
             return
 
         # 2a. Language probe on the mic stream. Sayzo is English-only, so if
@@ -407,6 +470,15 @@ class Agent:
                     mic_lang_prob,
                 )
                 self._captures_discarded += 1
+                await self._write_dropped_async(
+                    buffers,
+                    "non_english",
+                    proc_id,
+                    extra={
+                        "detected_lang": mic_lang,
+                        "prob": round(float(mic_lang_prob), 2),
+                    },
+                )
                 return
 
         # 2b. Transcribe both sources in the heavy worker.
@@ -456,6 +528,7 @@ class Agent:
         if not transcript:
             log.info("[session] DISCARDED (empty transcript)")
             self._captures_discarded += 1
+            await self._write_dropped_async(buffers, "empty_transcript", proc_id)
             return
 
         # 4. LLM relevance judgment
@@ -475,6 +548,12 @@ class Agent:
         if not verdict.keep:
             log.info("[session] DISCARDED by LLM (reason=%s)", verdict.discard_reason)
             self._captures_discarded += 1
+            await self._write_dropped_async(
+                buffers,
+                "llm_rejected",
+                proc_id,
+                extra={"discard_reason": verdict.discard_reason},
+            )
             return
 
         # 5a. Apply DSP to the raw session PCM. Mic gets the full chain
@@ -565,17 +644,19 @@ class Agent:
             }
         record = await loop.run_in_executor(
             self._executor,
-            self.sink.write,
-            transcript,
-            verdict.title,
-            verdict.summary,
-            verdict.relevant_span,
-            true_started_at,
-            ended_at,
-            mic_final,
-            sys_final,
-            sr,
-            metadata,
+            lambda: self.sink.write(
+                transcript,
+                verdict.title,
+                verdict.summary,
+                verdict.relevant_span,
+                true_started_at,
+                ended_at,
+                mic_final,
+                sys_final,
+                sr,
+                metadata,
+                rec_id=proc_id,
+            ),
         )
         rec_dir = self.cfg.captures_dir / record.id
         await self.retry_mgr.try_upload(record, rec_dir)

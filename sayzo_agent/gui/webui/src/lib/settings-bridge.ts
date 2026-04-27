@@ -4,6 +4,16 @@
 // app shell only types-up the methods it actually uses.
 
 import { whenReady } from "./bridge";
+import { buildMockCaptures } from "./captures-mock";
+
+// `npm run dev:mock` sets VITE_USE_MOCK_BRIDGE=1 (loaded from .env.mock via
+// `vite --mode mock`) so the Captures pane can be designed against realistic
+// fake data without a running Python agent. Production builds run with the
+// flag unset and hit the real bridge.
+const USE_MOCK_CAPTURES = import.meta.env.VITE_USE_MOCK_BRIDGE === "1";
+
+const mockCapturesState: { captures: CaptureSummary[] } | null =
+  USE_MOCK_CAPTURES ? { captures: buildMockCaptures() } : null;
 
 // ---- Response shapes ------------------------------------------------------
 
@@ -136,6 +146,58 @@ export type DetectorSpecInput = {
   disabled?: boolean;
 };
 
+// ---- Captures pane ------------------------------------------------------
+
+export type CaptureBucket =
+  | "in_progress"
+  | "uploaded"
+  | "failed"
+  | "skipped";
+
+export type CaptureStatusKey =
+  | "processing"
+  | "pending"
+  | "uploading"
+  | "uploaded"
+  | "failed_transient"
+  | "failed_permanent"
+  | "credit_blocked"
+  | "auth_blocked"
+  | "dropped";
+
+export type CaptureSummary = {
+  id: string;
+  title: string;
+  started_at: string; // ISO
+  ended_at: string; // ISO
+  duration_secs: number;
+  status: CaptureStatusKey;
+  bucket: CaptureBucket;
+  badge_label: string;
+  badge_tone: "gray" | "blue" | "green" | "amber" | "red";
+  detail: string | null;
+  attempts: number;
+  next_attempt_at: string | null;
+  has_audio: boolean;
+  is_processing: boolean;
+  dropped_reason: string | null;
+};
+
+export type CaptureDeleteResult = {
+  deleted: boolean;
+  error?: string;
+};
+
+export type CaptureRetryResult = {
+  retrying: boolean;
+  error?: string;
+};
+
+export type CaptureOpenResult = {
+  opened: boolean;
+  error?: string;
+};
+
 // ---- Settings-only window.pywebview.api surface --------------------------
 // Augments the `SayzoPywebviewApi` interface declared in `lib/bridge.ts`.
 // Both surfaces live on the same `window.pywebview.api` object at runtime;
@@ -196,6 +258,12 @@ declare global {
       strict: boolean,
     ): Promise<BuiltUrlPattern>;
     make_app_key(seed: string): Promise<string>;
+
+    // Captures pane.
+    list_captures(): Promise<CaptureSummary[]>;
+    delete_capture(capture_id: string): Promise<CaptureDeleteResult>;
+    retry_capture_upload(capture_id: string): Promise<CaptureRetryResult>;
+    open_capture_folder(capture_id: string): Promise<CaptureOpenResult>;
   }
 }
 
@@ -329,6 +397,67 @@ export const settingsBridge = {
   async makeAppKey(seed: string) {
     await whenReady();
     return window.pywebview.api.make_app_key(seed);
+  },
+
+  // ---- Captures ----------------------------------------------------------
+
+  async listCaptures(): Promise<CaptureSummary[]> {
+    if (mockCapturesState) {
+      return Promise.resolve(
+        mockCapturesState.captures.map((c) => ({ ...c })),
+      );
+    }
+    await whenReady();
+    return window.pywebview.api.list_captures();
+  },
+
+  async deleteCapture(captureId: string): Promise<CaptureDeleteResult> {
+    if (mockCapturesState) {
+      const before = mockCapturesState.captures.length;
+      mockCapturesState.captures = mockCapturesState.captures.filter(
+        (c) => c.id !== captureId,
+      );
+      return Promise.resolve({ deleted: mockCapturesState.captures.length < before });
+    }
+    await whenReady();
+    return window.pywebview.api.delete_capture(captureId);
+  },
+
+  async retryCaptureUpload(captureId: string): Promise<CaptureRetryResult> {
+    if (mockCapturesState) {
+      const c = mockCapturesState.captures.find((x) => x.id === captureId);
+      if (!c) return Promise.resolve({ retrying: false });
+      c.status = "uploading";
+      c.bucket = "in_progress";
+      c.badge_label = "Uploading…";
+      c.badge_tone = "blue";
+      c.detail = null;
+      c.attempts = (c.attempts ?? 0) + 1;
+      // Simulate a successful upload landing a couple of seconds later so
+      // the demo feels alive when the user clicks "Try again now".
+      setTimeout(() => {
+        if (!mockCapturesState) return;
+        const stillThere = mockCapturesState.captures.find((x) => x.id === captureId);
+        if (!stillThere) return;
+        stillThere.status = "uploaded";
+        stillThere.bucket = "uploaded";
+        stillThere.badge_label = "Saved to your account";
+        stillThere.badge_tone = "green";
+        stillThere.detail = null;
+      }, 2000);
+      return Promise.resolve({ retrying: true });
+    }
+    await whenReady();
+    return window.pywebview.api.retry_capture_upload(captureId);
+  },
+
+  async openCaptureFolder(captureId: string): Promise<CaptureOpenResult> {
+    if (mockCapturesState) {
+      console.info("[mock] open_capture_folder", captureId);
+      return Promise.resolve({ opened: true });
+    }
+    await whenReady();
+    return window.pywebview.api.open_capture_folder(captureId);
   },
 
   async finish() {

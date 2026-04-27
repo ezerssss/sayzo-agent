@@ -1,3 +1,8 @@
+// Side-effect import: when `VITE_USE_MOCK_BRIDGE=1`, installs a stub
+// `window.pywebview.api` and forces the Settings/Captures route. Tree-
+// shaken to nothing in production builds where the env var is unset.
+import "./lib/mock-bridge-init";
+
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import "./index.css";

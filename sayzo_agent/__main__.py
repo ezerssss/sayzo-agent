@@ -855,11 +855,31 @@ def service(force_setup: bool) -> None:
             ok = agent.arm.reload_detectors()
             return {"reloaded": ok}
 
+        def _ipc_snapshot_processing_captures() -> dict:
+            # Shallow copy — the dict is mutated only on the agent's asyncio
+            # loop (same loop the IPC handler runs on), so a snapshot here
+            # is consistent without locking.
+            return {k: dict(v) for k, v in agent._processing_state.items()}
+
+        def _ipc_nudge_upload_retry() -> dict:
+            if agent._sweep_in_progress:
+                return {"started": False, "reason": "already_running"}
+            agent._sweep_in_progress = True
+            agent._upload_sweep_last = time.monotonic()
+            task = asyncio.create_task(agent._run_periodic_sweep())
+            agent._background_tasks.add(task)
+            task.add_done_callback(agent._background_tasks.discard)
+            return {"started": True}
+
         ipc_server.register(Methods.INVALIDATE_TOKEN_CACHE, _ipc_invalidate_token_cache)
         ipc_server.register(Methods.REBIND_HOTKEY, _ipc_rebind_hotkey)
         ipc_server.register(Methods.SNAPSHOT_MIC_STATE, _ipc_snapshot_mic_state)
         ipc_server.register(Methods.SNAPSHOT_FOREGROUND, _ipc_snapshot_foreground)
         ipc_server.register(Methods.RELOAD_DETECTORS, _ipc_reload_detectors)
+        ipc_server.register(
+            Methods.SNAPSHOT_PROCESSING_CAPTURES, _ipc_snapshot_processing_captures
+        )
+        ipc_server.register(Methods.NUDGE_UPLOAD_RETRY, _ipc_nudge_upload_retry)
 
         try:
             await ipc_server.start()

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import uuid
 from dataclasses import asdict
 from datetime import datetime
@@ -13,6 +14,21 @@ import numpy as np
 from .models import ConversationRecord, TranscriptLine
 
 log = logging.getLogger(__name__)
+
+
+# Reasons a session can be dropped (silent skips that the Captures pane
+# surfaces under "Skipped"). The labels are the user-facing copy.
+DROPPED_REASON_LABELS: dict[str, str] = {
+    "gate_failed": "Skipped — not enough conversation",
+    "non_english": "Skipped — wasn't English",
+    "empty_transcript": "Skipped — nothing was transcribed",
+    "llm_rejected": "Sayzo decided not to keep this",
+}
+
+# Most-recent N dropped stubs to keep on disk. Older are pruned at write time
+# so the captures dir doesn't grow unbounded for users who frequently fail
+# the gate (e.g. brief hot-mic moments).
+DROPPED_STUB_CAP = 100
 
 
 def encode_opus_stereo(
@@ -124,8 +140,9 @@ class CaptureSink:
         sys_pcm16: bytes,
         sample_rate: int = 16000,
         metadata: dict | None = None,
+        rec_id: str | None = None,
     ) -> ConversationRecord:
-        rec_id = uuid.uuid4().hex[:12]
+        rec_id = rec_id or uuid.uuid4().hex[:12]
         rec_dir = self.captures_dir / rec_id
         rec_dir.mkdir(parents=True, exist_ok=True)
 
@@ -164,3 +181,88 @@ class CaptureSink:
         log.info("[sink]   transcript: %s", json_path.resolve())
         log.info("[sink]   audio:      %s", (rec_dir / audio_rel).resolve())
         return record
+
+    def write_dropped(
+        self,
+        started_at: datetime,
+        ended_at: datetime,
+        reason: str,
+        *,
+        extra: dict | None = None,
+        rec_id: str | None = None,
+    ) -> str:
+        """Persist a tiny stub for a dropped session — no audio.
+
+        Used by `app.py` at each discard point (gate fail, non-English, empty
+        transcript, LLM rejection) so the user can see in Settings → Captures
+        that Sayzo heard them and decided not to keep this one. Returns the
+        stub's record id.
+        """
+        rec_id = rec_id or uuid.uuid4().hex[:12]
+        rec_dir = self.captures_dir / rec_id
+        rec_dir.mkdir(parents=True, exist_ok=True)
+
+        dropped_meta: dict = {
+            "reason": reason,
+            "reason_label": DROPPED_REASON_LABELS.get(reason, "Skipped"),
+        }
+        if extra:
+            dropped_meta.update(extra)
+
+        record = ConversationRecord(
+            id=rec_id,
+            started_at=started_at,
+            ended_at=ended_at,
+            transcript=[],
+            title="",
+            summary="",
+            audio_path="",
+            relevant_span=(0.0, 0.0),
+            metadata={"dropped": dropped_meta},
+        )
+        json_path = rec_dir / "record.json"
+        with json_path.open("w", encoding="utf-8") as f:
+            json.dump(serialize_record(record), f, indent=2, ensure_ascii=False)
+        log.info("[sink] dropped stub id=%s reason=%s", rec_id, reason)
+
+        try:
+            self._prune_dropped_stubs()
+        except Exception:
+            log.debug("[sink] dropped-stub pruning failed", exc_info=True)
+        return rec_id
+
+    def _prune_dropped_stubs(self) -> None:
+        """Trim oldest dropped stubs beyond DROPPED_STUB_CAP. Operates only on
+        directories whose record.json has metadata.dropped — never touches
+        kept captures."""
+        if not self.captures_dir.exists():
+            return
+        stubs: list[tuple[datetime, Path]] = []
+        for entry in self.captures_dir.iterdir():
+            if not entry.is_dir() or entry.name.startswith("."):
+                continue
+            rec_json = entry / "record.json"
+            if not rec_json.exists():
+                continue
+            try:
+                with rec_json.open("r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                continue
+            metadata = data.get("metadata") or {}
+            if not metadata.get("dropped"):
+                continue
+            try:
+                ts = datetime.fromisoformat(data.get("started_at"))
+            except Exception:
+                ts = datetime.fromtimestamp(0)
+            stubs.append((ts, entry))
+        if len(stubs) <= DROPPED_STUB_CAP:
+            return
+        stubs.sort(key=lambda p: p[0])  # oldest first
+        excess = len(stubs) - DROPPED_STUB_CAP
+        for _, entry in stubs[:excess]:
+            try:
+                shutil.rmtree(entry)
+            except Exception:
+                log.debug("[sink] failed to prune %s", entry, exc_info=True)

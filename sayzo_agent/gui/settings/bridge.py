@@ -221,6 +221,86 @@ class Bridge:
         return {"text": text}
 
     # ------------------------------------------------------------------
+    # JS-callable methods — Captures pane
+    # ------------------------------------------------------------------
+
+    def list_captures(self) -> list[dict[str, Any]]:
+        """Return all known captures (in-progress + on-disk) for the
+        Captures pane.
+
+        Joins the live agent's processing state (via IPC) with the on-disk
+        record.json files. Missing IPC = agent not running = just show
+        what's on disk."""
+        from sayzo_agent.captures_index import enumerate_captures, summary_to_dict
+
+        processing: dict[str, dict] = {}
+        try:
+            result = self._ipc.call(Methods.SNAPSHOT_PROCESSING_CAPTURES)
+            if isinstance(result, dict):
+                processing = result
+        except IPCNotConnected:
+            pass
+        except IPCError:
+            log.debug("[settings.bridge] processing snapshot failed", exc_info=True)
+
+        try:
+            summaries = enumerate_captures(self._cfg.captures_dir, processing)
+        except Exception:
+            log.warning("[settings.bridge] enumerate_captures failed", exc_info=True)
+            return []
+        return [summary_to_dict(s) for s in summaries]
+
+    def delete_capture(self, capture_id: str) -> dict[str, Any]:
+        """Permanently delete the capture's local files. Validates the id
+        shape to prevent path traversal."""
+        from sayzo_agent.captures_index import delete_capture as _delete
+
+        if not isinstance(capture_id, str):
+            return {"deleted": False, "error": "invalid_id"}
+        try:
+            ok = _delete(self._cfg.captures_dir, capture_id)
+        except ValueError:
+            return {"deleted": False, "error": "invalid_id"}
+        except Exception as exc:
+            log.warning("[settings.bridge] delete_capture failed", exc_info=True)
+            return {"deleted": False, "error": str(exc)}
+        return {"deleted": ok}
+
+    def retry_capture_upload(self, capture_id: str) -> dict[str, Any]:
+        """Mark a capture as immediately due for retry, then nudge the live
+        agent's upload sweep so the user doesn't wait for the next tick."""
+        from sayzo_agent.captures_index import request_retry
+
+        if not isinstance(capture_id, str):
+            return {"retrying": False, "error": "invalid_id"}
+        try:
+            ok = request_retry(self._cfg.captures_dir, capture_id)
+        except ValueError:
+            return {"retrying": False, "error": "invalid_id"}
+        except Exception as exc:
+            log.warning("[settings.bridge] retry_capture_upload failed", exc_info=True)
+            return {"retrying": False, "error": str(exc)}
+        if ok:
+            self._ipc.call_quiet(Methods.NUDGE_UPLOAD_RETRY)
+        return {"retrying": ok}
+
+    def open_capture_folder(self, capture_id: str) -> dict[str, Any]:
+        """Reveal a capture's folder in the OS file manager."""
+        from sayzo_agent.captures_index import is_valid_id
+
+        if not isinstance(capture_id, str) or not is_valid_id(capture_id):
+            return {"opened": False, "error": "invalid_id"}
+        rec_dir = self._cfg.captures_dir / capture_id
+        if not rec_dir.exists():
+            return {"opened": False, "error": "missing"}
+        try:
+            open_folder(rec_dir)
+        except Exception as exc:
+            log.warning("[settings.bridge] open_capture_folder failed", exc_info=True)
+            return {"opened": False, "error": str(exc)}
+        return {"opened": True}
+
+    # ------------------------------------------------------------------
     # JS-callable methods — Account
     # ------------------------------------------------------------------
 
