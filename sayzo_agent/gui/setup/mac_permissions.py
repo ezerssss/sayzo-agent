@@ -205,12 +205,13 @@ def open_accessibility_settings() -> None:
 def is_accessibility_trusted() -> bool:
     """Return True if Sayzo currently has Accessibility permission.
 
-    Wraps ``AXIsProcessTrusted()`` (cheap, ~microseconds, never prompts).
-    Used by the setup window's Accessibility screen to verify the user
-    actually toggled the permission on after we deep-linked them to System
-    Settings — without this check we'd auto-advance them on a hopeful
-    "I clicked Open Settings" signal even when they never flipped the
-    switch.
+    Uses ``AXIsProcessTrustedWithOptions(None)`` rather than
+    ``AXIsProcessTrusted()``: the latter caches the trust bit at first
+    call, so once it returns False the cached value sticks for the
+    process lifetime — even after the user grants the permission. The
+    *WithOptions variant re-reads the TCC database each call, which is
+    what the setup window's polling loop needs to actually flip from
+    waiting → trusted without a relaunch.
 
     Returns False on non-darwin and on any binding failure (so the GUI
     keeps polling rather than silently passing on a bad import).
@@ -219,17 +220,19 @@ def is_accessibility_trusted() -> bool:
         return False
     try:
         from ApplicationServices import (  # type: ignore[import-not-found]
-            AXIsProcessTrusted,
+            AXIsProcessTrustedWithOptions,
         )
     except Exception:
         log.debug(
-            "[mac_permissions] AXIsProcessTrusted unavailable", exc_info=True
+            "[mac_permissions] AXIsProcessTrustedWithOptions unavailable",
+            exc_info=True,
         )
         return False
     try:
-        return bool(AXIsProcessTrusted())
+        return bool(AXIsProcessTrustedWithOptions(None))
     except Exception:
         log.debug(
-            "[mac_permissions] AXIsProcessTrusted call failed", exc_info=True
+            "[mac_permissions] AXIsProcessTrustedWithOptions call failed",
+            exc_info=True,
         )
         return False

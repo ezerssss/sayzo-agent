@@ -221,8 +221,10 @@ class Bridge:
         """Return whether Sayzo currently has Accessibility permission.
 
         Polled by the setup window after deep-linking the user to System
-        Settings. Wraps ``AXIsProcessTrusted()`` — cheap, never prompts.
-        Always ``{"trusted": False}`` on non-darwin.
+        Settings. Wraps ``AXIsProcessTrustedWithOptions(None)`` — cheap,
+        never prompts, and re-reads TCC each call (the cache-free variant
+        the polling loop needs). Always ``{"trusted": False}`` on
+        non-darwin.
         """
         if sys.platform != "darwin":
             return {"trusted": False}

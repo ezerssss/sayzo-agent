@@ -64,7 +64,7 @@ export function Accessibility({ step, onNext, onCancel }: Props) {
     <Layout
       step={step}
       title="Accessibility access"
-      subtitle="Lets your keyboard shortcut start Sayzo from any app, and helps Sayzo notice when you're in a web meeting (Meet, Zoom web, Teams web). Only the shortcut you picked wakes Sayzo up — anything else you type goes nowhere near it."
+      subtitle="Lets your keyboard shortcut start Sayzo from any app."
       footer={
         <>
           <Button variant="ghost" onClick={onCancel}>
@@ -89,16 +89,8 @@ export function Accessibility({ step, onNext, onCancel }: Props) {
       {state === "idle" && (
         <div className="space-y-3 text-sm leading-relaxed text-ink-muted">
           <p>
-            <strong>What Sayzo can do with this:</strong> watch for the one
-            shortcut you set, and read the title of your active browser tab
-            (e.g.&nbsp;<em>"Meet — abc-defg-hij"</em>) to detect when you've
-            joined a web meeting. Page contents, what you type into pages,
-            your browsing history — none of it crosses over.
-          </p>
-          <p>
-            Without this on, your shortcut won't work outside the Sayzo
-            window and Sayzo can't auto-prompt for browser meetings — so
-            we won't move you forward until it's set.
+            Enable Accessibility access so Sayzo can respond to shortcuts
+            anywhere on your Mac.
           </p>
         </div>
       )}
