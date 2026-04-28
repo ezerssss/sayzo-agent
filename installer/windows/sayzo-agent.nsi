@@ -2,10 +2,13 @@
 ; Installs the PyInstaller bundle, creates auto-start Task Scheduler entry,
 ; and registers with Add/Remove Programs.
 
-; Compile in Unicode mode so UTF-8 source bytes (em-dashes in the welcome /
-; finish page copy, smart punctuation in comments) render correctly. Without
-; this, NSIS 3 falls back to Windows-1252 and the welcome page title shows
-; "Sayzo â€" …" instead of "Sayzo — …".
+; Build a Unicode installer. NOTE: NSIS 3 does NOT auto-detect UTF-8 source
+; files without a BOM (it falls back to the active code page, Windows-1252
+; for English locales), so this directive alone does not make em-dashes /
+; smart punctuation in source render correctly at install time. To stay
+; portable across CI hosts and editor settings, keep this file pure ASCII
+; (use plain hyphens, straight quotes, etc.). Earlier versions had "Sayzo +
+; em-dash" in the welcome title and shipped the mojibake "Sayzo a-euro".
 Unicode true
 
 !include "MUI2.nsh"
@@ -14,7 +17,7 @@ Unicode true
 !include "WordFunc.nsh"
 
 ; Vendored NSIS plugins (see installer/windows/nsis-plugins/README.md).
-; We ship ApplicationID.dll so toast notifications work on Win10 — the
+; We ship ApplicationID.dll so toast notifications work on Win10 - the
 ; chocolatey `nsis` package on CI doesn't bundle third-party plugins.
 !addplugindir /x86-unicode "nsis-plugins\x86-unicode"
 
@@ -27,7 +30,7 @@ Unicode true
 ; PRODUCT_VERSION is normally injected by CI via `makensis /DPRODUCT_VERSION=$VERSION ...`
 ; where $VERSION is read from pyproject.toml (the single source of truth for Phase A
 ; auto-update). The !ifndef guard keeps local/dev `makensis ...` invocations working
-; without requiring the flag — they'll just produce an installer labelled 0.0.0-dev.
+; without requiring the flag - they'll just produce an installer labelled 0.0.0-dev.
 !ifndef PRODUCT_VERSION
     !define PRODUCT_VERSION "0.0.0-dev"
 !endif
@@ -52,24 +55,24 @@ UninstallIcon "..\..\installer\assets\logo.ico"
 !define MUI_ICON "..\..\installer\assets\logo.ico"
 !define MUI_UNICON "..\..\installer\assets\logo.ico"
 
-; Welcome page — introduces the armed-only model so users understand what
+; Welcome page - introduces the armed-only model so users understand what
 ; they're installing before files hit disk. Copy is the approved draft from
 ; installer/copy_draft.md; mirror any future revisions of that file here.
-!define MUI_WELCOMEPAGE_TITLE "Sayzo — the English speaking coach you bring to your meetings."
+!define MUI_WELCOMEPAGE_TITLE "Sayzo - the English speaking coach you bring to your meetings."
 !define MUI_WELCOMEPAGE_TEXT "Sayzo captures conversations from your meetings and turns them into personalized English-speaking drills. It only listens when you say so: press a keyboard shortcut, or say yes to a prompt when Sayzo notices you're in a meeting.$\r$\n$\r$\nYour microphone stays off until then."
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_INSTFILES
 
 ; Finish page with a "Launch Sayzo" checkbox that runs the windowless
 ; service exe (console=False per sayzo-agent.spec). The service detects
-; missing setup signals and opens its own first-run GUI if needed — that's
+; missing setup signals and opens its own first-run GUI if needed - that's
 ; the whole point of the GUI installer path. See ~/.claude/plans/i-created-a-memory-quizzical-cosmos.md.
 ; The MUI_FINISHPAGE_RUN_* defines must come BEFORE MUI_PAGE_FINISH.
 !define MUI_FINISHPAGE_TITLE "Sayzo is ready."
 !define MUI_FINISHPAGE_TEXT "We'll open a short setup window to get Sayzo ready. Nothing records until you say so."
 !define MUI_FINISHPAGE_RUN "$INSTDIR\${SERVICE_EXE}"
 ; --force-setup makes the service open the GUI regardless of detect_setup's
-; verdict — users get visual confirmation right after install even if they
+; verdict - users get visual confirmation right after install even if they
 ; had prior-install state from a previous CLI run.
 !define MUI_FINISHPAGE_RUN_PARAMETERS "service --force-setup"
 !define MUI_FINISHPAGE_RUN_TEXT "Launch Sayzo"
@@ -89,7 +92,7 @@ Section "Install"
     ; Stop any running agent before overwriting its exes. Without this, a user
     ; re-running the installer (the Phase A "Download update" path) hits
     ; ERROR_SHARING_VIOLATION on sayzo-agent.exe / sayzo-agent-service.exe mid
-    ; File /r and the install aborts with files half-replaced. Idempotent —
+    ; File /r and the install aborts with files half-replaced. Idempotent -
     ; both commands exit non-zero on "task/process not found" and we ignore
     ; the return. The Task Scheduler task itself is re-created below with /F.
     nsExec::ExecToLog 'schtasks /End /TN "Sayzo"'
@@ -107,7 +110,7 @@ Section "Install"
     ; Drop MicrosoftEdgeWebview2Setup.exe (~120 KB, downloads from MS CDN at
     ; install time) into installer/windows/ to enable bundling. Get it from:
     ;   https://go.microsoft.com/fwlink/p/?LinkId=2124703
-    ; The !if /FileExists guard makes the bootstrapper optional — if the
+    ; The !if /FileExists guard makes the bootstrapper optional - if the
     ; file isn't there at compile time the installer skips this whole block
     ; and assumes the target machine already has the runtime.
     !if /FileExists "MicrosoftEdgeWebview2Setup.exe"
@@ -121,11 +124,11 @@ Section "Install"
         webview2_skip:
     !endif
 
-    ; Bootstrap Microsoft Visual C++ Redistributable (2015–2022, x64). torch's
+    ; Bootstrap Microsoft Visual C++ Redistributable (2015-2022, x64). torch's
     ; c10.dll depends on msvcp140/vcruntime140 and we strip those from the
     ; PyInstaller bundle (see sayzo-agent.spec) so Windows loads matched
     ; versions from the Redist instead of PyInstaller's mismatched copies.
-    ; /install /quiet /norestart is idempotent — skips fast if up to date.
+    ; /install /quiet /norestart is idempotent - skips fast if up to date.
     !if /FileExists "VC_redist.x64.exe"
         DetailPrint "Installing Visual C++ Redistributable..."
         File "VC_redist.x64.exe"
@@ -145,7 +148,7 @@ Section "Install"
     ; /F: force overwrite if exists
     nsExec::ExecToLog 'schtasks /Create /TN "Sayzo" /TR "\"$INSTDIR\${SERVICE_EXE}\" service" /SC ONLOGON /RL HIGHEST /F'
 
-    ; Start Menu shortcut — also uses the windowless exe so clicking it doesn't
+    ; Start Menu shortcut - also uses the windowless exe so clicking it doesn't
     ; pop a terminal. The console exe stays available on PATH for CLI use.
     CreateDirectory "$SMPROGRAMS\${PRODUCT_NAME}"
     CreateShortCut "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME}.lnk" "$INSTDIR\${SERVICE_EXE}" "service"
