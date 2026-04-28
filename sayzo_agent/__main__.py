@@ -741,6 +741,15 @@ def service(force_setup: bool) -> None:
             except Exception:
                 log.warning("launchd registration failed (non-fatal)", exc_info=True)
 
+        # Reload cfg so anything the user changed during onboarding —
+        # most importantly the hotkey on the Shortcut screen — flows into
+        # the tray seed + ArmController construction below. Without this,
+        # the agent registers the stale default hotkey and the tray shows
+        # the wrong combo until the user restarts. Settings (which runs
+        # out-of-process) sidesteps this by IPC-nudging the live agent;
+        # onboarding has no such nudge because the agent doesn't exist yet.
+        cfg = load_config()
+
     from .auth.store import TokenStore
     from .gui.tray import TrayIcon, TrayState, Status
 

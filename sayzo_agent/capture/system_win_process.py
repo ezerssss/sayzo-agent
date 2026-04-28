@@ -371,6 +371,7 @@ class ProcessLoopbackCapture:
         sample_rate: int = 16_000,
         frame_ms: int = 20,
         queue_maxsize: int = 200,
+        queue: Optional[asyncio.Queue[tuple[float, np.ndarray]]] = None,
     ) -> None:
         if not target_pids:
             raise ValueError("ProcessLoopbackCapture requires at least one target PID")
@@ -381,7 +382,15 @@ class ProcessLoopbackCapture:
         self.sample_rate = sample_rate
         self.frame_samples = int(sample_rate * frame_ms / 1000)
         self.frame_duration = self.frame_samples / sample_rate
-        self.queue: asyncio.Queue[tuple[float, np.ndarray]] = asyncio.Queue(maxsize=queue_maxsize)
+        # Allow the caller (SystemCapture) to inject its own queue so
+        # external consumers that already hold a reference to it keep
+        # receiving frames. Without this, SystemCapture used to do
+        # ``self.queue = delegate.queue`` after start(), leaving every
+        # _consume task in app.py reading the now-orphaned original queue
+        # while real audio piled up in the delegate's queue and overflowed.
+        self.queue: asyncio.Queue[tuple[float, np.ndarray]] = (
+            queue if queue is not None else asyncio.Queue(maxsize=queue_maxsize)
+        )
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._threads: list[threading.Thread] = []
@@ -472,6 +481,19 @@ class ProcessLoopbackCapture:
         for t in self._threads:
             t.join(timeout=2.0)
         self._threads = []
+
+    def _enqueue_or_drop(self, item: tuple[float, np.ndarray], pid: int) -> None:
+        """Loop-thread callback: put a frame on the queue or drop on overflow.
+
+        Runs on the asyncio loop thread (scheduled via call_soon_threadsafe).
+        Catching QueueFull here is the only way to suppress it; catching it
+        around the call_soon_threadsafe call itself doesn't work because
+        the put_nowait isn't actually invoked until later.
+        """
+        try:
+            self.queue.put_nowait(item)
+        except asyncio.QueueFull:
+            log.warning("[proc-loopback] queue full, dropping frame pid=%d", pid)
 
     # ---- per-PID capture thread ------------------------------------------
 
@@ -761,12 +783,18 @@ class ProcessLoopbackCapture:
                         frame = resampled[pos : pos + self.frame_samples]
                         frame_mono = batch_first_mono + (pos / self.sample_rate)
                         pos += self.frame_samples
-                        try:
-                            loop.call_soon_threadsafe(
-                                self.queue.put_nowait, (frame_mono, frame)
-                            )
-                        except asyncio.QueueFull:
-                            log.warning("[proc-loopback] queue full pid=%d", pid)
+                        # The QueueFull check has to live INSIDE the
+                        # call_soon_threadsafe target — wrapping the
+                        # call_soon_threadsafe call itself in try/except
+                        # doesn't catch it because put_nowait runs later
+                        # on the loop thread, not in this thread. Without
+                        # the wrapper, a brief consumer hiccup floods
+                        # asyncio's default exception handler with one
+                        # "Exception in callback Queue.put_nowait" per
+                        # dropped frame.
+                        loop.call_soon_threadsafe(
+                            self._enqueue_or_drop, (frame_mono, frame), pid,
+                        )
         finally:
             try:
                 audio_client.Stop()

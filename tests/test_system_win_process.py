@@ -93,6 +93,19 @@ class TestConstructor:
         assert cap.queue is not None
         assert cap.queue.maxsize == 200
 
+    def test_external_queue_is_used_verbatim(self):
+        """SystemCapture passes its own queue in so external consumers
+        (app._consume) keep receiving frames after delegation. Regression
+        test for the silent-system-audio bug where SystemCapture used to
+        do ``self.queue = delegate.queue`` AFTER consumers had grabbed the
+        original queue reference, leaving them reading an empty queue while
+        the delegate piled real audio into its own queue."""
+        from sayzo_agent.capture.system_win_process import ProcessLoopbackCapture
+
+        external = asyncio.Queue(maxsize=10)
+        cap = ProcessLoopbackCapture((1234,), queue=external)
+        assert cap.queue is external
+
     @pytest.mark.asyncio
     async def test_start_rejects_mismatched_pids(self):
         from sayzo_agent.capture.system_win_process import ProcessLoopbackCapture
@@ -136,10 +149,18 @@ class TestSystemCaptureFallback:
         await cap.stop()
 
     @pytest.mark.asyncio
-    async def test_process_loopback_success_uses_delegate_queue(self, monkeypatch):
+    async def test_process_loopback_success_keeps_original_queue(self, monkeypatch):
+        """SystemCapture must NOT swap its queue when the delegate succeeds.
+
+        External consumers (app._consume) capture ``cap.queue`` by reference
+        at task creation. If we replaced it with the delegate's queue here
+        they'd silently read from the orphaned original forever — which is
+        exactly the bug that caused ``sys_total=0.0s`` in installed builds.
+        """
         from sayzo_agent.capture import system_win
 
         cap = system_win.SystemCapture()
+        original_queue = cap.queue  # what the consumer would have grabbed
 
         # Fake delegate returned by _try_start_process_loopback.
         delegate = MagicMock()
@@ -152,11 +173,47 @@ class TestSystemCaptureFallback:
         monkeypatch.setattr(cap, "_try_start_process_loopback", fake_try)
 
         await cap.start(target_pids=(1234,))
-        assert cap.queue is delegate.queue
+        assert cap.queue is original_queue, (
+            "SystemCapture.queue must remain identical so external consumers' "
+            "queue reference stays valid after delegation"
+        )
         assert cap._thread is None  # endpoint thread NOT started
 
         await cap.stop()
         delegate.stop.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_try_start_process_loopback_passes_queue_to_delegate(self, monkeypatch):
+        """The real _try_start_process_loopback must construct the delegate
+        with ``queue=self.queue`` so frames flow into the queue the consumer
+        is already reading. Without this the queue overflows and
+        ``sys_total=0.0s`` for the whole session."""
+        from sayzo_agent.capture import system_win
+
+        cap = system_win.SystemCapture()
+
+        captured_kwargs: dict = {}
+
+        class FakeDelegate:
+            def __init__(self, target_pids, **kwargs):
+                captured_kwargs.update(kwargs)
+                self.queue = kwargs.get("queue")
+
+            async def start(self):
+                pass
+
+            async def stop(self):
+                pass
+
+        # Patch the import target inside _try_start_process_loopback.
+        import sayzo_agent.capture.system_win_process as proc_module
+        monkeypatch.setattr(proc_module, "ProcessLoopbackCapture", FakeDelegate)
+        monkeypatch.setattr(proc_module, "is_supported", lambda: True)
+
+        delegate = await cap._try_start_process_loopback((1234,))
+        assert delegate is not None
+        assert "queue" in captured_kwargs, "delegate must be constructed with queue= kwarg"
+        assert captured_kwargs["queue"] is cap.queue
 
     @pytest.mark.asyncio
     async def test_process_loopback_failure_falls_back_to_endpoint(self, monkeypatch, caplog):

@@ -249,11 +249,14 @@ class SystemCapture:
             delegate = await self._try_start_process_loopback(target_pids)
             if delegate is not None:
                 # Successfully attached to the process-loopback client.
-                # Re-expose its queue as our own so downstream (_consume)
-                # reads from the per-process stream without any awareness
-                # of the delegation.
+                # The delegate was constructed with ``queue=self.queue`` so
+                # it writes frames into the same queue our external consumer
+                # (app._consume) is already draining. We MUST NOT do
+                # ``self.queue = delegate.queue`` here — earlier versions did,
+                # which left _consume holding a stale reference to the
+                # original queue while real audio piled up in the delegate's
+                # queue and overflowed (see system_win_process.py docstring).
                 self._process_loopback = delegate
-                self.queue = delegate.queue
                 return
             log.warning(
                 "system capture: process loopback unavailable for pids=%s — "
@@ -290,6 +293,11 @@ class SystemCapture:
                 target_pids,
                 sample_rate=self.sample_rate,
                 frame_ms=int(self.frame_duration * 1000),
+                # Share our queue so frames flow to the consumer that's
+                # already reading from ``self.queue`` (app._consume captured
+                # the reference at task creation; reassigning self.queue
+                # later wouldn't reach it).
+                queue=self.queue,
             )
             await delegate.start()
         except Exception:
