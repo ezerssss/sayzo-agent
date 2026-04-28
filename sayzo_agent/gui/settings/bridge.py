@@ -555,6 +555,12 @@ class Bridge:
         ``spec`` is a JSON-friendly DetectorSpec shape (the React side
         constructs it from the Add-app dialog). Replaces any existing
         spec with the same ``app_key`` so a re-add doesn't duplicate.
+
+        Browser specs that arrive with only ``url_patterns`` get a
+        title pattern auto-derived from the first URL pattern's host.
+        Required for macOS where ``get_browser_window_urls`` returns
+        ``[]`` (TCC-avoidance) — without a title pattern, the spec
+        would never match a tab on Mac.
         """
         if not isinstance(spec, dict):
             return {"added": False, "error": "spec must be an object"}
@@ -562,6 +568,18 @@ class Bridge:
             new_spec = DetectorSpec.model_validate(spec)
         except Exception as e:
             return {"added": False, "error": f"invalid spec: {e}"}
+        if (
+            new_spec.is_browser
+            and new_spec.url_patterns
+            and not new_spec.title_patterns
+        ):
+            host = detector_helpers.host_from_url_pattern(new_spec.url_patterns[0])
+            if host is not None:
+                derived = detector_helpers.title_pattern_from_host(host)
+                if derived is not None:
+                    new_spec = new_spec.model_copy(
+                        update={"title_patterns": [derived]}
+                    )
         self._cfg.arm.detectors = [
             s for s in self._cfg.arm.detectors if s.app_key != new_spec.app_key
         ]

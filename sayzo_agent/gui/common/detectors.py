@@ -89,6 +89,76 @@ def url_pattern(host: str, path: str, *, strict: bool) -> str:
     return rf"^https://{host_re}/"
 
 
+_GENERIC_LABELS = frozenset({
+    "www", "app", "m", "mobile", "web", "go",
+})
+
+
+def title_pattern_from_host(host: str) -> Optional[str]:
+    """Build a window-title regex that matches the host's product name.
+
+    Required for macOS Web specs: ``platform_mac.get_browser_window_urls``
+    always returns ``[]`` (avoids the Automation TCC dialog), so a custom
+    spec with only ``url_patterns`` can never match on Mac. Auto-deriving
+    a title pattern from the host means user-added Web specs still work
+    on macOS via ``get_browser_window_titles`` + the matcher's
+    title-pattern fallback.
+
+    Picks the most distinctive label of the host: ``chatgpt`` from
+    ``chatgpt.com``, ``gemini`` from ``gemini.google.com``, ``notion``
+    from ``app.notion.com``. Returns a case-insensitive word-bounded
+    regex (e.g. ``r"(?i)\\bchatgpt\\b"``) — title bars typically contain
+    the product name and the word boundary keeps the match precise
+    without requiring the user to think about regex.
+
+    Returns ``None`` when the host is too generic to safely auto-derive
+    (e.g. ``google.com``); the caller should leave ``title_patterns``
+    empty in that case.
+    """
+    parts = [p for p in host.lower().split(".") if p and p not in _GENERIC_LABELS]
+    if len(parts) >= 2:
+        parts = parts[:-1]  # drop TLD
+    if not parts:
+        return None
+    label = parts[0]
+    if not label or len(label) < 3:
+        return None
+    return rf"(?i)\b{re.escape(label)}\b"
+
+
+def host_from_url_pattern(pattern: str) -> Optional[str]:
+    """Reverse-parse the host out of a regex emitted by ``url_pattern``.
+
+    ``url_pattern(host, path, strict=False)`` returns
+    ``"^https://{re.escape(host)}/"``. This walks that string, treating
+    backslash-escapes literally, and stops at the first unescaped slash.
+    Used by ``add_detector`` to auto-fill ``title_patterns`` without
+    needing the front-end to send a separate host alongside the regex.
+
+    Returns ``None`` for non-conforming patterns (no ``^https://``
+    prefix, or no host before a slash).
+    """
+    if not pattern.startswith("^https://"):
+        return None
+    rest = pattern[len("^https://"):]
+    host_chars: list[str] = []
+    i = 0
+    while i < len(rest):
+        ch = rest[i]
+        if ch == "/":
+            break
+        if ch == "\\" and i + 1 < len(rest):
+            host_chars.append(rest[i + 1])
+            i += 2
+            continue
+        host_chars.append(ch)
+        i += 1
+    host = "".join(host_chars)
+    if not host or "." not in host:
+        return None
+    return host
+
+
 _KNOWN_HOST_NAMES: dict[str, str] = {
     "meet.google.com": "Google Meet",
     "teams.microsoft.com": "Microsoft Teams",

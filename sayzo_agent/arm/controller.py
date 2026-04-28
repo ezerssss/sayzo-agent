@@ -840,8 +840,21 @@ class ArmController:
                 except Exception:
                     log.debug("[arm] meeting-ended snapshot failed", exc_info=True)
                     continue
+                # Precompute "are any of the browser PIDs we scoped to at
+                # arm time still alive" — only consulted by the macOS
+                # browser branch of arm_app_still_holding_mic where
+                # mic.holders is always empty so we can't lean on pycaw.
+                # Windows ignores the value (mic.holders gives a direct
+                # answer); kept out of detectors.py so that module doesn't
+                # need to import psutil. None ⇒ no arm-target context for
+                # this caller, fall back to legacy foreground-dependent
+                # behavior.
+                arm_pids_alive: Optional[bool] = None
+                if reason.target_pids:
+                    arm_pids_alive = _any_pid_alive(reason.target_pids)
                 still = _d.arm_app_still_holding_mic(
-                    reason.app_key, self.cfg.detectors, mic, fg
+                    reason.app_key, self.cfg.detectors, mic, fg,
+                    arm_pids_alive=arm_pids_alive,
                 )
                 if still:
                     grace = 0.0
@@ -1283,6 +1296,33 @@ def _default_resolve_pids_for_spec() -> Callable[[DetectorSpec], tuple[int, ...]
         from .platform_mac import resolve_pids_for_spec as fn
         return fn
     return lambda spec: ()
+
+
+def _any_pid_alive(pids: tuple[int, ...]) -> bool:
+    """Best-effort: is any PID in ``pids`` still a live process?
+
+    Used by the meeting-ended watcher on macOS to decide "is the browser
+    we armed for still running?" without depending on browser-foreground
+    (the legacy check broke on Alt+Tab during a session). psutil's
+    ``pid_exists`` is a sysctl-style read on macOS — no TCC permission
+    required, sub-millisecond. Empty tuple returns False so the watcher
+    treats "no PIDs to check" as "released." Any psutil exception is
+    swallowed and treated as "alive" — we'd rather miss a meeting-ended
+    detection by a few polls than spuriously close a live session.
+    """
+    if not pids:
+        return False
+    try:
+        import psutil
+    except Exception:
+        return True
+    for pid in pids:
+        try:
+            if psutil.pid_exists(pid):
+                return True
+        except Exception:
+            return True
+    return False
 
 
 def _human_duration(secs: float) -> str:

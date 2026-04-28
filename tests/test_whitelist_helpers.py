@@ -12,7 +12,9 @@ import pytest
 from sayzo_agent.gui.common.detectors import (
     display_name_from_host as _display_name_from_host,
     friendly_url_pattern as _friendly_url_pattern,
+    host_from_url_pattern as _host_from_url_pattern,
     parse_meeting_url as _parse_meeting_url,
+    title_pattern_from_host as _title_pattern_from_host,
     unique_app_key as _unique_app_key,
     url_pattern as _url_pattern,
 )
@@ -153,3 +155,88 @@ def test_friendly_url_pattern_unknown_falls_through():
 ])
 def test_display_name_from_host(host: str, expected: str):
     assert _display_name_from_host(host) == expected
+
+
+# ---- title_pattern_from_host (v2.1.10, for macOS Web detector matching) ----
+
+
+@pytest.mark.parametrize("host, sample_title, should_match", [
+    # Bare-domain product hosts: title contains the product name.
+    ("chatgpt.com", "ChatGPT - Voice mode - Google Chrome", True),
+    ("chatgpt.com", "ChatGPT", True),
+    ("chatgpt.com", "Some other tab", False),
+    # Subdomain hosts: title contains the subdomain product name.
+    ("gemini.google.com", "Gemini - My conversation - Google Chrome", True),
+    ("gemini.google.com", "Google Maps", False),
+    ("app.notion.com", "Notion - My doc - Google Chrome", True),
+    # Case-insensitive matching.
+    ("chatgpt.com", "chatgpt", True),
+    ("chatgpt.com", "CHATGPT", True),
+    # Word-bounded — substring shouldn't false-match.
+    ("notion.com", "Promotionally - my page", False),
+])
+def test_title_pattern_from_host_matches_titles(
+    host: str, sample_title: str, should_match: bool,
+):
+    pattern = _title_pattern_from_host(host)
+    assert pattern is not None, f"expected pattern for {host}"
+    assert bool(re.search(pattern, sample_title)) is should_match
+
+
+@pytest.mark.parametrize("host", [
+    "ab.co",  # label too short ("ab")
+    "x.io",  # single-char label
+])
+def test_title_pattern_from_host_returns_none_for_too_short(host: str):
+    """Labels under 3 chars are too generic to safely auto-derive a
+    title pattern — skip and let the user add one manually if they
+    want macOS support."""
+    assert _title_pattern_from_host(host) is None
+
+
+def test_title_pattern_skips_generic_subdomains():
+    """``www`` / ``app`` etc. are noise; the meaningful label comes
+    after them. ``www.notion.com`` should derive ``notion``, not
+    ``www``."""
+    pattern = _title_pattern_from_host("www.notion.com")
+    assert pattern is not None
+    assert re.search(pattern, "Notion") is not None
+    assert re.search(pattern, "www something") is None
+
+
+# ---- host_from_url_pattern (reverse of url_pattern) -------------------
+
+
+@pytest.mark.parametrize("pattern, expected_host", [
+    # Non-strict: produced as ^https://{host}/
+    (r"^https://chatgpt\.com/", "chatgpt.com"),
+    (r"^https://meet\.google\.com/", "meet.google.com"),
+    (r"^https://app\.notion\.com/", "app.notion.com"),
+    # Strict path: ^https://{host}{path}
+    (r"^https://meet\.google\.com/abc-defg-hij", "meet.google.com"),
+    # Hyphenated host
+    (r"^https://my-org\.zoom\.us/", "my-org.zoom.us"),
+])
+def test_host_from_url_pattern(pattern: str, expected_host: str):
+    assert _host_from_url_pattern(pattern) == expected_host
+
+
+@pytest.mark.parametrize("pattern", [
+    "",  # empty
+    "chatgpt.com",  # no scheme prefix
+    "^http://example.com/",  # http (we only emit https)
+    "^https:///",  # empty host
+    "^https://x/",  # no dot in host
+])
+def test_host_from_url_pattern_rejects_non_conforming(pattern: str):
+    assert _host_from_url_pattern(pattern) is None
+
+
+def test_host_from_url_pattern_round_trips_url_pattern():
+    """The inverse should round-trip every pattern emitted by
+    ``url_pattern``."""
+    for host in ("chatgpt.com", "meet.google.com", "app.notion.com"):
+        for path in ("", "/abc-defg-hij", "/j/1234567890"):
+            for strict in (True, False):
+                pattern = _url_pattern(host, path, strict=strict)
+                assert _host_from_url_pattern(pattern) == host

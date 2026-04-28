@@ -291,6 +291,36 @@ def match_whitelist(
     # can Alt+Tab to a terminal during a Meet call and we still want to
     # attribute the mic-hold to the right browser spec.
     if _browser_holds_mic(mic, foreground):
+        # Pass 3a — when the user is looking at a browser tab, that
+        # foreground tab is ground truth for "what they're using right
+        # now." Match every browser spec against the foreground-tab
+        # URL/title alone first, so a chatgpt-com voice mode in the
+        # foreground wins over a gmeet tab still open in another
+        # window. Without this, detector list order decided (default
+        # specs first, custom appended), and a background gmeet URL
+        # could mask a foreground chatgpt-com match (user report
+        # 2026-04-29).
+        fg_url = foreground.browser_tab_url
+        fg_title = foreground.browser_tab_title or foreground.window_title
+        if fg_url:
+            fg_urls = [fg_url]
+            fg_titles = [fg_title] if fg_title else []
+            for spec in active_specs:
+                if not spec.is_browser:
+                    continue
+                if _browser_spec_matches(spec, fg_urls, fg_titles):
+                    return MatchResult(
+                        app_key=spec.app_key,
+                        display_name=spec.display_name,
+                        source="browser_mic_plus_url",
+                        target_pids=_pids_for_browser_holders(mic),
+                    )
+
+        # Pass 3b — fallback. Foreground isn't a browser (Alt+Tabbed
+        # to a terminal) or its URL/title didn't match anything we
+        # know. Match against every visible browser window's URL +
+        # title — preserves the v2.1.7 "Alt+Tab away from the browser
+        # still attributes the mic-hold correctly" behavior.
         urls = _collect_browser_urls(foreground)
         titles = _collect_browser_titles(foreground)
         for spec in active_specs:
@@ -370,6 +400,8 @@ def arm_app_still_holding_mic(
     specs: list[DetectorSpec],
     mic: MicState,
     foreground: ForegroundInfo,
+    *,
+    arm_pids_alive: Optional[bool] = None,
 ) -> bool:
     """For the meeting-ended watcher: is the arm-app still a mic-holder?
 
@@ -377,6 +409,15 @@ def arm_app_still_holding_mic(
     same signal type we'd use to match it fresh. Used per-poll by the
     watcher; a streak of ``False`` longer than the grace window triggers
     the meeting-ended toast.
+
+    ``arm_pids_alive`` is a precomputed boolean from the controller — True
+    iff at least one of the browser PIDs we scoped to at arm time is still
+    a live process. Only consulted on the macOS browser path (where
+    ``mic.holders`` is always empty so we can't rely on per-process
+    pycaw attribution); the Windows path uses ``mic.holders`` directly.
+    Callers without arm context (the disarmed-state suppression-clear
+    loop) pass ``None`` and get the legacy foreground-dependent behavior.
+    Kept out of this pure module so detectors.py never imports psutil.
     """
     spec = next((s for s in specs if s.app_key == app_key), None)
     if spec is None:
@@ -414,4 +455,25 @@ def arm_app_still_holding_mic(
     #   opens another in the same browser without releasing the mic, we
     #   keep capturing under the original arm_reason. The audio is still
     #   legitimate user content; only the app_key label is wrong.
+
+    # Windows: pycaw populates mic.holders, so _browser_holds_mic gives
+    # a direct per-process answer regardless of foreground.
+    if mic.holders:
+        return _browser_holds_mic(mic, foreground)
+
+    # macOS: mic.holders is always empty (no per-process attribution in
+    # CoreAudio). When the controller has armed for a browser meeting
+    # it passes arm_pids_alive — True iff any of the browser PIDs we
+    # scoped to at arm time is still a live process. Combined with
+    # mic.active (system-wide capture is happening), this is per-PROCESS
+    # attribution that doesn't depend on foreground, eliminating the
+    # false meeting-ended toast users hit when Alt+Tabbing from Chrome
+    # to Notes during a meeting (user report 2026-04-29). Per-tab
+    # attribution within the browser is a separate documented limitation.
+    if arm_pids_alive is not None:
+        return mic.active and arm_pids_alive
+
+    # Fallback for callers without arm context (the disarmed-state
+    # suppression-clear loop) and for legacy unit tests: the original
+    # foreground-dependent check. Same semantics pre-v2.1.10.
     return _browser_holds_mic(mic, foreground)

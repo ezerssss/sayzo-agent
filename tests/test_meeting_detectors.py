@@ -317,6 +317,72 @@ def test_arm_app_browser_released_when_browser_drops_mic():
     assert arm_app_still_holding_mic("gmeet", SPECS, mic, fg) is False
 
 
+# ---- macOS arm_pids_alive PID-binding (v2.1.10) ------------------------
+
+
+def test_arm_app_browser_macos_alt_tab_still_holding():
+    """macOS sim: empty mic.holders, foreground is a non-browser app
+    (Notes), but the browser PIDs we armed for are still alive AND
+    mic.active is True. Pre-v2.1.10 this returned False (foreground
+    isn't browser → fired false meeting-ended toast). With
+    arm_pids_alive=True passed by the controller, we correctly stay
+    True throughout the Alt+Tab."""
+    fg = ForegroundInfo(
+        process_name="Notes",
+        is_browser=False,
+        browser_tab_url=None,
+    )
+    mic = MicState(holders=[], active=True)
+    assert arm_app_still_holding_mic(
+        "gmeet", SPECS, mic, fg, arm_pids_alive=True,
+    ) is True
+
+
+def test_arm_app_browser_macos_pids_dead_returns_false():
+    """macOS sim: mic.holders empty, browser PIDs are gone (user
+    closed Chrome) → arm_pids_alive=False → release."""
+    fg = ForegroundInfo(
+        process_name="Notes",
+        is_browser=False,
+        browser_tab_url=None,
+    )
+    mic = MicState(holders=[], active=True)
+    assert arm_app_still_holding_mic(
+        "gmeet", SPECS, mic, fg, arm_pids_alive=False,
+    ) is False
+
+
+def test_arm_app_browser_macos_mic_inactive_returns_false():
+    """macOS sim: browser PIDs alive but mic.active is False (no
+    process is currently capturing). The session has effectively
+    ended."""
+    fg = ForegroundInfo(
+        process_name="Google Chrome",
+        is_browser=True,
+        browser_tab_url=None,
+    )
+    mic = MicState(holders=[], active=False)
+    assert arm_app_still_holding_mic(
+        "gmeet", SPECS, mic, fg, arm_pids_alive=True,
+    ) is False
+
+
+def test_arm_app_browser_arm_pids_alive_ignored_when_mic_holders_present():
+    """Windows path: mic.holders has the browser, so we get a direct
+    per-process answer — arm_pids_alive is irrelevant. (Defending
+    against a future refactor that confused the precedence.)"""
+    fg = ForegroundInfo(
+        process_name="WindowsTerminal.exe",
+        is_browser=False,
+        browser_tab_url=None,
+    )
+    mic = MicState(holders=[MicHolder("chrome.exe", 1234)], active=False)
+    # arm_pids_alive=False would falsely return False if it took precedence.
+    assert arm_app_still_holding_mic(
+        "gmeet", SPECS, mic, fg, arm_pids_alive=False,
+    ) is True
+
+
 # ---- disabled flag -----------------------------------------------------
 
 
@@ -508,10 +574,14 @@ def test_gmeet_match_carries_browser_holder_pid():
 
 
 def test_exclude_app_keys_skips_first_match_finds_next():
-    """Browser has both Meet and ChatGPT URLs visible. Excluding gmeet
-    must let chatgpt-com (a custom user spec) be found instead — without
-    this, a declined gmeet match in a background tab would shadow the
-    foreground chatgpt-com match for the rest of the browser session."""
+    """Browser has both Meet and ChatGPT URLs visible. Excluding the
+    site the user is actively in must let the OTHER match be found
+    instead, so a declined site doesn't shadow a backgrounded meeting
+    that's also a candidate.
+
+    v2.1.10+: foreground tab URL gets priority via Pass 3a, so the
+    no-exclude case picks the foreground site first. Exclusion still
+    works correctly to fall through to background matches in Pass 3b."""
     custom = DetectorSpec(
         app_key="chatgpt-com", display_name="ChatGPT", is_browser=True,
         url_patterns=[r"^https://chatgpt\.com/"],
@@ -527,14 +597,65 @@ def test_exclude_app_keys_skips_first_match_finds_next():
     )
     mic = MicState(holders=[MicHolder("chrome.exe", 1234)])
 
-    # Without exclusion: gmeet wins (default order, matches via background
-    # browser_window_urls).
+    # Without exclusion: chatgpt-com (foreground tab) wins via Pass 3a.
     r = match_whitelist(specs, fg, mic)
-    assert r is not None and r.app_key == "gmeet"
+    assert r is not None and r.app_key == "chatgpt-com"
 
-    # With gmeet excluded: chatgpt-com wins via the foreground tab URL.
+    # With gmeet excluded: chatgpt-com still wins (Pass 3a, gmeet
+    # never reached anyway).
     r = match_whitelist(specs, fg, mic, exclude_app_keys=frozenset({"gmeet"}))
     assert r is not None and r.app_key == "chatgpt-com"
+
+    # With chatgpt-com excluded: gmeet wins via Pass 3b fallback
+    # against the background browser window URL.
+    r = match_whitelist(specs, fg, mic, exclude_app_keys=frozenset({"chatgpt-com"}))
+    assert r is not None and r.app_key == "gmeet"
+
+
+def test_pass3_prefers_foreground_tab_over_background_window():
+    """When user is on chatgpt foreground while gmeet is still active
+    in a background window, the toast must fire for chatgpt-com (the
+    user's actual focus), not gmeet (which happens to come first in
+    detector order). Pre-v2.1.10, detector list order decided and
+    users hit "Recording Google Meet?" when they meant to capture
+    chatgpt voice mode (user report 2026-04-29)."""
+    custom = DetectorSpec(
+        app_key="chatgpt-com", display_name="ChatGPT", is_browser=True,
+        url_patterns=[r"^https://chatgpt\.com/"],
+    )
+    specs = default_detector_specs() + [custom]
+    fg = ForegroundInfo(
+        process_name="chrome.exe", is_browser=True,
+        browser_tab_url="https://chatgpt.com/c/abc",
+        browser_tab_title="ChatGPT - Voice mode",
+        window_title="ChatGPT - Voice mode",
+        browser_window_urls=(
+            "https://chatgpt.com/c/abc",
+            "https://meet.google.com/aaa-bbbb-ccc",
+        ),
+    )
+    mic = MicState(holders=[MicHolder("chrome.exe", 1234)])
+    r = match_whitelist(specs, fg, mic)
+    assert r is not None
+    assert r.app_key == "chatgpt-com"
+
+
+def test_pass3_falls_back_when_browser_not_foreground():
+    """When the user has Alt+Tabbed away from the browser entirely
+    (foreground.is_browser is False so foreground.browser_tab_url is
+    None), Pass 3a is skipped and Pass 3b matches against every
+    visible browser window's URL — preserving the v2.1.7 behavior
+    where a Meet call in a background browser still fires its toast."""
+    fg = ForegroundInfo(
+        process_name="WindowsTerminal.exe",
+        is_browser=False,
+        browser_tab_url=None,  # not a browser foreground
+        browser_window_urls=("https://meet.google.com/aaa-bbbb-ccc",),
+    )
+    mic = MicState(holders=[MicHolder("chrome.exe", 1234)])
+    r = match_whitelist(default_detector_specs(), fg, mic)
+    assert r is not None
+    assert r.app_key == "gmeet"
 
 
 def test_exclude_app_keys_returns_none_when_only_match_is_excluded():

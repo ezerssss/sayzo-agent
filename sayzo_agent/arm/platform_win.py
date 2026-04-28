@@ -50,10 +50,14 @@ _com_executor_lock = threading.Lock()
 # Per-HWND URL cache. Populated by ``get_browser_tab_url``; entries age out
 # after ``_URL_CACHE_TTL_SECS`` and stale entries are GC'd by
 # ``get_browser_window_urls`` each call (so long-running agents don't grow
-# an unbounded map). Slightly longer than the watcher's 2 s poll interval
-# so two back-to-back calls within one tick (foreground + window-list)
-# share a single UIA walk.
-_URL_CACHE_TTL_SECS = 2.5
+# an unbounded map). MUST be shorter than the watcher's 2 s poll interval
+# so a tab-switch is reflected on the very next poll instead of one poll
+# later — at TTL >= poll, the next poll lands inside the still-valid
+# window and returns the previous tab's URL, lagging the consent toast
+# 2.5–4.5 s after the user switched tabs (user report 2026-04-29). 1.5 s
+# is still long enough to dedup the foreground URL read against the
+# window-list URL read inside one watcher tick (~50 ms apart).
+_URL_CACHE_TTL_SECS = 1.5
 _url_cache_lock = threading.Lock()
 _url_cache: dict[int, tuple[float, Optional[str]]] = {}
 
