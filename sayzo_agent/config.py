@@ -401,18 +401,13 @@ class ArmConfig(BaseSettings):
 
     # Whitelist-consent suppression, keyed by app_key.
     #
-    # After a natural session close (user was armed, detector closed the
-    # session), we apply a short timed cooldown so we don't immediately
-    # re-prompt for the same app if it's still holding the mic.
-    cooldown_after_session_secs: float = 600.0   # 10 min after session naturally ended
-    #
-    # After the user declines or ignores the consent toast, we suppress
-    # new toasts for that app_key until we observe the app release the
-    # mic continuously for this long. This matches user intent better
-    # than a flat time cooldown: "Not now" means "not this meeting", so
-    # leaving + rejoining (a new session) fires a fresh prompt, while
-    # staying in the declined meeting stays quiet — the hotkey is always
-    # available as an opt-in path during the suppressed window.
+    # After the user declines or ignores the consent toast OR a
+    # whitelist-armed session ends, we suppress new toasts for that
+    # app_key until we observe the app release the mic continuously for
+    # this long. "Not now" / "I just stopped" both mean "not this
+    # meeting", so leaving + rejoining (a new session) fires a fresh
+    # prompt, while staying in the same meeting stays quiet — the hotkey
+    # is always available as an opt-in path during the suppressed window.
     decline_release_grace_secs: float = 15.0
 
     # Long-meeting check-in: elapsed-session marks (seconds from session

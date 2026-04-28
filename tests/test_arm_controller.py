@@ -115,7 +115,6 @@ def _make_controller(
         "whitelist_arm_release_grace_secs": 0.03,
         "meeting_ended_snooze_secs": 0.05,
         "decline_release_grace_secs": 0.05,
-        "cooldown_after_session_secs": 600.0,
         "long_meeting_checkin_marks_secs": [3600.0],
         "detectors": default_detector_specs(),
     }
@@ -356,7 +355,6 @@ async def test_whitelist_arm_uses_resolver_when_match_has_no_pids():
         whitelist_arm_release_grace_secs=0.03,
         meeting_ended_snooze_secs=0.05,
         decline_release_grace_secs=0.05,
-        cooldown_after_session_secs=600.0,
         long_meeting_checkin_marks_secs=[3600.0],
         detectors=default_detector_specs(),
     )
@@ -414,10 +412,8 @@ async def test_whitelist_decline_suppresses_until_app_releases_mic():
     ctrl._whitelist_task = asyncio.create_task(ctrl._run_whitelist_watcher())
     await asyncio.sleep(0.15)
     assert ctrl.state == ArmState.DISARMED
-    import time
-    # Declined → active suppression, regardless of wall-clock time.
-    assert ctrl._cooldowns.active("zoom", time.monotonic()) is True
-    # And specifically: tracked in the session-based slot, not the timed one.
+    # Declined → active suppression until the app releases the mic.
+    assert ctrl._cooldowns.active("zoom") is True
     assert "zoom" in ctrl._cooldowns.declined_release_at
     # No second toast fired despite zoom still holding the mic for many polls.
     zoom_toasts = [c for c in notifier.consent_calls
@@ -456,6 +452,62 @@ async def test_whitelist_decline_clears_when_app_releases_mic():
     # Zoom re-acquires the mic (user joined a new meeting).
     ctrl._q_mic_holders = lambda: [MicHolder("zoom.exe", 5678)]
     # Let the second toast fire + accept land.
+    await asyncio.sleep(0.2)
+    assert ctrl.state == ArmState.ARMED
+
+    ctrl._whitelist_task.cancel()
+    try:
+        await ctrl._whitelist_task
+    except asyncio.CancelledError:
+        pass
+    await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
+
+
+async def test_whitelist_session_end_clears_when_app_releases_mic():
+    """Bug 2026-04-28: arm via whitelist → end session → close + reopen
+    the app. Pre-fix, a flat 10-min timed cooldown silently suppressed
+    the next consent toast even though the app released the mic and
+    re-acquired it (a new session from the user's perspective). Now
+    post-session uses the same release-tracking as the decline path, so
+    a fresh prompt fires the moment the app re-acquires the mic past
+    the grace window."""
+    notifier = FakeNotifier()
+    notifier.consent_script = ["yes", "yes"]  # accept both whitelist toasts
+    ctrl, _, mic, sys_cap, *_ = _make_controller(
+        notifier=notifier,
+        mic_holders=[MicHolder("zoom.exe", 1234)],
+    )
+    ctrl._loop = asyncio.get_running_loop()
+    ctrl._whitelist_task = asyncio.create_task(ctrl._run_whitelist_watcher())
+
+    # First match → toast → arm.
+    await asyncio.sleep(0.1)
+    assert ctrl.state == ArmState.ARMED
+    assert ctrl._reason is not None and ctrl._reason.app_key == "zoom"
+
+    # User stops the session via hotkey / tray.
+    await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
+    assert ctrl.state == ArmState.DISARMED
+    # Suppression is now release-based, not wall-clock — so it lives in
+    # declined_release_at, not in some flat-timer dict.
+    assert "zoom" in ctrl._cooldowns.declined_release_at
+
+    # While zoom keeps holding the mic (e.g. user stayed in the meeting
+    # but stopped recording), the watcher must NOT re-prompt.
+    await asyncio.sleep(0.1)
+    assert ctrl.state == ArmState.DISARMED
+    zoom_toasts = [c for c in notifier.consent_calls
+                   if "Zoom" in c.get("body", "")]
+    assert len(zoom_toasts) == 1
+
+    # Zoom releases the mic (user closed it). After grace_secs of
+    # continuous absence, the suppression clears.
+    ctrl._q_mic_holders = lambda: []
+    await asyncio.sleep(0.2)
+    assert "zoom" not in ctrl._cooldowns.declined_release_at
+
+    # Zoom re-acquires the mic (a brand-new session). Toast fires.
+    ctrl._q_mic_holders = lambda: [MicHolder("zoom.exe", 9999)]
     await asyncio.sleep(0.2)
     assert ctrl.state == ArmState.ARMED
 
@@ -725,7 +777,6 @@ async def test_hotkey_smart_guess_mac_uses_whitelisted_resolver_on_match(monkeyp
         whitelist_arm_release_grace_secs=0.03,
         meeting_ended_snooze_secs=0.05,
         decline_release_grace_secs=0.05,
-        cooldown_after_session_secs=600.0,
         long_meeting_checkin_marks_secs=[3600.0],
         detectors=default_detector_specs(),
     )

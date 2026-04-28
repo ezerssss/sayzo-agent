@@ -82,34 +82,29 @@ class ArmReason:
 class _Cooldowns:
     """Per-app suppression state for the whitelist watcher.
 
-    Two independent mechanisms, both keyed by ``app_key``:
+    Single mechanism, keyed by ``app_key``: when the user declines a
+    consent toast OR a whitelist-armed session ends, we mark the app as
+    suppressed and clear it once the app releases the mic for
+    ``decline_release_grace_secs`` continuous seconds. Leaving + rejoining
+    a meeting (or closing + reopening a voice-mode session) counts as a
+    new session, so a fresh prompt fires.
 
-    - ``entries`` — timed cooldown. Suppress until a monotonic deadline.
-      Used after a natural session close so we don't immediately re-prompt
-      for the same app while it's still holding the mic.
-    - ``declined_release_at`` — session-based suppression. When the user
-      declines or ignores a consent toast, we record the app as declined
-      and clear it only once the app releases the mic for
-      ``decline_release_grace_secs`` continuous seconds. Leaving + rejoining
-      a meeting counts as a new session, so a fresh prompt fires.
-
-    ``active`` returns True if EITHER mechanism is currently suppressing
-    the app; the watcher calls it before showing a toast.
+    A flat wall-clock cooldown was tried previously for the post-session
+    case but caused user-reported bug 2026-04-28: stop a ChatGPT voice
+    session, close it, reopen it within 10 min → no toast. Using the
+    release-based mechanism for both paths means the watcher re-prompts
+    as soon as the app actually re-acquires the mic.
     """
-    entries: dict[str, float] = field(default_factory=dict)
     # Value = monotonic time when the current "not holding" streak started,
     # or None if the app is currently still holding the mic (streak hasn't
-    # started yet). Presence of the key = declined state.
+    # started yet). Presence of the key = suppressed state.
     declined_release_at: dict[str, Optional[float]] = field(default_factory=dict)
 
-    def active(self, app_key: str, now: float) -> bool:
-        if app_key in self.declined_release_at:
-            return True
-        until = self.entries.get(app_key, 0.0)
-        return now < until
+    def active(self, app_key: str) -> bool:
+        return app_key in self.declined_release_at
 
-    def suppressed_keys(self, now_mono: float) -> frozenset[str]:
-        """Union of declined app_keys + currently-active timed cooldowns.
+    def suppressed_keys(self) -> frozenset[str]:
+        """Set of currently-suppressed app_keys.
 
         Passed to ``match_whitelist(exclude_app_keys=…)`` so the watcher
         skips suppressed specs entirely instead of finding the first match,
@@ -117,20 +112,12 @@ class _Cooldowns:
         background gmeet tab mask a foreground chatgpt-com match (user
         report 2026-04-25).
         """
-        keys = set(self.declined_release_at.keys())
-        for app_key, until in self.entries.items():
-            if now_mono < until:
-                keys.add(app_key)
-        return frozenset(keys)
-
-    def set(self, app_key: str, until_mono: float) -> None:
-        """Set a timed cooldown until the given monotonic time."""
-        self.entries[app_key] = until_mono
+        return frozenset(self.declined_release_at.keys())
 
     def mark_declined(self, app_key: str) -> None:
-        """Mark the app as declined. Cleared by ``tick_session`` once the
-        app releases the mic for long enough."""
-        # Start with None — no release streak yet (app is still holding).
+        """Mark the app as suppressed (decline OR session end). Cleared by
+        ``tick_session`` once the app releases the mic for long enough."""
+        # Start with None — no release streak yet (app may still be holding).
         self.declined_release_at[app_key] = None
 
     def tick_session(
@@ -625,15 +612,15 @@ class ArmController:
         self._checkin_task = None
         self._meeting_ended_task = None
 
-        # Per-app cooldown so the whitelist watcher doesn't re-prompt for
-        # the same app immediately after a natural session end.
+        # Suppress re-prompts for this app until it releases the mic for
+        # ``decline_release_grace_secs`` continuous seconds. Reuses the
+        # decline path's release-tracking so closing + reopening a session
+        # (e.g. ChatGPT voice mode) immediately re-prompts on the new
+        # mic acquisition, while staying quiet if the app keeps holding
+        # the mic (still in the same Zoom call).
         prev = self._reason
         if prev is not None and prev.app_key:
-            now_mono = time.monotonic()
-            self._cooldowns.set(
-                prev.app_key,
-                now_mono + self.cfg.cooldown_after_session_secs,
-            )
+            self._cooldowns.mark_declined(prev.app_key)
 
         self.state = ArmState.DISARMED
         self._reason = None
@@ -729,7 +716,7 @@ class ArmController:
                 # can't shadow a chatgpt-com match in the foreground —
                 # without this filter the watcher would find gmeet first,
                 # see it's suppressed, and silently bail for the whole poll.
-                suppressed = self._cooldowns.suppressed_keys(now_mono)
+                suppressed = self._cooldowns.suppressed_keys()
                 match = _d.match_whitelist(
                     self.cfg.detectors, fg, mic,
                     exclude_app_keys=suppressed,

@@ -220,7 +220,7 @@ def match_whitelist(
     NSWorkspace) before arming. Empty tuple ⇒ endpoint-wide capture.
 
     ``exclude_app_keys`` lets the caller skip specs that are currently
-    suppressed (decline-release pending, or post-session timed cooldown).
+    suppressed (release pending after a decline or session end).
     Without this, a declined ``gmeet`` match in a background browser
     window would mask a ``chatgpt-com`` match in the foreground tab —
     the watcher only looks at the first match per poll, so the next

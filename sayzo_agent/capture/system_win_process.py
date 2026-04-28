@@ -39,6 +39,7 @@ from __future__ import annotations
 import asyncio
 import ctypes
 import ctypes.wintypes as wintypes
+import gc
 import logging
 import sys
 import threading
@@ -559,10 +560,25 @@ class ProcessLoopbackCapture:
             except Exception:
                 log.exception("[proc-loopback] capture loop crashed for pid=%d", pid)
             finally:
-                try:
-                    audio_client.Release()  # type: ignore[attr-defined]
-                except Exception:
-                    pass
+                # Drop the comtypes wrapper so its __del__ runs and the
+                # underlying IAudioClient COM ref-count drops to 0 BEFORE
+                # the next arm cycle tries to ActivateAudioInterfaceAsync
+                # against the same PID.
+                #
+                # Do NOT call ``audio_client.Release()`` explicitly here:
+                # comtypes already calls Release() in its __del__, so a
+                # manual call double-decrements the COM ref-count, frees
+                # the object once, then the auto-Release frees it again.
+                # The double-free corrupts mmdevapi.dll's per-PID cache;
+                # the next session's Initialize then fails with
+                # E_UNEXPECTED (0x8000FFFF "Catastrophic failure"). Field-
+                # observed: session 1 always worked, session 2+ always
+                # failed with that exact HRESULT until this was removed.
+                del audio_client
+                # Force a GC pass so the wrapper's __del__ runs now (in
+                # this thread, before it exits) instead of whenever the
+                # cycle collector decides — release ordering matters here.
+                gc.collect()
                 log.info("[proc-loopback] capture thread exiting for pid=%d", pid)
         finally:
             # Unconditional readiness signal — even on failure we must set
