@@ -39,7 +39,6 @@ from __future__ import annotations
 import asyncio
 import ctypes
 import ctypes.wintypes as wintypes
-import gc
 import logging
 import sys
 import threading
@@ -354,15 +353,418 @@ def _make_completion_handler(syms, done_event: threading.Event, result_box: dict
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Per-PID persistent capture thread (lifetime = agent process)
+# ---------------------------------------------------------------------------
+#
+# WASAPI process-loopback ActivateAudioInterfaceAsync has a fundamental
+# limitation: re-activating against the same target PID inside the same
+# host process fails — IAudioClient::Initialize on the second activation
+# returns E_UNEXPECTED (0x8000FFFF "Catastrophic failure"). Microsoft's
+# own ApplicationLoopback sample never re-activates; it activates once
+# per program run. We mirror that lifecycle: activate + Initialize each
+# PID exactly once per agent-process lifetime, then Start/Stop the same
+# IAudioClient across arm/disarm cycles.
+#
+# Per-PID dedicated thread also avoids cross-apartment COM marshaling —
+# all calls on the audio_client / capture_client wrappers happen from the
+# same thread that originally created them.
+_PERSISTENT_THREADS: dict[int, "_PersistentLoopbackThread"] = {}
+_PERSISTENT_THREADS_LOCK = threading.Lock()
+
+
+def _enqueue_or_drop_static(
+    queue: asyncio.Queue, item: tuple[float, np.ndarray], pid: int
+) -> None:
+    """Loop-thread callback: put a frame on the queue, drop on overflow.
+
+    Module-level (not bound to any class instance) because the
+    persistent capture thread outlives any one ``ProcessLoopbackCapture``
+    instance — those come and go with each arm cycle. Catching
+    QueueFull HERE (inside the call_soon_threadsafe target) is the only
+    way to suppress it; wrapping the call_soon_threadsafe call itself
+    in try/except doesn't catch it because put_nowait actually runs
+    later on the loop thread.
+    """
+    try:
+        queue.put_nowait(item)
+    except asyncio.QueueFull:
+        log.warning("[proc-loopback] queue full, dropping frame pid=%d", pid)
+
+
+class _PersistentLoopbackThread:
+    """One long-lived capture thread for a single target PID.
+
+    Spawned on first ``activate()`` for the PID and kept alive for the
+    agent-process lifetime (daemon=True). Each subsequent activate /
+    deactivate pair toggles ``audio_client.Start()`` / ``Stop()``
+    instead of calling ActivateAudioInterfaceAsync again — see the
+    module-level comment above for why we can't re-activate.
+
+    Thread states:
+      - waiting (idle)            ``_wake.wait()`` blocks until activate
+      - running (draining audio)  inner loop runs until ``_idle`` is set
+      - back to waiting on disarm
+    """
+
+    def __init__(self, pid: int, sample_rate: int, frame_ms: int) -> None:
+        self.pid = pid
+        self.sample_rate = sample_rate
+        self.frame_samples = int(sample_rate * frame_ms / 1000)
+
+        # Cycle-control events. ``_wake`` flips to True on activate(),
+        # ``_idle`` flips to True on deactivate(). The thread alternates
+        # between the two.
+        self._wake = threading.Event()
+        self._idle = threading.Event()
+        # First-time activation result. ``activate()`` blocks on the
+        # event; ``_first_activation_ok`` reports success/failure.
+        self._first_activation_done = threading.Event()
+        self._first_activation_ok = False
+
+        # Per-cycle queue/loop, set by activate() and read by the
+        # capture loop. ``_lock`` guards the swap so the thread sees a
+        # consistent (queue, loop) pair.
+        self._lock = threading.Lock()
+        self._queue: Optional[asyncio.Queue[tuple[float, np.ndarray]]] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+
+        # Spawned lazily on first activate(); ``daemon=True`` so the OS
+        # tears it down on agent exit (no explicit shutdown path).
+        self._thread: Optional[threading.Thread] = None
+
+    def activate(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        queue: asyncio.Queue,
+        timeout_secs: float = 5.0,
+    ) -> bool:
+        """Resume / start delivering frames to ``queue``.
+
+        Spawns the persistent thread on the very first call. Subsequent
+        calls just signal the running thread to resume. Blocks up to
+        ``timeout_secs`` only on the first call (waiting for WASAPI
+        Activate + Initialize to complete). Returns True on success.
+        """
+        with self._lock:
+            self._loop = loop
+            self._queue = queue
+        self._idle.clear()
+        self._wake.set()
+
+        if self._thread is None:
+            self._thread = threading.Thread(
+                target=self._run,
+                name=f"proc-loopback-pid{self.pid}",
+                daemon=True,
+            )
+            self._thread.start()
+
+        # First-time activation has to finish before we can claim
+        # success. ``_first_activation_done`` is set by the thread once
+        # ActivateAudioInterfaceAsync + Initialize either complete or
+        # fail. After that, every subsequent activate() returns
+        # immediately because the event is already set.
+        if not self._first_activation_done.wait(timeout=timeout_secs):
+            return False
+        return self._first_activation_ok
+
+    def deactivate(self) -> None:
+        """Stop delivering frames; thread stays alive."""
+        self._wake.clear()
+        self._idle.set()
+
+    def _run(self) -> None:  # noqa: C901 — long but linear
+        # CoInit. comtypes auto-inits this thread to STA on first import;
+        # explicit MTA call may trip RPC_E_CHANGED_MODE — that's fine,
+        # STA works for our usage (single-thread access, IAgileObject
+        # completion handler).
+        try:
+            import comtypes  # type: ignore[import-not-found]
+            _RPC_E_CHANGED_MODE = -2147417850
+            try:
+                comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
+            except OSError as e:
+                if getattr(e, "winerror", 0) != _RPC_E_CHANGED_MODE:
+                    log.exception(
+                        "[proc-loopback] CoInitializeEx failed pid=%d", self.pid,
+                    )
+                    self._first_activation_done.set()
+                    return
+                log.debug(
+                    "[proc-loopback] thread already CoInit'd, continuing pid=%d",
+                    self.pid,
+                )
+        except Exception:
+            log.exception("[proc-loopback] comtypes import failed pid=%d", self.pid)
+            self._first_activation_done.set()
+            return
+
+        # First (and only) WASAPI activation + initialization for this PID.
+        try:
+            syms = _load_comtypes_symbols()
+        except Exception:
+            log.exception("[proc-loopback] comtypes symbol load failed pid=%d", self.pid)
+            self._first_activation_done.set()
+            return
+
+        try:
+            audio_client = _activate_process_loopback_client(syms, self.pid)
+        except Exception:
+            log.exception("[proc-loopback] activation failed pid=%d", self.pid)
+            self._first_activation_done.set()
+            return
+        if audio_client is None:
+            log.warning("[proc-loopback] no IAudioClient returned pid=%d", self.pid)
+            self._first_activation_done.set()
+            return
+
+        native_rate = 48000
+        n_channels = 2
+        wfx = _make_loopback_waveformat(rate=native_rate, channels=n_channels)
+        buffer_duration_hns = 200 * _REFTIMES_PER_MS
+        try:
+            audio_client.Initialize(
+                _AUDCLNT_SHAREMODE_SHARED,
+                _AUDCLNT_STREAMFLAGS_LOOPBACK | _AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                buffer_duration_hns,
+                0,
+                ctypes.byref(wfx),
+                None,
+            )
+        except Exception:
+            log.exception("[proc-loopback] Initialize failed pid=%d", self.pid)
+            self._first_activation_done.set()
+            return
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateEventW.argtypes = [
+            ctypes.c_void_p, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR,
+        ]
+        kernel32.CreateEventW.restype = wintypes.HANDLE
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        event_handle = kernel32.CreateEventW(None, False, False, None)
+        if not event_handle:
+            log.error("[proc-loopback] CreateEventW failed pid=%d", self.pid)
+            self._first_activation_done.set()
+            return
+
+        try:
+            audio_client.SetEventHandle(event_handle)
+        except Exception:
+            log.exception("[proc-loopback] SetEventHandle failed pid=%d", self.pid)
+            self._first_activation_done.set()
+            return
+
+        try:
+            capture_client_iunk = audio_client.GetService(syms["IID_IAudioCaptureClient"])
+        except Exception:
+            log.exception(
+                "[proc-loopback] GetService(IAudioCaptureClient) failed pid=%d", self.pid,
+            )
+            self._first_activation_done.set()
+            return
+        if capture_client_iunk is None:
+            log.error("[proc-loopback] GetService returned NULL pid=%d", self.pid)
+            self._first_activation_done.set()
+            return
+
+        try:
+            capture_client_ptr = capture_client_iunk.QueryInterface(
+                syms["IAudioCaptureClient"]
+            )
+        except Exception:
+            log.exception(
+                "[proc-loopback] QueryInterface(IAudioCaptureClient) failed pid=%d", self.pid,
+            )
+            self._first_activation_done.set()
+            return
+
+        log.info("[proc-loopback] activated client for pid=%d (persistent)", self.pid)
+
+        # Resampling setup — same constants regardless of how many
+        # arm cycles we run; native format is fixed to Float32 / 2-ch / 48 kHz.
+        g = gcd(native_rate, self.sample_rate)
+        up = self.sample_rate // g
+        down = native_rate // g
+        need_resample = native_rate != self.sample_rate
+        native_samples_per_frame = self.frame_samples * down // up
+        batch_native_samples = native_samples_per_frame * _RESAMPLE_BATCH_FRAMES
+        batch_duration = batch_native_samples / native_rate
+
+        log.info(
+            "[proc-loopback] pid=%d native_sr=%d ch=%d target_sr=%d "
+            "resample=%d/%d batch=%d frames batch_dur=%.3fs",
+            self.pid, native_rate, n_channels, self.sample_rate, up, down,
+            _RESAMPLE_BATCH_FRAMES, batch_duration,
+        )
+
+        # First-activation success signaled. From here on, the thread
+        # only ever toggles Start/Stop on the same audio_client.
+        self._first_activation_ok = True
+        self._first_activation_done.set()
+
+        WAIT_TIMEOUT = 0x00000102
+        WAIT_OBJECT_0 = 0x00000000
+
+        # Outer loop: wait for activate, drain until deactivate, repeat.
+        # The thread only exits when the process dies (daemon=True).
+        while True:
+            # Block until next activate(). On first iteration ``_wake``
+            # is already set by activate() before the thread reached
+            # this point.
+            self._wake.wait()
+            self._idle.clear()
+
+            try:
+                audio_client.Start()
+            except Exception:
+                log.exception("[proc-loopback] Start failed pid=%d", self.pid)
+                self._wake.clear()
+                self._idle.set()
+                continue
+
+            accumulator: list[np.ndarray] = []
+            accumulator_samples = 0
+            accumulator_first_mono: Optional[float] = None
+
+            try:
+                while not self._idle.is_set():
+                    wait_result = kernel32.WaitForSingleObject(event_handle, 100)
+                    if wait_result == WAIT_TIMEOUT:
+                        continue
+                    if wait_result != WAIT_OBJECT_0:
+                        log.warning(
+                            "[proc-loopback] WaitForSingleObject returned 0x%x pid=%d",
+                            wait_result, self.pid,
+                        )
+                        continue
+
+                    while True:
+                        try:
+                            packet_length = capture_client_ptr.GetNextPacketSize()
+                        except Exception:
+                            log.exception(
+                                "[proc-loopback] GetNextPacketSize failed pid=%d", self.pid,
+                            )
+                            packet_length = 0
+                        if packet_length == 0:
+                            break
+
+                        try:
+                            data_ptr, frames_available, flags, _pos, _qpc = (
+                                capture_client_ptr.GetBuffer()
+                            )
+                        except Exception:
+                            log.exception(
+                                "[proc-loopback] GetBuffer failed pid=%d", self.pid,
+                            )
+                            break
+
+                        mono_at_read = time.monotonic()
+                        packet_mono_first = (
+                            mono_at_read - (frames_available / native_rate)
+                        )
+
+                        try:
+                            sample_count = int(frames_available) * n_channels
+                            if sample_count > 0:
+                                arr_type = ctypes.c_float * sample_count
+                                arr = arr_type.from_address(
+                                    ctypes.cast(data_ptr, ctypes.c_void_p).value or 0
+                                )
+                                samples = np.ctypeslib.as_array(arr).copy()
+                                if n_channels > 1:
+                                    samples = samples.reshape(-1, n_channels).mean(axis=1)
+                                if accumulator_first_mono is None:
+                                    accumulator_first_mono = packet_mono_first
+                                accumulator.append(samples)
+                                accumulator_samples += samples.shape[0]
+                        finally:
+                            try:
+                                capture_client_ptr.ReleaseBuffer(frames_available)
+                            except Exception:
+                                log.debug(
+                                    "[proc-loopback] ReleaseBuffer failed pid=%d",
+                                    self.pid, exc_info=True,
+                                )
+
+                    while accumulator_samples >= batch_native_samples:
+                        if accumulator_first_mono is None:
+                            break
+                        full = (
+                            np.concatenate(accumulator)
+                            if len(accumulator) > 1
+                            else accumulator[0]
+                        )
+                        batch_native = full[:batch_native_samples]
+                        remainder = full[batch_native_samples:]
+                        batch_first_mono = accumulator_first_mono
+                        if remainder.size > 0:
+                            accumulator = [remainder]
+                            accumulator_samples = int(remainder.shape[0])
+                            accumulator_first_mono = (
+                                batch_first_mono + batch_native_samples / native_rate
+                            )
+                        else:
+                            accumulator = []
+                            accumulator_samples = 0
+                            accumulator_first_mono = None
+
+                        if need_resample:
+                            resampled = resample_poly(batch_native, up, down).astype(
+                                np.float32
+                            )
+                        else:
+                            resampled = batch_native.astype(np.float32, copy=False)
+
+                        with self._lock:
+                            queue = self._queue
+                            loop = self._loop
+                        if queue is None or loop is None:
+                            break
+
+                        pos = 0
+                        while pos + self.frame_samples <= len(resampled):
+                            frame = resampled[pos : pos + self.frame_samples]
+                            frame_mono = batch_first_mono + (pos / self.sample_rate)
+                            pos += self.frame_samples
+                            loop.call_soon_threadsafe(
+                                _enqueue_or_drop_static,
+                                queue, (frame_mono, frame), self.pid,
+                            )
+            finally:
+                try:
+                    audio_client.Stop()
+                except Exception:
+                    pass
+                # Reset the wake event so the next activate() call has
+                # to set it explicitly. Without this clear, _wake would
+                # still be True from this cycle and the next activate's
+                # wait() would return immediately even before the
+                # caller signals.
+                self._wake.clear()
+            log.info("[proc-loopback] paused pid=%d", self.pid)
+
+
 class ProcessLoopbackCapture:
     """WASAPI process-loopback capture scoped to a set of target PIDs.
 
     Mirrors :class:`sayzo_agent.capture.system_win.SystemCapture`'s public
     interface — ``async def start`` / ``async def stop`` plus a
     ``queue: asyncio.Queue[tuple[float, np.ndarray]]`` of mono pipeline
-    frames. When multiple PIDs are requested, we activate one client per
-    PID and sum-mix their outputs into the same queue (all clients emit
-    the same float32 mix format so sum-mix is the cheapest merge).
+    frames.
+
+    Internally backed by per-PID persistent capture threads (see
+    ``_PersistentLoopbackThread``) so re-arming against the same PID
+    doesn't re-activate WASAPI — re-activation fails on Windows with
+    E_UNEXPECTED. The persistent thread activates each PID exactly
+    once per agent-process lifetime and toggles Start/Stop on subsequent
+    arm/disarm cycles.
     """
 
     def __init__(
@@ -381,6 +783,7 @@ class ProcessLoopbackCapture:
             raise ValueError("ProcessLoopbackCapture: no valid PIDs after filtering")
 
         self.sample_rate = sample_rate
+        self.frame_ms = frame_ms
         self.frame_samples = int(sample_rate * frame_ms / 1000)
         self.frame_duration = self.frame_samples / sample_rate
         # Allow the caller (SystemCapture) to inject its own queue so
@@ -393,23 +796,19 @@ class ProcessLoopbackCapture:
             queue if queue is not None else asyncio.Queue(maxsize=queue_maxsize)
         )
 
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._threads: list[threading.Thread] = []
-        self._stop = threading.Event()
-        # Per-thread readiness signal (event + success flag). ``start()``
-        # awaits these so an activation failure surfaces to the caller
-        # instead of dying silently inside the thread and leaving us with
-        # a "delegate started OK" lie + empty queue for the whole session.
-        self._ready_events: list[threading.Event] = []
-        self._ready_ok: list[bool] = []
+        # PIDs successfully activated this session — used by stop() to
+        # call deactivate on exactly the threads we activated, no more.
+        self._activated_pids: list[int] = []
 
     # ---- lifecycle --------------------------------------------------------
 
     async def start(self, *, target_pids: Optional[tuple[int, ...]] = None) -> None:
-        """Spawn one capture thread per target PID. ``target_pids`` kwarg is
-        accepted for signature parity with ``SystemCapture.start`` but, by
-        contract, must equal the PIDs passed to ``__init__`` (or be empty /
-        None — which we read as "use the constructor value")."""
+        """Activate (or wake) the persistent capture thread for each PID.
+
+        First call for a given PID spawns the persistent thread and
+        does the WASAPI Activate + Initialize. Subsequent calls just
+        toggle the audio_client from Stopped → Started.
+        """
         if target_pids and tuple(target_pids) != self.target_pids:
             raise ValueError(
                 "ProcessLoopbackCapture.start target_pids disagrees with the "
@@ -421,405 +820,47 @@ class ProcessLoopbackCapture:
                 "(version 2004, May 2020) or newer"
             )
 
-        self._loop = asyncio.get_running_loop()
-        self._stop.clear()
+        loop = asyncio.get_running_loop()
 
-        # Spawn one thread per PID. Each thread activates its own IAudioClient
-        # and runs an independent capture loop. Threads enqueue onto the
-        # shared asyncio.Queue via call_soon_threadsafe, so contention on
-        # the queue is the only cross-thread synchronization.
-        for idx, pid in enumerate(self.target_pids):
-            ready = threading.Event()
-            self._ready_events.append(ready)
-            self._ready_ok.append(False)
-            t = threading.Thread(
-                target=self._run_for_pid,
-                args=(pid, idx, ready),
-                name=f"system-proc-loopback-pid{pid}",
-                daemon=True,
-            )
-            self._threads.append(t)
-            t.start()
+        successes = 0
+        for pid in self.target_pids:
+            with _PERSISTENT_THREADS_LOCK:
+                pcap = _PERSISTENT_THREADS.get(pid)
+                if pcap is None:
+                    pcap = _PersistentLoopbackThread(
+                        pid, self.sample_rate, self.frame_ms,
+                    )
+                    _PERSISTENT_THREADS[pid] = pcap
 
-        # Wait for every thread to signal readiness (or for the wait to
-        # time out). If none activated successfully, raise so
-        # ``SystemCapture._try_start_process_loopback`` can fall back to
-        # endpoint-wide capture for this session — otherwise we'd end up
-        # with a silent delegate + empty queue for the whole meeting.
-        activation_deadline_secs = 5.0
-        await asyncio.to_thread(
-            self._wait_for_readiness, activation_deadline_secs,
-        )
-        if not any(self._ready_ok):
-            # Best-effort: tear down whatever threads did spin up.
-            self._stop.set()
+            # First-time activation blocks up to 5 s on WASAPI work, so
+            # marshal it onto a worker thread to keep the event loop free.
+            ok = await asyncio.to_thread(pcap.activate, loop, self.queue, 5.0)
+            if ok:
+                self._activated_pids.append(pid)
+                successes += 1
+            else:
+                log.warning(
+                    "[proc-loopback] activation failed pid=%d", pid,
+                )
+
+        if successes == 0:
             raise RuntimeError(
                 f"process-loopback activation failed for all {len(self.target_pids)} PID(s)"
             )
-        if not all(self._ready_ok):
-            # Some succeeded, some didn't. Keep going with the successes —
-            # better than losing the whole session. Failed ones are already
-            # exited threads (no cleanup needed).
+        if successes < len(self.target_pids):
             log.warning(
                 "[proc-loopback] only %d/%d target PIDs activated successfully",
-                sum(self._ready_ok), len(self._ready_ok),
+                successes, len(self.target_pids),
             )
-
-    def _wait_for_readiness(self, timeout_secs: float) -> None:
-        """Block until every thread's readiness event is set, or the overall
-        timeout elapses. Runs on a thread-pool worker (from
-        ``asyncio.to_thread``) so the main event loop keeps ticking.
-        """
-        deadline = time.monotonic() + timeout_secs
-        for ev in self._ready_events:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            ev.wait(timeout=remaining)
 
     async def stop(self) -> None:
-        self._stop.set()
-        for t in self._threads:
-            t.join(timeout=2.0)
-        self._threads = []
-
-    def _enqueue_or_drop(self, item: tuple[float, np.ndarray], pid: int) -> None:
-        """Loop-thread callback: put a frame on the queue or drop on overflow.
-
-        Runs on the asyncio loop thread (scheduled via call_soon_threadsafe).
-        Catching QueueFull here is the only way to suppress it; catching it
-        around the call_soon_threadsafe call itself doesn't work because
-        the put_nowait isn't actually invoked until later.
-        """
-        try:
-            self.queue.put_nowait(item)
-        except asyncio.QueueFull:
-            log.warning("[proc-loopback] queue full, dropping frame pid=%d", pid)
-
-    # ---- per-PID capture thread ------------------------------------------
-
-    def _run_for_pid(self, pid: int, ready_idx: int, ready: threading.Event) -> None:
-        """Blocking loop: activate a process-loopback IAudioClient for ``pid``,
-        initialize it in shared / event-driven / loopback mode, then poll
-        IAudioCaptureClient in an event-driven loop until ``_stop`` is set.
-
-        On any activation failure we log, signal readiness (with success=False),
-        and exit the thread — ``start()`` picks that up and raises, so
-        ``SystemCapture`` falls back to endpoint-wide capture for the session.
-        """
-        try:
-            try:
-                import comtypes  # type: ignore[import-not-found]
-                # Importing comtypes on a fresh thread auto-inits it to STA
-                # (sys.coinit_flags defaults to COINIT_APARTMENTTHREADED). Our
-                # explicit MTA call then trips RPC_E_CHANGED_MODE (0x80010106
-                # / signed -2147417850) and the whole capture aborts. STA is
-                # actually fine for our usage — each worker thread owns one
-                # IAudioClient (no concurrent calls from this thread) and the
-                # completion handler is IAgileObject so it can be dispatched
-                # from any apartment. So: try MTA, accept "already inited"
-                # silently, raise on any other COM init failure.
-                _RPC_E_CHANGED_MODE = -2147417850  # 0x80010106 as signed int
-                try:
-                    comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
-                except OSError as e:
-                    if getattr(e, "winerror", 0) != _RPC_E_CHANGED_MODE:
-                        raise
-                    log.debug(
-                        "[proc-loopback] thread already CoInit'd (likely STA from "
-                        "comtypes auto-init); continuing without re-init pid=%d", pid,
-                    )
-            except Exception:
-                log.exception("[proc-loopback] CoInitializeEx failed for pid=%d", pid)
-                return
-
-            try:
-                syms = _load_comtypes_symbols()
-            except Exception:
-                log.exception("[proc-loopback] comtypes symbol load failed for pid=%d", pid)
-                return
-
-            try:
-                audio_client = _activate_process_loopback_client(syms, pid)
-            except Exception:
-                log.exception("[proc-loopback] activation failed for pid=%d", pid)
-                return
-            if audio_client is None:
-                log.warning("[proc-loopback] no IAudioClient returned for pid=%d", pid)
-                return
-
-            log.info("[proc-loopback] activated client for pid=%d", pid)
-            # Mark this PID as successfully activated so ``start()`` stops
-            # waiting and returns to the caller (who then reads from
-            # ``self.queue``).
-            self._ready_ok[ready_idx] = True
-            ready.set()
-
-            try:
-                self._capture_loop(audio_client, pid, syms)
-            except Exception:
-                log.exception("[proc-loopback] capture loop crashed for pid=%d", pid)
-            finally:
-                # Drop the comtypes wrapper so its __del__ runs and the
-                # underlying IAudioClient COM ref-count drops to 0 BEFORE
-                # the next arm cycle tries to ActivateAudioInterfaceAsync
-                # against the same PID.
-                #
-                # Do NOT call ``audio_client.Release()`` explicitly here:
-                # comtypes already calls Release() in its __del__, so a
-                # manual call double-decrements the COM ref-count, frees
-                # the object once, then the auto-Release frees it again.
-                # The double-free corrupts mmdevapi.dll's per-PID cache;
-                # the next session's Initialize then fails with
-                # E_UNEXPECTED (0x8000FFFF "Catastrophic failure"). Field-
-                # observed: session 1 always worked, session 2+ always
-                # failed with that exact HRESULT until this was removed.
-                del audio_client
-                # Force a GC pass so the wrapper's __del__ runs now (in
-                # this thread, before it exits) instead of whenever the
-                # cycle collector decides — release ordering matters here.
-                gc.collect()
-                log.info("[proc-loopback] capture thread exiting for pid=%d", pid)
-        finally:
-            # Unconditional readiness signal — even on failure we must set
-            # the event so ``start()``'s wait loop doesn't block for the
-            # full activation timeout.
-            ready.set()
-
-    def _capture_loop(self, audio_client, pid: int, syms: dict) -> None:
-        """Drain the IAudioCaptureClient until ``_stop`` is set.
-
-        Reads native-rate float32 frames, accumulates them into resample
-        batches (same 25-frame window as endpoint capture), resamples to
-        pipeline rate, and enqueues mono pipeline frames with per-frame
-        monotonic timestamps.
-
-        ``syms`` is the COM symbol map from ``_load_comtypes_symbols`` —
-        we need ``IAudioCaptureClient`` from it to QueryInterface the bare
-        ``IUnknown`` that ``IAudioClient::GetService`` returns.
-        """
-        # Initialize in shared / event-driven / loopback mode with a 200 ms
-        # buffer. 200 ms gives plenty of headroom for the GIL + resampling
-        # while keeping latency low enough that end-of-meeting pauses close
-        # promptly.
-        buffer_duration_hns = 200 * _REFTIMES_PER_MS
-
-        # Process-loopback clients don't implement ``GetMixFormat`` — calling
-        # it returns E_NOTIMPL (0x80004001 / "Not implemented"). The SDK
-        # documents this: process loopback delivers a fixed format that the
-        # CALLER must build. Microsoft's ApplicationLoopback sample uses
-        # Float32 / 2-channel / 48 kHz; we mirror that exactly for a
-        # known-good combo, then resample to the pipeline target like before.
-        native_rate = 48000
-        n_channels = 2
-        wfx = _make_loopback_waveformat(rate=native_rate, channels=n_channels)
-
-        try:
-            audio_client.Initialize(
-                _AUDCLNT_SHAREMODE_SHARED,
-                _AUDCLNT_STREAMFLAGS_LOOPBACK | _AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                buffer_duration_hns,
-                0,
-                ctypes.byref(wfx),
-                None,
-            )
-        except Exception:
-            log.exception("[proc-loopback] Initialize failed pid=%d", pid)
-            return
-
-        # Event handle for the event-driven mode. Set argtypes/restype
-        # explicitly: HANDLE is a pointer (8 B on x64) but Python's bare
-        # ctypes.windll.kernel32.* defaults restype to c_int (4 B), which
-        # silently truncates handle values above 2^31. Bool args also need
-        # to round-trip cleanly through wintypes.BOOL.
-        kernel32 = ctypes.windll.kernel32
-        kernel32.CreateEventW.argtypes = [
-            ctypes.c_void_p,    # lpEventAttributes
-            wintypes.BOOL,      # bManualReset
-            wintypes.BOOL,      # bInitialState
-            wintypes.LPCWSTR,   # lpName
-        ]
-        kernel32.CreateEventW.restype = wintypes.HANDLE
-        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
-        kernel32.WaitForSingleObject.restype = wintypes.DWORD
-        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-        kernel32.CloseHandle.restype = wintypes.BOOL
-
-        event_handle = kernel32.CreateEventW(None, False, False, None)
-        if not event_handle:
-            log.error("[proc-loopback] CreateEventW failed pid=%d", pid)
-            return
-
-        try:
-            audio_client.SetEventHandle(event_handle)
-        except Exception:
-            log.exception("[proc-loopback] SetEventHandle failed pid=%d", pid)
-            kernel32.CloseHandle(event_handle)
-            return
-
-        # IAudioClient::GetService returns a bare ``POINTER(IUnknown)``
-        # (per pycaw's signature). The IUnknown wrapper only exposes
-        # AddRef/QueryInterface/Release — calling
-        # ``GetNextPacketSize/GetBuffer/ReleaseBuffer`` on it raises
-        # AttributeError. We have to QueryInterface for the real
-        # ``IAudioCaptureClient`` type defined in ``_load_comtypes_symbols``.
-        try:
-            capture_client_iunk = audio_client.GetService(syms["IID_IAudioCaptureClient"])
-        except Exception:
-            log.exception("[proc-loopback] GetService(IAudioCaptureClient) failed pid=%d", pid)
-            kernel32.CloseHandle(event_handle)
-            return
-        if capture_client_iunk is None:
-            log.error("[proc-loopback] GetService returned NULL pid=%d", pid)
-            kernel32.CloseHandle(event_handle)
-            return
-        try:
-            capture_client_ptr = capture_client_iunk.QueryInterface(syms["IAudioCaptureClient"])
-        except Exception:
-            log.exception(
-                "[proc-loopback] QueryInterface(IAudioCaptureClient) failed pid=%d", pid,
-            )
-            kernel32.CloseHandle(event_handle)
-            return
-
-        try:
-            audio_client.Start()
-        except Exception:
-            log.exception("[proc-loopback] Start failed pid=%d", pid)
-            kernel32.CloseHandle(event_handle)
-            return
-
-        # Resampling parameters (native → pipeline).
-        g = gcd(native_rate, self.sample_rate)
-        up = self.sample_rate // g
-        down = native_rate // g
-        need_resample = native_rate != self.sample_rate
-
-        native_samples_per_frame = self.frame_samples * down // up
-        batch_native_samples = native_samples_per_frame * _RESAMPLE_BATCH_FRAMES
-        batch_duration = batch_native_samples / native_rate
-
-        log.info(
-            "[proc-loopback] pid=%d native_sr=%d ch=%d target_sr=%d "
-            "resample=%d/%d batch=%d frames batch_dur=%.3fs",
-            pid, native_rate, n_channels, self.sample_rate, up, down,
-            _RESAMPLE_BATCH_FRAMES, batch_duration,
-        )
-
-        accumulator: list[np.ndarray] = []
-        accumulator_samples = 0
-        accumulator_first_mono: Optional[float] = None
-
-        WAIT_TIMEOUT = 0x00000102
-        WAIT_OBJECT_0 = 0x00000000
-
-        try:
-            while not self._stop.is_set():
-                # Wait up to 100 ms for the next audio buffer — short enough
-                # that stop() returns promptly.
-                wait_result = kernel32.WaitForSingleObject(event_handle, 100)
-                if wait_result == WAIT_TIMEOUT:
-                    continue
-                if wait_result != WAIT_OBJECT_0:
-                    log.warning(
-                        "[proc-loopback] WaitForSingleObject returned 0x%x pid=%d",
-                        wait_result, pid,
-                    )
-                    continue
-
-                # Drain all available packets before waiting again. Process
-                # loopback can deliver multiple packets per event when under
-                # load — missing one shows up as a silent gap.
-                while True:
-                    try:
-                        packet_length = capture_client_ptr.GetNextPacketSize()
-                    except Exception:
-                        log.exception("[proc-loopback] GetNextPacketSize failed pid=%d", pid)
-                        packet_length = 0
-                    if packet_length == 0:
-                        break
-
-                    try:
-                        data_ptr, frames_available, flags, _pos, _qpc = capture_client_ptr.GetBuffer()
-                    except Exception:
-                        log.exception("[proc-loopback] GetBuffer failed pid=%d", pid)
-                        break
-
-                    mono_at_read = time.monotonic()
-                    packet_mono_first = mono_at_read - (frames_available / native_rate)
-
-                    try:
-                        # Samples: interleaved float32 per channel.
-                        sample_count = int(frames_available) * n_channels
-                        if sample_count > 0:
-                            arr_type = ctypes.c_float * sample_count
-                            arr = arr_type.from_address(
-                                ctypes.cast(data_ptr, ctypes.c_void_p).value or 0
-                            )
-                            samples = np.ctypeslib.as_array(arr).copy()
-                            if n_channels > 1:
-                                samples = samples.reshape(-1, n_channels).mean(axis=1)
-                            if accumulator_first_mono is None:
-                                accumulator_first_mono = packet_mono_first
-                            accumulator.append(samples)
-                            accumulator_samples += samples.shape[0]
-                    finally:
-                        try:
-                            capture_client_ptr.ReleaseBuffer(frames_available)
-                        except Exception:
-                            log.debug("[proc-loopback] ReleaseBuffer failed pid=%d", pid, exc_info=True)
-
-                # Resample + enqueue once enough native-rate samples buffered.
-                while accumulator_samples >= batch_native_samples:
-                    if accumulator_first_mono is None:
-                        break
-                    full = np.concatenate(accumulator) if len(accumulator) > 1 else accumulator[0]
-                    batch_native = full[:batch_native_samples]
-                    remainder = full[batch_native_samples:]
-                    batch_first_mono = accumulator_first_mono
-                    if remainder.size > 0:
-                        accumulator = [remainder]
-                        accumulator_samples = int(remainder.shape[0])
-                        accumulator_first_mono = batch_first_mono + batch_native_samples / native_rate
-                    else:
-                        accumulator = []
-                        accumulator_samples = 0
-                        accumulator_first_mono = None
-
-                    if need_resample:
-                        resampled = resample_poly(batch_native, up, down).astype(np.float32)
-                    else:
-                        resampled = batch_native.astype(np.float32, copy=False)
-
-                    pos = 0
-                    loop = self._loop
-                    if loop is None:
-                        break
-                    while pos + self.frame_samples <= len(resampled):
-                        frame = resampled[pos : pos + self.frame_samples]
-                        frame_mono = batch_first_mono + (pos / self.sample_rate)
-                        pos += self.frame_samples
-                        # The QueueFull check has to live INSIDE the
-                        # call_soon_threadsafe target — wrapping the
-                        # call_soon_threadsafe call itself in try/except
-                        # doesn't catch it because put_nowait runs later
-                        # on the loop thread, not in this thread. Without
-                        # the wrapper, a brief consumer hiccup floods
-                        # asyncio's default exception handler with one
-                        # "Exception in callback Queue.put_nowait" per
-                        # dropped frame.
-                        loop.call_soon_threadsafe(
-                            self._enqueue_or_drop, (frame_mono, frame), pid,
-                        )
-        finally:
-            try:
-                audio_client.Stop()
-            except Exception:
-                pass
-            try:
-                kernel32.CloseHandle(event_handle)
-            except Exception:
-                pass
+        """Pause the persistent thread(s); they stay alive for next arm."""
+        for pid in self._activated_pids:
+            with _PERSISTENT_THREADS_LOCK:
+                pcap = _PERSISTENT_THREADS.get(pid)
+            if pcap is not None:
+                pcap.deactivate()
+        self._activated_pids = []
 
 
 # ---------------------------------------------------------------------------

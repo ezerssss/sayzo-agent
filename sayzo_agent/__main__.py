@@ -212,7 +212,14 @@ def test_capture(seconds: int, dump_wav: bool) -> None:
 @click.option("--pid", type=int, required=True, help="Target process PID (and its child process tree).")
 @click.option("--seconds", default=10, help="How long to capture before stopping.")
 @click.option("--dump-wav", is_flag=True, help="Save captured audio as test_proc_loopback.wav for listening.")
-def test_process_loopback(pid: int, seconds: int, dump_wav: bool) -> None:
+@click.option(
+    "--cycles", default=1,
+    help="Number of start/stop cycles against the SAME PID inside this one process. "
+    "Use --cycles=2 to verify the persistent-thread fix for the 'session 1 OK / "
+    "session 2 fails with E_UNEXPECTED' bug.",
+)
+@click.option("--gap-secs", default=2.0, help="Idle seconds between cycles when --cycles > 1.")
+def test_process_loopback(pid: int, seconds: int, dump_wav: bool, cycles: int, gap_secs: float) -> None:
     """Smoke-test the Windows WASAPI Process Loopback capture path.
 
     Activates ``ProcessLoopbackCapture`` against a single PID, drains its
@@ -242,56 +249,83 @@ def test_process_loopback(pid: int, seconds: int, dump_wav: bool) -> None:
             click.echo("ERROR: this Windows build is too old (need 10.0.19041+).", err=True)
             sys.exit(2)
 
-        cap = ProcessLoopbackCapture(
-            target_pids=(pid,),
-            sample_rate=cfg.capture.sample_rate,
-            frame_ms=cfg.capture.frame_ms,
-        )
-        click.echo(f"[smoke] starting process-loopback capture pid={pid} for {seconds}s")
-        try:
-            await cap.start()
-        except Exception as exc:
-            click.echo(f"ERROR: capture.start() raised {type(exc).__name__}: {exc}", err=True)
-            sys.exit(1)
+        all_audio: list[np.ndarray] = []
 
-        frames: list[np.ndarray] = []
-        end = asyncio.get_running_loop().time() + seconds
-        n = 0
-        while asyncio.get_running_loop().time() < end:
+        for cycle in range(1, cycles + 1):
+            cap = ProcessLoopbackCapture(
+                target_pids=(pid,),
+                sample_rate=cfg.capture.sample_rate,
+                frame_ms=cfg.capture.frame_ms,
+            )
+            click.echo(
+                f"[smoke] cycle {cycle}/{cycles}: starting process-loopback "
+                f"pid={pid} for {seconds}s"
+            )
             try:
-                _ts, frame = await asyncio.wait_for(cap.queue.get(), timeout=0.1)
-            except asyncio.TimeoutError:
-                continue
-            n += 1
-            frames.append(frame)
+                await cap.start()
+            except Exception as exc:
+                click.echo(
+                    f"ERROR cycle {cycle}: capture.start() raised "
+                    f"{type(exc).__name__}: {exc}",
+                    err=True,
+                )
+                sys.exit(1)
 
-        await cap.stop()
+            frames: list[np.ndarray] = []
+            end = asyncio.get_running_loop().time() + seconds
+            n = 0
+            while asyncio.get_running_loop().time() < end:
+                try:
+                    _ts, frame = await asyncio.wait_for(cap.queue.get(), timeout=0.1)
+                except asyncio.TimeoutError:
+                    continue
+                n += 1
+                frames.append(frame)
 
-        if not frames:
+            await cap.stop()
+
+            if not frames:
+                click.echo(
+                    f"[smoke] cycle {cycle}: FAIL — captured 0 frames in {seconds}s. "
+                    "Either COM activation is broken or the target was silent. "
+                    "Check the log for the failing call."
+                )
+                sys.exit(1)
+
+            audio = np.concatenate(frames)
+            rms = float(np.sqrt(np.mean(audio.astype(np.float32) ** 2)))
+            peak = float(np.max(np.abs(audio)))
             click.echo(
-                f"[smoke] FAIL — captured 0 frames in {seconds}s. "
-                "Either the COM activation path is broken or the target process "
-                "is genuinely silent. Check log lines above for the failing call."
+                f"[smoke] cycle {cycle}: OK — {n} frames, {len(audio)} samples "
+                f"({len(audio) / cfg.capture.sample_rate:.2f}s), "
+                f"rms={rms:.4f}, peak={peak:.4f}"
             )
-            sys.exit(1)
+            if rms < 1e-5:
+                click.echo(
+                    f"[smoke] cycle {cycle}: WARN — rms near-zero. "
+                    "Capture activated but the stream is silent; "
+                    "double-check the target PID is actually playing audio."
+                )
+            all_audio.append(audio)
 
-        audio = np.concatenate(frames)
-        rms = float(np.sqrt(np.mean(audio.astype(np.float32) ** 2)))
-        peak = float(np.max(np.abs(audio)))
-        click.echo(
-            f"[smoke] OK — {n} frames, {len(audio)} samples "
-            f"({len(audio) / cfg.capture.sample_rate:.2f}s), rms={rms:.4f}, peak={peak:.4f}"
-        )
-        if rms < 1e-5:
-            click.echo(
-                "[smoke] WARN — rms is near-zero. Capture activated but the "
-                "stream is silent; double-check the target PID is actually playing audio."
-            )
+            if cycle < cycles:
+                click.echo(f"[smoke] sleeping {gap_secs}s before next cycle...")
+                await asyncio.sleep(gap_secs)
 
-        if dump_wav:
+        if dump_wav and all_audio:
             from .capture.replay import save_wav
-            save_wav(audio, cfg.capture.sample_rate, "test_proc_loopback.wav")
-            click.echo("[smoke] wrote test_proc_loopback.wav — open it in any player to verify.")
+            full = np.concatenate(all_audio)
+            save_wav(full, cfg.capture.sample_rate, "test_proc_loopback.wav")
+            click.echo(
+                "[smoke] wrote test_proc_loopback.wav (concatenated all cycles) "
+                "— open it in any player to verify."
+            )
+
+        if cycles > 1:
+            click.echo(
+                f"[smoke] all {cycles} cycles passed — re-arming against the "
+                "same PID works without E_UNEXPECTED."
+            )
 
     asyncio.run(_run())
 
