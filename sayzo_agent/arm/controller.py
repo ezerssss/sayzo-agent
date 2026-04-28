@@ -507,13 +507,19 @@ class ArmController:
         # Fresh-start invariant: VAD counter + detector epoch rewind so the
         # next frame behaves as the first frame of a cold-started source.
         # Done before flipping armed_event so _consume doesn't process any
-        # in-flight frame against stale VAD state.
+        # in-flight frame against stale VAD state. Then open the session
+        # immediately at arm time — frames flow directly into the session
+        # buffer (no pre-buffer indirection) so a stale frame from a
+        # previous arm cycle can't accumulate zeros into next session's
+        # backfill.
+        arm_now = time.monotonic()
         try:
             self.vad_mic.reset()
             self.vad_sys.reset()
             self.detector.reset_source_epochs()
+            self.detector.open_session_on_arm(arm_now)
         except Exception:
-            log.exception("[arm] reset_source_epochs failed (non-fatal)")
+            log.exception("[arm] reset / open_session_on_arm failed (non-fatal)")
 
         self.state = ArmState.ARMED
         self._reason = reason
@@ -812,15 +818,22 @@ class ArmController:
         assert reason.app_key is not None
         try:
             grace = 0.0
-            snooze_until = 0.0
+            # ``keep_going_clicked`` switches the watcher into silent
+            # force-close mode: after the user explicitly declined the
+            # first toast we don't ask again, but we still track the
+            # arm-app's mic-holder absence and close the session if it
+            # crosses ``force_close_after_keep_going_secs``. The previous
+            # design (10-min ``snooze_until``) just stopped checking,
+            # which meant a meeting that genuinely ended a few minutes
+            # after "Keep going" still captured ~10 minutes of nothing
+            # before the next toast fired.
+            keep_going_clicked = False
+            absence_after_keep_going = 0.0
             while self.state == ArmState.ARMED and not self._stop.is_set():
                 try:
                     await asyncio.sleep(self.cfg.poll_interval_secs)
                 except asyncio.CancelledError:
                     return
-                now = time.monotonic()
-                if now < snooze_until:
-                    continue
                 try:
                     mic = self._snapshot_mic_state()
                     fg = self._snapshot_foreground()
@@ -832,7 +845,46 @@ class ArmController:
                 )
                 if still:
                     grace = 0.0
+                    absence_after_keep_going = 0.0
                     continue
+
+                if keep_going_clicked:
+                    # Post-"Keep going" path. User already saw and
+                    # declined the interactive toast; we don't re-toast
+                    # interactively — but we DO accumulate consecutive
+                    # absence (resets to 0 the moment the arm-app comes
+                    # back into mic-holders) and close the session when
+                    # it crosses the threshold. A friendly informational
+                    # toast (no buttons) tells them what happened so the
+                    # close isn't silent and confusing.
+                    absence_after_keep_going += self.cfg.poll_interval_secs
+                    if (
+                        absence_after_keep_going
+                        >= self.cfg.force_close_after_keep_going_secs
+                    ):
+                        log.info(
+                            "[arm] mic released for %.0fs after 'Keep going' "
+                            "— wrapping up the session (app=%s)",
+                            absence_after_keep_going, reason.app_key,
+                        )
+                        name = reason.display_name or "your meeting app"
+                        try:
+                            self.notifier.notify(
+                                "Wrapped up your session",
+                                f"Looks like {name} stayed quiet for a while — "
+                                "Sayzo saved what you had.",
+                            )
+                        except Exception:
+                            log.debug(
+                                "[arm] info toast on force-close failed",
+                                exc_info=True,
+                            )
+                        await self._disarm_internal(
+                            SessionCloseReason.WHITELIST_ENDED
+                        )
+                        return
+                    continue
+
                 grace += self.cfg.poll_interval_secs
                 if grace < self.cfg.whitelist_arm_release_grace_secs:
                     continue
@@ -849,9 +901,13 @@ class ArmController:
                 if result in ("yes", "timeout"):
                     await self._disarm_internal(SessionCloseReason.WHITELIST_ENDED)
                     return
-                # "Keep going" → snooze; fresh grace counter next poll.
+                # "Keep going" → switch to silent force-close mode and
+                # reset counters so the threshold is measured from
+                # *now*, not from the (possibly long) absence that
+                # triggered the toast in the first place.
+                keep_going_clicked = True
                 grace = 0.0
-                snooze_until = time.monotonic() + self.cfg.meeting_ended_snooze_secs
+                absence_after_keep_going = 0.0
         except asyncio.CancelledError:
             raise
         except Exception:

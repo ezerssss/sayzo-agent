@@ -95,14 +95,16 @@ The pipeline is **staged by cost** — cheap stages run continuously (while arme
 ArmController (DISARMED on launch)
     ↕ [hotkey press → start-confirm toast → arm]
     ↕ [whitelist match → consent toast → arm]
-ArmController.arm() → mic.start() + sys.start() + vad.reset() + detector.reset_source_epochs()
+ArmController.arm() → vad.reset() + detector.reset_source_epochs()
+                    + detector.open_session_on_arm(now)  ← session opens at arm time, not at first VAD
+                    + mic.start() + sys.start()
     ↓
 mic + system capture (asyncio queues, 16 kHz mono)
-    ↓ [only flows while armed_event is set]
+    ↓ [only flows while armed_event is set; mic.queue is drained on stop+start]
 Silero VAD (per source, stateful)
     ↓ [emits SpeechSegment events]
 ConversationDetector (silence-bounded sessions)
-    ↓ [appends PCM + segments to session buffer]
+    ↓ [appends PCM + segments to the already-open session buffer]
 [joint silence 45s → PENDING_CLOSE → end-confirmation toast]
 [toast Yes/timeout → commit_close → sink path; toast No/speech → revert]
     ↓
@@ -127,7 +129,7 @@ UploadClient (NoopUploadClient until user signs in)
 
 - **Whitelist watcher** (runs while DISARMED) — polls every `ArmConfig.poll_interval_secs` (default 2 s). Uses `platform_win.get_mic_holders()` / `platform_mac.is_mic_active()` + `get_foreground_info()` to build a `MicState` + `ForegroundInfo`. Feeds those to `detectors.match_whitelist()`. On match, fires the consent toast via `notifier.ask_consent()`. Per-app cooldown (30 min after decline, 10 min after session) keyed by `app_key`.
 - **Long-meeting check-in task** (runs while ARMED) — sleeps until each `long_meeting_checkin_marks_secs` mark from session-start, fires "Still in the meeting?" toast. "Wrap up" → disarm with reason `CHECKIN_WRAP_UP`.
-- **Meeting-ended watcher** (runs while whitelist-armed; NOT for hotkey-armed sessions) — polls mic-holders; if the arm-app hasn't held the mic for `whitelist_arm_release_grace_secs` (default 15 s), fires "Looks like your meeting ended" toast. "Keep going" snoozes `meeting_ended_snooze_secs` (default 10 min), then re-fires if still absent. Non-response defaults to Wrap up.
+- **Meeting-ended watcher** (runs while whitelist-armed; NOT for hotkey-armed sessions) — polls mic-holders; if the arm-app hasn't held the mic for `whitelist_arm_release_grace_secs` (default 6 s = three absent polls at the 2 s interval), fires "Looks like your meeting ended" toast. "Keep going" snoozes `meeting_ended_snooze_secs` (default 10 min), then re-fires if still absent. Non-response defaults to Wrap up.
 
 **Detection is mic-holder-based, not window-title-based.** `detectors.match_whitelist()` is pure logic operating on `MicState.holders` (Windows: pycaw WASAPI session enumeration) or `MicState.active + running_processes + foreground` (macOS: `kAudioDevicePropertyDeviceIsRunningSomewhere` + psutil + NSWorkspace). Works for Discord (which never changes window title during calls), survives app updates, mute-tolerant (muted users still have an active capture session).
 
@@ -135,15 +137,17 @@ Default whitelist ships with 21 apps (14 desktop + 7 web) — see `config.py::de
 
 ### Session state machine
 
-`ConversationDetector` now has three states (was two):
+`ConversationDetector` has three states:
 
-- **IDLE** → no session. First VAD segment opens one.
+- **IDLE** → no session. The ArmController calls `open_session_on_arm(now)` on every arm to transition into OPEN. Frames received while IDLE are **dropped on the floor** — there is no pre-buffer in armed-only mode (v2.1.7+); IDLE means "nothing should be coming through" and any frame that does is either a stale leftover from a previous arm cycle (e.g. `mic.queue` not fully drained) or post-close bleed-through, and either way it must not pollute the next session. The legacy `_open_session(now, trigger, vad_ts)` VAD-trigger path still exists as a fallback for unit tests that feed segments without frames.
 - **OPEN** → session in progress. Joint silence ≥ `joint_silence_close_secs` transitions to…
 - **PENDING_CLOSE** → buffers still held, nothing written to disk. `on_pending_close` callback (the ArmController) shows the end-confirmation toast:
   - `commit_close(reason)` — finalize: push buffers to `_closed_queue`, go back to IDLE, sink picks it up via `_ticker`.
   - `revert_close(now)` — cancel close: back to OPEN, silence timer reset.
   - VAD segment during PENDING_CLOSE → auto-revert (user resumed speaking is ground truth).
   - Legacy unit-test path (no callback registered) → commit immediately, preserving pre-armed-model behavior.
+
+**Gap-fill cap (v2.1.7+).** `on_frame` zero-fills small dropped-frame gaps to preserve the sample-to-mono-time invariant, but caps any single fill at `ConversationConfig.max_gap_fill_secs` (default 2 s). A larger gap is never a real audio dropout — it's stale state (stale frame from before the current arm cycle, system suspend / resume, USB reconnect) — and the detector re-anchors instead of injecting silence.
 
 New `SessionCloseReason` values: `HOTKEY_END`, `CHECKIN_WRAP_UP`, `WHITELIST_ENDED`. `SAFETY_CAP` is kept in the enum for backward compat with on-disk records but nothing in the new code path emits it (the 60-min cap is removed).
 

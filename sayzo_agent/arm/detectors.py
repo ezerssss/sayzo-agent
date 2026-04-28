@@ -398,12 +398,20 @@ def arm_app_still_holding_mic(
                     return True
         return False
 
-    # Browser spec: still-holding means a browser still has the mic AND the
-    # active tab URL or any browser window title still matches the spec.
-    # Foreground doesn't have to be the browser — same rationale as
-    # ``match_whitelist``'s Pass 3.
-    if not _browser_holds_mic(mic, foreground):
-        return False
-    urls = _collect_browser_urls(foreground)
-    titles = _collect_browser_titles(foreground)
-    return _browser_spec_matches(spec, urls, titles)
+    # Browser spec: once we're armed for this app, the arm session is bound
+    # to the browser PID at scope time. "Still holding" reduces to "the
+    # browser still holds the mic" — we deliberately do NOT re-check URL
+    # or title here:
+    # - Windows UIAutomation and macOS Accessibility typically only see the
+    #   focused tab's URL/title. A user tabbing away from chatgpt-com to
+    #   read email or take notes would otherwise flip the URL list and
+    #   trip a false meeting-ended toast within the grace window.
+    # - The mic-release signal is the ground truth: ending a chatgpt voice
+    #   session (or hanging up a Meet call) releases the browser's WASAPI
+    #   capture session, dropping its PID from mic.holders. That's the
+    #   actual "meeting ended" signal we want to act on.
+    # - Trade-off: if the user rapidly closes one whitelisted site and
+    #   opens another in the same browser without releasing the mic, we
+    #   keep capturing under the original arm_reason. The audio is still
+    #   legitimate user content; only the app_key label is wrong.
+    return _browser_holds_mic(mic, foreground)

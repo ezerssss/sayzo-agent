@@ -330,6 +330,210 @@ def test_process_loopback(pid: int, seconds: int, dump_wav: bool, cycles: int, g
     asyncio.run(_run())
 
 
+@cli.command("test-meeting-ended-flow", hidden=True)
+def test_meeting_ended_flow() -> None:
+    """Smoke-test the meeting-ended watcher (v2.1.7 changes) end-to-end.
+
+    Drives the real ArmController + ConversationDetector with fake
+    capture/VAD/notifier dependencies through two scripted scenarios:
+
+    Scenario A — tab-switch fix:
+        Browser holds the mic; foreground tab URL changes to a non-
+        whitelisted site (simulating the user tabbing from chatgpt.com
+        to news.ycombinator.com mid-voice-session). Expect: NO meeting-
+        ended toast fires within 3x the grace window.
+
+    Scenario B — Keep going force-close:
+        Browser drops the mic entirely. First meeting-ended toast fires
+        and the script clicks "Keep going". Mic stays absent. After
+        ``force_close_after_keep_going_secs``, expect a non-interactive
+        "Wrapped up your session" toast and a clean disarm.
+
+    Run me before rebuilding the installer to verify the wired-up flow
+    works. Each scenario takes ~1 s with the test-tuned timings; total
+    runtime under 5 s.
+    """
+    from typing import Any, Optional
+
+    from .arm.controller import ArmController, ArmReason, ArmState
+    from .arm.detectors import (
+        DetectorSpec, ForegroundInfo, MicHolder, MicState,
+    )
+    from .config import ArmConfig, ConversationConfig, default_detector_specs
+    from .conversation import ConversationDetector
+    from .models import SessionCloseReason
+
+    # Inline fakes (kept here so this command works in the installed
+    # bundle, which doesn't ship tests/).
+
+    class _FakeCapture:
+        def __init__(self) -> None:
+            self.start_count = 0
+            self.stop_count = 0
+
+        async def start(self, *, target_pids: tuple[int, ...] = ()) -> None:
+            self.start_count += 1
+
+        async def stop(self) -> None:
+            self.stop_count += 1
+
+        @property
+        def is_open(self) -> bool:
+            return self.start_count > self.stop_count
+
+    class _FakeVAD:
+        def reset(self) -> None:
+            pass
+
+    class _FakeNotifier:
+        def __init__(self) -> None:
+            self.fire_and_forget: list[tuple[str, str]] = []
+            self.consent_calls: list[dict[str, Any]] = []
+            self.consent_script: list[str] = []
+
+        def notify(self, title: str, body: str) -> None:
+            self.fire_and_forget.append((title, body))
+
+        def ask_consent(
+            self, title: str, body: str, yes_label: str, no_label: str,
+            timeout_secs: float, default_on_timeout: str = "no",
+        ) -> str:
+            self.consent_calls.append({"title": title, "body": body})
+            if self.consent_script:
+                return self.consent_script.pop(0)
+            return default_on_timeout
+
+    async def _run() -> None:
+        # Add a chatgpt-com browser spec on top of defaults so we have
+        # something to arm against in scenario A.
+        chatgpt_spec = DetectorSpec(
+            app_key="chatgpt-com",
+            display_name="ChatGPT",
+            is_browser=True,
+            url_patterns=[r"^https://chatgpt\.com/"],
+        )
+        cfg = ArmConfig(
+            hotkey="ctrl+alt+s",
+            poll_interval_secs=0.02,
+            consent_toast_timeout_secs=0.05,
+            end_toast_timeout_secs=0.05,
+            checkin_toast_timeout_secs=0.05,
+            meeting_ended_toast_timeout_secs=0.05,
+            whitelist_arm_release_grace_secs=0.05,
+            force_close_after_keep_going_secs=0.30,
+            decline_release_grace_secs=0.05,
+            long_meeting_checkin_marks_secs=[3600.0],
+            detectors=default_detector_specs() + [chatgpt_spec],
+        )
+        conv_cfg = ConversationConfig(joint_silence_close_secs=10.0)
+        detector = ConversationDetector(conv_cfg)
+        notifier = _FakeNotifier()
+        mic_cap = _FakeCapture()
+        sys_cap = _FakeCapture()
+        ctrl = ArmController(
+            cfg, detector,
+            mic_capture=mic_cap, sys_capture=sys_cap,
+            vad_mic=_FakeVAD(), vad_sys=_FakeVAD(),
+            notifier=notifier,
+            get_mic_holders=lambda: [MicHolder("chrome.exe", 9999)],
+            get_foreground_info=lambda: ForegroundInfo(
+                process_name="chrome.exe", is_browser=True,
+                browser_tab_url="https://chatgpt.com/c/abc",
+            ),
+            resolve_pids_for_spec=lambda spec: (9999,),
+        )
+        ctrl._loop = asyncio.get_running_loop()
+
+        # Force into ARMED with a chatgpt-com reason and start the
+        # meeting-ended watcher manually — we don't want the consent
+        # toast / whitelist arm path here, just the watcher under test.
+        reason = ArmReason(
+            source="whitelist", display_name="ChatGPT",
+            app_key="chatgpt-com", target_pids=(9999,),
+        )
+        await ctrl._arm_internal(reason)
+
+        # ---- Scenario A: tab-switch must NOT trip meeting-ended -----
+        click.echo("[smoke] scenario A: user tabs away from chatgpt.com to a "
+                   "non-whitelisted site (browser still holds mic)")
+        ctrl._q_foreground = lambda: ForegroundInfo(
+            process_name="chrome.exe", is_browser=True,
+            browser_tab_url="https://news.ycombinator.com/",
+            browser_window_urls=("https://news.ycombinator.com/",),
+        )
+        # Wait three grace windows. Old build would have toasted within
+        # one grace window; new build must not toast at all.
+        await asyncio.sleep(cfg.whitelist_arm_release_grace_secs * 3)
+        ended_toasts = [c for c in notifier.consent_calls
+                        if c["title"].startswith("Looks like your meeting")]
+        if ended_toasts:
+            click.echo(
+                f"[smoke] scenario A: FAIL — meeting-ended toast fired "
+                f"{len(ended_toasts)} time(s) during tab switch. "
+                "URL re-check fix is broken."
+            )
+            sys.exit(1)
+        if ctrl.state != ArmState.ARMED:
+            click.echo(
+                f"[smoke] scenario A: FAIL — agent disarmed during "
+                f"tab switch (state={ctrl.state}). Should stay ARMED."
+            )
+            sys.exit(1)
+        click.echo("[smoke] scenario A: OK — agent stayed ARMED through "
+                   "tab switch, no false toast.")
+
+        # ---- Scenario B: Keep going then sustained absence ----------
+        click.echo("[smoke] scenario B: browser releases mic; user clicks "
+                   "'Keep going' on the first toast; absence persists")
+        # Script the consent response: "no" = Keep going.
+        notifier.consent_script = ["no"]
+        # Drop chrome from mic-holders entirely.
+        ctrl._q_mic_holders = lambda: []
+        ctrl._q_foreground = lambda: ForegroundInfo(
+            process_name="chrome.exe", is_browser=True,
+            browser_tab_url="https://chatgpt.com/c/abc",
+        )
+        # First toast should fire after grace; user clicks Keep going;
+        # then we need to wait force_close_after_keep_going_secs more
+        # for the silent close.
+        timeout = (
+            cfg.whitelist_arm_release_grace_secs
+            + cfg.force_close_after_keep_going_secs
+            + 0.4   # safety margin for poll cadence
+        )
+        await asyncio.sleep(timeout)
+        if ctrl.state != ArmState.DISARMED:
+            click.echo(
+                f"[smoke] scenario B: FAIL — agent should be DISARMED "
+                f"after keep-going + sustained absence, got {ctrl.state}"
+            )
+            sys.exit(1)
+        # Exactly one CONSENT toast (the first) fired.
+        ended_toasts = [c for c in notifier.consent_calls
+                        if c["title"].startswith("Looks like your meeting")]
+        if len(ended_toasts) != 1:
+            click.echo(
+                f"[smoke] scenario B: FAIL — expected exactly 1 consent "
+                f"toast, got {len(ended_toasts)}. Old snooze-and-refire "
+                f"behavior may have leaked back in."
+            )
+            sys.exit(1)
+        # Informational fire-and-forget toast fired.
+        info_toasts = [t for t in notifier.fire_and_forget
+                       if "Wrapped up" in t[0]]
+        if len(info_toasts) != 1:
+            click.echo(
+                f"[smoke] scenario B: FAIL — expected one informational "
+                f"'Wrapped up' toast, got {[t[0] for t in notifier.fire_and_forget]}"
+            )
+            sys.exit(1)
+        click.echo("[smoke] scenario B: OK — silent force-close fired "
+                   "after Keep going; informational toast shown; agent disarmed.")
+        click.echo("[smoke] all meeting-ended-flow scenarios passed.")
+
+    asyncio.run(_run())
+
+
 @cli.command(hidden=True)
 @click.argument("audio_file", type=click.Path(exists=True))
 @click.option("--speed", default=1.0, help="Playback speed multiplier. 0 = as fast as possible.")

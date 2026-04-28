@@ -101,14 +101,6 @@ class ConversationConfig(BaseSettings):
     # this threshold still gets zeroed. Set to 0 to disable merging and fall
     # back to strict per-segment trimming.
     final_audio_merge_gap_secs: float = 5.0
-    # Pre-session rolling PCM buffer. Silero only yields a SpeechSegment after
-    # the speech *ends* (hangover_ms of trailing silence), so by the time
-    # on_segment fires and opens a session, the actual voiced audio happened
-    # up to tens of seconds ago. We backfill it from this buffer on open so
-    # the first turn of every session isn't silently truncated. 120s covers
-    # any realistic uninterrupted opening utterance; at 16 kHz mono that's
-    # ~48 MB per source at 25 min / 16 kHz mono int16.
-    max_pre_buffer_secs: float = 1500.0
     # Gap-fill thresholds for the mono-clock invariant. When a frame arrives
     # with capture_mono_ts more than this far past "expected next sample
     # time", the detector zero-fills the gap so buffer offsets stay aligned
@@ -120,6 +112,12 @@ class ConversationConfig(BaseSettings):
     # one scheduler hiccup on either end of a batch.
     gap_tolerance_secs_mic: float = 0.060
     gap_tolerance_secs_system: float = 0.150
+    # Hard upper bound on a single zero-fill gap. Real audio dropouts from
+    # scheduler / driver / USB hiccups don't exceed a few hundred ms; any
+    # bigger "gap" is stale state (stale frame from a previous arm cycle,
+    # system suspend resume, mono clock skip). Re-anchor instead of filling
+    # so the session can't end up minutes longer than the wall-clock event.
+    max_gap_fill_secs: float = 2.0
 
 
 class STTConfig(BaseSettings):
@@ -420,12 +418,26 @@ class ArmConfig(BaseSettings):
 
     # Meeting-ended watcher (whitelist-armed sessions only).
     # How long the arm-app can be absent from mic-holders before the toast
-    # fires. Absorbs transient drops / immediate-rejoin scenarios.
-    whitelist_arm_release_grace_secs: float = 15.0
+    # fires. Absorbs transient drops / immediate-rejoin scenarios — real
+    # blips (mute/unmute re-enumeration, view/device swaps) are 1–3 s; 6 s
+    # = three consecutive absent polls at the 2 s interval, enough to
+    # filter them without making the post-meeting wait feel sluggish.
+    whitelist_arm_release_grace_secs: float = 6.0
     meeting_ended_toast_timeout_secs: float = 15.0
-    # After "Keep going", snooze the watcher this long before re-asking.
-    # Each snooze-expiry fires a fresh toast; non-response on that toast
-    # defaults to Wrap up and commits the close.
+    # After the user clicks "Keep going" on the meeting-ended toast we no
+    # longer fire follow-up toasts (they already declined once), but if
+    # the arm-app stays absent from mic-holders for this many consecutive
+    # seconds we close the session and show an informational toast — the
+    # original "Keep going" was issued under the assumption the meeting
+    # was still live; a long sustained mic-release invalidates that
+    # assumption. 90 s is well above plausible false-positive durations
+    # (network reconnects in WebRTC apps top out at ~30 s, audio-device
+    # switches under 5 s).
+    force_close_after_keep_going_secs: float = 90.0
+    # Deprecated as of v2.1.7: the meeting-ended watcher used to pause
+    # for this many seconds after "Keep going" before re-checking. The
+    # field is kept so existing user_settings.json files still parse
+    # without errors; nothing reads it anymore.
     meeting_ended_snooze_secs: float = 600.0
 
     # Per-app detection rules. Populated from ``default_detector_specs()``.

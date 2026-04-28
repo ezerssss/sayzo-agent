@@ -288,13 +288,32 @@ def test_arm_app_browser_still_holding_with_url_match():
     assert arm_app_still_holding_mic("gmeet", SPECS, mic, fg) is True
 
 
-def test_arm_app_browser_released_when_tab_navigated_away():
+def test_arm_app_browser_still_holding_when_tab_navigated_away():
+    """v2.1.7+: switching tabs in the same browser window does NOT trip
+    the meeting-ended check. UIAutomation typically only sees the
+    focused tab's URL, so a user tabbing to email or notes during a
+    chatgpt-com voice session would otherwise trigger a false toast.
+    The arm session is bound to the browser PID at scope time; "still
+    holding" reduces to "browser still holds the mic.\""""
     fg = ForegroundInfo(
         process_name="chrome.exe",
         is_browser=True,
         browser_tab_url="https://news.ycombinator.com/",
     )
     mic = MicState(holders=[MicHolder("chrome.exe", 1111)])
+    assert arm_app_still_holding_mic("gmeet", SPECS, mic, fg) is True
+
+
+def test_arm_app_browser_released_when_browser_drops_mic():
+    """The actual ground truth — when the browser process leaves
+    mic.holders entirely (user ended the voice session), still-holding
+    returns False and the meeting-ended path can fire."""
+    fg = ForegroundInfo(
+        process_name="chrome.exe",
+        is_browser=True,
+        browser_tab_url="https://news.ycombinator.com/",
+    )
+    mic = MicState(holders=[])  # browser no longer holds the mic
     assert arm_app_still_holding_mic("gmeet", SPECS, mic, fg) is False
 
 
@@ -540,10 +559,12 @@ def test_macos_proxy_match_has_empty_target_pids():
     assert r.target_pids == ()
 
 
-def test_custom_url_spec_arm_app_still_holding_via_window_urls():
-    """Meeting-ended watcher: a custom URL spec should stay ``True`` as
-    long as a browser still has the mic AND any browser window URL still
-    matches the spec. Mirrors the fg-away case above."""
+def test_custom_url_spec_arm_app_still_holding_via_browser_pid():
+    """v2.1.7+: a custom URL spec stays ``True`` as long as a browser
+    still has the mic, regardless of the URL list. The URL re-check was
+    removed because UIAutomation typically only surfaces the focused
+    tab — switching tabs to take notes during the session would
+    otherwise trip a false meeting-ended toast."""
     specs = _custom_url_specs(r"^https://chatgpt\.com/")
     fg = ForegroundInfo(
         process_name="WindowsTerminal.exe",
@@ -553,7 +574,9 @@ def test_custom_url_spec_arm_app_still_holding_via_window_urls():
     mic = MicState(holders=[MicHolder("chrome.exe", 9999)])
     assert arm_app_still_holding_mic("custom_site", specs, mic, fg) is True
 
-    # And goes False the moment the tab navigates away.
+    # User tabs to a non-matching URL — still True, because the browser
+    # PID still holds the mic. This is the new behavior; the old build
+    # returned False here and fired a spurious meeting-ended toast.
     fg_elsewhere = ForegroundInfo(
         process_name="WindowsTerminal.exe",
         is_browser=False,
@@ -561,4 +584,11 @@ def test_custom_url_spec_arm_app_still_holding_via_window_urls():
     )
     assert arm_app_still_holding_mic(
         "custom_site", specs, mic, fg_elsewhere,
+    ) is True
+
+    # Only when the browser drops the mic entirely does still-holding
+    # return False.
+    mic_no_browser = MicState(holders=[])
+    assert arm_app_still_holding_mic(
+        "custom_site", specs, mic_no_browser, fg_elsewhere,
     ) is False

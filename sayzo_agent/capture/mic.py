@@ -112,6 +112,15 @@ class MicCapture:
 
     async def start(self) -> None:
         self._loop = asyncio.get_running_loop()
+        # Defense-in-depth: drain any frames left over from a previous arm
+        # cycle. Belt-and-suspenders against the path where stop() left
+        # frames in the queue; without this, the consumer would pull
+        # 3-minute-old frames as the first input to a new session and
+        # the detector's gap-fill would inject minutes of zeros.
+        self._drain_queue()
+        # Reset the de-aliasing anchor so the first new frame's stamp is
+        # set by wall clock, not max(wall, last_old + frame_duration).
+        self._last_emitted_ts = None
         self._stream = sd.InputStream(
             samplerate=self.sample_rate,
             blocksize=self.frame_samples,
@@ -151,4 +160,14 @@ class MicCapture:
             self._stream.stop()
             self._stream.close()
             self._stream = None
+            # PortAudio can fire one more callback between stream.stop()
+            # and the audio thread joining; drain anything that landed.
+            self._drain_queue()
             log.info("mic capture stopped")
+
+    def _drain_queue(self) -> None:
+        while True:
+            try:
+                self.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return

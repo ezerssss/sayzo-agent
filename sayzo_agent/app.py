@@ -288,14 +288,13 @@ class Agent:
                 llm_state, kept, discarded, echo_n, echo_s,
             )
         else:
-            # Armed but no session yet (streams open, waiting for first VAD segment).
-            mic_pre = len(d._pre_buffers["mic"]) / 2 / d.sample_rate
-            sys_pre = len(d._pre_buffers["system"]) / 2 / d.sample_rate
+            # ARMED but detector IDLE — should be a brief transient (between
+            # disarm closing the session and the controller clearing the
+            # armed flag). With session-on-arm, ARMED implies OPEN.
             log.info(
-                "[heartbeat] state=%s%s IDLE pre_buffer mic=%.1fs sys=%.1fs llm=%s "
+                "[heartbeat] state=%s%s IDLE (transient) llm=%s "
                 "kept=%d discarded=%d echo_dropped=%d/%.0fs",
                 arm_state, reason_tag,
-                mic_pre, sys_pre,
                 llm_state, kept, discarded, echo_n, echo_s,
             )
 

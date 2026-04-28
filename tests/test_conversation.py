@@ -95,64 +95,41 @@ def _frame(seconds: float, sr: int = 16000, amplitude: float = 0.1) -> np.ndarra
     return np.full(int(seconds * sr), amplitude, dtype=np.float32)
 
 
-def test_pre_buffer_backfills_opening_turn():
-    """The opening segment's PCM must be backfilled from the pre-buffer.
-
-    Simulates the real pipeline order: on_frame is called for every frame
-    while IDLE (Silero buffers + waits for hangover), then on_segment fires
-    retroactively with start_ts at the beginning of that buffered audio. The
-    session's mic_pcm must contain the audio from seg.start_ts onward, not
-    be empty.
+def test_on_frame_drops_when_idle():
+    """Regression: in armed-only mode, frames received while IDLE must be
+    dropped on the floor — there is no pre-buffer, and any frame seen
+    while IDLE is either a stale leftover from a previous arm cycle or
+    post-close bleed-through. Either way it must not pollute the next
+    session.
     """
     sr = 16000
     d = ConversationDetector(_cfg(), sample_rate=sr)
-    # Stream 5 seconds of "voiced" mic audio while still IDLE.
     frame_secs = 0.02
-    total_secs = 5.0
-    for i in range(int(total_secs / frame_secs)):
-        t = 100.0 + i * frame_secs
-        d.on_frame("mic", _frame(frame_secs, sr), t, t)
-        d.on_frame("system", np.zeros(int(frame_secs * sr), dtype=np.float32), t, t)
-    assert d.state == SessionState.IDLE
-    # VAD finally yields: a segment that started at t=0 on its clock and ran
-    # to the end of what we buffered.
-    d.on_segment(SpeechSegment("mic", 0.0, total_secs), now=100.0 + total_secs)
-    assert d.state == SessionState.OPEN
-    buffers = d._buffers
-    assert buffers is not None
-    # The full 5s should have been backfilled.
-    expected_bytes = int(total_secs * sr) * 2
-    assert abs(len(buffers.mic_pcm) - expected_bytes) <= 2 * 2  # allow 1-frame rounding
-    # Segment got rebased: since trigger_start_ts was 0, offset is 0, so the
-    # segment should still be (0, 5).
-    assert buffers.mic_segments[0].start_ts == 0.0
-    assert abs(buffers.mic_segments[0].end_ts - total_secs) < 1e-6
-
-
-def test_pre_buffer_rebases_timeline_when_trigger_mid_stream():
-    """If the triggering segment starts mid-pre-buffer (e.g. user was silent
-    for a while before speaking), the session timeline rebases to the
-    segment's start so mic_pcm[0] corresponds to seg.start_ts."""
-    sr = 16000
-    d = ConversationDetector(_cfg(), sample_rate=sr)
-    frame_secs = 0.02
-    # 3s of silence then 2s of "voiced" buffered while IDLE
     for i in range(int(5.0 / frame_secs)):
         t = 100.0 + i * frame_secs
         d.on_frame("mic", _frame(frame_secs, sr), t, t)
         d.on_frame("system", _frame(frame_secs, sr), t, t)
-    # Segment spans 3.0→5.0 on the VAD clock
-    d.on_segment(SpeechSegment("mic", 3.0, 5.0), now=105.0)
-    buffers = d._buffers
-    assert buffers is not None
-    # Backfill should be the last ~2s, not the full 5s.
-    assert abs(len(buffers.mic_pcm) - int(2.0 * sr) * 2) <= 2 * 2
-    # Timeline rebased: segment is now (0, 2)
-    assert buffers.mic_segments[0].start_ts == 0.0
-    assert abs(buffers.mic_segments[0].end_ts - 2.0) < 1e-6
-    # Subsequent segment at VAD-clock 6.0 → session-clock 3.0
-    d.on_segment(SpeechSegment("system", 6.0, 7.0), now=106.0)
-    assert abs(buffers.sys_segments[-1].start_ts - 3.0) < 1e-6
+    # State stays IDLE; nothing is buffered (no pre-buffer in the new model).
+    assert d.state == SessionState.IDLE
+    assert d._buffers is None
+    # Open session at arm time; buffers start empty.
+    d.open_session_on_arm(now=200.0)
+    assert d.state == SessionState.OPEN
+    assert d._buffers is not None
+    assert len(d._buffers.mic_pcm) == 0
+    assert len(d._buffers.sys_pcm) == 0
+
+
+def test_open_session_on_arm_idempotent_when_open():
+    """Calling open_session_on_arm a second time while already OPEN must
+    not reset the in-flight session."""
+    d = ConversationDetector(_cfg())
+    d.open_session_on_arm(now=100.0)
+    first_buffers = d._buffers
+    assert first_buffers is not None
+    d.open_session_on_arm(now=110.0)
+    # Same buffers object — second call was a no-op.
+    assert d._buffers is first_buffers
 
 
 def test_back_to_back_sessions_without_vad_reset():
@@ -188,21 +165,6 @@ def test_back_to_back_sessions_without_vad_reset():
     d.on_segment(SpeechSegment("system", 3712.0, 3713.0), now=3802.0)
     assert abs(d._buffers.sys_segments[-1].start_ts - 11.5) < 1e-6
     assert abs(d._buffers.sys_segments[-1].end_ts - 12.5) < 1e-6
-
-
-def test_pre_buffer_respects_max_size():
-    """When the pre-buffer exceeds its cap, old samples are dropped and the
-    offset counter is bumped so indexing stays correct."""
-    sr = 16000
-    d = ConversationDetector(_cfg(max_pre_buffer_secs=1.0), sample_rate=sr)
-    frame_secs = 0.02
-    # Push 3s while IDLE → buffer should cap at ~1s
-    for i in range(int(3.0 / frame_secs)):
-        t = 100.0 + i * frame_secs
-        d.on_frame("mic", _frame(frame_secs, sr), t, t)
-    assert len(d._pre_buffers["mic"]) <= int(1.0 * sr) * 2
-    # _pre_start_sample should reflect the ~2s dropped off the front
-    assert d._pre_start_sample["mic"] >= int(1.9 * sr)
 
 
 def test_session_opens_on_first_segment():
@@ -312,13 +274,11 @@ def test_reset_source_epochs_clears_state():
     d = ConversationDetector(_cfg())
     d._source_epoch_mono["mic"] = 100.0
     d._source_frames_seen["mic"] = 50
-    d._pre_buffers["mic"].extend(b"\x00" * 100)
-    d._pre_start_sample["mic"] = 10
+    d._stream_end_mono["mic"] = 105.0
     d.reset_source_epochs()
     assert d._source_epoch_mono == {"mic": None, "system": None}
     assert d._source_frames_seen == {"mic": 0, "system": 0}
-    assert len(d._pre_buffers["mic"]) == 0
-    assert d._pre_start_sample["mic"] == 0
+    assert d._stream_end_mono == {"mic": None, "system": None}
 
 
 def test_reset_source_epochs_raises_when_not_idle():
@@ -469,109 +429,139 @@ def test_gate_fails_no_counterparty():
 # ----------------------------------------------------------------------
 
 
-def test_session_buffers_aligned_despite_unequal_pre_buffer_fill():
-    """If mic and system have pre-buffered different amounts of audio
-    before a session triggers, the session's mic_pcm and sys_pcm must
-    still start at the same wall-clock moment (session_t0_mono).
-
-    Regression guard for the server-side speaker-tag-flip bug: the fix
-    uses capture_mono_ts to align both channels at session open. Here,
-    we simulate mic starting 500 ms earlier than system and verify the
-    resulting PCM buffers end at the same monotonic time.
+def test_session_buffers_aligned_when_sources_start_at_different_times():
+    """Mic and sys streams come up at slightly different mono times after
+    arm. The session opens at arm_now, and each source's first real frame
+    gap-fills from arm_now to its own capture_mono_ts. Both buffers must
+    end up the same length once they've each received the same number of
+    real seconds of frames.
     """
     sr = 16000
     d = ConversationDetector(_cfg(), sample_rate=sr)
     frame_secs = 0.02
-    # Mic has 3 seconds of pre-buffer; system only has 2 seconds (started
-    # later). Both share the same monotonic clock: mic at t=100.0, system
-    # at t=100.5.
-    t_mic_start = 100.0
-    t_sys_start = 100.5
-    for i in range(int(3.0 / frame_secs)):
-        t = t_mic_start + i * frame_secs
-        d.on_frame("mic", _frame(frame_secs, sr), t, t)
-    for i in range(int(2.5 / frame_secs)):
-        t = t_sys_start + i * frame_secs
-        d.on_frame("system", _frame(frame_secs, sr), t, t)
-    # Trigger: mic VAD fires a segment. In the never-reset VAD convention,
-    # seg.start_ts is the sample-second index on mic's counter. Mic has
-    # processed 3 seconds of samples, so a segment at the 2-second mark
-    # (1s ago in wall-clock terms = t=102.0 monotonic) has start_ts=2.0.
-    d.on_segment(SpeechSegment("mic", 2.0, 3.0), now=103.0)
+    arm_now = 100.0
+    d.open_session_on_arm(now=arm_now)
+    # Mic's first real frame arrives 100 ms after arm; sys's 600 ms after.
+    # Both then stream 2 seconds of frames in lockstep.
+    n_frames = int(2.0 / frame_secs)
+    for i in range(n_frames):
+        t_mic = arm_now + 0.10 + i * frame_secs
+        t_sys = arm_now + 0.60 + i * frame_secs
+        d.on_frame("mic", _frame(frame_secs, sr), t_mic, t_mic)
+        d.on_frame("system", _frame(frame_secs, sr), t_sys, t_sys)
     buffers = d._buffers
     assert buffers is not None
-    # session_t0_mono = mic_epoch + 2.0 = 100.0 + 2.0 = 102.0.
-    assert abs(buffers.session_t0_mono - 102.0) < 1e-3
-    # mic_pcm should cover [102.0, 103.0] = 1 second.
+    assert buffers.session_t0_mono == arm_now
+    # Mic: 100 ms of zero-fill + 2 s real = ~2.10 s.
     mic_dur = len(buffers.mic_pcm) / 2 / sr
-    assert abs(mic_dur - 1.0) < 0.05, f"mic_pcm = {mic_dur:.3f}s (expected ~1.0s)"
-    # sys_pcm should also cover [102.0, 103.0]. System's pre-buffer covered
-    # [100.5, 103.0], so the slice from 102.0 onward = 1 second.
+    assert abs(mic_dur - 2.10) < 0.05, f"mic_pcm = {mic_dur:.3f}s (expected ~2.10s)"
+    # Sys: 600 ms of zero-fill + 2 s real = ~2.60 s.
     sys_dur = len(buffers.sys_pcm) / 2 / sr
-    assert abs(sys_dur - 1.0) < 0.05, f"sys_pcm = {sys_dur:.3f}s (expected ~1.0s)"
-    # Cross-check: mic_pcm and sys_pcm have the same length (both end at
-    # same mono time after the trigger segment's capture).
-    assert abs(len(buffers.mic_pcm) - len(buffers.sys_pcm)) <= 2 * 2
+    assert abs(sys_dur - 2.60) < 0.05, f"sys_pcm = {sys_dur:.3f}s (expected ~2.60s)"
+    # Both buffers anchored to the same session_t0_mono: equal-index
+    # samples correspond to the same wall-clock moment, even though the
+    # buffers have different lengths (sys is 500 ms behind).
 
 
-def test_session_pads_front_when_source_started_after_session_t0():
-    """If one source's pre-buffer starts AFTER session_t0_mono (e.g., that
-    source's capture started later than the other), the detector zero-pads
-    the front of that source's session PCM so both channels still align."""
+def test_in_session_gap_fill_zero_fills_dropped_frame():
+    """Modest scheduler-jitter gaps within a session are zero-filled so
+    the sample-to-mono-time invariant holds."""
     sr = 16000
     d = ConversationDetector(_cfg(), sample_rate=sr)
     frame_secs = 0.02
-    # Mic has 3 seconds of pre-buffer starting at t=100.
-    for i in range(int(3.0 / frame_secs)):
-        t = 100.0 + i * frame_secs
-        d.on_frame("mic", _frame(frame_secs, sr), t, t)
-    # System started 1 second later (t=101.0) and has only 2 seconds of pre.
-    for i in range(int(2.0 / frame_secs)):
-        t = 101.0 + i * frame_secs
-        d.on_frame("system", _frame(frame_secs, sr), t, t)
-    # Mic triggers a segment at start_ts=0.5 (mono time 100.5) — earlier
-    # than system's pre-buffer can reach.
-    d.on_segment(SpeechSegment("mic", 0.5, 3.0), now=103.0)
-    buffers = d._buffers
-    assert buffers is not None
-    # session_t0_mono = 100.5. Both channels must span [100.5, ~103.0].
-    assert abs(buffers.session_t0_mono - 100.5) < 1e-3
-    # mic_pcm: 2.5 seconds (from pre-buffer, samples 0.5s→3.0s).
-    assert abs(len(buffers.mic_pcm) / 2 / sr - 2.5) < 0.05
-    # sys_pcm: 2.5 seconds total, where the first 0.5s is zero-padded (sys
-    # started at 101.0, pad covers [100.5, 101.0]), plus 2.0s of real.
-    assert abs(len(buffers.sys_pcm) / 2 / sr - 2.5) < 0.05
-    # Verify the pad is actually zeros at the front.
-    pad_samples = int(0.5 * sr)
-    pad_bytes = bytes(buffers.sys_pcm[: pad_samples * 2])
-    arr = np.frombuffer(pad_bytes, dtype=np.int16)
-    assert np.all(arr == 0), "front pad on sys_pcm should be zeros"
-
-
-def test_on_frame_zero_fills_dropped_frame_gap():
-    """When a frame arrives late (gap > tolerance), the detector zero-fills
-    the gap so the sample-to-mono-time invariant holds."""
-    sr = 16000
-    d = ConversationDetector(_cfg(), sample_rate=sr)
-    frame_secs = 0.02
-    # Push 1 second of frames normally (in lockstep with a nominal 20ms
-    # cadence).
+    arm_now = 100.0
+    d.open_session_on_arm(now=arm_now)
+    # 1 s of frames in lockstep starting right at arm.
     for i in range(int(1.0 / frame_secs)):
+        t = arm_now + i * frame_secs
+        d.on_frame("mic", _frame(frame_secs, sr), t, t)
+    len_before = len(d._buffers.mic_pcm)
+    # 200 ms gap, then a frame.
+    t_gap = arm_now + 1.0 + 0.2
+    d.on_frame("mic", _frame(frame_secs, sr), t_gap, t_gap)
+    len_after = len(d._buffers.mic_pcm)
+    expected_growth_samples = int(0.22 * sr)  # 200 ms zero-fill + 20 ms frame
+    actual_growth_samples = (len_after - len_before) // 2
+    assert abs(actual_growth_samples - expected_growth_samples) <= int(frame_secs * sr) + 1
+
+
+def test_in_session_gap_fill_caps_at_max_and_reanchors():
+    """An implausibly large gap (e.g. stale frame from before this arm
+    cycle, or system suspend) must NOT be zero-filled into oblivion. The
+    detector re-anchors instead, so the session timeline doesn't end up
+    minutes longer than the actual wall-clock event.
+
+    Direct regression guard for the bug where stale frames in mic.queue
+    crossing a 200-second disarm gap caused the detector to inject 200 s
+    of zeros into mic_pcm.
+    """
+    sr = 16000
+    cfg = _cfg(max_gap_fill_secs=2.0)
+    d = ConversationDetector(cfg, sample_rate=sr)
+    frame_secs = 0.02
+    arm_now = 100.0
+    d.open_session_on_arm(now=arm_now)
+    # 1 s of normal frames.
+    for i in range(int(1.0 / frame_secs)):
+        t = arm_now + i * frame_secs
+        d.on_frame("mic", _frame(frame_secs, sr), t, t)
+    len_before = len(d._buffers.mic_pcm)
+    # Now a frame arrives 200 s in the future (the bug scenario, just
+    # mirrored: same effect — gap exceeds the cap).
+    t_runaway = arm_now + 1.0 + 200.0
+    d.on_frame("mic", _frame(frame_secs, sr), t_runaway, t_runaway)
+    len_after = len(d._buffers.mic_pcm)
+    # No 200 s of zero-fill — only the 20 ms of the frame itself was added.
+    growth_samples = (len_after - len_before) // 2
+    assert growth_samples <= int(frame_secs * sr) + 1, (
+        f"runaway gap-fill: buffer grew by {growth_samples} samples; "
+        f"expected ~{int(frame_secs * sr)} (one frame, no fill)"
+    )
+
+
+def test_stale_frames_across_arm_boundary_do_not_inject_zeros():
+    """End-to-end regression for the v2.1.5 bug: a stale frame whose
+    capture_mono_ts is from a previous arm cycle (3 minutes ago), followed
+    by a normal frame from the new arm, must not result in 200 seconds of
+    silence at the start of the session.
+
+    Models the real failure mode: ``mic.queue`` retained frames from
+    before disarm, ``armed_event`` blocked the consumer for 200 s, and on
+    re-arm the consumer pulled the stale frames first, then the new
+    frames — producing a ~200 s gap-fill in the previous code path.
+    """
+    sr = 16000
+    cfg = _cfg(max_gap_fill_secs=2.0)
+    d = ConversationDetector(cfg, sample_rate=sr)
+    frame_secs = 0.02
+
+    # ---- prior arm cycle: open + close a session at t≈100. ----
+    d.open_session_on_arm(now=100.0)
+    for i in range(int(0.5 / frame_secs)):
         t = 100.0 + i * frame_secs
         d.on_frame("mic", _frame(frame_secs, sr), t, t)
-    pre_len_before = len(d._pre_buffers["mic"])
-    # Simulate a 200ms gap: next frame's capture_mono_ts jumps ahead by
-    # 0.2s + nominal 20ms instead of just 20ms.
-    t_gap = 100.0 + 1.0 + 0.2  # 200ms gap
-    d.on_frame("mic", _frame(frame_secs, sr), t_gap, t_gap)
-    pre_len_after = len(d._pre_buffers["mic"])
-    # Expected: buffer grew by (gap + frame) * sr samples = 220ms * sr samples.
-    expected_growth_samples = int(0.22 * sr)
-    actual_growth_samples = (pre_len_after - pre_len_before) // 2
-    # Allow ±1 frame of rounding.
-    assert abs(actual_growth_samples - expected_growth_samples) <= int(frame_secs * sr) + 1, (
-        f"expected ~{expected_growth_samples} samples of growth from gap-fill + frame, "
-        f"got {actual_growth_samples}"
+    d.commit_close(101.0, SessionCloseReason.WHITELIST_ENDED)
+    assert d.state == SessionState.IDLE
+
+    # ---- 200 s of disarm. The detector resets epoch state on re-arm. ----
+    d.reset_source_epochs()
+    arm_now = 300.0
+    d.open_session_on_arm(now=arm_now)
+
+    # ---- a stale frame slips through (timestamped from 200 s ago). ----
+    stale_ts = 100.5
+    d.on_frame("mic", _frame(frame_secs, sr), stale_ts, arm_now)
+    # Then real frames at the NEW arm time.
+    for i in range(int(0.5 / frame_secs)):
+        t = arm_now + i * frame_secs
+        d.on_frame("mic", _frame(frame_secs, sr), t, t)
+
+    # mic_pcm must NOT contain 200 seconds of zeros — at most a fraction
+    # of a second of either fill or junk from the stale frame.
+    mic_dur = len(d._buffers.mic_pcm) / 2 / sr
+    assert mic_dur < 1.0, (
+        f"stale-frame regression: mic_pcm grew to {mic_dur:.1f}s, expected < 1s. "
+        "200-second zero-fill is back."
     )
 
 
@@ -582,20 +572,21 @@ def test_close_pads_shorter_buffer_to_match():
     sr = 16000
     d = ConversationDetector(_cfg(joint_silence_close_secs=5.0), sample_rate=sr)
     frame_secs = 0.02
-    # Feed mic and sys for 2 seconds each, in lockstep (epochs anchored).
+    arm_now = 100.0
+    d.open_session_on_arm(now=arm_now)
+    # Feed mic and sys for 2 seconds each, in lockstep.
     for i in range(int(2.0 / frame_secs)):
-        t = 100.0 + i * frame_secs
+        t = arm_now + i * frame_secs
         d.on_frame("mic", _frame(frame_secs, sr), t, t)
         d.on_frame("system", _frame(frame_secs, sr), t, t)
-    # Session opens on mic segment.
-    d.on_segment(SpeechSegment("mic", 0.0, 2.0), now=102.0)
     # Continue feeding mic past the point where sys goes silent.
     for i in range(int(1.0 / frame_secs)):
-        t = 102.0 + i * frame_secs
+        t = arm_now + 2.0 + i * frame_secs
         d.on_frame("mic", _frame(frame_secs, sr), t, t)
-    # sys gets no more frames. At close, sys_pcm should be padded to match.
-    d.on_segment(SpeechSegment("mic", 2.5, 3.0), now=103.0)  # keep session alive
-    d.tick(110.0)  # past joint silence
+    # Add a couple of segments so the session has voice activity.
+    d.on_segment(SpeechSegment("mic", 0.0, 2.0), now=arm_now + 2.0)
+    d.on_segment(SpeechSegment("mic", 2.5, 3.0), now=arm_now + 3.0)
+    d.tick(arm_now + 10.0)  # past joint silence
     closed = d.take_closed_session()
     assert closed is not None
     assert len(closed.mic_pcm) == len(closed.sys_pcm), (

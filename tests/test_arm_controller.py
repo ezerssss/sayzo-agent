@@ -113,7 +113,7 @@ def _make_controller(
         "checkin_toast_timeout_secs": 0.1,
         "meeting_ended_toast_timeout_secs": 0.1,
         "whitelist_arm_release_grace_secs": 0.03,
-        "meeting_ended_snooze_secs": 0.05,
+        "force_close_after_keep_going_secs": 0.05,
         "decline_release_grace_secs": 0.05,
         "long_meeting_checkin_marks_secs": [3600.0],
         "detectors": default_detector_specs(),
@@ -227,6 +227,29 @@ async def test_stream_start_failure_notifies_and_stays_disarmed():
     await ctrl._on_hotkey_pressed()
     assert ctrl.state == ArmState.DISARMED
     assert any("Couldn't start" in t for t, _ in notifier.fire_and_forget)
+
+
+async def test_arm_opens_detector_session_immediately():
+    """Regression for v2.1.5 stale-frame bug: ``_arm_internal`` must open
+    the detector's session at arm time (not wait for the first VAD
+    segment) and frames flow directly into mic_pcm. Without this, stale
+    frames left in mic.queue from a previous arm cycle would feed into
+    the pre-buffer and the detector's gap-fill would inject ~200 s of
+    zeros into the next session."""
+    from sayzo_agent.conversation import SessionState
+    notifier = FakeNotifier()
+    notifier.consent_script = ["yes"]
+    ctrl, detector, *_ = _make_controller(notifier=notifier)
+
+    await ctrl._on_hotkey_pressed()
+    assert ctrl.state == ArmState.ARMED
+    assert detector.state == SessionState.OPEN
+    assert detector._buffers is not None
+    # Buffers start empty — no pre-buffer indirection.
+    assert len(detector._buffers.mic_pcm) == 0
+    assert len(detector._buffers.sys_pcm) == 0
+
+    await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
 
 
 # ---- pending-close flow (detector integration) -----------------------
@@ -353,7 +376,7 @@ async def test_whitelist_arm_uses_resolver_when_match_has_no_pids():
         checkin_toast_timeout_secs=0.1,
         meeting_ended_toast_timeout_secs=0.1,
         whitelist_arm_release_grace_secs=0.03,
-        meeting_ended_snooze_secs=0.05,
+        force_close_after_keep_going_secs=0.05,
         decline_release_grace_secs=0.05,
         long_meeting_checkin_marks_secs=[3600.0],
         detectors=default_detector_specs(),
@@ -656,17 +679,22 @@ async def test_meeting_ended_watcher_does_not_start_for_hotkey_arm():
     await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
 
 
-async def test_meeting_ended_keep_going_snoozes_and_refires():
+async def test_meeting_ended_keep_going_force_closes_after_threshold():
+    """After 'Keep going', the watcher does NOT re-toast — it silently
+    accumulates consecutive mic-holder absence and force-closes once it
+    crosses ``force_close_after_keep_going_secs``. An informational
+    (non-consent) toast tells the user what happened so the close
+    doesn't feel mysterious. Replaces the old snooze-and-refire flow."""
     notifier = FakeNotifier()
-    # Sequence: whitelist yes, first meeting-ended Keep going, second meeting-ended yes (Wrap up)
-    notifier.consent_script = ["yes", "no", "yes"]
+    # Whitelist yes → arm. First (and only) meeting-ended toast → "Keep going" (no).
+    notifier.consent_script = ["yes", "no"]
     ctrl, _, *_ = _make_controller(
         notifier=notifier,
         mic_holders=[MicHolder("zoom.exe", 1234)],
         cfg_overrides={
             "poll_interval_secs": 0.01,
             "whitelist_arm_release_grace_secs": 0.02,
-            "meeting_ended_snooze_secs": 0.06,
+            "force_close_after_keep_going_secs": 0.06,
             "meeting_ended_toast_timeout_secs": 0.02,
         },
     )
@@ -675,19 +703,69 @@ async def test_meeting_ended_keep_going_snoozes_and_refires():
     await asyncio.sleep(0.05)
     assert ctrl.state == ArmState.ARMED
     ctrl._q_mic_holders = lambda: []
-    # Wait for first toast + snooze + second toast + disarm.
+    # Wait for first toast → Keep going → 60 ms+ of continued absence → force-close.
     await asyncio.sleep(0.35)
     assert ctrl.state == ArmState.DISARMED
-    # Two meeting-ended toasts fired.
+    # Exactly ONE meeting-ended consent toast — the second close path
+    # is silent (informational notify, not consent).
     meeting_ended_calls = [c for c in notifier.consent_calls
                            if c["title"] == "Looks like your meeting ended"]
-    assert len(meeting_ended_calls) >= 2
+    assert len(meeting_ended_calls) == 1
+    # Informational "we wrapped it up" toast fired (fire-and-forget,
+    # captured by FakeNotifier.fire_and_forget).
+    info_calls = [t for t in notifier.fire_and_forget
+                  if "Wrapped up" in t[0]]
+    assert len(info_calls) == 1, (
+        f"expected one informational 'Wrapped up' toast, "
+        f"got {[t[0] for t in notifier.fire_and_forget]}"
+    )
 
     ctrl._whitelist_task.cancel()
     try:
         await ctrl._whitelist_task
     except asyncio.CancelledError:
         pass
+
+
+async def test_meeting_ended_keep_going_resets_on_mic_return():
+    """After 'Keep going', if the arm-app comes back into mic-holders
+    the absence counter resets — we don't force-close on cumulative
+    absence, only consecutive. Without this, brief mic-release blips
+    after Keep going would still trigger force-close eventually."""
+    notifier = FakeNotifier()
+    notifier.consent_script = ["yes", "no"]  # arm, then Keep going
+    ctrl, _, *_ = _make_controller(
+        notifier=notifier,
+        mic_holders=[MicHolder("zoom.exe", 1234)],
+        cfg_overrides={
+            "poll_interval_secs": 0.01,
+            "whitelist_arm_release_grace_secs": 0.02,
+            # Threshold is generous; we'll bounce the holder list before it trips.
+            "force_close_after_keep_going_secs": 0.20,
+            "meeting_ended_toast_timeout_secs": 0.02,
+        },
+    )
+    ctrl._loop = asyncio.get_running_loop()
+    ctrl._whitelist_task = asyncio.create_task(ctrl._run_whitelist_watcher())
+    await asyncio.sleep(0.05)
+    assert ctrl.state == ArmState.ARMED
+    # Drop holders → first toast → Keep going.
+    ctrl._q_mic_holders = lambda: []
+    await asyncio.sleep(0.10)
+    # Holder returns BEFORE the force-close threshold elapses. Counter resets.
+    ctrl._q_mic_holders = lambda: [MicHolder("zoom.exe", 1234)]
+    await asyncio.sleep(0.15)
+    # Still ARMED — force-close didn't trip because absence wasn't consecutive.
+    assert ctrl.state == ArmState.ARMED, (
+        "mic-holder return after Keep going must reset the absence counter"
+    )
+
+    ctrl._whitelist_task.cancel()
+    try:
+        await ctrl._whitelist_task
+    except asyncio.CancelledError:
+        pass
+    await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
 
 
 # ---- hotkey smart-guess (v1.7.0) -----------------------------------
@@ -775,7 +853,7 @@ async def test_hotkey_smart_guess_mac_uses_whitelisted_resolver_on_match(monkeyp
         checkin_toast_timeout_secs=0.1,
         meeting_ended_toast_timeout_secs=0.1,
         whitelist_arm_release_grace_secs=0.03,
-        meeting_ended_snooze_secs=0.05,
+        force_close_after_keep_going_secs=0.05,
         decline_release_grace_secs=0.05,
         long_meeting_checkin_marks_secs=[3600.0],
         detectors=default_detector_specs(),
