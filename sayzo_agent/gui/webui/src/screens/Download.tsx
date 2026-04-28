@@ -8,14 +8,13 @@ import { subscribe, SayzoEvent } from "../lib/events";
 
 interface Props {
   onDone: () => void;
-  onCancel: () => void;
 }
 
 function formatGB(bytes: number): string {
   return (bytes / 1024 / 1024 / 1024).toFixed(2) + " GB";
 }
 
-export function Download({ onDone, onCancel }: Props) {
+export function Download({ onDone }: Props) {
   const [progress, setProgress] = useState({ done: 0, total: 0 });
   const [status, setStatus] = useState<"idle" | "downloading" | "done" | "error">(
     "idle",
@@ -67,14 +66,9 @@ export function Download({ onDone, onCancel }: Props) {
       title="Setting things up"
       subtitle="Getting Sayzo ready — about 2 GB, one time only."
       footer={
-        <>
-          <Button variant="ghost" onClick={onCancel}>
-            Cancel
-          </Button>
-          <Button onClick={onDone} disabled={status !== "done"}>
-            Continue
-          </Button>
-        </>
+        <Button onClick={onDone} disabled={status !== "done"}>
+          Continue
+        </Button>
       }
     >
       <div className="space-y-3">

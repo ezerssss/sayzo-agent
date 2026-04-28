@@ -179,12 +179,7 @@ export function App() {
         />
       );
     case "download":
-      return (
-        <Download
-          onDone={() => advance()}
-          onCancel={handleCancel}
-        />
-      );
+      return <Download onDone={() => advance()} />;
     case "microphone":
       return (
         <Microphone

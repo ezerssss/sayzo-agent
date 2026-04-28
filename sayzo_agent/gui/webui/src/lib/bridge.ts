@@ -75,6 +75,7 @@ declare global {
     mark_permissions_onboarded(): Promise<null>;
     finish(): Promise<null>;
     quit_app(): Promise<null>;
+    restart_app(): Promise<null>;
   }
 
   interface Window {
@@ -222,5 +223,9 @@ export const bridge = {
   async quitApp() {
     await whenReady();
     return window.pywebview.api.quit_app();
+  },
+  async restartApp() {
+    await whenReady();
+    return window.pywebview.api.restart_app();
   },
 };

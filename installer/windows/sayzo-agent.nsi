@@ -2,6 +2,12 @@
 ; Installs the PyInstaller bundle, creates auto-start Task Scheduler entry,
 ; and registers with Add/Remove Programs.
 
+; Compile in Unicode mode so UTF-8 source bytes (em-dashes in the welcome /
+; finish page copy, smart punctuation in comments) render correctly. Without
+; this, NSIS 3 falls back to Windows-1252 and the welcome page title shows
+; "Sayzo â€" …" instead of "Sayzo — …".
+Unicode true
+
 !include "MUI2.nsh"
 !include "nsDialogs.nsh"
 !include "WinMessages.nsh"

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import enum
 import logging
+import os
 import sys
 import threading
 from typing import TYPE_CHECKING, Any
@@ -221,9 +222,12 @@ class Bridge:
         """Return whether Sayzo currently has Accessibility permission.
 
         Polled by the setup window after deep-linking the user to System
-        Settings. Wraps ``AXIsProcessTrustedWithOptions(None)`` — cheap,
-        never prompts, and re-reads TCC each call (the cache-free variant
-        the polling loop needs). Always ``{"trusted": False}`` on
+        Settings. Wraps ``AXIsProcessTrustedWithOptions`` with an explicit
+        no-prompt options dict — cheap and never prompts. macOS does not
+        always update the trust bit for an already-running process even
+        after the user grants access through System Settings; the Accessibility
+        screen pairs this with a Restart escape hatch (see ``restart_app``)
+        so the user is never stuck. Always ``{"trusted": False}`` on
         non-darwin.
         """
         if sys.platform != "darwin":
@@ -273,13 +277,86 @@ class Bridge:
                 log.warning("failed to destroy setup window", exc_info=True)
 
     def quit_app(self) -> None:
-        """User cancelled. Service should exit without starting tray/agent."""
+        """User cancelled. Service should exit without starting tray/agent.
+
+        On macOS we ``os._exit`` directly rather than relying on
+        ``window.destroy`` + ``webview.start`` returning, because pywebview's
+        Cocoa backend calls ``NSApplication.stop_()`` in its windowWillClose_
+        handler, and Apple's docs are explicit: ``stop:`` only takes effect
+        after the *next* NSEvent is received. With no further user input
+        after the cancel click, the NSApp runloop sits idle forever and the
+        Python main thread never returns from ``webview.start``. The dock
+        icon stays, Activity Monitor shows the process as not responding,
+        the user has to force-quit. Hard-exiting from the bridge thread
+        sidesteps the whole runloop. On Windows the WinForms backend doesn't
+        have this quirk — Windows message loops exit naturally on form close
+        — so the same hard exit there is just a safety belt.
+
+        Reference: pywebview cocoa.py windowWillClose_ at
+        site-packages/webview/platforms/cocoa.py:98 and Apple's
+        NSApplication.stop(_:) documentation.
+        """
         self._result = SetupResult.QUIT
+        self._login.cancel()
         if self._window is not None:
             try:
                 self._window.destroy()
             except Exception:
-                log.warning("failed to destroy setup window", exc_info=True)
+                log.debug("failed to destroy setup window", exc_info=True)
+        os._exit(0)
+
+    def restart_app(self) -> None:
+        """Relaunch Sayzo. Escape hatch for the Accessibility step.
+
+        macOS doesn't reliably update the Accessibility trust bit for an
+        already-running process when the user adds it through System
+        Settings, so the polling check can stay False even after a real
+        grant. A fresh process always reads the correct bit on startup.
+
+        On macOS we spawn ``open -n`` against the .app bundle (detached) so
+        a new instance starts before this one exits. On Windows / dev, we
+        only exit — the user relaunches manually. Either way we hard-exit
+        so pywebview/NSApp can't wedge the dying process.
+        """
+        from pathlib import Path
+
+        self._result = SetupResult.QUIT
+        self._login.cancel()
+        if self._window is not None:
+            try:
+                self._window.destroy()
+            except Exception:
+                log.debug(
+                    "failed to destroy setup window before restart",
+                    exc_info=True,
+                )
+
+        if sys.platform == "darwin":
+            try:
+                exe = Path(sys.executable).resolve()
+                app_bundle = next(
+                    (p for p in exe.parents if p.suffix == ".app"), None
+                )
+                if app_bundle is not None and app_bundle.exists():
+                    import subprocess
+
+                    subprocess.Popen(
+                        ["open", "-n", str(app_bundle)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        start_new_session=True,
+                    )
+                    log.warning("restart_app: relaunching %s", app_bundle)
+                else:
+                    log.warning(
+                        "restart_app: no .app bundle found above %s — exiting "
+                        "without relaunch",
+                        exe,
+                    )
+            except Exception:
+                log.warning("restart_app: relaunch spawn failed", exc_info=True)
+
+        os._exit(0)
 
     # ------------------------------------------------------------------
     # Worker-thread implementations

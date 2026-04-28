@@ -9,6 +9,7 @@ or exit.
 from __future__ import annotations
 
 import logging
+import os
 
 import webview
 
@@ -55,6 +56,21 @@ class SetupWindow:
             text_select=False,
         )
         self._bridge._attach_window(window)
+
+        # Catch the user-closed-via-X path (the Cancel button is handled by
+        # Bridge.quit_app, which hard-exits directly). pywebview's Cocoa
+        # backend calls NSApplication.stop_() in windowWillClose_; Apple's
+        # docs say stop: only takes effect after the next NSEvent is
+        # received, so without further user interaction the NSApp runloop
+        # sits idle and webview.start() never returns. We hard-exit here if
+        # the bridge result is still QUIT (default — user never reached
+        # Done) so the process can't get wedged.
+        def _on_closed() -> None:
+            if self._bridge.result == SetupResult.QUIT:
+                log.warning("setup window closed via X — exiting")
+                os._exit(0)
+
+        window.events.closed += _on_closed
 
         # webview.start() blocks until the window is destroyed. debug=True
         # opens the devtools panel — gated on Config.debug for ad-hoc UI work.

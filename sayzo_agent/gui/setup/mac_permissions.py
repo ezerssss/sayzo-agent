@@ -205,13 +205,21 @@ def open_accessibility_settings() -> None:
 def is_accessibility_trusted() -> bool:
     """Return True if Sayzo currently has Accessibility permission.
 
-    Uses ``AXIsProcessTrustedWithOptions(None)`` rather than
-    ``AXIsProcessTrusted()``: the latter caches the trust bit at first
-    call, so once it returns False the cached value sticks for the
-    process lifetime — even after the user grants the permission. The
-    *WithOptions variant re-reads the TCC database each call, which is
-    what the setup window's polling loop needs to actually flip from
-    waiting → trusted without a relaunch.
+    Uses ``AXIsProcessTrustedWithOptions`` with an explicit options dict
+    (``{kAXTrustedCheckOptionPrompt: False}``) rather than passing ``None``
+    or calling ``AXIsProcessTrusted()``. Apple's headers document
+    ``AXIsProcessTrustedWithOptions(NULL)`` as equivalent to the cached
+    ``AXIsProcessTrusted()`` form, so passing NULL doesn't reliably flip
+    once the user grants access — even though the prior comment claimed
+    it did. Passing an explicit options dict is what the macOS sample
+    code does and is the form most likely to re-read the TCC database.
+
+    Even with a proper options dict, macOS does not always notify a
+    long-running process when its Accessibility entry is added, so this
+    can still return False after a successful grant. The setup window
+    pairs this with a "Restart Sayzo" escape hatch (Accessibility.tsx)
+    so the user is never stuck — a relaunched process always sees the
+    correct trust state on startup.
 
     Returns False on non-darwin and on any binding failure (so the GUI
     keeps polling rather than silently passing on a bad import).
@@ -221,6 +229,7 @@ def is_accessibility_trusted() -> bool:
     try:
         from ApplicationServices import (  # type: ignore[import-not-found]
             AXIsProcessTrustedWithOptions,
+            kAXTrustedCheckOptionPrompt,
         )
     except Exception:
         log.debug(
@@ -229,7 +238,8 @@ def is_accessibility_trusted() -> bool:
         )
         return False
     try:
-        return bool(AXIsProcessTrustedWithOptions(None))
+        options = {kAXTrustedCheckOptionPrompt: False}
+        return bool(AXIsProcessTrustedWithOptions(options))
     except Exception:
         log.debug(
             "[mac_permissions] AXIsProcessTrustedWithOptions call failed",

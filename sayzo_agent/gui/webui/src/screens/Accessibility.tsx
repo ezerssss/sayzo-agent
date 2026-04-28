@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { CheckCircle2, ExternalLink } from "lucide-react";
+import { CheckCircle2, ExternalLink, RefreshCw } from "lucide-react";
 import { Button } from "../components/ui/Button";
 import { Layout } from "../components/Layout";
 import { bridge } from "../lib/bridge";
@@ -13,13 +13,22 @@ interface Props {
 type State = "idle" | "waiting" | "trusted";
 
 const POLL_INTERVAL_MS = 1500;
+// macOS doesn't always notify a running process when its Accessibility
+// entry is granted — the trust bit can stay False even after a real grant
+// until the app is relaunched. After this many ms in "waiting", we surface
+// a Restart button so the user is never stuck.
+const RESTART_HINT_DELAY_MS = 10_000;
 
 export function Accessibility({ step, onNext, onCancel }: Props) {
   const [state, setState] = useState<State>("idle");
+  const [showRestartHint, setShowRestartHint] = useState(false);
   const pollRef = useRef<number | null>(null);
 
   useEffect(() => {
-    if (state !== "waiting") return;
+    if (state !== "waiting") {
+      setShowRestartHint(false);
+      return;
+    }
     let cancelled = false;
 
     const tick = async () => {
@@ -40,12 +49,17 @@ export function Accessibility({ step, onNext, onCancel }: Props) {
     };
 
     pollRef.current = window.setTimeout(tick, POLL_INTERVAL_MS);
+    const hintTimer = window.setTimeout(
+      () => !cancelled && setShowRestartHint(true),
+      RESTART_HINT_DELAY_MS,
+    );
     return () => {
       cancelled = true;
       if (pollRef.current !== null) {
         clearTimeout(pollRef.current);
         pollRef.current = null;
       }
+      clearTimeout(hintTimer);
     };
   }, [state]);
 
@@ -58,6 +72,15 @@ export function Accessibility({ step, onNext, onCancel }: Props) {
       // waiting state so polling picks up the grant when it happens.
     }
     setState("waiting");
+  }
+
+  async function handleRestart() {
+    try {
+      await bridge.restartApp();
+    } catch {
+      // restart_app hard-exits on the Python side, so the bridge call
+      // typically never resolves. The catch is just defensive.
+    }
   }
 
   return (
@@ -119,6 +142,27 @@ export function Accessibility({ step, onNext, onCancel }: Props) {
               </li>
             </ol>
           </div>
+
+          {showRestartHint && (
+            <div className="rounded-md border border-ink-muted/20 bg-ink-muted/5 p-3 text-sm leading-relaxed">
+              <p className="font-medium text-ink">
+                Already added Sayzo and toggled it on?
+              </p>
+              <p className="mt-1 text-ink-muted">
+                macOS sometimes doesn't tell a running app that its
+                Accessibility was just granted. A quick restart picks it
+                up — your progress so far is saved.
+              </p>
+              <Button
+                variant="secondary"
+                onClick={handleRestart}
+                className="mt-2"
+              >
+                <RefreshCw className="h-4 w-4" />
+                Restart Sayzo
+              </Button>
+            </div>
+          )}
         </div>
       )}
 

@@ -966,7 +966,13 @@ def service(force_setup: bool) -> None:
         if setup_result == SetupResult.QUIT:
             log.warning("user cancelled setup — exiting")
             remove_pid(cfg.pid_path)
-            return
+            # Force-exit. pywebview's Cocoa backend doesn't always tear down
+            # NSApp cleanly when the only window is destroyed mid-flow (e.g.,
+            # a worker thread still has an evaluate_js call queued against the
+            # dying window), leaving a non-responsive process behind that the
+            # user has to force-quit. The setup window owns no agent / capture
+            # state worth flushing, so a hard exit here is safe and reliable.
+            os._exit(0)
         # COMPLETED: persist the first-launch marker so subsequent launchd /
         # Task Scheduler restarts don't re-open the GUI unnecessarily, then
         # register the macOS launchd LaunchAgent for auto-start on login.
