@@ -56,6 +56,17 @@ function initialScreen(
 ): Screen {
   if (!status.has_token) return "welcome";
   if (!status.has_model) return "download";
+  // One-shot resume after Restart-Sayzo from the Accessibility screen.
+  // The backend writes a marker before exit and clears it on this read,
+  // so we only honor it when the target screen is actually in this
+  // platform's sequence (defensive — if a future build changes the
+  // sequence, a stale marker shouldn't crash us).
+  if (
+    status.resume_at === "accessibility" &&
+    (sequence as string[]).includes("accessibility")
+  ) {
+    return "accessibility";
+  }
   // Already-complete flow won't reach here (detect_setup + .setup-seen gates
   // the window entirely), but guard anyway: jump to the first screen after
   // download so the user can still walk through permissions.

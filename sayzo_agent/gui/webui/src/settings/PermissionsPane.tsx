@@ -61,7 +61,7 @@ export function PermissionsPane() {
       ) : (
         <>
           <p className="mt-3 max-w-md text-sm leading-relaxed text-ink-muted">
-            Grant the permissions Sayzo needs to capture meetings and let
+            Allow the permissions Sayzo needs to capture meetings and let
             the keyboard shortcut work anywhere.
           </p>
 

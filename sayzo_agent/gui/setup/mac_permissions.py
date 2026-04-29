@@ -177,6 +177,53 @@ def prompt_notifications() -> Optional[bool]:
         return None
 
 
+def is_notification_authorised() -> Optional[bool]:
+    """Non-prompting probe of current notification authorisation. Polled by
+    the Notifications onboarding screen while the user toggles Sayzo on in
+    System Settings, mirroring how Accessibility polls
+    ``is_accessibility_trusted()``. Returns True / False / None (error)."""
+    if sys.platform != "darwin":
+        return None
+    notifier = _get_notifier()
+    if notifier is None:
+        return None
+    try:
+        return bool(notifier.has_authorisation())
+    except Exception:
+        log.warning(
+            "[mac_permissions] has_authorisation failed", exc_info=True
+        )
+        return None
+
+
+def send_verification_notification() -> bool:
+    """Fire a single test toast so the user can confirm notifications
+    actually appear on their screen. ``request_authorisation`` returning
+    True can lie when the bundle is misconfigured (signed but not notarised,
+    AUMID drift, etc.); an actual toast hitting the screen is ground truth.
+
+    Returns True on best-effort send success, False otherwise. Failures
+    are logged but never propagated.
+    """
+    if sys.platform != "darwin":
+        return False
+    notifier = _get_notifier()
+    if notifier is None:
+        return False
+    try:
+        notifier.send(
+            title="Sayzo notifications are on",
+            message="You'll see prompts like this when Sayzo spots a meeting.",
+        )
+        return True
+    except Exception:
+        log.warning(
+            "[mac_permissions] send_verification_notification failed",
+            exc_info=True,
+        )
+        return False
+
+
 def _open(deeplink: str) -> None:
     if sys.platform != "darwin":
         return

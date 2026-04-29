@@ -82,3 +82,32 @@ def open_notification_settings() -> None:
         )
     except OSError as e:
         log.warning("[win_permissions] open settings failed: %s", e)
+
+
+def send_verification_notification() -> bool:
+    """Fire a single test toast so the user can confirm notifications
+    actually appear on their screen. ``has_authorisation()`` returning True
+    isn't always enough — Focus Assist + the per-app toggle can still
+    swallow toasts silently. An actual toast hitting the screen is the
+    ground-truth check.
+
+    Returns True on best-effort send success, False otherwise. Failures
+    are logged but never propagated.
+    """
+    if sys.platform != "win32":
+        return False
+    notifier = _get_notifier()
+    if notifier is None:
+        return False
+    try:
+        notifier.send(
+            title="Sayzo notifications are on",
+            message="You'll see prompts like this when Sayzo spots a meeting.",
+        )
+        return True
+    except Exception:
+        log.warning(
+            "[win_permissions] send_verification_notification failed",
+            exc_info=True,
+        )
+        return False

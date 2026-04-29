@@ -7,6 +7,13 @@ export type SetupStatus = {
   has_mic_permission: boolean | null;
   has_permissions_onboarded: boolean;
   is_complete: boolean;
+  // One-shot resume hint set by Bridge.restart_app() before it hard-exits
+  // (currently only "accessibility"). App.tsx's initialScreen() reads this
+  // on the first get_status() call after a Restart-Sayzo round-trip and
+  // jumps straight back to the Accessibility screen instead of dropping
+  // the user to the default sequence[2] (Microphone). Cleared by the
+  // backend on read.
+  resume_at: "accessibility" | null;
 };
 
 export type ConfigSnapshot = {
@@ -57,6 +64,8 @@ declare global {
     prompt_mic_permission(): Promise<PermissionResult>;
     prompt_audio_capture_permission(): Promise<PermissionResult>;
     prompt_notification_permission(): Promise<PermissionResult>;
+    check_notification_permission(): Promise<PermissionResult>;
+    send_test_notification(): Promise<{ sent: boolean }>;
 
     // Settings deep-links.
     open_mic_settings(): Promise<null>;
@@ -175,6 +184,14 @@ export const bridge = {
   async promptNotificationPermission() {
     await whenReady();
     return window.pywebview.api.prompt_notification_permission();
+  },
+  async checkNotificationPermission() {
+    await whenReady();
+    return window.pywebview.api.check_notification_permission();
+  },
+  async sendTestNotification() {
+    await whenReady();
+    return window.pywebview.api.send_test_notification();
   },
   async openMicSettings() {
     await whenReady();

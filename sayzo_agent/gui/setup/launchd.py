@@ -83,22 +83,28 @@ def _is_currently_loaded() -> bool:
     return result.returncode == 0
 
 
-def ensure_launchd_registered() -> bool:
-    """Write the LaunchAgent plist and load it.
+def ensure_launchd_registered(*, load_immediately: bool = False) -> bool:
+    """Write the LaunchAgent plist (and optionally load it).
 
-    Skips the ``unload``+``load`` cycle when the plist body is unchanged
-    and the job is already loaded — crucial on setup-complete, because we
-    call this from inside the running service and a needless ``load``
-    with ``RunAtLoad=true`` spawns a second instance that races with
-    the first (the first wins the PID file; the second exits via
-    "service already running, exiting" — harmless but noisy).
+    By default this only writes the plist. ``launchctl load`` is NOT run,
+    because the only caller — the setup-complete path in ``__main__.py``
+    — runs from inside an already-live sayzo-agent process. Calling
+    ``launchctl load`` on a plist with ``RunAtLoad=true`` from there
+    asks launchd to spawn a *second* sayzo-agent. The pidfile guard in
+    ``service()`` is supposed to make the second copy exit immediately,
+    but in practice (user report 2026-04-29) the duplicate survived and
+    showed up as a second menu-bar icon. Sidestepping the load entirely
+    is the only behavior that's safe by construction: the plist sitting
+    in ``~/Library/LaunchAgents/`` auto-loads at the user's next login,
+    which is exactly what RunAtLoad already promises.
+
+    Pass ``load_immediately=True`` only from contexts where the agent is
+    NOT currently running (e.g. an admin-style reset command, or a CLI
+    install path). Default callers should leave it False.
 
     Returns:
-        True  if the plist was written/refreshed and loaded (or was
-              already loaded in a matching state)
-        False if we skipped (non-darwin, or the .app isn't installed at
-              the expected path so registration would be pointing at
-              nothing) or a subprocess call failed
+        True  if the plist was written or already up-to-date
+        False if we skipped (non-darwin / .app missing) or a write failed
 
     Never raises; logs and returns False on any error so the caller (the
     service start path) doesn't crash on a non-fatal registration failure.
@@ -122,43 +128,39 @@ def ensure_launchd_registered() -> bool:
         plist_path.parent.mkdir(parents=True, exist_ok=True)
         existing = plist_path.read_text(encoding="utf-8") if plist_path.exists() else ""
         plist_changed = existing != plist_body
-        currently_loaded = _is_currently_loaded()
-
-        if not plist_changed and currently_loaded:
-            log.info(
-                "launchd plist already loaded and unchanged at %s — skipping reload",
-                plist_path,
-            )
-            return True
 
         if plist_changed:
             plist_path.write_text(plist_body, encoding="utf-8")
             os.chmod(plist_path, 0o644)
             log.info("wrote launchd plist to %s", plist_path)
+        else:
+            log.info(
+                "launchd plist unchanged at %s — registered for next login", plist_path
+            )
 
-        # Only unload if the job is actually loaded — avoids an unnecessary
-        # stop/start on the plist-just-written + not-loaded-yet path.
-        if currently_loaded:
-            subprocess.run(
-                ["launchctl", "unload", str(plist_path)],
+        if load_immediately:
+            currently_loaded = _is_currently_loaded()
+            if currently_loaded:
+                subprocess.run(
+                    ["launchctl", "unload", str(plist_path)],
+                    capture_output=True,
+                    check=False,
+                )
+            result = subprocess.run(
+                ["launchctl", "load", str(plist_path)],
                 capture_output=True,
                 check=False,
             )
-        result = subprocess.run(
-            ["launchctl", "load", str(plist_path)],
-            capture_output=True,
-            check=False,
-        )
-        if result.returncode != 0:
-            log.warning(
-                "launchctl load returned %d: %s",
-                result.returncode,
-                result.stderr.decode(errors="replace").strip(),
-            )
-            return False
+            if result.returncode != 0:
+                log.warning(
+                    "launchctl load returned %d: %s",
+                    result.returncode,
+                    result.stderr.decode(errors="replace").strip(),
+                )
+                return False
+            log.info("launchctl loaded %s", plist_path)
     except OSError:
         log.warning("launchd registration failed", exc_info=True)
         return False
 
-    log.info("launchd LaunchAgent %s registered", LAUNCH_AGENT_LABEL)
     return True

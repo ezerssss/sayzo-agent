@@ -31,6 +31,16 @@ log = logging.getLogger(__name__)
 # completed the whole setup", not just the permissions step.
 _PERMISSIONS_MARKER_NAME = ".permissions_onboarded_v1"
 
+# One-shot marker written by restart_app() before it hard-exits. The next
+# instance reads it on the first get_status() call, deletes it, and tells
+# the frontend to skip straight back to the Accessibility screen — instead
+# of the default sequence[2] (Microphone, step 3) that initialScreen() would
+# otherwise return for a token+model-already-present user. Without this,
+# clicking "Restart Sayzo" from the Accessibility-waiting state dropped the
+# user three screens back even though every earlier permission was already
+# done.
+_RESUME_AT_ACCESSIBILITY_MARKER = ".resume_at_accessibility"
+
 
 class SetupResult(enum.Enum):
     """Outcome of the first-run setup window."""
@@ -91,7 +101,23 @@ class Bridge:
     # ------------------------------------------------------------------
 
     def get_status(self) -> dict[str, Any]:
-        return detect_setup(self._cfg).to_dict()
+        status = detect_setup(self._cfg).to_dict()
+        # One-shot — consumed by App.tsx's initialScreen() on first read after
+        # a Restart-Sayzo round-trip from the Accessibility screen.
+        status["resume_at"] = self._consume_resume_marker()
+        return status
+
+    def _consume_resume_marker(self) -> str | None:
+        path = self._cfg.data_dir / _RESUME_AT_ACCESSIBILITY_MARKER
+        if not path.exists():
+            return None
+        try:
+            path.unlink()
+        except OSError:
+            log.warning(
+                "failed to remove resume marker at %s", path, exc_info=True
+            )
+        return "accessibility"
 
     def get_config_snapshot(self) -> dict[str, Any]:
         """Non-secret config bits the GUI may want for display."""
@@ -160,7 +186,7 @@ class Bridge:
         return {"granted": mac_permissions.prompt_audio_capture()}
 
     def prompt_notification_permission(self) -> dict[str, Any]:
-        """User clicked Grant on the Notifications row. On macOS, fires the
+        """User clicked Allow on the Notifications row. On macOS, fires the
         UNUserNotificationCenter dialog on first call. On Windows, just
         returns current toast-authorization status (non-prompting)."""
         if sys.platform == "darwin":
@@ -172,6 +198,44 @@ class Bridge:
 
             return {"granted": win_permissions.has_notification_permission()}
         return {"granted": None}
+
+    def check_notification_permission(self) -> dict[str, Any]:
+        """Non-prompting current-state probe. Polled by the Notifications
+        screen while it's deep-linked the user into System Settings, so the
+        UI flips to "granted" automatically when the user toggles us on
+        without us re-firing the OS dialog (which only fires once per app
+        anyway, but the no-prompt variant is cleaner and matches the
+        Accessibility polling pattern)."""
+        if sys.platform == "darwin":
+            from sayzo_agent.gui.setup import mac_permissions
+
+            return {"granted": mac_permissions.is_notification_authorised()}
+        if sys.platform == "win32":
+            from sayzo_agent.gui.setup import win_permissions
+
+            return {"granted": win_permissions.has_notification_permission()}
+        return {"granted": None}
+
+    def send_test_notification(self) -> dict[str, Any]:
+        """Fire a one-off verification toast right after permission flips
+        granted. End-to-end check: a return of `request_authorisation()`
+        True can lie if the bundle is misconfigured; an actual toast
+        appearing on the user's screen is ground truth.
+
+        Best-effort — failures are swallowed and reported as `{"sent": False}`
+        so the UI can choose whether to show a softer error.
+        """
+        if sys.platform == "darwin":
+            from sayzo_agent.gui.setup import mac_permissions
+
+            sent = mac_permissions.send_verification_notification()
+            return {"sent": bool(sent)}
+        if sys.platform == "win32":
+            from sayzo_agent.gui.setup import win_permissions
+
+            sent = win_permissions.send_verification_notification()
+            return {"sent": bool(sent)}
+        return {"sent": False}
 
     def open_mic_settings(self) -> None:
         if sys.platform == "darwin":
@@ -317,8 +381,26 @@ class Bridge:
         a new instance starts before this one exits. On Windows / dev, we
         only exit — the user relaunches manually. Either way we hard-exit
         so pywebview/NSApp can't wedge the dying process.
+
+        Writes ``.resume_at_accessibility`` before exit so the next instance
+        jumps straight back to the Accessibility screen via App.tsx's
+        initialScreen(). Without this, the new process treated the user as
+        a fresh token+model-present startup and dropped them at sequence[2]
+        (Microphone, step 3) — three screens behind where they were.
         """
         from pathlib import Path
+
+        # Write the resume marker FIRST. Even if the relaunch spawn fails
+        # below, the marker is harmless on a stale boot — get_status()
+        # consumes it once and ignores it after that.
+        try:
+            marker = self._cfg.data_dir / _RESUME_AT_ACCESSIBILITY_MARKER
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.touch(exist_ok=True)
+        except OSError:
+            log.warning(
+                "failed to write resume marker before restart", exc_info=True
+            )
 
         self._result = SetupResult.QUIT
         self._login.cancel()

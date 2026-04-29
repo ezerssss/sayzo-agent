@@ -104,18 +104,36 @@ One window, one walkthrough. No second tkinter step after it closes — everythi
 
 > **Why no separate Automation screen.** v1 used `osascript` to read browser tab URLs, which forced the macOS Automation TCC dialog (*"Sayzo wants to control your browser"*) — alarming wording for a coaching app, especially around work browsers with sensitive content. v2 reads browser **window titles** via `AXUIElementCopyAttributeValue`, which is gated by the **same** Accessibility permission already required for the global hotkey. No second dialog ever appears. Detection precision is preserved by combining title-regex matching with the existing mic-holder filter (`detectors._browser_holds_mic`).
 
-### Screen 06 — Notifications (both platforms, different copy)
+### Screen 06 — Notifications (both platforms)
 
-- Title (macOS, **APPROVED**): **Let Sayzo send you notifications**
-- Title (Windows, **APPROVED**): **Check your notification settings**
-- Body (macOS, **APPROVED**): *"Sayzo asks before recording when it spots you in a meeting, and lets you know when a conversation saves. Skip this and you won't see the ask."*
-- Body (Windows, **APPROVED**): *"Sayzo asks before recording when it spots you in a meeting. Make sure notifications are on so the prompts actually show up."*
-- Buttons: **Cancel** / **Skip for now** / **Grant** (macOS) or **Check setting** (Windows)
-- Pending label: **Asking…** (macOS) / **Checking…** (Windows)
-- Sub-body (pre-grant, macOS, **APPROVED**): *"macOS will ask once. Click Allow so you don't miss the meeting prompts."*
-- Sub-body (pre-grant, Windows, **APPROVED**): *"Make sure Sayzo is enabled under Settings → System → Notifications."*
-- Granted sub-body (**APPROVED**): *"All set."*
-- Denied sub-body (**APPROVED**): *"Notifications are blocked. Open Settings to turn them on, then try again."*
+Re-shaped in v2.1.11 to match the Accessibility screen's poll-until-granted
+pattern. The previous "click Grant, click Skip for now if it's annoying"
+flow let users sail past the most essential permission of the app —
+notifications are the *only* way Sayzo asks for consent before recording,
+so a user who skips them doesn't get the auto-suggest toast at all and
+ends up thinking the app is broken (user report 2026-04-29).
+
+- Title (**APPROVED**): **Turn on notifications**
+- Body (**APPROVED**): *"Sayzo uses notifications to ask before recording in your meetings, and to confirm when a capture is saved. This step is essential — without notifications, Sayzo can't ask for your consent."*
+- Primary button: **Allow** (idle) → **Asking…** (asking) → **Re-open Settings** (waiting) → **Continue** (granted)
+- Secondary button: **Cancel** (quits onboarding)
+- "Skip for now" is no longer in the footer. It's a small text link below the permission card — *"I'll set this up later"* — and clicking it opens a confirm dialog (see below).
+
+State copy:
+
+- Idle (macOS): *"Click Allow to start. macOS will show a system prompt — click Allow there too."*
+- Idle (Windows): *"Click Allow to start. Sayzo will check whether Windows is set up to display its toasts."*
+- Asking: *"Asking…"* with a pulsing dot.
+- Waiting: *"Waiting for notifications…"* with a pulsing dot, plus instruction *"Open System Settings → Notifications → Sayzo and turn it on. We'll detect it within a second or two."* (macOS) / *"Open Settings → System → Notifications → Sayzo and turn it on. We'll detect it within a second or two."* (Windows). After 10s in waiting, surface the restart hint *"Already turned it on? Sayzo sometimes doesn't pick up the change until the next launch. Try toggling it off and on, or restart Sayzo."*
+- Granted: green checkmark, *"All set!"*, plus *"You should see a test notification — that's the kind of nudge Sayzo will use during meetings."* (Bridge fires `send_test_notification()` automatically as ground-truth verification — `request_authorisation()` returning True can lie when the bundle is misconfigured; an actual toast is the real check.)
+
+Skip confirm dialog:
+
+- Title: **Skip notifications?**
+- Body: *"Without notifications, Sayzo can't ask before joining your meetings, and the global shortcut won't show a confirmation. You can turn this on later from Settings."*
+- Buttons: **Skip anyway** (ghost) / **Stay and set up** (primary)
+
+Polling: setup window polls `desktop_notifier.has_authorisation()` every 1.5s while in the waiting state — same shape as Accessibility's `AXIsProcessTrustedWithOptions` poll. There's no "trust me, I clicked Allow" path: the Continue button only unlocks after the bridge confirms the toast actually went through.
 
 ### Screen 07 — Shortcut (both)
 

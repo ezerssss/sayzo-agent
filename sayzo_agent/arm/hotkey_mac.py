@@ -234,6 +234,13 @@ class MacHotkeySource:
         def _trampoline(_call_ref: int, _event_ref: int, _user_data: int) -> int:
             # Runs on the main thread (Carbon events go through NSApp's
             # queue). Marshal onto the asyncio loop and return noErr (0).
+            # The log line is intentionally INFO and unconditional — the
+            # macOS hotkey path is the most opaque single thing in the
+            # arm subsystem (no GUI feedback if it silently fails to
+            # register or fails to deliver), so observability here is
+            # cheap insurance. One line per actual press is rare enough
+            # to not pollute the log.
+            log.info("[arm.hotkey_mac] hotkey fired")
             try:
                 self._loop.call_soon_threadsafe(self._callback)
             except RuntimeError:
@@ -279,7 +286,11 @@ class MacHotkeySource:
         self._hot_key_ref = hot_key_ref
         self._carbon = carbon
         self._binding = binding
-        log.info("[arm.hotkey_mac] registered %s", binding)
+        log.info(
+            "[arm.hotkey_mac] registered %s (mods=0x%x key=%d) — Carbon "
+            "event handler installed, waiting for events on NSApp main loop",
+            binding, mods, key_code,
+        )
         return None
 
     def unregister(self) -> None:
