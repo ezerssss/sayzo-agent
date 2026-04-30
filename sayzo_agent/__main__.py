@@ -704,11 +704,11 @@ def diagnose_notifications() -> None:
     )
     logging.getLogger().addHandler(stream_handler)
 
-    from .notify import APP_AUMID, DesktopNotifier
+    from .notify import APP_AUMID, make_notifier
 
     click.echo("=== Sayzo notification diagnostic ===\n")
-    click.echo("Constructing DesktopNotifier...")
-    notifier = DesktopNotifier(app_name=APP_AUMID)
+    click.echo("Constructing notifier...")
+    notifier = make_notifier(app_name=APP_AUMID)
     # Give the background loop a moment to finish init + initial auth
     # probe before we start firing test toasts. The wait inside __init__
     # gates on loop creation, not on the auth probe completing.
@@ -930,9 +930,9 @@ def run() -> None:
         log.info("Uploads enabled → %s", cfg.auth.effective_server_url)
 
     from .app import Agent
-    from .notify import APP_AUMID, DesktopNotifier, NoopNotifier
+    from .notify import APP_AUMID, NoopNotifier, make_notifier
 
-    notifier = DesktopNotifier(app_name=APP_AUMID) if cfg.notifications_enabled else NoopNotifier()
+    notifier = make_notifier(app_name=APP_AUMID) if cfg.notifications_enabled else NoopNotifier()
     agent = Agent(cfg, upload_client=upload_client, notifier=notifier, auth_client=auth_client)
 
     async def _main() -> None:
@@ -1082,7 +1082,7 @@ def service(force_setup: bool) -> None:
         log.warning("uploads enabled → %s", cfg.auth.effective_server_url)
 
     from .app import Agent
-    from .notify import APP_AUMID, DesktopNotifier, NoopNotifier
+    from .notify import APP_AUMID, NoopNotifier, make_notifier
 
     # Seed the tray with the user's actual hotkey at construction. The
     # TrayState dataclass field has a default of "Ctrl+Alt+S" for tests,
@@ -1092,7 +1092,7 @@ def service(force_setup: bool) -> None:
     tray_state = TrayState(hotkey_display=humanize_binding(cfg.arm.hotkey))
     tray = TrayIcon(tray_state, cfg.captures_dir)
 
-    notifier = DesktopNotifier(app_name=APP_AUMID) if cfg.notifications_enabled else NoopNotifier()
+    notifier = make_notifier(app_name=APP_AUMID) if cfg.notifications_enabled else NoopNotifier()
     agent = Agent(cfg, upload_client=upload_client, notifier=notifier, auth_client=auth_client)
 
     async def _main() -> None:

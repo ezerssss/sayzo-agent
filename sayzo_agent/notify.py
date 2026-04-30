@@ -588,3 +588,52 @@ class DesktopNotifier:
         except asyncio.TimeoutError:
             log.info("[notify] ask timed out (no click): title=%r", title)
             return "timeout"
+
+
+def make_notifier(app_name: str = APP_AUMID) -> Notifier:
+    """Construct the right notifier for the current platform + bundle state.
+
+    On macOS, ``UNUserNotificationCenter`` (the only backend
+    ``desktop-notifier`` ships) silently drops every notification when
+    the host bundle is unsigned. We can't fix that from Python — it's
+    the OS notification daemon refusing to render. As a stop-gap we
+    detect the unsigned-bundle case and route through
+    :class:`MacUnsignedNotifier`, which uses the older
+    ``NSUserNotification`` API (deprecated since macOS 11 but still
+    functional and signing-lax through macOS 15).
+
+    The proper fix is to sign + notarise: populate ``APPLE_DEVELOPER_ID``
+    + the notarytool secrets in CI and the existing pipeline takes
+    over. This factory then naturally falls through to the modern
+    ``DesktopNotifier`` with no further code change.
+    """
+    if sys.platform == "darwin":
+        try:
+            from desktop_notifier.backends.macos_support import (  # type: ignore[import-not-found]
+                is_bundle,
+                is_signed_bundle,
+            )
+
+            in_bundle = bool(is_bundle())
+            signed = bool(is_signed_bundle()) if in_bundle else False
+            log.info(
+                "[notify] make_notifier: is_bundle=%s is_signed=%s",
+                in_bundle,
+                signed,
+            )
+            if in_bundle and not signed:
+                log.warning(
+                    "[notify] Bundle is UNSIGNED — UNUserNotificationCenter "
+                    "would silently drop every toast. Falling back to "
+                    "NSUserNotification (deprecated but functional). "
+                    "Sign + notarise the .app to use the modern backend."
+                )
+                from .notify_mac_unsigned import MacUnsignedNotifier
+
+                return MacUnsignedNotifier(app_name=app_name)
+        except Exception:
+            log.warning(
+                "[notify] make_notifier: signing check failed; using default backend",
+                exc_info=True,
+            )
+    return DesktopNotifier(app_name=app_name)
