@@ -59,9 +59,54 @@ def _get_notifier():
         if _NOTIFIER is not None or _NOTIFIER_INIT_FAILED:
             return _NOTIFIER
         try:
+            from desktop_notifier import Icon
             from desktop_notifier.sync import DesktopNotifierSync
 
-            _NOTIFIER = DesktopNotifierSync(app_name="Sayzo")
+            from sayzo_agent.gui.common.assets import notification_icon_path
+
+            # Bump desktop-notifier's own logger so its codesign /
+            # auth-grant lines flow into agent.log alongside our own
+            # ``[mac_permissions]`` lines. Mirrors what notify.py does
+            # for the runtime notifier.
+            try:
+                logging.getLogger("desktop_notifier").setLevel(logging.INFO)
+            except Exception:
+                pass
+
+            # Pass our own logo so the test toast shows the Sayzo icon
+            # instead of desktop-notifier's bundled python.png. Same fix
+            # we apply on Windows; on macOS UNN it shows up next to the
+            # title in the Notification Center.
+            icon_p = notification_icon_path()
+            app_icon = Icon(path=icon_p) if icon_p else None
+            log.info(
+                "[mac_permissions] notifier init: icon=%s exists=%s",
+                icon_p,
+                icon_p.exists() if icon_p else False,
+            )
+            _NOTIFIER = DesktopNotifierSync(app_name="Sayzo", app_icon=app_icon)
+            log.info(
+                "[mac_permissions] DesktopNotifierSync init OK"
+            )
+            # Bundle introspection — mirrors notify.py so users running
+            # diagnose-notifications and users hitting the onboarding
+            # test-toast path get the same identity log either way.
+            try:
+                from desktop_notifier.backends.macos_support import (  # type: ignore[import-not-found]
+                    is_bundle,
+                    is_signed_bundle,
+                )
+
+                log.info(
+                    "[mac_permissions] bundle: is_bundle=%s is_signed=%s",
+                    is_bundle(),
+                    is_signed_bundle(),
+                )
+            except Exception:
+                log.debug(
+                    "[mac_permissions] bundle introspection failed",
+                    exc_info=True,
+                )
         except Exception:
             _NOTIFIER_INIT_FAILED = True
             log.warning(
@@ -209,11 +254,34 @@ def send_verification_notification() -> bool:
         return False
     notifier = _get_notifier()
     if notifier is None:
+        log.warning(
+            "[mac_permissions] verification toast skipped — notifier unavailable"
+        )
         return False
+    log.info("[mac_permissions] verification toast: send begin")
     try:
-        notifier.send(
+        # has_authorisation is a quick sync probe; logging the result
+        # alongside the send call lets us correlate "user clicked Test
+        # but no toast" reports against whether UNN even thinks we have
+        # rights at the moment of the send.
+        try:
+            authed = notifier.has_authorisation()
+            log.info(
+                "[mac_permissions] verification toast: has_authorisation=%s",
+                authed,
+            )
+        except Exception:
+            log.debug(
+                "[mac_permissions] verification toast: has_authorisation failed",
+                exc_info=True,
+            )
+
+        identifier = notifier.send(
             title="Sayzo notifications are on",
             message="You'll see prompts like this when Sayzo spots a meeting.",
+        )
+        log.info(
+            "[mac_permissions] verification toast: send done id=%s", identifier
         )
         return True
     except Exception:

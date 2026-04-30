@@ -209,6 +209,13 @@ class CaptureSink:
         if extra:
             dropped_meta.update(extra)
 
+        # Mark the upload state terminal at write-time so the retry sweep
+        # never picks these stubs up. Without this they look like legacy
+        # records (missing metadata.upload), the sweep treats them as
+        # pending, tries to upload (no audio file → fails), and logs a
+        # warning per stub on every sweep. See retry.STATUS_DISCARDED_LOCALLY.
+        from .retry import discarded_locally_state
+
         record = ConversationRecord(
             id=rec_id,
             started_at=started_at,
@@ -218,7 +225,10 @@ class CaptureSink:
             summary="",
             audio_path="",
             relevant_span=(0.0, 0.0),
-            metadata={"dropped": dropped_meta},
+            metadata={
+                "dropped": dropped_meta,
+                "upload": discarded_locally_state(),
+            },
         )
         json_path = rec_dir / "record.json"
         with json_path.open("w", encoding="utf-8") as f:

@@ -47,3 +47,24 @@ def icon_path() -> Optional[Path]:
     if png.exists():
         return png
     return None
+
+
+def notification_icon_path() -> Optional[Path]:
+    """Pick the Sayzo logo to pass to ``desktop-notifier``.
+
+    Always PNG — WinRT toasts and macOS UNN render ``.png`` cleanly,
+    whereas ``.ico`` is patchily supported in modern Action Center
+    templates. Returning a path here drives the toast icon you see
+    in the Action Center / Notification Center; passing ``None`` (or
+    leaving ``app_icon`` unset) makes desktop-notifier fall back to
+    its bundled ``python.png`` resource — which is exactly the
+    "Python icon on Windows toasts" bug we're fixing.
+    """
+    if getattr(sys, "frozen", False):
+        base = Path(sys._MEIPASS) / "installer" / "assets"  # type: ignore[attr-defined]
+    else:
+        base = Path(__file__).resolve().parent.parent.parent.parent / "installer" / "assets"
+    png = base / "logo.png"
+    if png.exists():
+        return png
+    return None

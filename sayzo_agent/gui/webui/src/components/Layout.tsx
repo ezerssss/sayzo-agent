@@ -13,8 +13,8 @@ interface Props {
 
 export function Layout({ step, title, subtitle, children, footer }: Props) {
   return (
-    <div className="flex min-h-full flex-col px-10 py-12">
-      <header className="mb-12 flex items-center gap-2.5">
+    <div className="flex min-h-full flex-col px-10 py-8">
+      <header className="mb-8 flex items-center gap-2.5">
         <img src={logoUrl} alt="" className="h-8 w-8" />
         <span className="text-sm font-medium tracking-tight text-ink">
           Sayzo
@@ -23,7 +23,7 @@ export function Layout({ step, title, subtitle, children, footer }: Props) {
 
       <div className="mx-auto w-full max-w-md flex-1">
         {step && (
-          <div className="mb-4 flex items-baseline gap-3 text-ink-muted">
+          <div className="mb-3 flex items-baseline gap-3 text-ink-muted">
             <span className="text-xs font-medium tracking-wider">{step}</span>
             <span className="h-px flex-1 bg-ink-border" />
           </div>
@@ -36,11 +36,11 @@ export function Layout({ step, title, subtitle, children, footer }: Props) {
             {subtitle}
           </p>
         )}
-        <div className="mt-8">{children}</div>
+        <div className="mt-6">{children}</div>
       </div>
 
       {footer && (
-        <div className="mx-auto mt-auto flex w-full max-w-md items-center justify-end gap-3 pt-8">
+        <div className="mx-auto mt-auto flex w-full max-w-md items-center justify-end gap-3 pt-6">
           {footer}
         </div>
       )}

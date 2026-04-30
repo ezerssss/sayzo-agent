@@ -122,7 +122,9 @@ class SettingsWindow:
         # X-button → hide instead of destroy. Returning False cancels the
         # close so pywebview leaves the OS window alive (just hidden).
         # ``_quitting`` is set by the explicit ``quit`` command; in that
-        # case we let the close go through.
+        # case we let the close go through. macOS: also drop the Dock
+        # icon back to hidden once the user closes Settings — symmetric
+        # with the show path which switches to Regular.
         def on_closing() -> Optional[bool]:
             if self._quitting:
                 return None
@@ -130,9 +132,39 @@ class SettingsWindow:
                 window.hide()
             except Exception:
                 log.warning("[settings] hide on close failed", exc_info=True)
+            if sys.platform == "darwin":
+                try:
+                    from sayzo_agent.gui.common.mac_dock import set_dock_visible
+
+                    set_dock_visible(False)
+                except Exception:
+                    log.warning(
+                        "[settings] dock-hide on close failed", exc_info=True
+                    )
             return False
 
         window.events.closing += on_closing
+
+        # macOS: the window is currently hidden (idle pre-warm). pywebview
+        # has already bumped NSApp to Regular activation policy as part of
+        # bringing up the Cocoa run loop, so a Dock icon for this
+        # subprocess is sitting next to the agent's. Hide it. We hook
+        # ``loaded`` instead of running this inline because pywebview
+        # finalises its activation policy as part of window creation,
+        # which happens after our constructor returns; setting before
+        # that gets overwritten.
+        if sys.platform == "darwin":
+            def _hide_dock_after_load() -> None:
+                try:
+                    from sayzo_agent.gui.common.mac_dock import set_dock_visible
+
+                    set_dock_visible(False)
+                except Exception:
+                    log.warning(
+                        "[settings] dock-hide after load failed", exc_info=True
+                    )
+
+            window.events.loaded += _hide_dock_after_load
 
         # Stdin reader runs in a daemon thread so webview.start() can own
         # the main thread. Commands queue inside the pipe before the GUI is
@@ -177,10 +209,25 @@ class SettingsWindow:
 
     @staticmethod
     def _dispatch_show(window: "webview.Window") -> None:
+        # macOS: switch back to Regular activation policy first so the
+        # window can take focus and show a Dock icon while it's open.
+        # Then activate the process so the window pops to the
+        # foreground instead of opening behind the user's current app.
         try:
             window.show()
         except Exception:
             log.warning("[settings] show failed", exc_info=True)
+        if sys.platform == "darwin":
+            try:
+                from sayzo_agent.gui.common.mac_dock import (
+                    activate_app,
+                    set_dock_visible,
+                )
+
+                set_dock_visible(True)
+                activate_app()
+            except Exception:
+                log.warning("[settings] dock-show / activate failed", exc_info=True)
 
     @staticmethod
     def _dispatch_hide(window: "webview.Window") -> None:
@@ -188,6 +235,13 @@ class SettingsWindow:
             window.hide()
         except Exception:
             log.warning("[settings] hide failed", exc_info=True)
+        if sys.platform == "darwin":
+            try:
+                from sayzo_agent.gui.common.mac_dock import set_dock_visible
+
+                set_dock_visible(False)
+            except Exception:
+                log.warning("[settings] dock-hide on hide failed", exc_info=True)
 
     def _dispatch_quit(self, window: "webview.Window") -> None:
         self._quitting = True

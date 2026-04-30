@@ -178,12 +178,89 @@ jobs:
           path: dist/Sayzo.dmg
 
   # -----------------------------------------------------------------------
-  # Deploy to droplet — waits for both builds, then scp's binaries + scripts.
-  # The install scripts (install.ps1, install.sh) live in the repo and are
-  # uploaded alongside the binaries so every main-push ships both together.
+  # Deploy Windows binary — runs as soon as the Windows build finishes.
+  # Split out from the manifest job so a slow Windows build doesn't hold
+  # up Mac users from getting the new Sayzo.dmg the moment it's ready
+  # (Mac builds typically finish in ~5 min vs. Windows' ~25 min).
   # -----------------------------------------------------------------------
-  deploy:
-    needs: [build-windows, build-macos]
+  deploy-windows:
+    needs: build-windows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Windows installer
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-installer
+          path: artifacts/windows
+
+      - name: Set up SSH
+        env:
+          SSH_KEY: ${{ secrets.DROPLET_SSH_KEY }}
+          HOST: ${{ secrets.DROPLET_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts
+
+      - name: Deploy Windows installer
+        env:
+          HOST: ${{ secrets.DROPLET_HOST }}
+        run: |
+          scp -i ~/.ssh/deploy_key \
+            artifacts/windows/sayzo-setup.exe \
+            installer/install.ps1 \
+            root@"$HOST":/var/www/sayzo/releases/windows/
+
+  # -----------------------------------------------------------------------
+  # Deploy macOS binary — runs as soon as the Mac build finishes.
+  # -----------------------------------------------------------------------
+  deploy-macos:
+    needs: build-macos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download macOS installer
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-installer
+          path: artifacts/macos
+
+      - name: Set up SSH
+        env:
+          SSH_KEY: ${{ secrets.DROPLET_SSH_KEY }}
+          HOST: ${{ secrets.DROPLET_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts
+
+      - name: Deploy macOS installer
+        env:
+          HOST: ${{ secrets.DROPLET_HOST }}
+        run: |
+          scp -i ~/.ssh/deploy_key \
+            artifacts/macos/Sayzo.dmg \
+            installer/install.sh \
+            root@"$HOST":/var/www/sayzo/releases/macos/
+
+  # -----------------------------------------------------------------------
+  # Deploy auto-update manifest. Joins both platforms — we hold off
+  # writing latest.json until the binaries it references are actually on
+  # the droplet, otherwise the agent's update checker would send users
+  # to a 404 (or worse, a stale binary with the wrong SHA256).
+  #
+  # latest.json is the file the running agent fetches on startup + every
+  # 6h to decide whether to surface an "update available" toast. Hosted
+  # at the releases root (not under windows/ or macos/) so both platforms
+  # share one URL.
+  # -----------------------------------------------------------------------
+  deploy-manifest:
+    needs: [deploy-windows, deploy-macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -210,25 +287,6 @@ jobs:
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts
 
-      - name: Deploy to droplet
-        env:
-          HOST: ${{ secrets.DROPLET_HOST }}
-        run: |
-          scp -i ~/.ssh/deploy_key \
-            artifacts/windows/sayzo-setup.exe \
-            installer/install.ps1 \
-            root@"$HOST":/var/www/sayzo/releases/windows/
-
-          scp -i ~/.ssh/deploy_key \
-            artifacts/macos/Sayzo.dmg \
-            installer/install.sh \
-            root@"$HOST":/var/www/sayzo/releases/macos/
-
-      # Auto-update manifest (Phase A, notify-only). The running agent fetches
-      # this file on startup + every 6h and raises a tray/toast notification
-      # when its advertised version is newer than __version__. Hosted at the
-      # releases root (not under windows/ or macos/) so both platforms share
-      # one URL.
       - name: Generate latest.json
         env:
           COMMIT_MESSAGE: ${{ github.event.head_commit.message }}

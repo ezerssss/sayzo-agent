@@ -21,4 +21,30 @@
   button {
     font: inherit;
   }
+
+  /* Custom scrollbar — applies to every scroll container in the setup +
+     Settings windows. WebView2 / WKWebView default scrollbars are
+     chunky and grey, which clashes with our minimal monochrome theme;
+     this matches the rest of the UI. We style globally rather than
+     per-container so we don't have to remember to add a class on every
+     overflow-y site (Notifications, AddAppDialog, SettingsApp, etc). */
+  *::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  *::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  *::-webkit-scrollbar-thumb {
+    background: rgba(0, 0, 0, 0.18);
+    border-radius: 9999px;
+  }
+  *::-webkit-scrollbar-thumb:hover {
+    background: rgba(0, 0, 0, 0.32);
+  }
+  /* Firefox-style fallback (also picked up by some WebView2 builds). */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(0, 0, 0, 0.18) transparent;
+  }
 }

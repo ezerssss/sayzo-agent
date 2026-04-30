@@ -675,6 +675,62 @@ def logout() -> None:
     click.echo("Logged out.")
 
 
+@cli.command("diagnose-notifications")
+def diagnose_notifications() -> None:
+    """Run a desktop-notification diagnostic and dump the report.
+
+    Constructs the same ``DesktopNotifier`` the agent uses, captures
+    bundle / codesign state, probes ``has_authorisation``, then sends
+    one fire-and-forget toast and one consent toast. Prints a
+    structured report to stdout AND writes every step into
+    ``~/.sayzo/agent/logs/agent.log`` so the same data is available
+    offline if the user pastes the file later.
+
+    Use this when notifications appear to do nothing on a user's machine
+    despite the OS settings showing Sayzo as authorised — the report
+    + log lines together pinpoint whether the failure is in our wrapper,
+    desktop-notifier, or the OS.
+    """
+    import json as _json
+
+    cfg = load_config()
+    _setup_file_logging(cfg.logs_dir)
+    # Also mirror to stdout so the user immediately sees the lines, not
+    # just the structured report at the end. The file handler is still
+    # capturing everything for offline review.
+    stream_handler = logging.StreamHandler(sys.stderr)
+    stream_handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)-5s %(name)s  %(message)s")
+    )
+    logging.getLogger().addHandler(stream_handler)
+
+    from .notify import APP_AUMID, DesktopNotifier
+
+    click.echo("=== Sayzo notification diagnostic ===\n")
+    click.echo("Constructing DesktopNotifier...")
+    notifier = DesktopNotifier(app_name=APP_AUMID)
+    # Give the background loop a moment to finish init + initial auth
+    # probe before we start firing test toasts. The wait inside __init__
+    # gates on loop creation, not on the auth probe completing.
+    time.sleep(2.0)
+
+    click.echo("Running diagnose() — watch your screen for two test toasts...\n")
+    report = notifier.diagnose()
+
+    click.echo("\n=== Report ===")
+    click.echo(_json.dumps(report, indent=2, default=str))
+    click.echo("\nFull trace written to: " + str(cfg.logs_dir / "agent.log"))
+    click.echo(
+        "\nNo toast on screen? Check:\n"
+        "  • macOS: System Settings → Notifications → Sayzo → Banner Style "
+        "is set (NOT 'None'); Focus mode is off; toggle Allow off+on.\n"
+        "  • Windows: Settings → System → Notifications → Sayzo is on; "
+        "Focus assist is off.\n"
+        "  • In agent.log, look for `[notify] bundle is_signed=False` "
+        "(macOS) or `[notify] backend init failed`.\n"
+    )
+
+
 @cli.command("first-run")
 @click.pass_context
 def first_run(ctx: click.Context) -> None:
@@ -984,6 +1040,20 @@ def service(force_setup: bool) -> None:
                 ensure_launchd_registered()
             except Exception:
                 log.warning("launchd registration failed (non-fatal)", exc_info=True)
+
+            # Onboarding's pywebview left NSApp in Regular activation
+            # policy (Dock icon visible). Restore Accessory so the
+            # agent runs as a background tray-only app from here on —
+            # only pystray's NSStatusItem should be visible. Without
+            # this the user sees a Sayzo Dock icon for the agent
+            # process AND a second one for the pre-warmed Settings
+            # subprocess.
+            try:
+                from .gui.common.mac_dock import set_dock_visible
+
+                set_dock_visible(False)
+            except Exception:
+                log.warning("dock-hide after onboarding failed (non-fatal)", exc_info=True)
 
         # Reload cfg so anything the user changed during onboarding —
         # most importantly the hotkey on the Shortcut screen — flows into

@@ -41,9 +41,31 @@ def _get_notifier():
             except Exception:
                 pass
         try:
+            from desktop_notifier import Icon
             from desktop_notifier.sync import DesktopNotifierSync
 
-            _NOTIFIER = DesktopNotifierSync(app_name="Sayzo")
+            from sayzo_agent.gui.common.assets import notification_icon_path
+
+            try:
+                logging.getLogger("desktop_notifier").setLevel(logging.INFO)
+            except Exception:
+                pass
+
+            # Pass our own icon so the WinRT backend's register_hkey writes
+            # ``HKCU\SOFTWARE\Classes\AppUserModelId\Sayzo\IconUri`` pointing
+            # at our logo. Without this, ``app_icon`` defaults to the
+            # bundled ``desktop_notifier/resources/python.png`` and the
+            # Notifications onboarding test toast shows a Python snake
+            # icon — which is what users see, and is exactly the wrong
+            # first impression. Same fix applies on macOS.
+            icon_p = notification_icon_path()
+            app_icon = Icon(path=icon_p) if icon_p else None
+            log.info(
+                "[win_permissions] notifier init: icon=%s exists=%s",
+                icon_p,
+                icon_p.exists() if icon_p else False,
+            )
+            _NOTIFIER = DesktopNotifierSync(app_name="Sayzo", app_icon=app_icon)
         except Exception:
             _NOTIFIER_INIT_FAILED = True
             log.warning(
@@ -98,11 +120,18 @@ def send_verification_notification() -> bool:
         return False
     notifier = _get_notifier()
     if notifier is None:
+        log.warning(
+            "[win_permissions] verification toast skipped — notifier unavailable"
+        )
         return False
+    log.info("[win_permissions] verification toast: send begin")
     try:
-        notifier.send(
+        identifier = notifier.send(
             title="Sayzo notifications are on",
             message="You'll see prompts like this when Sayzo spots a meeting.",
+        )
+        log.info(
+            "[win_permissions] verification toast: send done id=%s", identifier
         )
         return True
     except Exception:

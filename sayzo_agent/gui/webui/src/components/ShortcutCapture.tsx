@@ -24,6 +24,12 @@ const MODIFIER_KEYS: Record<string, string> = {
   OS: "cmd",
 };
 
+// Canonical modifier render order — mirrors what Windows / macOS / VS Code
+// / most apps use. We display in this order regardless of the order the
+// user pressed the modifiers, so two equivalent combos (Ctrl+Alt+A vs
+// Alt+Ctrl+A) render and serialise identically.
+const MODIFIER_ORDER = ["ctrl", "alt", "shift", "cmd"] as const;
+
 function humanizeBinding(binding: string): string {
   return binding
     .split("+")
@@ -35,14 +41,81 @@ function titleCase(s: string): string {
   return s.charAt(0).toUpperCase() + s.slice(1);
 }
 
-// Normalize `event.key` for the main (non-modifier) key. Lowercase single
-// chars, keep named keys like "F5" / "Space" / "Enter" readable.
-function normalizeKey(key: string): string {
-  if (key === " ") return "space";
-  if (key.length === 1) return key.toLowerCase();
-  // Arrow keys, function keys, etc. tkinter keysyms are lowercase in our
-  // storage format, so match that.
-  return key.toLowerCase();
+// Translate ``KeyboardEvent.code`` (the *physical* key, layout-agnostic)
+// into the lowercase token our backend's hotkey grammar accepts (see
+// ``arm/hotkey_mac.py::_VK`` and pynput's grammar).
+//
+// On macOS, pressing Alt+M produces ``event.key === "µ"`` because the OS
+// resolves Option-modified characters before the JS event fires. Using
+// ``event.code`` (``"KeyM"``) instead lets us recover the underlying
+// letter so combos like Alt+M and Alt+A actually save as ``alt+m`` /
+// ``alt+a`` rather than ``alt+µ`` / ``alt+å`` (which the agent's parser
+// rejects as unsupported keys).
+function physicalKeyFromCode(code: string): string | null {
+  if (/^Key[A-Z]$/.test(code)) return code.charAt(3).toLowerCase();
+  if (/^Digit[0-9]$/.test(code)) return code.charAt(5);
+  if (/^F([1-9]|1[0-2])$/.test(code)) return code.toLowerCase();
+  switch (code) {
+    case "Space":
+      return "space";
+    case "Enter":
+    case "NumpadEnter":
+      return "enter";
+    case "Tab":
+      return "tab";
+    case "Backspace":
+      return "backspace";
+    case "Delete":
+      return "delete";
+    case "ArrowUp":
+      return "up";
+    case "ArrowDown":
+      return "down";
+    case "ArrowLeft":
+      return "left";
+    case "ArrowRight":
+      return "right";
+    case "Minus":
+      return "-";
+    case "Equal":
+      return "=";
+    case "BracketLeft":
+      return "[";
+    case "BracketRight":
+      return "]";
+    case "Backslash":
+      return "\\";
+    case "Semicolon":
+      return ";";
+    case "Quote":
+      return "'";
+    case "Comma":
+      return ",";
+    case "Period":
+      return ".";
+    case "Slash":
+      return "/";
+    case "Backquote":
+      return "`";
+    default:
+      return null;
+  }
+}
+
+// Sort the held modifiers by canonical render order. Anything outside
+// the canonical set (shouldn't happen, but defensive) is appended at
+// the end in insertion order.
+function sortModifiers(mods: Iterable<string>): string[] {
+  const set = new Set(mods);
+  const ordered: string[] = [];
+  for (const m of MODIFIER_ORDER) {
+    if (set.has(m)) {
+      ordered.push(m);
+      set.delete(m);
+    }
+  }
+  ordered.push(...set);
+  return ordered;
 }
 
 export function ShortcutCapture({ initialBinding, onChange }: Props) {
@@ -83,9 +156,18 @@ export function ShortcutCapture({ initialBinding, onChange }: Props) {
         return;
       }
 
-      const key = normalizeKey(e.key);
-      // Sort modifiers so equivalent combos stringify the same way.
-      const mods = Array.from(heldModifiersRef.current).sort();
+      const key = physicalKeyFromCode(e.code);
+      if (key === null) {
+        setStatus({
+          text: "That key isn't supported. Try a letter, digit, function key, or arrow.",
+          tone: "error",
+        });
+        return;
+      }
+      // Render modifiers in canonical order (Ctrl → Alt → Shift → Cmd)
+      // so two equivalent combos serialise the same way regardless of
+      // which modifier the user pressed first.
+      const mods = sortModifiers(heldModifiersRef.current);
       const candidate = [...mods, key].join("+");
 
       // Bounce through the bridge for validation so the error strings are

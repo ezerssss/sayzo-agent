@@ -367,6 +367,32 @@ def test_sink_write_dropped_creates_stub_no_audio(tmp_path):
     assert data["metadata"]["dropped"]["reason_label"]
 
 
+def test_sink_write_dropped_marks_upload_terminal(tmp_path):
+    """Dropped stubs land with metadata.upload.status = discarded_locally so
+    the retry sweep skips them. Without this, the sweep treats them as
+    legacy/pending records, repeatedly tries to upload them (no audio file
+    on disk), and pollutes agent.log with a warning per stub per sweep."""
+    from sayzo_agent.retry import (
+        STATUS_DISCARDED_LOCALLY,
+        is_due,
+        is_terminal,
+    )
+    from sayzo_agent.sink import CaptureSink
+
+    sink = CaptureSink(tmp_path)
+    rec_id = sink.write_dropped(
+        datetime(2026, 4, 27, 12, 0, 0),
+        datetime(2026, 4, 27, 12, 0, 22),
+        "gate_failed",
+    )
+    data = json.loads((tmp_path / rec_id / "record.json").read_text())
+    upload = data["metadata"]["upload"]
+    assert upload["status"] == STATUS_DISCARDED_LOCALLY
+    # Sweep gating: terminal AND not due → never retried.
+    assert is_terminal(upload) is True
+    assert is_due(upload, datetime(2099, 1, 1)) is False
+
+
 def test_sink_write_dropped_prunes_oldest_beyond_cap(tmp_path, monkeypatch):
     """The cap is normally 100 — patch it to a small number to keep the test
     fast and still exercise the prune path."""
