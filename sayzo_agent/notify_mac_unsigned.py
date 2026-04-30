@@ -65,10 +65,13 @@ class MacUnsignedNotifier:
     """Notifier that works on unsigned macOS bundles via ``NSUserNotification``.
 
     Drop-in replacement for :class:`sayzo_agent.notify.DesktopNotifier` —
-    same ``notify`` / ``ask_consent`` / ``diagnose`` surface, same
-    threading contract (own asyncio loop on a daemon thread, callbacks
-    bridged onto it). Auto-selected by ``notify.make_notifier`` when
-    ``is_signed_bundle()`` returns False.
+    same ``notify`` / ``ask_consent`` / ``diagnose`` surface. Fire-and-
+    forget toasts go through ``NSUserNotification`` on the notifier's
+    own asyncio loop (daemon thread). Consent dialogs route through
+    :func:`sayzo_agent.consent_modal.consent_modal_macos` (osascript)
+    — the same path the signed-bundle notifier uses, since the modal
+    is independent of bundle signature anyway. Auto-selected by
+    ``notify.make_notifier`` when ``is_signed_bundle()`` returns False.
 
     All exceptions are swallowed and logged — toasts are auxiliary UX,
     they never bring down the capture pipeline.
@@ -79,17 +82,6 @@ class MacUnsignedNotifier:
         self._init_failed = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._loop_ready = threading.Event()
-        # Pinned reference to the ObjC delegate. PyObjC will GC the
-        # Python wrapper otherwise, dropping the methods the notification
-        # center is supposed to call back into.
-        self._delegate = None
-        # identifier → asyncio.Future. The delegate (called on the main
-        # thread by the notification center) finds the pending future
-        # by identifier and resolves it on the notifier's loop. Lock
-        # protects the dict against simultaneous access from the
-        # delegate thread + the notifier thread.
-        self._pending: dict[str, asyncio.Future[ConsentResult]] = {}
-        self._pending_lock = threading.Lock()
         self._bundle_info: dict[str, Any] = {}
 
         log.info(
@@ -145,18 +137,6 @@ class MacUnsignedNotifier:
                 "[notify-mac-legacy] bundle introspection failed", exc_info=True
             )
 
-        try:
-            self._install_delegate()
-        except Exception:
-            log.warning(
-                "[notify-mac-legacy] delegate install failed; consent toasts "
-                "will fall through to timeout",
-                exc_info=True,
-            )
-            # Don't mark init_failed — fire-and-forget notify() still works
-            # without a delegate. ask_consent will just always return
-            # "timeout" which the caller maps to default_on_timeout.
-
         self._loop_ready.set()
         try:
             loop.run_forever()
@@ -165,82 +145,6 @@ class MacUnsignedNotifier:
                 loop.close()
             except Exception:
                 pass
-
-    def _install_delegate(self) -> None:
-        """Subclass NSObject to receive notification activation callbacks.
-
-        Calls ``[NSUserNotificationCenter setDelegate:]`` so the system
-        invokes our methods when the user clicks the notification body
-        or its action button. The delegate methods fire on the main
-        thread (where pystray's NSApp run loop is pumping the
-        CFRunLoop), and we marshal the resolution onto the notifier's
-        own asyncio loop via ``call_soon_threadsafe``.
-        """
-        from Foundation import NSObject, NSUserNotificationCenter  # type: ignore[import-not-found]
-
-        wrapper = self  # captured by the inner class
-
-        class _SayzoLegacyDelegate(NSObject):  # type: ignore[misc]
-            # The two delegate selectors NSUserNotificationCenter knows
-            # about. PyObjC matches by selector name; both must exist
-            # even if shouldPresent always returns True.
-
-            def userNotificationCenter_didActivateNotification_(
-                self, center, notification
-            ) -> None:
-                try:
-                    ident = (
-                        str(notification.identifier())
-                        if notification.identifier() is not None
-                        else ""
-                    )
-                    activation_type = int(notification.activationType())
-                    # 1 = ContentsClicked, 2 = ActionButtonClicked,
-                    # 3 = Replied (we don't use), 4 = AdditionalActionClicked
-                    yes = activation_type in (1, 2, 4)
-                    log.info(
-                        "[notify-mac-legacy] delegate fired: id=%s "
-                        "activation_type=%s → %s",
-                        ident,
-                        activation_type,
-                        "yes" if yes else "no",
-                    )
-                    wrapper._resolve(ident, "yes" if yes else "no")
-                except Exception:
-                    log.warning(
-                        "[notify-mac-legacy] delegate handler failed",
-                        exc_info=True,
-                    )
-
-            def userNotificationCenter_shouldPresentNotification_(
-                self, center, notification
-            ) -> bool:
-                # Always present — Sayzo is a background process with
-                # no foreground window concept, so the default
-                # "suppress while frontmost" behavior would silently
-                # eat every toast we send during onboarding.
-                return True
-
-        delegate = _SayzoLegacyDelegate.alloc().init()
-        center = NSUserNotificationCenter.defaultUserNotificationCenter()
-        center.setDelegate_(delegate)
-        # Pin so PyObjC's GC doesn't drop the wrapper while the notification
-        # center is still calling into it.
-        self._delegate = delegate
-        log.info("[notify-mac-legacy] delegate installed on default center")
-
-    def _resolve(self, identifier: str, value: ConsentResult) -> None:
-        """Bridge a delegate-thread click into the notifier loop."""
-        with self._pending_lock:
-            fut = self._pending.pop(identifier, None)
-        if fut is None or fut.done():
-            return
-        loop = fut.get_loop()
-        try:
-            loop.call_soon_threadsafe(_set_future_result, fut, value)
-        except RuntimeError:
-            # Loop closed mid-shutdown.
-            pass
 
     # ------------------------------------------------------------------
     # Public API
@@ -277,43 +181,42 @@ class MacUnsignedNotifier:
         timeout_secs: float,
         default_on_timeout: ConsentResult = "no",
     ) -> ConsentResult:
-        """Interactive toast with a single Yes button via NSUserNotification.
+        """Modal dialog via :mod:`sayzo_agent.consent_modal`.
 
-        ``no_label`` is unused — only one button reliably renders on
-        Banner mode. The whole consent flow collapses to "did the user
-        click Yes within ``timeout_secs``?"; anything else (dismiss,
-        banner timeout, app quit) returns ``"timeout"``. The
-        ArmController already treats timeout as no-arm in every consent
-        site, so this is a behaviour-preserving simplification — the
-        non-yes paths weren't meaningfully distinguishable on macOS
-        even with the modern API.
+        Notifications-with-buttons on the legacy NSUserNotification
+        API render only one button reliably (the Action button), and
+        on Banner-style preference of "None" they silently route to
+        Notification Center. For consent decisions the user must see,
+        a modal is the correct tool — same as the signed path in
+        ``notify.DesktopNotifier.ask_consent``.
         """
-        if self._init_failed or self._loop is None:
-            log.warning(
-                "[notify-mac-legacy] ask_consent dropped (backend down): "
-                "title=%r",
-                title,
-            )
-            return default_on_timeout
         log.info(
-            "[notify-mac-legacy] ask scheduled: title=%r yes=%r timeout=%ss",
+            "[notify-mac-legacy] ask scheduled (modal): title=%r yes=%r no=%r timeout=%ss",
             title,
             yes_label,
+            no_label,
             timeout_secs,
         )
         try:
-            fut = asyncio.run_coroutine_threadsafe(
-                self._async_consent(title, body, yes_label, timeout_secs),
-                self._loop,
+            from .consent_modal import consent_modal_macos
+
+            result = consent_modal_macos(
+                title,
+                body,
+                yes_label,
+                no_label,
+                timeout_secs,
+                default_on_timeout,
             )
-            result = fut.result(timeout=timeout_secs + 5.0)
             log.info(
-                "[notify-mac-legacy] ask resolved: title=%r → %s", title, result
+                "[notify-mac-legacy] ask resolved (modal): title=%r → %s",
+                title,
+                result,
             )
             return result
         except Exception:
             log.warning(
-                "[notify-mac-legacy] ask_consent failed: title=%r",
+                "[notify-mac-legacy] modal ask_consent failed: title=%r",
                 title,
                 exc_info=True,
             )
@@ -356,15 +259,15 @@ class MacUnsignedNotifier:
             )
 
         try:
-            consent_result = asyncio.run_coroutine_threadsafe(
-                self._async_consent(
-                    "Sayzo consent test",
-                    "Click Yes within 3 seconds to confirm consent toasts work.",
-                    "Yes",
-                    3.0,
-                ),
-                self._loop,
-            ).result(timeout=_DELIVER_TIMEOUT_SECS + 4)
+            from .consent_modal import consent_modal_macos
+
+            consent_result = consent_modal_macos(
+                "Sayzo consent test",
+                "Click Yes within 5 seconds to confirm consent dialogs work.",
+                "Yes",
+                "No",
+                5.0,
+            )
             report["consent_send"] = {"ok": True, "result": consent_result}
             log.info(
                 "[notify-mac-legacy] diagnose: consent_send result=%s",
@@ -447,38 +350,3 @@ class MacUnsignedNotifier:
             )
             return None
 
-    async def _async_consent(
-        self,
-        title: str,
-        body: str,
-        yes_label: str,
-        timeout_secs: float,
-    ) -> ConsentResult:
-        loop = asyncio.get_running_loop()
-        result_fut: asyncio.Future[ConsentResult] = loop.create_future()
-        ident = await self._async_deliver(title, body, action_title=yes_label)
-        if ident is None:
-            return "timeout"
-
-        with self._pending_lock:
-            self._pending[ident] = result_fut
-
-        try:
-            return await asyncio.wait_for(result_fut, timeout=timeout_secs)
-        except asyncio.TimeoutError:
-            with self._pending_lock:
-                self._pending.pop(ident, None)
-            log.info(
-                "[notify-mac-legacy] consent timed out: title=%r id=%s",
-                title,
-                ident,
-            )
-            return "timeout"
-
-
-def _set_future_result(
-    fut: asyncio.Future[ConsentResult], value: ConsentResult
-) -> None:
-    """call_soon_threadsafe target — guard against double-resolve."""
-    if not fut.done():
-        fut.set_result(value)

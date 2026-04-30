@@ -392,11 +392,54 @@ class DesktopNotifier:
         timeout_secs: float,
         default_on_timeout: ConsentResult = "no",
     ) -> ConsentResult:
-        """Show an interactive toast with two action buttons, block up to
-        ``timeout_secs`` for a response, return ``"yes"``, ``"no"``, or
-        ``"timeout"`` (which maps to ``default_on_timeout`` in the caller's
-        semantic layer if desired — we pass it through distinctly so callers
-        can distinguish "clicked No" from "ignored")."""
+        """Ask the user a yes/no question that needs to be seen.
+
+        On **macOS** this dispatches to a modal dialog (``osascript
+        display dialog`` via :mod:`sayzo_agent.consent_modal`) rather
+        than a notification. Notifications on macOS go to Notification
+        Center and are silently suppressed when Banner Style is
+        ``None`` or Focus mode is on — too unreliable for decisions
+        the user must see. Modals always appear, work without bundle
+        signing, and don't depend on any OS notification preference.
+
+        On **Windows** we keep using the notification path — WinRT
+        toasts with action buttons are reliable enough that a modal
+        is unnecessary. The ``ask_consent`` contract is otherwise
+        identical across platforms.
+
+        Returns ``"yes"`` / ``"no"`` / ``"timeout"``. ``timeout`` is
+        passed through distinctly so callers can distinguish "clicked
+        No" from "ignored". On any failure we return
+        ``default_on_timeout`` — a broken consent path must never
+        crash the capture pipeline.
+        """
+        if sys.platform == "darwin":
+            log.info(
+                "[notify] ask scheduled (modal): title=%r yes=%r no=%r timeout=%ss",
+                title,
+                yes_label,
+                no_label,
+                timeout_secs,
+            )
+            try:
+                from .consent_modal import consent_modal_macos
+
+                result = consent_modal_macos(
+                    title,
+                    body,
+                    yes_label,
+                    no_label,
+                    timeout_secs,
+                    default_on_timeout,
+                )
+                log.info("[notify] ask resolved (modal): title=%r → %s", title, result)
+                return result
+            except Exception:
+                log.warning(
+                    "[notify] modal ask_consent failed: title=%r", title, exc_info=True
+                )
+                return default_on_timeout
+
         if self._init_failed or self._impl is None or self._loop is None:
             log.warning(
                 "[notify] ask_consent dropped (backend unavailable): title=%r",
@@ -552,10 +595,18 @@ class DesktopNotifier:
         loop = asyncio.get_running_loop()
         result_fut: asyncio.Future[ConsentResult] = loop.create_future()
 
+        # desktop-notifier's macOS backend invokes ``on_pressed`` from
+        # UNN's private dispatch queue (it doesn't marshal to our loop
+        # the way the WinRT backend does). ``asyncio.Future.set_result``
+        # is not thread-safe, so we hop via ``call_soon_threadsafe``;
+        # on Windows the hop is redundant but harmless.
         def _resolve(value: ConsentResult) -> None:
             log.info("[notify] ask button: title=%r → %s", title, value)
-            if not result_fut.done():
-                result_fut.set_result(value)
+            try:
+                loop.call_soon_threadsafe(_set_future_safely, result_fut, value)
+            except RuntimeError:
+                # Loop closed mid-shutdown.
+                pass
 
         yes_btn = Button(title=yes_label, on_pressed=lambda: _resolve("yes"))
         no_btn = Button(title=no_label, on_pressed=lambda: _resolve("no"))
@@ -588,6 +639,14 @@ class DesktopNotifier:
         except asyncio.TimeoutError:
             log.info("[notify] ask timed out (no click): title=%r", title)
             return "timeout"
+
+
+def _set_future_safely(
+    fut: "asyncio.Future[ConsentResult]", value: ConsentResult
+) -> None:
+    """call_soon_threadsafe target — guard against double-resolve."""
+    if not fut.done():
+        fut.set_result(value)
 
 
 def make_notifier(app_name: str = APP_AUMID) -> Notifier:

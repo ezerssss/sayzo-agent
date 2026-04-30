@@ -682,6 +682,9 @@ class ArmController:
             "[arm] whitelist watcher started (poll=%.1fs, %d detectors)",
             self.cfg.poll_interval_secs, len(self.cfg.detectors),
         )
+        # Diagnostic dedup key for the no-match log below — see the
+        # call site for what it covers and when it gets reset.
+        last_no_match_signature: Optional[tuple] = None
         try:
             last_match_key: Optional[str] = None
             while not self._stop.is_set():
@@ -729,12 +732,40 @@ class ArmController:
                 )
                 if match is None:
                     last_match_key = None
-                    # Record any unmatched mic-holders so the Settings
-                    # Meeting Apps pane can suggest them. Only writes the
-                    # first time a key appears this session; browsers are
-                    # skipped since those are handled by the Web tab.
+                    # Diagnostic for "watcher silently doesn't fire" reports:
+                    # when the user has a browser open with mic active and
+                    # nothing matched, log the titles we tried. Dedup'd on
+                    # (bundle, sorted-titles) so a long meeting in the same
+                    # state doesn't spam at the 2 s poll cadence. Cleared on
+                    # any uninteresting tick or successful match so the next
+                    # interesting state logs again.
+                    if mic.active and fg.is_browser:
+                        sig_titles = tuple(
+                            sorted({
+                                fg.browser_tab_title or "",
+                                fg.window_title or "",
+                                *fg.browser_window_titles,
+                            } - {""})
+                        )
+                        signature = (fg.bundle_id, sig_titles)
+                        if signature != last_no_match_signature:
+                            last_no_match_signature = signature
+                            log.info(
+                                "[arm] no whitelist match: fg.bundle=%s "
+                                "tab_title=%r win_titles=%r url=%r — "
+                                "active_specs=%d (suppressed=%d)",
+                                fg.bundle_id,
+                                fg.browser_tab_title,
+                                list(sig_titles),
+                                fg.browser_tab_url,
+                                len(self.cfg.detectors),
+                                len(suppressed),
+                            )
+                    elif last_no_match_signature is not None:
+                        last_no_match_signature = None
                     self._record_unmatched_holders(mic, fg)
                     continue
+                last_no_match_signature = None
                 # One-shot INFO log per match transition so field debugging
                 # doesn't require raising the global log level.
                 if match.app_key != last_match_key:

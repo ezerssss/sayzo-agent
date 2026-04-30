@@ -289,15 +289,20 @@ def is_mic_active() -> bool:
     try:
         import CoreAudio  # type: ignore[import-not-found]
     except Exception:
-        log.debug("[arm.mac] CoreAudio framework unavailable", exc_info=True)
+        log.warning(
+            "[arm.mac] CoreAudio framework unavailable — is_mic_active will "
+            "always return False (whitelist watcher will never fire)",
+            exc_info=True,
+        )
         return False
 
     # NOTE: the exact CoreAudio property selector / struct types differ between
     # pyobjc-framework-CoreAudio versions. The implementation sketch below is
     # the shape we want; the ArmController tolerates this returning False so
     # any binding incompatibility degrades to "no mic signal" rather than
-    # crashing. Follow-up: pin an exact pyobjc recipe after real-Mac verification
-    # (see deferred-work memory project_deferred_work.md).
+    # crashing. Errors flow through _warn_mic_active_once so a broken binding
+    # leaves a single warning per agent run instead of silently disabling the
+    # watcher.
     try:
         prop = CoreAudio.AudioObjectPropertyAddress(
             mSelector=CoreAudio.kAudioDevicePropertyDeviceIsRunningSomewhere,
@@ -317,6 +322,9 @@ def is_mic_active() -> bool:
             sys_prop, 0, None, size_ptr, default_id_ptr,
         )
         if err != 0:
+            _warn_mic_active_once(
+                "AudioObjectGetPropertyData(default-input) returned err=%d", err
+            )
             return False
         default_id = default_id_ptr[0]
         running_ptr = (CoreAudio.UInt32 * 1)(0)
@@ -324,11 +332,42 @@ def is_mic_active() -> bool:
             default_id, prop, 0, None, size_ptr, running_ptr,
         )
         if err != 0:
+            _warn_mic_active_once(
+                "AudioObjectGetPropertyData(is-running) returned err=%d", err
+            )
             return False
         return bool(running_ptr[0])
-    except Exception:
-        log.debug("[arm.mac] is_mic_active query failed", exc_info=True)
+    except Exception as exc:
+        _warn_mic_active_once(
+            "is_mic_active CoreAudio call raised: %s",
+            exc,
+            exc_info=True,
+        )
         return False
+
+
+_MIC_ACTIVE_WARN_FIRED = False
+
+
+def _warn_mic_active_once(fmt: str, *args: object, exc_info: bool = False) -> None:
+    """Log a one-shot warning the first time ``is_mic_active`` hits a
+    failure path, then drop to debug for subsequent identical hits.
+
+    Without this throttle we'd spam agent.log at the watcher's poll
+    cadence (every 2 s) every time the CoreAudio binding is broken;
+    one warning per agent run is enough to surface the issue.
+    """
+    global _MIC_ACTIVE_WARN_FIRED
+    if _MIC_ACTIVE_WARN_FIRED:
+        log.debug("[arm.mac] " + fmt, *args, exc_info=exc_info)
+        return
+    _MIC_ACTIVE_WARN_FIRED = True
+    log.warning(
+        "[arm.mac] " + fmt + " — whitelist watcher won't see mic-active "
+        "until this is resolved",
+        *args,
+        exc_info=exc_info,
+    )
 
 
 def get_running_processes() -> frozenset[str]:

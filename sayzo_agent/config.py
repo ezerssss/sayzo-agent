@@ -219,9 +219,11 @@ class DetectorSpec(BaseSettings):
       This is how Google Meet / Teams web / Zoom web / Webex / Whereby /
       Jitsi / 8x8 are matched.
     - ``title_patterns`` are tried against any visible browser window title
-      when ``is_browser`` is True. Needed on Windows where we can't cheaply
-      read the active-tab URL; the Chrome/Edge window title (e.g. ``Meet -
-      abc-defg-hij - Google Chrome``) is the only signal available.
+      when ``is_browser`` is True. Each entry is an OR — any single match
+      fires. Brand-name regexes work well in practice because the
+      upstream gate (browser is foreground AND mic is active) supplies
+      the precision; the title pattern only has to disambiguate "which
+      meeting service?".
     - ``disabled`` marks a spec the user has toggled off in the Settings
       Meeting Apps pane. The matcher skips these so the consent toast
       doesn't fire — but the spec stays in the list so the user can flip
@@ -322,7 +324,18 @@ def default_detector_specs() -> list[DetectorSpec]:
         DetectorSpec(
             app_key="gmeet", display_name="Google Meet", is_browser=True,
             url_patterns=[r"^https://meet\.google\.com/[a-z]{3,4}-[a-z]{3,4}-[a-z]{3,4}"],
-            title_patterns=[r"\bMeet - [a-z]{3,4}-[a-z]{3,4}-[a-z]{3,4}\b"],
+            # Brand-match (instead of meeting-code-match) because the
+            # title format drifts across Chrome / Safari / Edge versions.
+            # The mic-active + browser-foreground gate upstream supplies
+            # the precision; this just disambiguates which service.
+            title_patterns=[
+                r"(?i)\bGoogle Meet\b",
+                r"(?i)\bgmeet\b",
+                # Legacy Chrome title format ("Meet - <code> - Google
+                # Chrome") that some browser/OS combos still produce
+                # without the "Google Meet" branding above.
+                r"\bMeet - [a-z]{3,4}-[a-z]{3,4}-[a-z]{3,4}\b",
+            ],
         ),
         DetectorSpec(
             app_key="teams_web", display_name="Microsoft Teams",
@@ -331,10 +344,7 @@ def default_detector_specs() -> list[DetectorSpec]:
                 r"teams\.microsoft\.com/.+/l/meetup-join/",
                 r"teams\.microsoft\.com/_#/conversations/.+/meeting",
             ],
-            # Teams web titles channels and pages with " | Microsoft Teams"
-            # — paired with the mic-holder filter (browser actively using
-            # the mic), this is precise enough to only fire during calls.
-            title_patterns=[r"\| Microsoft Teams\b"],
+            title_patterns=[r"(?i)\bMicrosoft Teams\b"],
         ),
         DetectorSpec(
             app_key="zoom_web", display_name="Zoom", is_browser=True,
@@ -342,14 +352,12 @@ def default_detector_specs() -> list[DetectorSpec]:
                 r"^https://[^/]+\.zoom\.us/wc/join/",
                 r"^https://[^/]+\.zoom\.us/j/\d+",
             ],
-            # Zoom web titles the meeting window "Zoom Meeting"; distinct
-            # enough from their marketing pages / client downloads.
-            title_patterns=[r"\bZoom Meeting\b"],
+            title_patterns=[r"(?i)\bZoom Meeting\b"],
         ),
         DetectorSpec(
             app_key="webex_web", display_name="Webex", is_browser=True,
             url_patterns=[r"^https://[^/]+\.webex\.com/(meet|wbxmjs|webappng)/"],
-            title_patterns=[r"(?i)\b(?:cisco )?webex\b"],
+            title_patterns=[r"(?i)\bwebex\b"],
         ),
         DetectorSpec(
             app_key="whereby", display_name="Whereby", is_browser=True,
@@ -359,12 +367,12 @@ def default_detector_specs() -> list[DetectorSpec]:
         DetectorSpec(
             app_key="jitsi", display_name="Jitsi Meet", is_browser=True,
             url_patterns=[r"^https://meet\.jit\.si/[^/]+"],
-            title_patterns=[r"(?i)\bjitsi\s*meet\b"],
+            title_patterns=[r"(?i)\bjitsi\b"],
         ),
         DetectorSpec(
             app_key="8x8", display_name="8x8 Meet", is_browser=True,
             url_patterns=[r"^https://8x8\.vc/[^/]+"],
-            title_patterns=[r"(?i)\b8x8\s*meet\b"],
+            title_patterns=[r"(?i)\b8x8\b"],
         ),
     ]
 

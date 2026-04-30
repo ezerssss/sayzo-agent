@@ -371,13 +371,10 @@ def _browser_spec_matches(
 
     URL patterns are tried against ``urls`` first — that's the reliable
     signal when UIA / AppleScript can read the active tab. They're also
-    tried against ``titles`` as a legacy fallback (some macOS configs
-    populate tab titles with the URL string when Automation permission
-    was denied, and a minority of users set browser flags that put the
-    full URL in the window title). ``title_patterns`` are title-only —
-    that's how Windows matches the ship-with Meet/Zoom-web specs when
-    UIA can't read the omnibox (minimized-to-tray, PWA-mode windows,
-    etc.).
+    tried against ``titles`` as a legacy fallback for the tiny minority
+    of configs that put the URL in the title. ``title_patterns`` are
+    title-only any-of regexes — that's how Windows matches the ship-with
+    Meet/Zoom-web specs when UIA can't read the omnibox.
     """
     for pattern in spec.url_patterns:
         rx = _compile(pattern)
