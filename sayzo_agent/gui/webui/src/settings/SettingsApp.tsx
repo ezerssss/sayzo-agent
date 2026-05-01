@@ -10,16 +10,18 @@ import { PermissionsPane } from "./PermissionsPane";
 import { ShortcutPane } from "./ShortcutPane";
 import logoUrl from "../assets/logo.png";
 
-// Sidebar order matches the legacy tkinter Settings so muscle memory
-// carries over. "Captures" sits next to Meeting Apps since both deal with
-// what Sayzo records.
+// Sidebar order: lead with the panes the user actually returns to
+// post-onboarding. Account first (token expiry / re-login is the most
+// common reason to open Settings), then capture controls (Meeting Apps),
+// then artifacts (Captures), then setup-once items (Shortcut,
+// Notifications, Permissions), then static reference (About).
 const PANE_NAMES = [
-  "Shortcut",
+  "Account",
   "Meeting Apps",
   "Captures",
-  "Permissions",
-  "Account",
+  "Shortcut",
   "Notifications",
+  "Permissions",
   "About",
 ] as const;
 type PaneName = (typeof PANE_NAMES)[number];
@@ -33,7 +35,7 @@ function normalizePane(s: string | null | undefined): PaneName | null {
 const SIDEBAR_REFRESH_MS = 5_000;
 
 export function SettingsApp() {
-  const [active, setActive] = useState<PaneName>("Shortcut");
+  const [active, setActive] = useState<PaneName>("Account");
   const [ready, setReady] = useState(false);
   const [globalError, setGlobalError] = useState<string | null>(null);
   const [inProgressCount, setInProgressCount] = useState(0);
@@ -148,7 +150,7 @@ interface SidebarProps {
 
 function Sidebar({ active, onSelect, inProgressCount }: SidebarProps) {
   return (
-    <nav className="w-56 shrink-0 border-r border-ink-border bg-gray-50">
+    <nav className="flex h-full w-56 shrink-0 flex-col border-r border-ink-border bg-gray-50">
       <div className="flex items-center gap-3 px-5 pt-8 pb-6">
         <img src={logoUrl} alt="" className="h-9 w-9 shrink-0" />
         <div className="min-w-0">
@@ -169,6 +171,10 @@ function Sidebar({ active, onSelect, inProgressCount }: SidebarProps) {
           />
         ))}
       </ul>
+      <div className="mt-auto px-4 pb-6 pt-8 text-xs leading-snug text-ink-muted">
+        Sayzo keeps running when you close this window — open it again
+        any time from the menu bar.
+      </div>
     </nav>
   );
 }

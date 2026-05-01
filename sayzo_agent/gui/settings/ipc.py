@@ -68,6 +68,10 @@ class Methods:
     # subprocess kick the upload retry sweep when the user hits "Try again".
     SNAPSHOT_PROCESSING_CAPTURES = "snapshot_processing_captures"
     NUDGE_UPLOAD_RETRY = "nudge_upload_retry"
+    # Second-instance handoff: a freshly-launched sayzo-agent that detects
+    # the primary already running uses this to ask the primary to surface
+    # its Settings window before exiting. Same trigger the tray menu uses.
+    OPEN_SETTINGS = "open_settings"
 
 
 class IPCError(Exception):

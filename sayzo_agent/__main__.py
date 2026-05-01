@@ -975,7 +975,25 @@ def service(force_setup: bool) -> None:
     from .pidfile import is_running, write_pid, remove_pid
 
     if is_running(cfg.pid_path):
-        log.warning("service already running, exiting")
+        # A primary is already alive. The user just clicked the Sayzo .app /
+        # .exe / Start-Menu shortcut while we were running in the background,
+        # so they want to *see* the agent. Ask the primary to surface its
+        # Settings window via IPC, then exit. ``call_quiet`` swallows
+        # IPCNotConnected (stale pidfile / IPC server not up yet), so a
+        # crashed-or-mid-startup primary degrades to the prior silent-exit
+        # behavior instead of erroring.
+        try:
+            from .gui.settings.ipc import IPCClient, Methods
+
+            IPCClient(cfg.data_dir).call_quiet(Methods.OPEN_SETTINGS)
+            log.warning(
+                "service already running — asked primary to open Settings, exiting"
+            )
+        except Exception:
+            log.warning(
+                "service already running — IPC handoff failed, exiting",
+                exc_info=True,
+            )
         return
 
     write_pid(cfg.pid_path)
@@ -1203,6 +1221,14 @@ def service(force_setup: bool) -> None:
             task.add_done_callback(agent._background_tasks.discard)
             return {"started": True}
 
+        def _ipc_open_settings() -> dict:
+            # Surface the Settings window. Same trigger the tray menu uses,
+            # so the show path (pre-warmed --idle subprocess, hide-on-close
+            # contract, dock-icon toggle on macOS) is identical. _tray_bridge
+            # picks the event up on its next 0.5 s tick.
+            tray_state.settings_event.set()
+            return {"ok": True}
+
         ipc_server.register(Methods.INVALIDATE_TOKEN_CACHE, _ipc_invalidate_token_cache)
         ipc_server.register(Methods.REBIND_HOTKEY, _ipc_rebind_hotkey)
         ipc_server.register(Methods.SNAPSHOT_MIC_STATE, _ipc_snapshot_mic_state)
@@ -1212,6 +1238,7 @@ def service(force_setup: bool) -> None:
             Methods.SNAPSHOT_PROCESSING_CAPTURES, _ipc_snapshot_processing_captures
         )
         ipc_server.register(Methods.NUDGE_UPLOAD_RETRY, _ipc_nudge_upload_retry)
+        ipc_server.register(Methods.OPEN_SETTINGS, _ipc_open_settings)
 
         try:
             await ipc_server.start()
@@ -1504,6 +1531,26 @@ def service(force_setup: bool) -> None:
 
             worker = threading.Thread(target=_asyncio_runner, name="asyncio", daemon=False)
             worker.start()
+
+            # Install the kAEReopenApplication handler before pystray hands
+            # the main thread to NSApp.run(). Without this, clicking the
+            # Sayzo Dock icon / Spotlight launching the .app while we're
+            # already running silently does nothing — LSUIElement=True apps
+            # don't get a second process spawned, so there's no "second
+            # launch IPC" path on macOS the way there is on Windows.
+            # ``tray_state.settings_event`` is a threading.Event, safe to
+            # set from the AppKit main thread; ``_tray_bridge`` picks it
+            # up on its next 0.5 s tick from the asyncio worker.
+            try:
+                from .gui.common.mac_reopen import install_reopen_handler
+
+                install_reopen_handler(tray_state.settings_event.set)
+            except Exception:
+                log.warning(
+                    "[mac_reopen] install failed — Dock-click won't open Settings",
+                    exc_info=True,
+                )
+
             try:
                 tray.run_main()
             finally:
