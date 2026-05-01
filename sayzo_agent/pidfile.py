@@ -22,8 +22,22 @@ from pathlib import Path
 def is_running(pid_path: Path) -> bool:
     """Check if a service is already running based on the PID file.
 
-    Returns False on any failure (missing file, stale PID, OS error).
-    Stale pidfiles are silently removed so a crashed primary doesn't
+    Returns False on missing file or stale PID; True if the recorded PID
+    is alive.
+
+    Cross-privilege correctness on Windows is the load-bearing detail
+    here. The naive ``os.kill(pid, 0)`` idiom calls
+    ``OpenProcess(PROCESS_ALL_ACCESS, …)`` under the hood, which fails
+    with ``ERROR_ACCESS_DENIED`` (→ Python ``PermissionError``) when the
+    target process belongs to a higher integrity level — e.g., the
+    post-install Sayzo agent inherits NSIS's elevated token, and a
+    later user-clicked Sayzo (medium integrity) can't open it. The old
+    code treated ``PermissionError`` as "process dead", removed the
+    pidfile, and let the secondary become a second primary. ``psutil
+    .pid_exists`` queries the OS without needing PROCESS_ALL_ACCESS, so
+    it returns True correctly in that case.
+
+    Stale pidfiles are removed so a crashed primary doesn't
     permanently lock subsequent launches out.
     """
     if not pid_path.exists():
@@ -32,12 +46,28 @@ def is_running(pid_path: Path) -> bool:
         pid = int(pid_path.read_text().strip())
     except (ValueError, OSError):
         return False
-    # Check if the process is alive.
+
     try:
-        os.kill(pid, 0)  # signal 0 = just check, don't kill
+        import psutil  # type: ignore[import-not-found]
+
+        if psutil.pid_exists(pid):
+            return True
+        # Confirmed gone — clean up the stale file.
+        pid_path.unlink(missing_ok=True)
+        return False
+    except Exception:
+        # psutil missing / OS query failed — fall through to the
+        # ``os.kill`` path with explicit cross-privilege handling.
+        pass
+
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        # Process is alive but in a higher integrity level (or another
+        # user) we can't query. Don't touch the pidfile.
         return True
     except OSError:
-        # Process doesn't exist — stale PID file.
         pid_path.unlink(missing_ok=True)
         return False
 

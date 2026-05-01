@@ -84,3 +84,50 @@ def test_remove_pid_is_idempotent(tmp_path: Path) -> None:
     pidfile.remove_pid(pid_path)
     pidfile.remove_pid(pid_path)  # gone — no-op
     assert not pid_path.exists()
+
+
+def test_is_running_treats_cross_privilege_as_alive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Simulate the post-install-elevated vs. user-clicked scenario.
+
+    When the post-install Sayzo agent runs elevated and a later
+    user-clicked Sayzo (medium integrity) tries ``os.kill(elevated_pid,
+    0)``, Windows refuses with ERROR_ACCESS_DENIED → ``PermissionError``.
+    The old logic treated that as "process gone" and removed the pidfile,
+    letting two instances coexist. ``is_running`` must report True for a
+    PID that ``psutil.pid_exists`` confirms is alive — even if our own
+    ``os.kill`` probe would have failed.
+    """
+    pid_path = tmp_path / "agent.pid"
+    pid_path.write_text("12345")  # arbitrary "elevated" PID
+
+    import psutil
+    monkeypatch.setattr(psutil, "pid_exists", lambda pid: pid == 12345)
+
+    # Pretend os.kill would fail with PermissionError if it were tried.
+    # The is_running fast-path uses psutil first, so the os.kill mock is
+    # belt-and-braces: even if the psutil branch were skipped, the
+    # PermissionError-as-alive branch should catch it.
+    def _fake_kill(pid: int, sig: int) -> None:
+        raise PermissionError("Access is denied")
+
+    monkeypatch.setattr(pidfile.os, "kill", _fake_kill)
+
+    assert pidfile.is_running(pid_path) is True
+    # Pidfile must NOT be removed.
+    assert pid_path.exists()
+
+
+def test_acquire_loses_to_cross_privilege_primary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end: try_acquire_pidfile must lose to a cross-privilege primary."""
+    pid_path = tmp_path / "agent.pid"
+    pid_path.write_text("12345")
+
+    import psutil
+    monkeypatch.setattr(psutil, "pid_exists", lambda pid: pid == 12345)
+
+    assert pidfile.try_acquire_pidfile(pid_path) is False
+    assert pid_path.read_text().strip() == "12345"  # primary's PID intact

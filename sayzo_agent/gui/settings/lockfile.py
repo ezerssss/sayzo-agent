@@ -26,11 +26,27 @@ _LOCK_FILENAME = "settings.pid"
 
 
 def _is_pid_alive(pid: int) -> bool:
-    """Best-effort liveness check. Returns True on signal-0 success."""
+    """Best-effort liveness check, robust to cross-privilege contexts.
+
+    On Windows, ``os.kill(pid, 0)`` raises ``PermissionError`` when the
+    target lives at a higher integrity level (e.g. an elevated Settings
+    spawned by NSIS finish-page vs. a user-launched Settings). Treating
+    that as "dead" lets a second instance come up alongside the first.
+    ``psutil.pid_exists`` queries the OS without ``PROCESS_ALL_ACCESS``,
+    so it returns True correctly across the elevation boundary.
+    """
     if pid <= 0:
         return False
     try:
+        import psutil  # type: ignore[import-not-found]
+
+        return bool(psutil.pid_exists(pid))
+    except Exception:
+        pass
+    try:
         os.kill(pid, 0)
+        return True
+    except PermissionError:
         return True
     except OSError:
         return False
