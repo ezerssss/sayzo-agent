@@ -1,4 +1,18 @@
-"""PID file management to prevent duplicate service instances."""
+"""PID file management to prevent duplicate service instances.
+
+The contract used by ``service()`` / ``run()``:
+
+1. Call :func:`try_acquire_pidfile` — atomic create-or-fail. Returns True
+   if we became the primary; False if another live instance beat us.
+2. On success, the agent runs and the pidfile lives until step 3.
+3. Call :func:`remove_pid` in a ``finally`` block on exit.
+
+The earlier two-step pattern (``is_running`` then ``write_pid``) had a
+TOCTOU window: two concurrent launches could both observe "no pidfile"
+and then both write it, ending up with two live primaries. Atomic
+``O_CREAT | O_EXCL`` closes that window — only one process can win the
+exclusive create.
+"""
 from __future__ import annotations
 
 import os
@@ -6,7 +20,12 @@ from pathlib import Path
 
 
 def is_running(pid_path: Path) -> bool:
-    """Check if a service is already running based on the PID file."""
+    """Check if a service is already running based on the PID file.
+
+    Returns False on any failure (missing file, stale PID, OS error).
+    Stale pidfiles are silently removed so a crashed primary doesn't
+    permanently lock subsequent launches out.
+    """
     if not pid_path.exists():
         return False
     try:
@@ -23,8 +42,64 @@ def is_running(pid_path: Path) -> bool:
         return False
 
 
+def try_acquire_pidfile(pid_path: Path) -> bool:
+    """Atomically claim the pidfile or report that another instance has it.
+
+    Returns True if this process became the primary (pidfile now contains
+    our PID); False if another live instance beat us.
+
+    Implementation: ``O_CREAT | O_EXCL`` exclusive create races atomically
+    at the OS level. If it fails because the file exists, we re-check
+    ``is_running`` — a stale pidfile (process dead) is removed and we
+    retry the exclusive create exactly once. Two retries would loop on
+    a true race; bounding it at one keeps the worst case to "lose to a
+    same-instant competitor", which is the right behavior — if we lost
+    the race, we should exit, not keep trying.
+    """
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = str(os.getpid()).encode()
+
+    for attempt in range(2):
+        try:
+            fd = os.open(
+                pid_path,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+            )
+        except FileExistsError:
+            # Someone else holds it. If they're alive, we lose.
+            if is_running(pid_path):
+                return False
+            # Holder is dead OR the pidfile is corrupt (non-numeric, empty,
+            # zero PID). ``is_running`` only auto-removes the dead-PID case;
+            # we clean up the rest ourselves so the retry's O_EXCL can win.
+            try:
+                pid_path.unlink(missing_ok=True)
+            except OSError:
+                return False
+            continue
+        except OSError:
+            # Permissions / disk full / unusual fs. Treat as "couldn't
+            # acquire" rather than crashing — the caller will exit.
+            return False
+
+        try:
+            os.write(fd, payload)
+        finally:
+            os.close(fd)
+        return True
+
+    # Lost the race even after retry — give up.
+    return False
+
+
 def write_pid(pid_path: Path) -> None:
-    """Write the current process PID to the file."""
+    """Overwrite the PID file with the current PID. Non-atomic.
+
+    Kept for backward compatibility with paths that already enforce
+    single-instance some other way. New callers should prefer
+    :func:`try_acquire_pidfile`.
+    """
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
     pid_path.write_text(str(os.getpid()))
 
 

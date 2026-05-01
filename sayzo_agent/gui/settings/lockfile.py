@@ -72,18 +72,52 @@ class SettingsLock:
             self._acquired = False
             return self
 
-        prior = self.existing_pid()
-        if prior is not None and prior != os.getpid() and _is_pid_alive(prior):
-            log.info("[settings.lock] another Settings window is open (pid=%d)", prior)
-            self._acquired = False
+        # Atomic create-or-fail with O_EXCL to close the TOCTOU window
+        # between "no live lockfile" and "we wrote ours". Two concurrent
+        # Settings subprocess spawns now race at the OS level — exactly
+        # one wins.
+        payload = str(os.getpid()).encode("utf-8")
+        for _attempt in range(2):
+            try:
+                fd = os.open(
+                    self._path,
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                )
+            except FileExistsError:
+                prior = self.existing_pid()
+                if prior is not None and prior != os.getpid() and _is_pid_alive(prior):
+                    log.info(
+                        "[settings.lock] another Settings window is open (pid=%d)",
+                        prior,
+                    )
+                    self._acquired = False
+                    return self
+                # Stale — remove and retry the exclusive create exactly once.
+                try:
+                    self._path.unlink(missing_ok=True)
+                except OSError:
+                    log.warning(
+                        "[settings.lock] failed to clear stale lock", exc_info=True
+                    )
+                    self._acquired = False
+                    return self
+                continue
+            except OSError:
+                log.warning(
+                    "[settings.lock] failed to create %s", self._path, exc_info=True
+                )
+                self._acquired = False
+                return self
+
+            try:
+                os.write(fd, payload)
+            finally:
+                os.close(fd)
+            self._acquired = True
             return self
 
-        try:
-            self._path.write_text(str(os.getpid()), encoding="utf-8")
-            self._acquired = True
-        except OSError:
-            log.warning("[settings.lock] failed to write %s", self._path, exc_info=True)
-            self._acquired = False
+        # Lost the race even after the stale-clear retry.
+        self._acquired = False
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:

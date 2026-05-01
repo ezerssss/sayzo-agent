@@ -911,6 +911,21 @@ def run() -> None:
     _setup_logging(cfg.log_level, cfg.debug)
     log = logging.getLogger("run")
 
+    # Single-instance enforcement, same atomic gate as ``service``. Without
+    # this, a developer iterating in two terminals (or the dev ``run`` while
+    # an installed ``service`` is also active) ends up with two primaries
+    # both holding the audio devices — the failure mode the user explicitly
+    # called out. ``run`` doesn't host an IPC server, so a second invocation
+    # silently exits without trying to surface Settings (the only signal the
+    # user gets is the log line below).
+    from .pidfile import try_acquire_pidfile, remove_pid
+
+    if not try_acquire_pidfile(cfg.pid_path):
+        log.warning(
+            "agent already running (pidfile=%s) — exiting", cfg.pid_path,
+        )
+        return
+
     from .auth.store import TokenStore
 
     upload_client = None
@@ -955,6 +970,8 @@ def run() -> None:
         asyncio.run(_main())
     except KeyboardInterrupt:
         pass
+    finally:
+        remove_pid(cfg.pid_path)
 
 
 @cli.command()
@@ -972,16 +989,16 @@ def service(force_setup: bool) -> None:
     _setup_file_logging(cfg.logs_dir)
     log = logging.getLogger("service")
 
-    from .pidfile import is_running, write_pid, remove_pid
+    from .pidfile import try_acquire_pidfile, remove_pid
 
-    if is_running(cfg.pid_path):
-        # A primary is already alive. The user just clicked the Sayzo .app /
-        # .exe / Start-Menu shortcut while we were running in the background,
-        # so they want to *see* the agent. Ask the primary to surface its
-        # Settings window via IPC, then exit. ``call_quiet`` swallows
-        # IPCNotConnected (stale pidfile / IPC server not up yet), so a
-        # crashed-or-mid-startup primary degrades to the prior silent-exit
-        # behavior instead of erroring.
+    # Atomic single-instance gate. ``try_acquire_pidfile`` uses
+    # ``O_CREAT | O_EXCL`` so two near-simultaneous launches race at the
+    # OS level — exactly one becomes the primary. The loser asks the
+    # winner to surface Settings via IPC, then exits. ``call_quiet``
+    # swallows IPCNotConnected (winner's IPC server may not be up yet
+    # in the rare just-started case), so a mid-startup primary degrades
+    # to the prior silent-exit behavior.
+    if not try_acquire_pidfile(cfg.pid_path):
         try:
             from .gui.settings.ipc import IPCClient, Methods
 
@@ -996,7 +1013,6 @@ def service(force_setup: bool) -> None:
             )
         return
 
-    write_pid(cfg.pid_path)
     from . import __version__
     log.warning("sayzo-agent service starting v%s (pid=%d)", __version__, os.getpid())
 
@@ -1109,6 +1125,20 @@ def service(force_setup: bool) -> None:
     # _sync_arm_state_to_tray runs.
     tray_state = TrayState(hotkey_display=humanize_binding(cfg.arm.hotkey))
     tray = TrayIcon(tray_state, cfg.captures_dir)
+
+    # User-click launch (no primary was running, parent process looks like
+    # the OS shell) → surface the Settings window once the agent boots so
+    # the user gets visual confirmation. Auto-start paths (Task Scheduler /
+    # launchd) and the post-onboarding-finish path (where SetupWindow just
+    # closed) stay silent. The flag is on tray_state so _tray_bridge picks
+    # it up via its existing settings-event polling — no new wiring.
+    from .launch_source import looks_user_launched
+
+    if not should_show_gui and looks_user_launched():
+        log.warning(
+            "service: user-click launch detected — auto-opening Settings"
+        )
+        tray_state.settings_event.set()
 
     notifier = make_notifier(app_name=APP_AUMID) if cfg.notifications_enabled else NoopNotifier()
     agent = Agent(cfg, upload_client=upload_client, notifier=notifier, auth_client=auth_client)
