@@ -65,13 +65,19 @@ class MockUploadClient:
     def enqueue(self, kind: str, **kwargs: Any) -> None:
         self.queue.append(_QueuedOutcome(kind, kwargs))
 
-    async def upload(self, record: ConversationRecord) -> str | None:
+    async def upload(self, record: ConversationRecord) -> dict | None:
         self.calls.append(record.id)
         if not self.queue:
-            return f"srv_{record.id}"
+            return {"capture_id": f"srv_{record.id}"}
         out = self.queue.pop(0)
         if out.kind == "success":
-            return out.kwargs.get("capture_id", f"srv_{record.id}")
+            body: dict = {"capture_id": out.kwargs.get("capture_id", f"srv_{record.id}")}
+            # Optional server-generated fields the retry manager will use
+            # to overwrite the local placeholder title/summary/span.
+            for key in ("title", "summary", "relevant_span"):
+                if key in out.kwargs:
+                    body[key] = out.kwargs[key]
+            return body
         if out.kind == "credit_limit":
             raise _http_error(
                 402,
@@ -238,6 +244,91 @@ async def test_live_upload_success_updates_metadata(env):
     assert state["server_capture_id"] == "srv_abc"
     assert state["next_attempt_at"] is None
     assert state["last_error_kind"] is None
+
+
+async def test_server_response_overwrites_placeholder_title_and_summary(env):
+    """When the upload response carries title/summary/relevant_span, those
+    values overwrite the local placeholder and clear the placeholder flag."""
+    rec_dir, record = _write_capture(
+        env.captures_dir, "rec_overwrite", env.clock()
+    )
+    # Mark the local copy as a placeholder so we can verify the flag flips.
+    rec_data = json.loads((rec_dir / "record.json").read_text(encoding="utf-8"))
+    rec_data["title"] = "Conversation · 2026-04-21 12:00"
+    rec_data["summary"] = ""
+    rec_data["metadata"]["placeholder_title"] = True
+    rec_data["metadata"]["local_llm_used"] = False
+    (rec_dir / "record.json").write_text(json.dumps(rec_data), encoding="utf-8")
+    record = read_record_from_dir(rec_dir)
+
+    env.upload.enqueue(
+        "success",
+        capture_id="srv_overwrite",
+        title="Standup with backend team",
+        summary="Discussed indexer rollout and migration plan.",
+        relevant_span=[12.5, 412.0],
+    )
+    outcome = await env.mgr.try_upload(record, rec_dir)
+    assert outcome == UploadOutcome.SUCCESS
+
+    overwritten = read_record_from_dir(rec_dir)
+    assert overwritten.title == "Standup with backend team"
+    assert overwritten.summary == "Discussed indexer rollout and migration plan."
+    assert overwritten.relevant_span == (12.5, 412.0)
+    assert overwritten.metadata.get("placeholder_title") is False
+    # Upload state is still updated correctly.
+    state = overwritten.metadata["upload"]
+    assert state["status"] == STATUS_UPLOADED
+    assert state["server_capture_id"] == "srv_overwrite"
+
+
+async def test_server_response_without_overwrite_leaves_placeholder(env):
+    """If the response only carries capture_id, the local placeholder
+    title/summary/span are kept untouched (server hasn't generated yet)."""
+    rec_dir, record = _write_capture(
+        env.captures_dir, "rec_no_overwrite", env.clock()
+    )
+    rec_data = json.loads((rec_dir / "record.json").read_text(encoding="utf-8"))
+    rec_data["title"] = "Conversation · 2026-04-21 12:00"
+    rec_data["metadata"]["placeholder_title"] = True
+    (rec_dir / "record.json").write_text(json.dumps(rec_data), encoding="utf-8")
+    record = read_record_from_dir(rec_dir)
+
+    env.upload.enqueue("success", capture_id="srv_pending")
+    outcome = await env.mgr.try_upload(record, rec_dir)
+    assert outcome == UploadOutcome.SUCCESS
+
+    after = read_record_from_dir(rec_dir)
+    assert after.title == "Conversation · 2026-04-21 12:00"
+    # Placeholder flag stays True until server actually overwrites.
+    assert after.metadata.get("placeholder_title") is True
+
+
+async def test_server_partial_overwrite_only_touches_provided_fields(env):
+    """Server returning only `title` shouldn't blank the local summary."""
+    rec_dir, record = _write_capture(
+        env.captures_dir, "rec_partial", env.clock()
+    )
+    rec_data = json.loads((rec_dir / "record.json").read_text(encoding="utf-8"))
+    rec_data["title"] = "Conversation · placeholder"
+    rec_data["summary"] = ""  # placeholder
+    rec_data["metadata"]["placeholder_title"] = True
+    (rec_dir / "record.json").write_text(json.dumps(rec_data), encoding="utf-8")
+    record = read_record_from_dir(rec_dir)
+
+    env.upload.enqueue(
+        "success",
+        capture_id="srv_partial",
+        title="Real title only",
+    )
+    outcome = await env.mgr.try_upload(record, rec_dir)
+    assert outcome == UploadOutcome.SUCCESS
+
+    after = read_record_from_dir(rec_dir)
+    assert after.title == "Real title only"
+    # Summary unchanged (still the empty placeholder); span unchanged.
+    assert after.summary == ""
+    assert after.metadata.get("placeholder_title") is False
 
 
 async def test_live_upload_transient_schedules_retry(env):

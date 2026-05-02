@@ -244,14 +244,20 @@ class UploadRetryManager:
         # Perform the upload (serialized across the manager via the semaphore).
         outcome: UploadOutcome
         message: str | None = None
-        server_capture_id: str | None = None
+        server_response: dict | None = None
         async with self._upload_sem:
             try:
-                server_capture_id = await self._upload_client.upload(record)
+                server_response = await self._upload_client.upload(record)
                 outcome = UploadOutcome.SUCCESS
             except Exception as exc:
                 outcome, message = classify_exception(exc)
                 log.warning("[upload] failed id=%s outcome=%s — %s", record.id, outcome.value, message)
+
+        server_capture_id: str | None = None
+        if isinstance(server_response, dict):
+            cid = server_response.get("capture_id")
+            if isinstance(cid, str):
+                server_capture_id = cid
 
         # Persist the outcome on the record.
         await self._update_record_state(
@@ -262,6 +268,20 @@ class UploadRetryManager:
                 max_permanent_other_attempts=self._cfg.max_permanent_other_attempts,
             ),
         )
+
+        # Apply any server-generated title/summary/relevant_span on top of
+        # the local placeholder. Skipped silently if the response didn't
+        # carry these (old server, async generation pattern, etc.) — the
+        # placeholder stays and a future GET /api/captures/{id} sweep
+        # could pick up the upgrade.
+        if outcome == UploadOutcome.SUCCESS and isinstance(server_response, dict):
+            try:
+                await self._apply_server_overwrite(rec_dir, server_response)
+            except Exception:
+                log.warning(
+                    "[upload] server-overwrite failed id=%s (non-fatal)",
+                    record.id, exc_info=True,
+                )
 
         # Global-pause + notification side effects.
         if outcome == UploadOutcome.CREDIT_LIMIT:
@@ -374,6 +394,75 @@ class UploadRetryManager:
             return new_upload
 
         return await loop.run_in_executor(self._executor, _do)
+
+    async def _apply_server_overwrite(self, rec_dir: Path, body: dict) -> bool:
+        """Overwrite local title / summary / relevant_span from the upload
+        response.
+
+        Called after a successful upload, on the body the server returned
+        alongside ``capture_id``. Each field is independent — we write
+        whichever ones the server supplied, leave the rest as the
+        client-side placeholder. Non-string title / non-string summary /
+        non-2-element-numeric span are ignored.
+
+        Returns True if record.json was rewritten, False otherwise.
+        """
+        title = body.get("title")
+        summary = body.get("summary")
+        span_raw = body.get("relevant_span")
+
+        new_title: str | None = None
+        if isinstance(title, str) and title.strip():
+            new_title = title
+
+        new_summary: str | None = None
+        if isinstance(summary, str):
+            new_summary = summary
+
+        new_span: tuple[float, float] | None = None
+        if (
+            isinstance(span_raw, (list, tuple))
+            and len(span_raw) == 2
+            and all(isinstance(v, (int, float)) for v in span_raw)
+        ):
+            new_span = (float(span_raw[0]), float(span_raw[1]))
+
+        if new_title is None and new_summary is None and new_span is None:
+            return False
+
+        loop = asyncio.get_running_loop()
+
+        def _do() -> bool:
+            record = read_record_from_dir(rec_dir)
+            changed = False
+            if new_title is not None and record.title != new_title:
+                record.title = new_title
+                changed = True
+            if new_summary is not None and record.summary != new_summary:
+                record.summary = new_summary
+                changed = True
+            if new_span is not None and tuple(record.relevant_span) != new_span:
+                record.relevant_span = new_span
+                changed = True
+            # Flip the placeholder flag once any server-generated value
+            # lands; the client-side title/summary are no longer the
+            # placeholder we shipped at upload time.
+            if changed and record.metadata.get("placeholder_title"):
+                record.metadata["placeholder_title"] = False
+            if changed:
+                write_record_atomic(rec_dir, record)
+            return changed
+
+        applied = await loop.run_in_executor(self._executor, _do)
+        if applied:
+            log.info(
+                "[upload] applied server overwrite id=%s (title=%s summary=%s span=%s)",
+                rec_dir.name,
+                "yes" if new_title is not None else "no",
+                "yes" if new_summary is not None else "no",
+                "yes" if new_span is not None else "no",
+            )
+        return applied
 
     # ------------------------------------------------------------------
     # Sweep (startup + periodic) — stubs; filled in next task.

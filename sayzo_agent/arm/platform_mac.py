@@ -25,6 +25,7 @@ regexes already handle the same way they do on Windows.
 """
 from __future__ import annotations
 
+import ctypes
 import logging
 import sys
 import time
@@ -277,66 +278,130 @@ def get_browser_window_urls() -> list[str]:
     return []
 
 
-def is_mic_active() -> bool:
-    """Is any process currently capturing from the default input device?
+# CoreAudio FourCC selectors (from <CoreAudio/AudioHardwareBase.h>). Defined
+# inline so we don't depend on pyobjc-framework-CoreAudio re-exporting them
+# under a stable Python name — see ``_load_core_audio`` for why we abandoned
+# pyobjc here.
+_kAudioObjectSystemObject = 1
+_kAudioHardwarePropertyDefaultInputDevice = 0x64496E20  # 'dIn '
+_kAudioObjectPropertyScopeGlobal = 0x676C6F62  # 'glob'
+# kAudioObjectPropertyElementMain (renamed from ElementMaster in macOS 12);
+# both names are 0 — the constant value never changed.
+_kAudioObjectPropertyElementMain = 0
+_kAudioDevicePropertyDeviceIsRunningSomewhere = 0x676F696E  # 'goin'
 
-    Queries ``kAudioDevicePropertyDeviceIsRunningSomewhere`` via pyobjc's
-    CoreAudio bindings. Returns False on any error (permission denied,
-    missing framework, device absent).
+
+class _AudioObjectPropertyAddress(ctypes.Structure):
+    _fields_ = [
+        ("mSelector", ctypes.c_uint32),
+        ("mScope", ctypes.c_uint32),
+        ("mElement", ctypes.c_uint32),
+    ]
+
+
+_CORE_AUDIO_LIB: Optional[ctypes.CDLL] = None
+_CORE_AUDIO_LOAD_FAILED = False
+
+
+def _load_core_audio() -> Optional[ctypes.CDLL]:
+    """Lazy-load the CoreAudio framework via ctypes and bind argtypes once.
+
+    pyobjc-framework-CoreAudio was previously used here, but its bindings
+    don't expose the ``UInt32`` integer type the way our caller assumed
+    (``CoreAudio.UInt32`` raises AttributeError from pyobjc's lazy-import
+    layer). Rather than chase pyobjc binding shape across versions, we
+    call CoreAudio directly: the C ABI is stable since OS X 10.6 and
+    ``AudioObjectGetPropertyData`` takes only ``UInt32`` / pointer args
+    that ctypes models exactly.
     """
-    if sys.platform != "darwin":
-        return False
+    global _CORE_AUDIO_LIB, _CORE_AUDIO_LOAD_FAILED
+    if _CORE_AUDIO_LIB is not None:
+        return _CORE_AUDIO_LIB
+    if _CORE_AUDIO_LOAD_FAILED:
+        return None
     try:
-        import CoreAudio  # type: ignore[import-not-found]
+        lib = ctypes.CDLL(
+            "/System/Library/Frameworks/CoreAudio.framework/CoreAudio"
+        )
+        lib.AudioObjectGetPropertyData.argtypes = [
+            ctypes.c_uint32,                              # AudioObjectID
+            ctypes.POINTER(_AudioObjectPropertyAddress),  # address
+            ctypes.c_uint32,                              # qualifierDataSize
+            ctypes.c_void_p,                              # qualifierData
+            ctypes.POINTER(ctypes.c_uint32),              # ioDataSize
+            ctypes.c_void_p,                              # outData
+        ]
+        lib.AudioObjectGetPropertyData.restype = ctypes.c_int32  # OSStatus
     except Exception:
+        _CORE_AUDIO_LOAD_FAILED = True
         log.warning(
             "[arm.mac] CoreAudio framework unavailable — is_mic_active will "
             "always return False (whitelist watcher will never fire)",
             exc_info=True,
         )
+        return None
+    _CORE_AUDIO_LIB = lib
+    return lib
+
+
+def is_mic_active() -> bool:
+    """Is any process currently capturing from the default input device?
+
+    Queries ``kAudioDevicePropertyDeviceIsRunningSomewhere`` on the default
+    input device via the CoreAudio C API (loaded with ctypes; pyobjc is
+    not used here — see ``_load_core_audio``). Returns False on any error
+    (framework missing, no default input, OS denied the call).
+    """
+    if sys.platform != "darwin":
+        return False
+    lib = _load_core_audio()
+    if lib is None:
         return False
 
-    # NOTE: the exact CoreAudio property selector / struct types differ between
-    # pyobjc-framework-CoreAudio versions. The implementation sketch below is
-    # the shape we want; the ArmController tolerates this returning False so
-    # any binding incompatibility degrades to "no mic signal" rather than
-    # crashing. Errors flow through _warn_mic_active_once so a broken binding
-    # leaves a single warning per agent run instead of silently disabling the
-    # watcher.
     try:
-        prop = CoreAudio.AudioObjectPropertyAddress(
-            mSelector=CoreAudio.kAudioDevicePropertyDeviceIsRunningSomewhere,
-            mScope=CoreAudio.kAudioObjectPropertyScopeGlobal,
-            mElement=CoreAudio.kAudioObjectPropertyElementMaster,
+        # Step 1: read the default input device's AudioObjectID.
+        addr_default = _AudioObjectPropertyAddress(
+            _kAudioHardwarePropertyDefaultInputDevice,
+            _kAudioObjectPropertyScopeGlobal,
+            _kAudioObjectPropertyElementMain,
         )
-        # Default input device id.
-        sys_prop = CoreAudio.AudioObjectPropertyAddress(
-            mSelector=CoreAudio.kAudioHardwarePropertyDefaultInputDevice,
-            mScope=CoreAudio.kAudioObjectPropertyScopeGlobal,
-            mElement=CoreAudio.kAudioObjectPropertyElementMaster,
-        )
-        default_id_ptr = (CoreAudio.UInt32 * 1)(0)
-        size_ptr = (CoreAudio.UInt32 * 1)(4)
-        err = CoreAudio.AudioObjectGetPropertyData(
-            CoreAudio.kAudioObjectSystemObject,
-            sys_prop, 0, None, size_ptr, default_id_ptr,
+        default_id = ctypes.c_uint32(0)
+        size = ctypes.c_uint32(ctypes.sizeof(ctypes.c_uint32))
+        err = lib.AudioObjectGetPropertyData(
+            _kAudioObjectSystemObject,
+            ctypes.byref(addr_default),
+            0, None,
+            ctypes.byref(size), ctypes.byref(default_id),
         )
         if err != 0:
             _warn_mic_active_once(
-                "AudioObjectGetPropertyData(default-input) returned err=%d", err
+                "AudioObjectGetPropertyData(default-input) returned err=%d", err,
             )
             return False
-        default_id = default_id_ptr[0]
-        running_ptr = (CoreAudio.UInt32 * 1)(0)
-        err = CoreAudio.AudioObjectGetPropertyData(
-            default_id, prop, 0, None, size_ptr, running_ptr,
+        if default_id.value == 0:
+            # 0 means "no default input device" — treat as inactive.
+            return False
+
+        # Step 2: read kAudioDevicePropertyDeviceIsRunningSomewhere on it.
+        addr_running = _AudioObjectPropertyAddress(
+            _kAudioDevicePropertyDeviceIsRunningSomewhere,
+            _kAudioObjectPropertyScopeGlobal,
+            _kAudioObjectPropertyElementMain,
+        )
+        running = ctypes.c_uint32(0)
+        size = ctypes.c_uint32(ctypes.sizeof(ctypes.c_uint32))
+        err = lib.AudioObjectGetPropertyData(
+            default_id.value,
+            ctypes.byref(addr_running),
+            0, None,
+            ctypes.byref(size), ctypes.byref(running),
         )
         if err != 0:
             _warn_mic_active_once(
-                "AudioObjectGetPropertyData(is-running) returned err=%d", err
+                "AudioObjectGetPropertyData(is-running) returned err=%d", err,
             )
             return False
-        return bool(running_ptr[0])
+        return bool(running.value)
     except Exception as exc:
         _warn_mic_active_once(
             "is_mic_active CoreAudio call raised: %s",

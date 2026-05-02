@@ -15,11 +15,17 @@ log = logging.getLogger(__name__)
 
 
 class UploadClient(Protocol):
-    async def upload(self, record: ConversationRecord) -> str | None: ...
+    async def upload(self, record: ConversationRecord) -> dict | None:
+        """Upload one record. Return the server's response body as a dict
+        (at minimum ``{"capture_id": ...}``; may also include
+        ``title``/``summary``/``relevant_span`` for the agent to overwrite
+        the local placeholder with), or ``None`` when no response body is
+        available (e.g. the no-op client). Raise on failure."""
+        ...
 
 
 class NoopUploadClient:
-    async def upload(self, record: ConversationRecord) -> str | None:
+    async def upload(self, record: ConversationRecord) -> dict | None:
         log.info("[upload] (noop) record id=%s", record.id)
         return None
 
@@ -29,7 +35,9 @@ class AuthenticatedUploadClient:
 
     Raises on any failure — the caller (UploadRetryManager) classifies the
     exception, updates record state, and decides whether to retry. Returns
-    the server-assigned capture_id on success.
+    the parsed JSON response body on success — at minimum a ``capture_id``,
+    optionally also server-generated ``title``/``summary``/``relevant_span``
+    that the retry manager will use to overwrite the local placeholder.
     """
 
     def __init__(self, auth_client, captures_dir: Path) -> None:
@@ -37,7 +45,7 @@ class AuthenticatedUploadClient:
         self._client: AuthenticatedClient = auth_client
         self._captures_dir = captures_dir
 
-    async def upload(self, record: ConversationRecord) -> str | None:
+    async def upload(self, record: ConversationRecord) -> dict | None:
         audio_path = self._captures_dir / record.id / record.audio_path
         if not audio_path.exists():
             raise FileNotFoundError(f"audio file not found: {audio_path}")
@@ -51,7 +59,14 @@ class AuthenticatedUploadClient:
                 timeout=httpx.Timeout(60.0),
             )
         resp.raise_for_status()
-        body = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
-        capture_id = body.get("capture_id") if isinstance(body, dict) else None
+        body: dict | None = None
+        if resp.headers.get("content-type", "").startswith("application/json"):
+            try:
+                parsed = resp.json()
+            except Exception:
+                parsed = None
+            if isinstance(parsed, dict):
+                body = parsed
+        capture_id = body.get("capture_id") if body else None
         log.info("[upload] success id=%s server_id=%s", record.id, capture_id or "?")
-        return capture_id
+        return body
