@@ -46,6 +46,7 @@ export type NotificationFlags = {
   welcome: boolean;
   post_arm: boolean;
   capture_saved: boolean;
+  daily_drill: boolean;
 };
 
 export type NotificationKey = keyof NotificationFlags;

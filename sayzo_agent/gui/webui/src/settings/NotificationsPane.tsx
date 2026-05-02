@@ -15,6 +15,7 @@ const SUB_TOGGLES: readonly SubToggle[] = [
   { key: "welcome", label: "Show the welcome message on first launch" },
   { key: "post_arm", label: "Show “Sayzo is capturing” reminders after I arm" },
   { key: "capture_saved", label: "Show “Conversation saved” when a capture finishes" },
+  { key: "daily_drill", label: "Send me a daily 60-second drill notification" },
 ];
 
 export function NotificationsPane() {
@@ -33,6 +34,7 @@ export function NotificationsPane() {
             welcome: false,
             post_arm: false,
             capture_saved: false,
+            daily_drill: false,
           });
         }
       }

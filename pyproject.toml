@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sayzo-agent"
-version = "2.2.1"
+version = "2.3.0"
 description = "Armed-only capture agent for Sayzo — records meetings on user consent (hotkey or whitelisted meeting app) and feeds them to downstream English-coaching analysis."
 requires-python = ">=3.10"
 dependencies = [
@@ -51,6 +51,9 @@ dependencies = [
     # macOS: mic-active query via CoreAudio, frontmost app via NSWorkspace.
     "pyobjc-framework-Cocoa>=10.0; sys_platform == 'darwin'",
     "pyobjc-framework-CoreAudio>=10.0; sys_platform == 'darwin'",
+    # macOS: idle-time query via Quartz CGEventSourceSecondsSinceLastEventType.
+    # Used by sayzo_agent/idle.py for the daily-drill scheduler's idle gate.
+    "pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'",
 ]
 
 [project.optional-dependencies]

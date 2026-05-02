@@ -507,6 +507,73 @@ class UploadConfig(BaseSettings):
     pause_state_filename: str = ".upload_state.json"
 
 
+class NotificationConfig(BaseSettings):
+    """Daily-drill notification scheduler config.
+
+    Controls a per-workday notification that opens that day's pre-generated
+    60-second speaking drill in the user's default browser. Timing is learned
+    per-user via a (day_of_week, hour) acceptance-rate bucket model with
+    Thompson-sampled hour selection.
+
+    Master ``Config.notifications_enabled`` still wins — when False, the
+    daily-drill scheduler doesn't even tick.
+    """
+
+    # Master sub-toggle. Default ON for signed-in users (the scheduler also
+    # gates on TokenStore.has_tokens(), so an unauthenticated user is silent
+    # regardless). Toggle in Settings → Notifications.
+    daily_drill_enabled: bool = True
+
+    # User must be idle (no kbd/mouse) at least this long before we fire,
+    # to avoid interrupting an active meeting or a user mid-rush.
+    min_idle_secs: float = 180.0
+
+    # Cold-start hour (no engagement history yet). 11am local — outside
+    # morning rush, before lunch, after standups.
+    cold_start_hour: int = 11
+
+    # Workday window (local time, 24-hour). max_hour exclusive.
+    min_hour: int = 9
+    lunch_start_hour: int = 12
+    lunch_end_hour: int = 13     # exclusive — lunch covers 12 only
+    max_hour: int = 17           # exclusive — last firing hour is 16
+
+    # At/after this hour, if we never fired today, surface the EOD tray
+    # fallback instead of firing late-evening "make-up" notifications.
+    eod_fallback_hour: int = 17
+
+    # Window for distinguishing tap (engaged) from soft_tap (late tap).
+    # No-tap after dismiss_window_secs records as "expire". A late tap
+    # within soft_tap_window_secs still counts as soft engagement.
+    dismiss_window_secs: float = 300.0       # 5 min
+    soft_tap_window_secs: float = 14400.0    # 4 h
+
+    # Bucket scoring: smoothed_score =
+    #   (taps*1.0 + soft_taps*0.3 + expires*0.0) * decay / (fires + alpha)
+    # alpha=3 smooths a single bad fire so it can't permanently kill a slot.
+    prior_alpha: float = 3.0
+
+    # Per-bucket recency decay applied at read time:
+    # decay = recency_decay ** days_since_bucket_last_fired_at.
+    recency_decay: float = 0.95
+
+    # Hours where smoothed_score < this AND fires >= 3 are excluded from
+    # the candidate set. Single bad day shouldn't disqualify a slot.
+    # Score range is [0, 1] in the dismiss-collapsed outcome model
+    # (taps weight +1, soft_taps +0.3, expires 0); 0.05 ≈ 5% engagement
+    # rate after smoothing. Thompson sampling does most exploration work
+    # — this is a hard floor for "obviously dead" slots only.
+    bad_score_threshold: float = 0.05
+
+    # Maximum history-log entries kept on disk. Older entries roll into
+    # bucket aggregates (no signal lost) but lose their per-event timeline.
+    max_history: int = 200
+
+    # Scheduler tick cadence. Each tick re-evaluates all gates; firing
+    # happens once per workday max.
+    tick_secs: float = 60.0
+
+
 class Config(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="SAYZO_",
@@ -542,6 +609,7 @@ class Config(BaseSettings):
     arm: ArmConfig = Field(default_factory=ArmConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)
     upload: UploadConfig = Field(default_factory=UploadConfig)
+    notifications: NotificationConfig = Field(default_factory=NotificationConfig)
 
     @property
     def models_dir(self) -> Path:
@@ -562,6 +630,10 @@ class Config(BaseSettings):
     @property
     def pid_path(self) -> Path:
         return self.data_dir / "agent.pid"
+
+    @property
+    def notification_stats_path(self) -> Path:
+        return self.data_dir / "notification-stats.json"
 
     def ensure_dirs(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -616,6 +688,21 @@ def load_config() -> Config:
         user_arm = {k: v for k, v in user["arm"].items() if k.lower() not in env_arm_keys}
         if user_arm:
             init_kwargs["arm"] = {**probe.arm.model_dump(), **user_arm}
+
+    if isinstance(user.get("notifications"), dict):
+        env_notif_keys = {
+            k[len("SAYZO_NOTIFICATIONS__"):].lower()
+            for k in os.environ
+            if k.upper().startswith("SAYZO_NOTIFICATIONS__")
+        }
+        user_notif = {
+            k: v for k, v in user["notifications"].items()
+            if k.lower() not in env_notif_keys
+        }
+        if user_notif:
+            init_kwargs["notifications"] = {
+                **probe.notifications.model_dump(), **user_notif
+            }
 
     cfg = Config(**init_kwargs) if init_kwargs else probe
     cfg.ensure_dirs()

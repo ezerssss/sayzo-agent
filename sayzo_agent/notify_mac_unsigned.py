@@ -47,12 +47,23 @@ import logging
 import sys
 import threading
 import uuid
-from typing import Any, Literal, Optional
+from typing import Any, Callable, Literal, Optional
 
 log = logging.getLogger(__name__)
 
 
 ConsentResult = Literal["yes", "no", "timeout"]
+
+
+# NSUserNotification activation type constants (NSUserNotificationActivationType
+# enum from <Foundation/NSUserNotification.h>). We don't pull these from
+# pyobjc at module load because the import would fail on non-mac CI; the
+# coroutine that needs them imports inside its try-block.
+_NSUNOT_ACTIVATION_NONE = 0
+_NSUNOT_ACTIVATION_CONTENTS_CLICKED = 1
+_NSUNOT_ACTIVATION_ACTION_BUTTON_CLICKED = 2
+_NSUNOT_ACTIVATION_REPLIED = 3
+_NSUNOT_ACTIVATION_ADDITIONAL_ACTION_CLICKED = 4
 
 
 # Mirror the wait budget in ``notify.py`` so identical "this hung"
@@ -83,6 +94,13 @@ class MacUnsignedNotifier:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._loop_ready = threading.Event()
         self._bundle_info: dict[str, Any] = {}
+
+        # actionable-toast click dispatch: keyed by NSUserNotification
+        # identifier. Kept as a dict so the delegate (which receives the
+        # raw NSUserNotification on click) can route back to Python.
+        # Strong reference to the delegate prevents pyobjc-default GC.
+        self._action_callbacks: dict[str, Callable[[], None]] = {}
+        self._delegate_ref: Any = None
 
         log.info(
             "[notify-mac-legacy] init: app_name=%r platform=darwin frozen=%s "
@@ -137,6 +155,18 @@ class MacUnsignedNotifier:
                 "[notify-mac-legacy] bundle introspection failed", exc_info=True
             )
 
+        # Install the NSUserNotificationCenterDelegate once. The delegate
+        # routes activation events (button click, content click) back to
+        # the per-notification callbacks registered via notify_actionable.
+        try:
+            self._install_delegate()
+        except Exception:
+            log.warning(
+                "[notify-mac-legacy] failed to install NSUserNotificationCenter "
+                "delegate; actionable toasts will not round-trip clicks",
+                exc_info=True,
+            )
+
         self._loop_ready.set()
         try:
             loop.run_forever()
@@ -145,6 +175,76 @@ class MacUnsignedNotifier:
                 loop.close()
             except Exception:
                 pass
+
+    def _install_delegate(self) -> None:
+        """Set ourselves as the NSUserNotificationCenter delegate.
+
+        The delegate's ``userNotificationCenter:didActivateNotification:``
+        method fires when the user clicks the toast body, the action
+        button, or the close button. We dispatch on ``activationType``
+        to the registered ``on_pressed`` for that notification's
+        identifier. pyobjc subclasses ``NSObject`` declaratively here.
+        """
+        from Foundation import (  # type: ignore[import-not-found]
+            NSObject,
+            NSUserNotificationCenter,
+        )
+        import objc  # type: ignore[import-not-found]
+
+        notifier = self  # captured for closure use inside the ObjC class
+
+        class _SayzoNotifyDelegate(NSObject):
+            # pyobjc selector signature: voidv@:@@ (void method taking two
+            # object args). Method names follow Cocoa's naming convention.
+            def userNotificationCenter_didActivateNotification_(
+                self_, center, notification
+            ):
+                try:
+                    activation = int(notification.activationType())
+                except Exception:
+                    activation = _NSUNOT_ACTIVATION_NONE
+                ident = None
+                try:
+                    ident = str(notification.identifier())
+                except Exception:
+                    pass
+                log.info(
+                    "[notify-mac-legacy] delegate activation: id=%s type=%d",
+                    ident,
+                    activation,
+                )
+                if activation not in (
+                    _NSUNOT_ACTIVATION_ACTION_BUTTON_CLICKED,
+                    _NSUNOT_ACTIVATION_CONTENTS_CLICKED,
+                ):
+                    return
+                if not ident:
+                    return
+                cb = notifier._action_callbacks.pop(ident, None)
+                if cb is None:
+                    return
+                try:
+                    cb()
+                except Exception:
+                    log.warning(
+                        "[notify-mac-legacy] delegate callback raised: id=%s",
+                        ident,
+                        exc_info=True,
+                    )
+
+            # Always present even when the OS thinks the user has disabled
+            # us (e.g., banner style = none) — without this, clicks from
+            # Notification Center don't always route back to us.
+            def userNotificationCenter_shouldPresentNotification_(
+                self_, center, notification
+            ):
+                return True
+
+        delegate = _SayzoNotifyDelegate.alloc().init()
+        self._delegate_ref = delegate  # strong ref — pyobjc weak-refs by default
+        center = NSUserNotificationCenter.defaultUserNotificationCenter()
+        center.setDelegate_(delegate)
+        log.info("[notify-mac-legacy] NSUserNotificationCenter delegate installed")
 
     # ------------------------------------------------------------------
     # Public API
@@ -222,6 +322,61 @@ class MacUnsignedNotifier:
             )
             return default_on_timeout
 
+    def notify_actionable(
+        self,
+        title: str,
+        body: str,
+        *,
+        button_label: str,
+        on_pressed: Callable[[], None],
+        expire_after_secs: float,
+        on_expire: Optional[Callable[[], None]] = None,
+    ) -> bool:
+        """Fire-and-forget actionable toast with a single action button.
+
+        On NSUserNotification the action button is the right-hand button;
+        clicking the toast body also activates (we treat both as engagement).
+        See ``_install_delegate`` for the activation-type dispatch.
+
+        Returns ``True`` if dispatched. ``on_pressed`` and ``on_expire``
+        are mutually exclusive: a single-fire latch means whichever
+        happens first wins. Both callbacks run on the notifier loop.
+        """
+        if self._init_failed or self._loop is None:
+            log.warning(
+                "[notify-mac-legacy] notify_actionable dropped (backend "
+                "unavailable): title=%r",
+                title,
+            )
+            return False
+        log.info(
+            "[notify-mac-legacy] actionable scheduled: title=%r button=%r "
+            "expire_after=%ss",
+            title,
+            button_label,
+            expire_after_secs,
+        )
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._async_deliver_actionable(
+                    title, body, button_label, on_pressed, expire_after_secs, on_expire,
+                ),
+                self._loop,
+            )
+            return True
+        except Exception:
+            log.warning(
+                "[notify-mac-legacy] actionable schedule failed", exc_info=True
+            )
+            return False
+
+    def has_authorisation_sync(self) -> Optional[bool]:
+        """NSUserNotification has no auth concept — always True if the
+        backend booted at all."""
+        if self._init_failed or self._loop is None:
+            return None
+        return True
+
     def diagnose(self) -> dict[str, Any]:
         """Mirror ``DesktopNotifier.diagnose`` so the CLI report shape is
         identical regardless of which backend is selected."""
@@ -286,12 +441,87 @@ class MacUnsignedNotifier:
     # Loop-local coroutines
     # ------------------------------------------------------------------
 
+    async def _async_deliver_actionable(
+        self,
+        title: str,
+        body: str,
+        button_label: str,
+        on_pressed: Callable[[], None],
+        expire_after_secs: float,
+        on_expire: Optional[Callable[[], None]],
+    ) -> None:
+        """Loop-local: deliver the toast + register click + watchdog."""
+        loop = asyncio.get_running_loop()
+        latch = {"fired": False}
+        timer_handle: dict[str, Any] = {"h": None}
+
+        def _fire_pressed() -> None:
+            if latch["fired"]:
+                return
+            latch["fired"] = True
+            log.info("[notify-mac-legacy] actionable pressed: title=%r", title)
+            handle = timer_handle.get("h")
+            if handle is not None:
+                try:
+                    handle.cancel()
+                except Exception:
+                    pass
+            try:
+                on_pressed()
+            except Exception:
+                log.warning(
+                    "[notify-mac-legacy] actionable on_pressed raised",
+                    exc_info=True,
+                )
+
+        def _fire_expire() -> None:
+            if latch["fired"]:
+                return
+            latch["fired"] = True
+            log.info("[notify-mac-legacy] actionable expired: title=%r", title)
+            # Drop the entry from the dispatch table so a late click
+            # (Notification Center can hold the toast for hours) finds
+            # nothing to call.
+            self._action_callbacks.pop(_pending_ident["id"], None)
+            if on_expire is None:
+                return
+            try:
+                on_expire()
+            except Exception:
+                log.warning(
+                    "[notify-mac-legacy] actionable on_expire raised",
+                    exc_info=True,
+                )
+
+        # Register the dispatch entry BEFORE delivering so a fast click
+        # arriving before this coroutine resumes still finds the callback.
+        # The delegate hops back to the notifier loop via threadsafe
+        # scheduling so the latch + timer-cancel run consistently.
+        def _delegate_invoked() -> None:
+            try:
+                loop.call_soon_threadsafe(_fire_pressed)
+            except RuntimeError:
+                pass
+
+        ident = await self._async_deliver(
+            title, body, action_title=button_label, on_press=_delegate_invoked,
+        )
+        _pending_ident: dict[str, Optional[str]] = {"id": ident}
+        if ident is None:
+            # Delivery failed — fire the expire callback so the scheduler
+            # can record the outcome and move on.
+            _fire_expire()
+            return
+
+        timer_handle["h"] = loop.call_later(expire_after_secs, _fire_expire)
+
     async def _async_deliver(
         self,
         title: str,
         body: str,
         *,
         action_title: Optional[str],
+        on_press: Optional[Callable[[], None]] = None,
     ) -> Optional[str]:
         """Build + deliver an NSUserNotification. Returns its identifier
         on success or ``None`` on failure. Runs on the notifier loop;
@@ -324,6 +554,11 @@ class MacUnsignedNotifier:
                 # without offering a click target.
                 notif.setHasActionButton_(True)
                 notif.setActionButtonTitle_(action_title)
+                if on_press is not None:
+                    # Register click dispatch BEFORE delivery so a very
+                    # fast click can't arrive at the delegate before the
+                    # entry exists.
+                    self._action_callbacks[ident] = on_press
             else:
                 notif.setHasActionButton_(False)
 

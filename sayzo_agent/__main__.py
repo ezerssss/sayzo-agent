@@ -731,6 +731,53 @@ def diagnose_notifications() -> None:
     )
 
 
+@cli.command("test-drill-notification")
+def test_drill_notification() -> None:
+    """Fire today's daily-drill notification right now (bypassing gates).
+
+    Asks the running agent (over IPC) to call ``/api/sessions/today`` and
+    fire the actionable toast immediately. Use this to verify the round
+    trip — copy from ``scenarioTitle``, click → browser opens drill —
+    without waiting for the model's chosen hour or sustained idle.
+
+    The agent must already be running (``sayzo-agent service``). If it's
+    not, this prints an error and exits non-zero.
+    """
+    import json as _json
+
+    cfg = load_config()
+    from .gui.settings.ipc import IPCClient, IPCNotConnected, Methods
+
+    client = IPCClient(cfg.data_dir)
+    try:
+        result = client.call(Methods.TEST_DRILL_NOTIFICATION)
+    except IPCNotConnected:
+        click.echo(
+            "ERROR: Sayzo agent is not running. Start it first with "
+            "`sayzo-agent service` (or launch the app), then re-run.",
+            err=True,
+        )
+        sys.exit(1)
+    except Exception as exc:
+        click.echo(f"ERROR: IPC call failed: {exc!r}", err=True)
+        sys.exit(2)
+
+    click.echo(_json.dumps(result, indent=2))
+    if not isinstance(result, dict) or not result.get("ok"):
+        click.echo(
+            "\nThe agent could not fire the test notification. Check "
+            "agent.log under ~/.sayzo/agent/logs/ for the [daily_drill] "
+            "and [notify] lines from the last few seconds.",
+            err=True,
+        )
+        sys.exit(3)
+    click.echo(
+        "\nFire scheduled. Watch for the notification — clicking it should "
+        "open today's drill in your browser. Status is logged under "
+        "[daily_drill] in agent.log.",
+    )
+
+
 @cli.command("first-run")
 @click.pass_context
 def first_run(ctx: click.Context) -> None:
@@ -1111,7 +1158,63 @@ def service(force_setup: bool) -> None:
         tray_state.settings_event.set()
 
     notifier = make_notifier(app_name=APP_AUMID) if cfg.notifications_enabled else NoopNotifier()
-    agent = Agent(cfg, upload_client=upload_client, notifier=notifier, auth_client=auth_client)
+
+    # Daily-drill scheduler — per-workday notification opening that day's
+    # 60-second drill in the user's default browser. Constructed only when
+    # both master notifications + the daily-drill sub-toggle are on. The
+    # scheduler does its own auth gating (TokenStore.has_tokens) on every
+    # tick, so it's safe to construct pre-login.
+    daily_drill = None
+    if cfg.notifications_enabled and cfg.notifications.daily_drill_enabled:
+        try:
+            from .daily_drill import DailyDrillScheduler
+
+            def _auth_client_factory():
+                if not store.has_tokens() or not cfg.auth.effective_server_url:
+                    return None
+                return auth_client
+
+            def _is_mic_active_fn() -> bool:
+                # Cheap platform query reusing the arm subsystem's primitives.
+                # Wrapped here because agent.arm doesn't exist at scheduler
+                # construction time — this lambda runs per tick.
+                try:
+                    if sys.platform == "win32":
+                        from .arm.platform_win import get_mic_holders
+                        return bool(get_mic_holders())
+                    if sys.platform == "darwin":
+                        from .arm.platform_mac import is_mic_active
+                        return bool(is_mic_active())
+                except Exception:
+                    log.debug(
+                        "[daily_drill] is_mic_active probe raised", exc_info=True
+                    )
+                return False
+
+            daily_drill = DailyDrillScheduler(
+                cfg=cfg.notifications,
+                master_notifications_enabled=cfg.notifications_enabled,
+                stats_path=cfg.notification_stats_path,
+                notifier=notifier,
+                token_store=store,
+                auth_client_factory=_auth_client_factory,
+                arm_state_fn=lambda: agent.arm.state,
+                is_mic_active_fn=_is_mic_active_fn,
+                tray_state=tray_state,
+            )
+        except Exception:
+            log.warning(
+                "daily-drill scheduler construction failed (non-fatal)",
+                exc_info=True,
+            )
+
+    agent = Agent(
+        cfg,
+        upload_client=upload_client,
+        notifier=notifier,
+        auth_client=auth_client,
+        daily_drill_scheduler=daily_drill,
+    )
 
     async def _main() -> None:
         loop = asyncio.get_running_loop()
@@ -1229,6 +1332,45 @@ def service(force_setup: bool) -> None:
             tray_state.settings_event.set()
             return {"ok": True}
 
+        def _ipc_reload_notification_config() -> dict:
+            try:
+                fresh = load_config()
+            except Exception:
+                log.warning(
+                    "[ipc] reload_notification_config: load_config failed",
+                    exc_info=True,
+                )
+                return {"reloaded": False}
+            if agent.daily_drill is not None:
+                try:
+                    agent.daily_drill.reload_config(
+                        fresh.notifications, fresh.notifications_enabled
+                    )
+                except Exception:
+                    log.warning(
+                        "[ipc] reload_notification_config: scheduler reload raised",
+                        exc_info=True,
+                    )
+            return {"reloaded": True}
+
+        def _ipc_test_drill_notification() -> dict:
+            if agent.daily_drill is None:
+                return {"ok": False, "reason": "daily_drill_not_constructed"}
+            # The scheduler runs on the agent's asyncio loop; schedule the
+            # fire_now coroutine onto that loop and return immediately so
+            # the IPC client doesn't time out waiting for HTTP + dispatch.
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    agent.daily_drill.fire_now(ignore_gates=True), loop,
+                )
+            except Exception:
+                log.warning(
+                    "[ipc] test_drill_notification: schedule failed",
+                    exc_info=True,
+                )
+                return {"ok": False, "reason": "schedule_failed"}
+            return {"ok": True}
+
         ipc_server.register(Methods.INVALIDATE_TOKEN_CACHE, _ipc_invalidate_token_cache)
         ipc_server.register(Methods.REBIND_HOTKEY, _ipc_rebind_hotkey)
         ipc_server.register(Methods.SNAPSHOT_MIC_STATE, _ipc_snapshot_mic_state)
@@ -1239,6 +1381,12 @@ def service(force_setup: bool) -> None:
         )
         ipc_server.register(Methods.NUDGE_UPLOAD_RETRY, _ipc_nudge_upload_retry)
         ipc_server.register(Methods.OPEN_SETTINGS, _ipc_open_settings)
+        ipc_server.register(
+            Methods.RELOAD_NOTIFICATION_CONFIG, _ipc_reload_notification_config
+        )
+        ipc_server.register(
+            Methods.TEST_DRILL_NOTIFICATION, _ipc_test_drill_notification
+        )
 
         try:
             await ipc_server.start()
@@ -1429,6 +1577,28 @@ def service(force_setup: bool) -> None:
                 if tray_state.settings_event.is_set():
                     tray_state.settings_event.clear()
                     asyncio.create_task(settings_launcher.show())
+                # Daily-drill EOD tray click — opens today's drill in the
+                # browser via the scheduler (which records a soft_tap and
+                # clears the tray label). Silently no-op if the scheduler
+                # wasn't constructed (notifications disabled at boot).
+                if tray_state.eod_drill_event.is_set():
+                    tray_state.eod_drill_event.clear()
+                    if agent.daily_drill is not None:
+                        try:
+                            agent.daily_drill.on_eod_tray_click()
+                            tray.update()
+                        except Exception:
+                            log.warning(
+                                "[daily_drill] EOD tray click handler raised",
+                                exc_info=True,
+                            )
+                # Daily-drill manual test trigger (Debug submenu).
+                if tray_state.test_drill_event.is_set():
+                    tray_state.test_drill_event.clear()
+                    if agent.daily_drill is not None:
+                        asyncio.create_task(
+                            agent.daily_drill.fire_now(ignore_gates=True)
+                        )
                 # Belt-and-braces poll sync in case the callback ever fails
                 # to fire (e.g. state changed before the callback was wired).
                 _sync_arm_state_to_tray()

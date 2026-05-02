@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import threading
 import time
 import types
 
@@ -168,3 +169,131 @@ def test_ask_consent_timeout(monkeypatch):
         "Hmm?", "body", "Yes", "No", timeout_secs=0.2, default_on_timeout="no"
     )
     assert result == "timeout"
+
+
+def test_noop_notifier_actionable_returns_false_and_calls_expire():
+    """Test paths can drive the expire branch via NoopNotifier."""
+    expired: list[bool] = []
+    pressed: list[bool] = []
+    result = NoopNotifier().notify_actionable(
+        "t", "b",
+        button_label="Open",
+        on_pressed=lambda: pressed.append(True),
+        expire_after_secs=1.0,
+        on_expire=lambda: expired.append(True),
+    )
+    assert result is False
+    assert expired == [True]
+    assert pressed == []
+
+
+def test_noop_notifier_has_authorisation_returns_none():
+    assert NoopNotifier().has_authorisation_sync() is None
+
+
+def test_actionable_press_invokes_on_pressed(monkeypatch):
+    """Clicking the button fires on_pressed and cancels the expire timer."""
+
+    class _Async:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def send(self, *, title, message, buttons=None, **kw):
+            await asyncio.sleep(0)
+            if buttons:
+                buttons[0].on_pressed()
+
+    _install_fake_backend(monkeypatch, _Async)
+    n = DesktopNotifier(app_name="Test")
+
+    pressed = threading.Event()
+    expired = threading.Event()
+    dispatched = n.notify_actionable(
+        "Daily drill",
+        "Body",
+        button_label="Open drill",
+        on_pressed=lambda: pressed.set(),
+        expire_after_secs=2.0,
+        on_expire=lambda: expired.set(),
+    )
+    assert dispatched is True
+    assert pressed.wait(timeout=1.0)
+    # Allow the timer a moment to fire — it shouldn't because the latch
+    # snapped on the press path first.
+    time.sleep(0.3)
+    assert not expired.is_set()
+
+
+def test_actionable_expire_fires_when_no_press(monkeypatch):
+    """No press within expire_after_secs → on_expire fires exactly once."""
+
+    class _Async:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def send(self, *, title, message, buttons=None, **kw):
+            pass  # never invoke on_pressed
+
+    _install_fake_backend(monkeypatch, _Async)
+    n = DesktopNotifier(app_name="Test")
+
+    pressed_calls: list[bool] = []
+    expired = threading.Event()
+    n.notify_actionable(
+        "Daily drill",
+        "Body",
+        button_label="Open drill",
+        on_pressed=lambda: pressed_calls.append(True),
+        expire_after_secs=0.2,
+        on_expire=lambda: expired.set(),
+    )
+    assert expired.wait(timeout=1.5)
+    assert pressed_calls == []
+
+
+def test_actionable_send_failure_fires_expire(monkeypatch):
+    """Backend send failure fires on_expire so the scheduler doesn't hang."""
+
+    class _Async:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def send(self, *, title, message, buttons=None, **kw):
+            raise RuntimeError("backend boom")
+
+    _install_fake_backend(monkeypatch, _Async)
+    n = DesktopNotifier(app_name="Test")
+
+    expired = threading.Event()
+    n.notify_actionable(
+        "Daily drill",
+        "Body",
+        button_label="Open drill",
+        on_pressed=lambda: None,
+        expire_after_secs=10.0,
+        on_expire=lambda: expired.set(),
+    )
+    assert expired.wait(timeout=1.0)
+
+
+def test_actionable_returns_false_when_backend_unavailable(monkeypatch):
+    class _Boom:
+        def __init__(self, *a, **kw):
+            raise RuntimeError("no backend")
+
+    _install_fake_backend(monkeypatch, _Boom)
+    n = DesktopNotifier(app_name="Test")
+    pressed: list[bool] = []
+    expired: list[bool] = []
+    result = n.notify_actionable(
+        "t", "b",
+        button_label="Open",
+        on_pressed=lambda: pressed.append(True),
+        expire_after_secs=0.1,
+        on_expire=lambda: expired.append(True),
+    )
+    # Backend unavailable returns False AND never fires either callback —
+    # the caller (scheduler) is responsible for the EOD fallback path.
+    assert result is False
+    assert pressed == []
+    assert expired == []

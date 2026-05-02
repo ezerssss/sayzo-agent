@@ -55,7 +55,7 @@ import logging
 import sys
 import threading
 from pathlib import Path
-from typing import Any, Literal, Optional, Protocol
+from typing import Any, Callable, Literal, Optional, Protocol
 
 log = logging.getLogger(__name__)
 
@@ -85,6 +85,19 @@ _SEND_TIMEOUT_SECS = 8.0
 class Notifier(Protocol):
     def notify(self, title: str, body: str) -> None: ...
 
+    def notify_actionable(
+        self,
+        title: str,
+        body: str,
+        *,
+        button_label: str,
+        on_pressed: Callable[[], None],
+        expire_after_secs: float,
+        on_expire: Optional[Callable[[], None]] = None,
+    ) -> bool: ...
+
+    def has_authorisation_sync(self) -> Optional[bool]: ...
+
 
 class NoopNotifier:
     def notify(self, title: str, body: str) -> None:
@@ -101,6 +114,30 @@ class NoopNotifier:
     ) -> ConsentResult:
         log.debug("[notify] (noop) consent %s — %s → %s", title, body, default_on_timeout)
         return default_on_timeout
+
+    def notify_actionable(
+        self,
+        title: str,
+        body: str,
+        *,
+        button_label: str,
+        on_pressed: Callable[[], None],
+        expire_after_secs: float,
+        on_expire: Optional[Callable[[], None]] = None,
+    ) -> bool:
+        log.debug(
+            "[notify] (noop) actionable %s — %s [%s]", title, body, button_label
+        )
+        # Test paths can drive the expire branch by registering on_expire.
+        if on_expire is not None:
+            try:
+                on_expire()
+            except Exception:
+                log.debug("[notify] (noop) on_expire raised", exc_info=True)
+        return False
+
+    def has_authorisation_sync(self) -> Optional[bool]:
+        return None
 
 
 def _logo_path() -> Path:
@@ -465,6 +502,71 @@ class DesktopNotifier:
             log.warning("[notify] ask_consent failed", exc_info=True)
             return default_on_timeout
 
+    def notify_actionable(
+        self,
+        title: str,
+        body: str,
+        *,
+        button_label: str,
+        on_pressed: Callable[[], None],
+        expire_after_secs: float,
+        on_expire: Optional[Callable[[], None]] = None,
+    ) -> bool:
+        """Fire-and-forget actionable toast with a single button.
+
+        Schedules onto the existing notifier loop. Both ``on_pressed``
+        (button click) and ``on_expire`` (no click within
+        ``expire_after_secs``) are guarded by a single-fire latch — one
+        will run, the other will not. Both callbacks execute on the
+        notifier's daemon-thread asyncio loop.
+
+        Returns ``True`` if the toast was dispatched, ``False`` if the
+        backend is unavailable (init failure, dummy backend). When False
+        is returned, neither callback fires — the caller must handle the
+        skip itself.
+        """
+        if self._init_failed or self._impl is None or self._loop is None:
+            log.warning(
+                "[notify] notify_actionable dropped (backend unavailable): title=%r",
+                title,
+            )
+            return False
+        log.info(
+            "[notify] actionable scheduled: title=%r button=%r expire_after=%ss",
+            title,
+            button_label,
+            expire_after_secs,
+        )
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._send_actionable(
+                    title, body, button_label, on_pressed, expire_after_secs, on_expire,
+                ),
+                self._loop,
+            )
+            return True
+        except Exception:
+            log.warning("[notify] actionable schedule failed", exc_info=True)
+            return False
+
+    def has_authorisation_sync(self) -> Optional[bool]:
+        """Sync surface over the async ``has_authorisation`` probe.
+
+        ``None`` means the backend can't tell us (dummy fallback, not
+        booted yet). The daily-drill scheduler treats ``False`` as
+        "OS-level notifications disabled" → one-time tray prompt.
+        """
+        if self._init_failed or self._impl is None or self._loop is None:
+            return None
+        try:
+            fut = asyncio.run_coroutine_threadsafe(
+                self._impl_has_authorisation(), self._loop
+            )
+            return fut.result(timeout=2.0)
+        except Exception:
+            log.debug("[notify] has_authorisation_sync failed", exc_info=True)
+            return None
+
     # ---- diagnostics -------------------------------------------------------
 
     def diagnose(self) -> dict[str, Any]:
@@ -639,6 +741,98 @@ class DesktopNotifier:
         except asyncio.TimeoutError:
             log.info("[notify] ask timed out (no click): title=%r", title)
             return "timeout"
+
+    async def _send_actionable(
+        self,
+        title: str,
+        body: str,
+        button_label: str,
+        on_pressed: Callable[[], None],
+        expire_after_secs: float,
+        on_expire: Optional[Callable[[], None]],
+    ) -> None:
+        """Loop-local: dispatch an actionable toast + watchdog."""
+        from desktop_notifier import Button
+
+        loop = asyncio.get_running_loop()
+        latch = {"fired": False}
+        # Hold a reference to the watchdog handle so the on_pressed callback
+        # can cancel it on click.
+        timer_handle: dict[str, Any] = {"h": None}
+
+        def _fire_pressed() -> None:
+            if latch["fired"]:
+                return
+            latch["fired"] = True
+            log.info("[notify] actionable pressed: title=%r", title)
+            handle = timer_handle.get("h")
+            if handle is not None:
+                try:
+                    handle.cancel()
+                except Exception:
+                    pass
+            try:
+                on_pressed()
+            except Exception:
+                log.warning(
+                    "[notify] actionable on_pressed raised: title=%r",
+                    title,
+                    exc_info=True,
+                )
+
+        def _fire_expire() -> None:
+            if latch["fired"]:
+                return
+            latch["fired"] = True
+            log.info("[notify] actionable expired: title=%r", title)
+            if on_expire is None:
+                return
+            try:
+                on_expire()
+            except Exception:
+                log.warning(
+                    "[notify] actionable on_expire raised: title=%r",
+                    title,
+                    exc_info=True,
+                )
+
+        # desktop-notifier dispatches on_pressed off-loop on macOS — same
+        # pattern as ask_consent. Hop back via call_soon_threadsafe so the
+        # latch + timer-cancel run on the loop thread.
+        def _on_button() -> None:
+            try:
+                loop.call_soon_threadsafe(_fire_pressed)
+            except RuntimeError:
+                pass
+
+        button = Button(title=button_label, on_pressed=_on_button)
+
+        log.info("[notify] actionable send begin: title=%r", title)
+        try:
+            assert self._impl is not None
+            identifier = await asyncio.wait_for(
+                self._impl.send(title=title, message=body, buttons=[button]),
+                timeout=_SEND_TIMEOUT_SECS,
+            )
+            log.info(
+                "[notify] actionable send done: title=%r id=%s", title, identifier
+            )
+        except asyncio.TimeoutError:
+            log.warning(
+                "[notify] actionable send timed out after %ss: title=%r",
+                _SEND_TIMEOUT_SECS,
+                title,
+            )
+            _fire_expire()
+            return
+        except Exception:
+            log.warning(
+                "[notify] actionable send failed: title=%r", title, exc_info=True
+            )
+            _fire_expire()
+            return
+
+        timer_handle["h"] = loop.call_later(expire_after_secs, _fire_expire)
 
 
 def _set_future_safely(

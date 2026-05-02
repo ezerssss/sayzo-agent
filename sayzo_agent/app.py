@@ -114,6 +114,7 @@ class Agent:
         sys_capture=None,
         notifier: Optional[Notifier] = None,
         auth_client=None,
+        daily_drill_scheduler=None,
     ) -> None:
         self.cfg = config
         self.mic = mic_capture or MicCapture(
@@ -190,6 +191,12 @@ class Agent:
             notifier=self.notifier,
             data_dir=self.cfg.data_dir,
         )
+
+        # Optional daily-drill scheduler. Constructed by the service entry
+        # point (__main__.service) only when the user is signed-in and the
+        # feature is enabled in config. The agent itself just owns the
+        # start/stop lifecycle hook.
+        self.daily_drill = daily_drill_scheduler
 
     # ---- pipeline ----------------------------------------------------------
 
@@ -762,6 +769,17 @@ class Agent:
         # until the user arms via hotkey or accepts a consent toast.
         await self.arm.start()
 
+        # Daily-drill notification scheduler — independent of capture path.
+        # Ticks on its own schedule, fires at most one toast per workday.
+        if self.daily_drill is not None:
+            try:
+                await self.daily_drill.start()
+            except Exception:
+                log.warning(
+                    "[agent] daily-drill scheduler failed to start (non-fatal)",
+                    exc_info=True,
+                )
+
         # First-launch welcome toast — fires once per install, flagged by
         # data_dir/welcomed.json so reopening the agent doesn't re-surface
         # the message.
@@ -786,6 +804,15 @@ class Agent:
         finally:
             for t in consumers:
                 t.cancel()
+            # Stop the daily-drill scheduler before the arm controller so
+            # any in-flight fetch_today_session is cancelled cleanly.
+            if self.daily_drill is not None:
+                try:
+                    await self.daily_drill.stop()
+                except Exception:
+                    log.debug(
+                        "[agent] daily-drill stop raised", exc_info=True
+                    )
             # Stop the arm controller — force-closes any open session,
             # stops streams, unregisters hotkey, cancels background watchers.
             await self.arm.stop()

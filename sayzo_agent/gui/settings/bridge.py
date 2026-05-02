@@ -104,6 +104,14 @@ _NOTIFICATION_KEYS: dict[str, dict] = {
         "store_patch": lambda v: {"notify_capture_saved": v},
         "cfg_attr": ("notify_capture_saved",),
     },
+    # Daily-drill scheduler sub-toggle. Persists to user_settings.json
+    # under "notifications.daily_drill_enabled"; the live agent is
+    # nudged to reload via Methods.RELOAD_NOTIFICATION_CONFIG so the
+    # change takes effect on the next scheduler tick.
+    "daily_drill": {
+        "store_patch": lambda v: {"notifications": {"daily_drill_enabled": v}},
+        "cfg_attr": ("notifications", "daily_drill_enabled"),
+    },
 }
 
 
@@ -405,21 +413,24 @@ class Bridge:
     # ------------------------------------------------------------------
 
     def get_notifications(self) -> dict[str, bool]:
-        """Read the four notification flags from the live ``Config`` overlay."""
+        """Read all notification flags from the live ``Config`` overlay."""
         return {
             "master": bool(self._cfg.notifications_enabled),
             "welcome": bool(self._cfg.notify_welcome),
             "post_arm": bool(self._cfg.arm.notify_post_arm),
             "capture_saved": bool(self._cfg.notify_capture_saved),
+            "daily_drill": bool(self._cfg.notifications.daily_drill_enabled),
         }
 
     def set_notification(self, key: str, value: bool) -> dict[str, Any]:
         """Persist a single notification flag.
 
         Mutates ``self._cfg`` so subsequent reads in this subprocess are
-        consistent and writes the change to ``user_settings.json``. The
-        running agent process keeps its in-memory ``Config`` until restart;
-        Phase 3's IPC layer will let us nudge it to reload sooner.
+        consistent and writes the change to ``user_settings.json``. After
+        a successful write, nudges the live agent (best-effort) to reload
+        the relevant subsystem — daily_drill goes through
+        ``RELOAD_NOTIFICATION_CONFIG`` so the scheduler picks the change
+        up on its next tick.
         """
         spec = _NOTIFICATION_KEYS.get(key)
         if spec is None:
@@ -442,6 +453,20 @@ class Bridge:
                 "[settings.bridge] persist notification %s failed", key, exc_info=True,
             )
             return {"saved": False, "error": "couldn't write user_settings.json"}
+
+        # Nudge the live agent so the change applies without a restart.
+        # Daily-drill toggle hits its own scheduler reload path; the
+        # master / welcome / capture_saved / post_arm toggles read
+        # straight from cfg on each event so they don't need a nudge.
+        if key in ("daily_drill", "master"):
+            try:
+                self._ipc.call_quiet(Methods.RELOAD_NOTIFICATION_CONFIG)
+            except Exception:
+                log.debug(
+                    "[settings.bridge] reload_notification_config nudge failed",
+                    exc_info=True,
+                )
+
         return {"saved": True}
 
     # ------------------------------------------------------------------
