@@ -2,7 +2,6 @@ import { useEffect, useState } from "react";
 import { bridge, SetupStatus, ConfigSnapshot } from "./lib/bridge";
 import { subscribe, SayzoEvent } from "./lib/events";
 import { Welcome } from "./screens/Welcome";
-import { Download } from "./screens/Download";
 import { Microphone } from "./screens/Microphone";
 import { AudioCapture } from "./screens/AudioCapture";
 import { Accessibility } from "./screens/Accessibility";
@@ -11,22 +10,20 @@ import { Shortcut } from "./screens/Shortcut";
 import { Done } from "./screens/Done";
 import { Alert } from "./components/ui/Alert";
 
-// Linear per-platform screen sequence. The first two (welcome, download)
-// are skippable if the user already signed in / already has the model —
-// e.g. when the install was cancelled mid-flow and re-opened. Everything
-// after that is a straight walk to the Done screen.
+// Linear per-platform screen sequence. The first screen (welcome) is
+// skippable if the user is already signed in. Everything after is a
+// straight walk to the Done screen.
 //
-// macOS (8): welcome → download → microphone → audio-capture →
-//            accessibility → notifications → shortcut → done
+// macOS (7): welcome → microphone → audio-capture → accessibility →
+//            notifications → shortcut → done
 //   (Accessibility doubles as the gate for the global hotkey AND the
 //   AX-based web meeting detector — there's no separate Automation
 //   screen, since reading browser tab URLs would force the scary
 //   "Sayzo wants to control your browser" TCC dialog.)
-// Windows (5): welcome → download → notifications → shortcut → done
+// Windows (4): welcome → notifications → shortcut → done
 type Screen =
   | "loading"
   | "welcome"
-  | "download"
   | "microphone"
   | "audio-capture"
   | "accessibility"
@@ -38,7 +35,6 @@ function sequenceFor(platform: string): Screen[] {
   if (platform === "darwin") {
     return [
       "welcome",
-      "download",
       "microphone",
       "audio-capture",
       "accessibility",
@@ -47,7 +43,7 @@ function sequenceFor(platform: string): Screen[] {
       "done",
     ];
   }
-  return ["welcome", "download", "notifications", "shortcut", "done"];
+  return ["welcome", "notifications", "shortcut", "done"];
 }
 
 function initialScreen(
@@ -55,7 +51,6 @@ function initialScreen(
   sequence: Screen[],
 ): Screen {
   if (!status.has_token) return "welcome";
-  if (!status.has_model) return "download";
   // One-shot resume after Restart-Sayzo from the Accessibility screen.
   // The backend writes a marker before exit and clears it on this read,
   // so we only honor it when the target screen is actually in this
@@ -68,9 +63,9 @@ function initialScreen(
     return "accessibility";
   }
   // Already-complete flow won't reach here (detect_setup + .setup-seen gates
-  // the window entirely), but guard anyway: jump to the first screen after
-  // download so the user can still walk through permissions.
-  return sequence[2] ?? "done";
+  // the window entirely), but guard anyway: jump to the first post-welcome
+  // screen so the user can still walk through permissions.
+  return sequence[1] ?? "done";
 }
 
 function stepLabel(screen: Screen, sequence: Screen[]): string | undefined {
@@ -121,17 +116,11 @@ export function App() {
       if (evt.type === "login_done" && config) {
         const s = await bridge.getStatus();
         setStatus(s);
-        // After login we want the user to see the download screen next,
-        // not a jump to permissions.
-        setScreen("download");
-      } else if (evt.type === "download_done" && config) {
-        const s = await bridge.getStatus();
-        setStatus(s);
-        // After download, advance to the first post-download screen in
-        // this platform's sequence.
+        // After login, advance to the first post-welcome screen in this
+        // platform's sequence.
         const seq = sequenceFor(config.platform);
-        const postDownload = seq[2] ?? "done";
-        setScreen(postDownload);
+        const postWelcome = seq[1] ?? "done";
+        setScreen(postWelcome);
       }
     });
   }, [config]);
@@ -183,14 +172,14 @@ export function App() {
             // no-op safety hook in case events get lost.
             void bridge.getStatus().then((s) => {
               setStatus(s);
-              setScreen("download");
+              const seq = sequenceFor(config.platform);
+              const postWelcome = seq[1] ?? "done";
+              setScreen(postWelcome);
             });
           }}
           onCancel={handleCancel}
         />
       );
-    case "download":
-      return <Download onDone={() => advance()} />;
     case "microphone":
       return (
         <Microphone

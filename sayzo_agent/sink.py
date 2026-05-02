@@ -22,7 +22,6 @@ DROPPED_REASON_LABELS: dict[str, str] = {
     "gate_failed": "Skipped — not enough conversation",
     "non_english": "Skipped — wasn't English",
     "empty_transcript": "Skipped — nothing was transcribed",
-    "llm_rejected": "Sayzo decided not to keep this",
 }
 
 # Most-recent N dropped stubs to keep on disk. Older are pruned at write time
@@ -146,12 +145,10 @@ class CaptureSink:
         rec_dir = self.captures_dir / rec_id
         rec_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save the FULL session audio and transcript. We deliberately do NOT
-        # crop to `relevant_span` here — small local LLMs routinely
-        # under-estimate how much context a conversation needs, and once
-        # cropped from the on-disk file that audio is gone forever. Keep
-        # everything, store the LLM's span as metadata, let downstream
-        # analysis decide whether to trust it.
+        # Save the FULL session audio and transcript. ``relevant_span`` is
+        # stored as metadata only; downstream server analysis decides what
+        # to trim. The agent now ships the full-session span by default
+        # (start=0, end=duration); cropping happens server-side when needed.
         start_s, end_s = relevant_span
         audio_rel = "audio.opus"
         encode_opus_stereo(

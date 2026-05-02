@@ -191,14 +191,6 @@ class EchoGuardConfig(BaseSettings):
     debug: bool = False
 
 
-class LLMConfig(BaseSettings):
-    repo_id: str = "Qwen/Qwen2.5-3B-Instruct-GGUF"
-    filename: str = "qwen2.5-3b-instruct-q4_k_m.gguf"
-    n_ctx: int = 8192
-    n_threads: int | None = None
-    idle_unload_secs: float = 300.0
-
-
 class DetectorSpec(BaseSettings):
     """Per-app detection rule for the whitelist auto-suggest path.
 
@@ -547,7 +539,6 @@ class Config(BaseSettings):
     stt: STTConfig = Field(default_factory=STTConfig)
     speaker: SpeakerConfig = Field(default_factory=SpeakerConfig)
     echo_guard: EchoGuardConfig = Field(default_factory=EchoGuardConfig)
-    llm: LLMConfig = Field(default_factory=LLMConfig)
     arm: ArmConfig = Field(default_factory=ArmConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)
     upload: UploadConfig = Field(default_factory=UploadConfig)

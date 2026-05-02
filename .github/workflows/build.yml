@@ -34,9 +34,6 @@ jobs:
       - name: Install dependencies
         shell: bash
         run: |
-          pip install llama-cpp-python \
-            --only-binary=llama-cpp-python \
-            --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
           pip install webrtcvad-wheels librosa
           pip install resemblyzer --no-deps
           pip install -e .
@@ -118,9 +115,6 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install llama-cpp-python \
-            --only-binary=llama-cpp-python \
-            --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
           pip install webrtcvad-wheels librosa
           pip install resemblyzer --no-deps
           pip install -e .

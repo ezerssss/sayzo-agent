@@ -734,9 +734,8 @@ def diagnose_notifications() -> None:
 @cli.command("first-run")
 @click.pass_context
 def first_run(ctx: click.Context) -> None:
-    """One-time setup: download models and log in."""
+    """One-time setup: log in and start the service."""
     from rich.console import Console
-    from huggingface_hub import hf_hub_download
 
     cfg = load_config()
     _setup_logging(cfg.log_level, cfg.debug)
@@ -751,36 +750,7 @@ def first_run(ctx: click.Context) -> None:
     console.print("[cyan]  ===========[/]")
     console.print()
 
-    # Step 1: Download model
-    # Suppress noisy HTTP and huggingface_hub logs during download.
-    import warnings
-    warnings.filterwarnings("ignore", message=".*unauthenticated.*")
-    for noisy in ("httpx", "httpcore", "huggingface_hub", "filelock"):
-        logging.getLogger(noisy).setLevel(logging.ERROR)
-
-    model_path = cfg.models_dir / cfg.llm.filename
-    if model_path.exists():
-        console.print("  [green]Language model already downloaded.[/]")
-    else:
-        console.print("  Downloading language model...")
-        try:
-            hf_hub_download(
-                repo_id=cfg.llm.repo_id,
-                filename=cfg.llm.filename,
-                local_dir=str(cfg.models_dir),
-            )
-            console.print("  [green]Language model ready.[/]")
-        except KeyboardInterrupt:
-            console.print("\n  [yellow]Cancelled.[/]")
-            sys.exit(130)
-        except Exception as e:
-            console.print(f"  [red]Download failed: {e}[/]")
-            console.print("  Run [bold]sayzo-agent first-run[/] again to retry.")
-            sys.exit(1)
-
-    console.print()
-
-    # Step 2: Login
+    # Step 1: Login
     from .auth.store import TokenStore
 
     store = TokenStore(cfg.auth_path)
@@ -812,7 +782,7 @@ def first_run(ctx: click.Context) -> None:
     else:
         console.print("  [dim]Auth not configured — skipping login.[/]")
 
-    # Step 3: Start the service in the background (if not already running)
+    # Step 2: Start the service in the background (if not already running)
     from pathlib import Path
 
     from .pidfile import is_running

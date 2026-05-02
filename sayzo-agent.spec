@@ -69,16 +69,6 @@ fw_vad_onnx = fw_pkg / "assets" / "silero_vad_v6.onnx"
 if fw_vad_onnx.exists():
     datas.append((str(fw_vad_onnx), "faster_whisper/assets"))
 
-# llama-cpp-python ships its native libs in llama_cpp/lib/ and resolves them
-# via os.add_dll_directory (Windows) at import time. PyInstaller won't collect
-# that subdir otherwise.
-import llama_cpp
-llama_cpp_lib = Path(llama_cpp.__file__).parent / "lib"
-if llama_cpp_lib.exists():
-    for f in llama_cpp_lib.iterdir():
-        if f.is_file() and f.suffix.lower() in (".dll", ".dylib", ".so"):
-            datas.append((str(f), "llama_cpp/lib"))
-
 # Resemblyzer ships pretrained speaker-embedding weights as package data.
 # VoiceEncoder() loads it at construction time (sayzo_agent/speaker.py).
 import resemblyzer
@@ -133,8 +123,6 @@ hiddenimports = [
     "resemblyzer",
     "librosa",
     "webrtcvad",
-    # LLM
-    "llama_cpp",
     # Audio encoding
     "av",
     # Config
@@ -145,8 +133,6 @@ hiddenimports = [
     "PIL",
     "PIL.Image",
     "PIL.ImageDraw",
-    # HuggingFace
-    "huggingface_hub",
     # Networking
     "httpx",
     # torch — required by Silero VAD feed()

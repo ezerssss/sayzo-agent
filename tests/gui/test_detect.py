@@ -41,11 +41,6 @@ def _write_token(cfg: Config) -> None:
     )
 
 
-def _write_model(cfg: Config, *, size: int = 1024) -> None:
-    path = cfg.models_dir / cfg.llm.filename
-    path.write_bytes(b"\x00" * size)
-
-
 def _write_onboarded_marker(cfg: Config) -> None:
     (cfg.data_dir / _PERMISSIONS_MARKER_NAME).touch()
 
@@ -58,7 +53,6 @@ def _write_onboarded_marker(cfg: Config) -> None:
 def test_empty_state_is_incomplete(cfg: Config) -> None:
     status = detect_setup(cfg)
     assert status.has_token is False
-    assert status.has_model is False
     assert status.is_complete is False
 
 
@@ -66,35 +60,16 @@ def test_token_only_is_incomplete(cfg: Config) -> None:
     _write_token(cfg)
     status = detect_setup(cfg)
     assert status.has_token is True
-    assert status.has_model is False
+    # Onboarded marker is still required.
     assert status.is_complete is False
 
 
-def test_model_only_is_incomplete(cfg: Config) -> None:
-    _write_model(cfg)
-    status = detect_setup(cfg)
-    assert status.has_token is False
-    assert status.has_model is True
-    assert status.is_complete is False
-
-
-def test_empty_model_file_is_incomplete(cfg: Config) -> None:
-    """Zero-byte model file (e.g. half-written download) must fail has_model."""
+def test_token_plus_onboarded_is_complete_when_not_darwin(cfg: Config) -> None:
     _write_token(cfg)
-    _write_model(cfg, size=0)
-    status = detect_setup(cfg)
-    assert status.has_model is False
-    assert status.is_complete is False
-
-
-def test_both_signals_complete_when_not_darwin(cfg: Config) -> None:
-    _write_token(cfg)
-    _write_model(cfg)
     _write_onboarded_marker(cfg)
     with patch("sayzo_agent.gui.setup.detect.sys.platform", "win32"):
         status = detect_setup(cfg)
     assert status.has_token is True
-    assert status.has_model is True
     assert status.has_mic_permission is None
     # Windows now walks the shortcut + notifications screens too, so the
     # onboarded marker is the same gate it is on macOS.
@@ -144,7 +119,6 @@ def _run_darwin_detect(
 
 def test_mac_permission_granted(cfg: Config, mac_env: Path) -> None:
     _write_token(cfg)
-    _write_model(cfg)
     _write_onboarded_marker(cfg)
     status = _run_darwin_detect(cfg, returncode=0, audio_tap_path=mac_env)
     assert status.has_mic_permission is True
@@ -154,7 +128,6 @@ def test_mac_permission_granted(cfg: Config, mac_env: Path) -> None:
 
 def test_mac_permission_denied(cfg: Config, mac_env: Path) -> None:
     _write_token(cfg)
-    _write_model(cfg)
     _write_onboarded_marker(cfg)
     status = _run_darwin_detect(
         cfg,
@@ -170,7 +143,6 @@ def test_mac_permission_timeout_means_granted(cfg: Config, mac_env: Path) -> Non
     """If audio-tap is still running past the probe timeout it cleared the
     permission gate — treat as granted."""
     _write_token(cfg)
-    _write_model(cfg)
     _write_onboarded_marker(cfg)
     status = _run_darwin_detect(cfg, timeout=True, audio_tap_path=mac_env)
     assert status.has_mic_permission is True
@@ -180,7 +152,6 @@ def test_mac_permission_timeout_means_granted(cfg: Config, mac_env: Path) -> Non
 def test_mac_binary_missing_is_unknown(cfg: Config) -> None:
     """If audio-tap can't be located the probe is inconclusive — don't block."""
     _write_token(cfg)
-    _write_model(cfg)
     _write_onboarded_marker(cfg)
     status = _run_darwin_detect(cfg, audio_tap_found=False)
     assert status.has_mic_permission is None
@@ -191,7 +162,6 @@ def test_mac_unknown_exit_code_is_unknown(cfg: Config, mac_env: Path) -> None:
     """Non-zero, non-77 exit code is treated as inconclusive rather than
     denied — prevents false-deny wedging the GUI."""
     _write_token(cfg)
-    _write_model(cfg)
     _write_onboarded_marker(cfg)
     status = _run_darwin_detect(cfg, returncode=13, audio_tap_path=mac_env)
     assert status.has_mic_permission is None
@@ -202,7 +172,6 @@ def test_probe_is_off_by_default(cfg: Config) -> None:
     """Default probe=False is the new behaviour: no audio-tap spawn, no TCC
     dialog before the GUI has shown an explanation."""
     _write_token(cfg)
-    _write_model(cfg)
     _write_onboarded_marker(cfg)
     with patch("sayzo_agent.gui.setup.detect.sys.platform", "darwin"), patch(
         "sayzo_agent.gui.setup.detect.subprocess.run"
@@ -224,7 +193,6 @@ def test_mac_not_onboarded_blocks_is_complete(cfg: Config) -> None:
     False on darwin so the service opens the GUI and shows the Permissions
     screen on next launch."""
     _write_token(cfg)
-    _write_model(cfg)
     # Intentionally no marker.
     with patch("sayzo_agent.gui.setup.detect.sys.platform", "darwin"):
         status = detect_setup(cfg)
@@ -234,7 +202,6 @@ def test_mac_not_onboarded_blocks_is_complete(cfg: Config) -> None:
 
 def test_mac_onboarded_marker_flows_into_is_complete(cfg: Config) -> None:
     _write_token(cfg)
-    _write_model(cfg)
     _write_onboarded_marker(cfg)
     with patch("sayzo_agent.gui.setup.detect.sys.platform", "darwin"):
         status = detect_setup(cfg)
@@ -246,7 +213,6 @@ def test_not_onboarded_blocks_is_complete_on_non_darwin(cfg: Config) -> None:
     """Windows now walks the same linear setup flow (shortcut + notifications
     screens), so the onboarded marker gates is_complete on both platforms."""
     _write_token(cfg)
-    _write_model(cfg)
     # Don't write the marker.
     with patch("sayzo_agent.gui.setup.detect.sys.platform", "win32"):
         status = detect_setup(cfg)
@@ -262,14 +228,12 @@ def test_not_onboarded_blocks_is_complete_on_non_darwin(cfg: Config) -> None:
 def test_status_to_dict_includes_all_fields() -> None:
     s = SetupStatus(
         has_token=True,
-        has_model=True,
         has_mic_permission=None,
         has_permissions_onboarded=True,
         is_complete=True,
     )
     assert s.to_dict() == {
         "has_token": True,
-        "has_model": True,
         "has_mic_permission": None,
         "has_permissions_onboarded": True,
         "is_complete": True,

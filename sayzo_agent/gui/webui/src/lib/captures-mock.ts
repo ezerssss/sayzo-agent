@@ -189,18 +189,6 @@ const SPECS: MockSpec[] = [
     has_audio: false,
     dropped_reason: "empty_transcript",
   },
-  {
-    status: "dropped",
-    bucket: "skipped",
-    badge_label: "Sayzo decided not to keep this",
-    badge_tone: "gray",
-    title: "Untitled meeting",
-    startedMinutesAgo: 60 * 22,
-    duration_secs: 6 * 60,
-    detail: "It didn't look like a real conversation.",
-    has_audio: false,
-    dropped_reason: "llm_rejected",
-  },
 ];
 
 export function buildMockCaptures(): CaptureSummary[] {

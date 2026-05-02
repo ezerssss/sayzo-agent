@@ -45,7 +45,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import subprocess
 import sys
 from typing import Literal
@@ -148,19 +147,37 @@ def consent_modal_macos(
     if result.returncode == 1 and not output:
         return "no"
 
-    # Output format: ``button returned:<label>, gave up:<true|false>``.
-    if "gave up:true" in output.lower():
-        return "timeout"
-
-    m = re.search(r"button returned:([^,\n]+)", output)
-    if m is None:
+    # Output format (single line, no quoting on field values):
+    #     button returned:LABEL, gave up:<true|false>
+    # or, when no ``giving up after`` is in effect:
+    #     button returned:LABEL
+    #
+    # LABEL itself may contain commas — every "Yes, stop" / "Yes, start"
+    # / "Yes, done" / "Yes, keep going" toast does. A previous regex
+    # parser split on the first comma and captured just "Yes", which
+    # never matched yes_label and silently fell back to default_on_timeout
+    # — so e.g. "Yes, stop" on the disarm-confirm toast was parsed as
+    # "no" and recording kept running. Strip the optional ``, gave up:``
+    # trailing marker first (rsplit so a label-internal comma can't
+    # eat it) and treat the residual as the literal label.
+    prefix = "button returned:"
+    if not output.startswith(prefix):
         log.warning(
             "[modal] could not parse osascript output: %r — returning default",
             output,
         )
         return default_on_timeout
 
-    button = m.group(1).strip()
+    gave_up_marker = ", gave up:"
+    button_section = output[len(prefix):]
+    gave_up_value = ""
+    if gave_up_marker in button_section:
+        button_section, gave_up_value = button_section.rsplit(gave_up_marker, 1)
+
+    if gave_up_value.strip().lower().startswith("true"):
+        return "timeout"
+
+    button = button_section.strip()
     if button == yes_label:
         return "yes"
     if button == no_label:

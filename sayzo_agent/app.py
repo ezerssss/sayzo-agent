@@ -26,7 +26,6 @@ from .conversation import (
 from .dsp import apply_mic_dsp, apply_sys_dsp
 from . import echo_guard
 from .models import SessionBuffers, SpeechSegment, TranscriptLine
-from .relevance import RelevanceLLM, RelevanceVerdict
 from .sink import CaptureSink
 from .speaker import SpeakerIdentifier
 from .stt import WhisperSTT, TranscribedSegment
@@ -43,6 +42,21 @@ def _format_duration(secs: float) -> str:
     if secs >= 60:
         return f"{int(round(secs / 60))} min"
     return f"{int(round(secs))}s"
+
+
+def _placeholder_title(arm_app_key: Optional[str], started_at: datetime) -> str:
+    """Build the client-side placeholder title for a kept capture.
+
+    The local relevance LLM used to generate this; with the LLM removed,
+    we ship a deterministic placeholder so the toast / Captures pane have
+    something readable. The server is expected to overwrite this with a
+    generated title on upload (see ``metadata.placeholder_title=True`` in
+    ``_process_session_inner``).
+    """
+    stamp = started_at.strftime("%Y-%m-%d %H:%M")
+    if arm_app_key:
+        return f"{arm_app_key.title()} call · {stamp}"
+    return f"Conversation · {stamp}"
 
 
 # Split a Whisper segment whenever its internal words have a pause longer
@@ -128,7 +142,6 @@ class Agent:
         self.detector = ConversationDetector(config.conversation, sample_rate=config.capture.sample_rate)
         self.stt = WhisperSTT(config.stt, models_dir=str(config.models_dir))
         self.speaker = SpeakerIdentifier(config.speaker)
-        self.llm = RelevanceLLM(config.llm, models_dir=config.models_dir)
         self.sink = CaptureSink(
             config.captures_dir,
             opus_bitrate=config.capture.opus_bitrate,
@@ -220,7 +233,6 @@ class Agent:
             await asyncio.sleep(1.0)
             now = time.monotonic()
             self.detector.tick(now)
-            self.llm.maybe_unload(now)
             self._maybe_heartbeat(now)
             self._maybe_run_upload_sweep(now)
             buffers = self.detector.take_closed_session()
@@ -245,7 +257,6 @@ class Agent:
         self._heartbeat_last = now
 
         d = self.detector
-        llm_state = "loaded" if d is not None and self.llm._llm is not None else "unloaded"
         kept = self._captures_kept
         discarded = self._captures_discarded
         echo_n = self._echo_segments_dropped
@@ -266,10 +277,10 @@ class Agent:
             sys_voiced = d._buffers.sys_total_voiced()
             log.info(
                 "[heartbeat] state=%s%s OPEN elapsed=%.1fs mic_voiced=%.1fs sys_voiced=%.1fs "
-                "llm=%s kept=%d discarded=%d echo_dropped=%d/%.0fs",
+                "kept=%d discarded=%d echo_dropped=%d/%.0fs",
                 arm_state, reason_tag,
                 elapsed, mic_voiced, sys_voiced,
-                llm_state, kept, discarded, echo_n, echo_s,
+                kept, discarded, echo_n, echo_s,
             )
         elif d.state == SessionState.PENDING_CLOSE and d._buffers is not None:
             elapsed = now - d._session_start_mono
@@ -277,25 +288,25 @@ class Agent:
             silence = now - last_any if last_any > 0 else 0.0
             log.info(
                 "[heartbeat] state=%s%s PENDING_CLOSE elapsed=%.1fs silence=%.1fs "
-                "llm=%s kept=%d discarded=%d",
+                "kept=%d discarded=%d",
                 arm_state, reason_tag, elapsed, silence,
-                llm_state, kept, discarded,
+                kept, discarded,
             )
         elif arm_state == "DISARMED":
             log.info(
                 "[heartbeat] state=DISARMED waiting for hotkey or meeting detect "
-                "llm=%s kept=%d discarded=%d echo_dropped=%d/%.0fs",
-                llm_state, kept, discarded, echo_n, echo_s,
+                "kept=%d discarded=%d echo_dropped=%d/%.0fs",
+                kept, discarded, echo_n, echo_s,
             )
         else:
             # ARMED but detector IDLE — should be a brief transient (between
             # disarm closing the session and the controller clearing the
             # armed flag). With session-on-arm, ARMED implies OPEN.
             log.info(
-                "[heartbeat] state=%s%s IDLE (transient) llm=%s "
+                "[heartbeat] state=%s%s IDLE (transient) "
                 "kept=%d discarded=%d echo_dropped=%d/%.0fs",
                 arm_state, reason_tag,
-                llm_state, kept, discarded, echo_n, echo_s,
+                kept, discarded, echo_n, echo_s,
             )
 
     def _maybe_run_upload_sweep(self, now: float) -> None:
@@ -530,30 +541,8 @@ class Agent:
             await self._write_dropped_async(buffers, "empty_transcript", proc_id)
             return
 
-        # 4. LLM relevance judgment
+        # 4. (No local relevance LLM — server generates title/summary post-upload.)
         total_duration = max(len(buffers.mic_pcm), len(buffers.sys_pcm)) / 2 / sr
-        verdict: RelevanceVerdict = await loop.run_in_executor(
-            self._executor, self.llm.judge, transcript, total_duration
-        )
-        log.info(
-            "[llm] is_user_participant=%s is_real=%s span=%.1f→%.1f title=%r summary=%r",
-            verdict.is_user_participant,
-            verdict.is_real_conversation,
-            verdict.relevant_span[0],
-            verdict.relevant_span[1],
-            verdict.title,
-            verdict.summary[:120],
-        )
-        if not verdict.keep:
-            log.info("[session] DISCARDED by LLM (reason=%s)", verdict.discard_reason)
-            self._captures_discarded += 1
-            await self._write_dropped_async(
-                buffers,
-                "llm_rejected",
-                proc_id,
-                extra={"discard_reason": verdict.discard_reason},
-            )
-            return
 
         # 5a. Apply DSP to the raw session PCM. Mic gets the full chain
         # (highpass + noisereduce + peak-norm); system gets a light touch
@@ -628,9 +617,21 @@ class Agent:
         true_started_at = buffers.started_at - timedelta(seconds=backfill_secs)
         pcm_duration = buffers.pcm_duration(sr)
         ended_at = true_started_at + timedelta(seconds=pcm_duration)
+        # Placeholder title shipped client-side; server overwrites via the
+        # upload response (see metadata flags below). Summary is left empty
+        # for the server to fill.
+        placeholder_title = _placeholder_title(buffers.arm_app_key, true_started_at)
+        placeholder_summary = ""
+        full_span = (0.0, total_duration)
         metadata = {
             "close_reason": buffers.close_reason.value if buffers.close_reason else None,
             "upload": empty_upload_state(),
+            # Signals to the server that title/summary need server-side
+            # generation. Old clients omit ``local_llm_used``; missing OR
+            # True means the client title is real and shouldn't be
+            # regenerated.
+            "local_llm_used": False,
+            "placeholder_title": True,
         }
         if eg_report is not None:
             metadata["echo_guard"] = {
@@ -645,9 +646,9 @@ class Agent:
             self._executor,
             lambda: self.sink.write(
                 transcript,
-                verdict.title,
-                verdict.summary,
-                verdict.relevant_span,
+                placeholder_title,
+                placeholder_summary,
+                full_span,
                 true_started_at,
                 ended_at,
                 mic_final,
@@ -663,7 +664,7 @@ class Agent:
 
         duration_s = (ended_at - true_started_at).total_seconds()
         if self.cfg.notify_capture_saved:
-            body = f"{verdict.title} \u00b7 {_format_duration(duration_s)}"
+            body = f"{placeholder_title} \u00b7 {_format_duration(duration_s)}"
             await loop.run_in_executor(
                 self._executor, self.notifier.notify, "Conversation saved", body
             )

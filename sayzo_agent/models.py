@@ -65,6 +65,11 @@ class SessionBuffers:
     session_t0_mono: float = 0.0
     session_end_mono: float = 0.0
     close_reason: Optional[SessionCloseReason] = None
+    # Arm-app key (e.g. "zoom", "discord") when the session was opened via a
+    # whitelist match. None for hotkey arms or when the arm reason had no
+    # app attribution. Used downstream to build the placeholder title that
+    # ships with the upload until the server generates a real one.
+    arm_app_key: Optional[str] = None
 
     def mic_total_voiced(self) -> float:
         return sum(s.duration for s in self.mic_segments)

@@ -5,7 +5,6 @@ first-run GUI window before launching the tray + capture pipeline.
 
 The detection probes:
   - auth token present at ``cfg.auth_path``
-  - LLM weights present (and non-empty) at ``cfg.models_dir / cfg.llm.filename``
   - macOS only: whether the user has completed the in-app permissions
     onboarding (marker file at ``cfg.data_dir/.permissions_onboarded_v1``)
   - macOS only (opt-in): Audio Capture permission by briefly spawning the
@@ -66,7 +65,6 @@ class SetupStatus:
     """
 
     has_token: bool
-    has_model: bool
     has_mic_permission: bool | None
     has_permissions_onboarded: bool
     is_complete: bool
@@ -74,7 +72,6 @@ class SetupStatus:
     def to_dict(self) -> dict[str, Any]:
         return {
             "has_token": self.has_token,
-            "has_model": self.has_model,
             "has_mic_permission": self.has_mic_permission,
             "has_permissions_onboarded": self.has_permissions_onboarded,
             "is_complete": self.is_complete,
@@ -84,11 +81,10 @@ class SetupStatus:
 def _compute_is_complete(
     *,
     has_token: bool,
-    has_model: bool,
     has_mic_permission: bool | None,
     has_permissions_onboarded: bool,
 ) -> bool:
-    if not has_token or not has_model:
+    if not has_token:
         return False
     # The onboarding marker is what we enforce on both platforms now. A
     # macOS user with a denied mic probe will be walked through the Mic
@@ -106,14 +102,6 @@ def _check_token(cfg: Config) -> bool:
         return TokenStore(cfg.auth_path).has_tokens()
     except Exception:
         log.warning("token probe failed", exc_info=True)
-        return False
-
-
-def _check_model(cfg: Config) -> bool:
-    path = cfg.models_dir / cfg.llm.filename
-    try:
-        return path.exists() and path.stat().st_size > 0
-    except OSError:
         return False
 
 
@@ -172,7 +160,6 @@ def detect_setup(cfg: Config, *, probe_mac_permission: bool = False) -> SetupSta
     ``recheck_mac_permission`` call after the user has clicked through).
     """
     has_token = _check_token(cfg)
-    has_model = _check_model(cfg)
     if sys.platform == "darwin" and probe_mac_permission:
         has_mic_permission: bool | None = _check_mac_mic_permission()
     else:
@@ -182,13 +169,11 @@ def detect_setup(cfg: Config, *, probe_mac_permission: bool = False) -> SetupSta
     has_permissions_onboarded = _check_permissions_onboarded(cfg)
     is_complete = _compute_is_complete(
         has_token=has_token,
-        has_model=has_model,
         has_mic_permission=has_mic_permission,
         has_permissions_onboarded=has_permissions_onboarded,
     )
     return SetupStatus(
         has_token=has_token,
-        has_model=has_model,
         has_mic_permission=has_mic_permission,
         has_permissions_onboarded=has_permissions_onboarded,
         is_complete=is_complete,

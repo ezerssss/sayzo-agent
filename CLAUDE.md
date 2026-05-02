@@ -15,24 +15,19 @@ Everything runs locally (no paid APIs in the hot path). Armed sessions are bound
 
 ## Install (Windows, Python 3.12)
 
-The dependency graph has several traps. Follow this order exactly when setting up a fresh machine — `pip install -e .[dev]` alone will fail.
+`resemblyzer` is the one trap. Follow this order on a fresh machine:
 
 ```bash
 py -3.12 -m venv .venv
 .venv\Scripts\activate
 
-# 1. llama-cpp-python: prebuilt wheels live on a separate index, and pip will
-#    silently fall back to source-build (which needs MSVC + CMake) unless you
-#    force binary-only.
-pip install llama-cpp-python --only-binary=llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
-
-# 2. resemblyzer hard-pins source-only `webrtcvad`. Install its prebuilt
-#    replacement first, then resemblyzer with --no-deps so pip doesn't
-#    re-resolve the source one.
+# resemblyzer hard-pins source-only `webrtcvad`. Install its prebuilt
+# replacement first, then resemblyzer with --no-deps so pip doesn't
+# re-resolve the source one.
 pip install webrtcvad-wheels librosa
 pip install resemblyzer --no-deps
 
-# 3. Now the rest.
+# Now the rest.
 pip install -e .[dev]
 ```
 
@@ -42,8 +37,6 @@ pip install -e .[dev]
 - `pyobjc-framework-Cocoa` + `pyobjc-framework-CoreAudio` (macOS only, marker-conditional) — NSWorkspace frontmost-app + CoreAudio mic-active query.
 
 These land via the normal `pip install -e .[dev]` step now — no special handling.
-
-**Python 3.13 does not work** — `llama-cpp-python` has no prebuilt wheels for it. Stay on 3.12.
 
 `resemblyzer` will print a `pip` warning that `webrtcvad` and `typing` are missing. Both are harmless: `webrtcvad-wheels` provides the same `webrtcvad` Python module under a different distribution name, and Python 3.12 has `typing` built in.
 
@@ -57,7 +50,7 @@ pytest tests/
 pytest tests/test_conversation.py::test_gate_passes_late_substantive_user_turn -v
 
 # CLI commands (all under one entrypoint)
-sayzo-agent setup         # one-time: download Qwen GGUF (~2 GB) into ~/.sayzo/agent/models/
+sayzo-agent first-run     # one-time: log in + start the service
 sayzo-agent devices       # list mic + loopback devices
 sayzo-agent test-capture  # 10-second capture sanity check
 sayzo-agent run           # main 24/7 loop with verbose terminal output
@@ -85,7 +78,7 @@ Toggle all non-consent toasts with `SAYZO_NOTIFICATIONS_ENABLED=0`. Consent + en
 
 ### Heartbeat log
 
-`[heartbeat]` line every `Config.heartbeat_secs` seconds (default 30, `SAYZO_HEARTBEAT_SECS=0` disables). Shows arm state (`ARMED` + reason tag like `(zoom)` / `(hotkey)`, or `DISARMED`), detector state (`OPEN` / `PENDING_CLOSE` / `IDLE`), elapsed / pre-buffer / silence counters, LLM loaded/unloaded, running kept/discarded counters. Lets a user watching the terminal for hours tell at a glance whether the agent is alive, what it's currently doing, and why it's currently armed.
+`[heartbeat]` line every `Config.heartbeat_secs` seconds (default 30, `SAYZO_HEARTBEAT_SECS=0` disables). Shows arm state (`ARMED` + reason tag like `(zoom)` / `(hotkey)`, or `DISARMED`), detector state (`OPEN` / `PENDING_CLOSE` / `IDLE`), elapsed / silence counters, running kept/discarded counters. Lets a user watching the terminal for hours tell at a glance whether the agent is alive, what it's currently doing, and why it's currently armed.
 
 ## Architecture
 
@@ -114,8 +107,8 @@ faster-whisper (transcribe mic + system separately)
     ↓
 Speaker tagging (mic = "user" by definition; Resemblyzer greedy clustering on system audio for "other_1", "other_2", …)
     ↓
-Relevance LLM (Qwen 2.5 3B Q4 via llama-cpp-python)
-    ↓ [judges participant + extracts relevant span + title + summary]
+Placeholder title + empty summary (server generates real ones post-upload — see `metadata.local_llm_used=False`, `metadata.placeholder_title=True` in upload payload)
+    ↓
 Post-capture DSP (highpass + spectral-gate denoise on mic; light HPF on system)
     ↓ [cleans the on-disk audio without affecting STT, which already ran]
 CaptureSink (Opus stereo: mic=L, system=R; record.json)
@@ -161,14 +154,14 @@ These are the rules the conversation detector and gate logic encode. Several wer
 
 3. **When a session passes the gate, the *whole* session is transcribed**, not a trimmed slice. The other-side speech surrounding the user's turns is required context for downstream analysis.
 
-4. **The relevance LLM must NOT crop tightly.** Its prompt instructs it to be generous. As a safety net, `RelevanceLLM._parse` also pads `relevant_span` by ±15 s (`SPAN_PAD_SECS`) before returning. Small local LLMs crop too tight even when told not to — the padding is intentional.
+4. **`title` / `summary` / `relevant_span` are server-side concerns now.** The agent ships a placeholder title (`"Conversation · YYYY-MM-DD HH:MM"` or `"Zoom call · ..."` when an arm-app is known), an empty summary, and a full-session span. The upload payload sets `metadata.local_llm_used=False` + `metadata.placeholder_title=True` so the server knows to overwrite. Don't reintroduce client-side title/summary generation — keep the agent thin.
 
 5. **Whisper hallucinates "Thank you" / "Thanks for watching" on silence.** Mitigated in `WhisperSTT.transcribe_pcm16` by `vad_filter=True`, `condition_on_previous_text=False`, and tightened `no_speech_threshold` / `log_prob_threshold`. Don't loosen these.
 
 ### Module responsibilities
 
 - **`conversation.py`** — Pure (no I/O, no models). State machine (IDLE / OPEN / PENDING_CLOSE) + gate. Unit-tested with synthetic VAD events. The most behavior-critical file in the project; treat changes here with care.
-- **`app.py`** — Async orchestrator. Wires ArmController → capture → VAD → detector → heavy-worker pool → sink. `_consume` waits on `arm.armed_event` so frames only flow while armed. All STT/embedding/LLM work runs on a single-worker `ThreadPoolExecutor` so heavy stages never run in parallel and starve the CPU. Capture + VAD run on the asyncio loop.
+- **`app.py`** — Async orchestrator. Wires ArmController → capture → VAD → detector → heavy-worker pool → sink. `_consume` waits on `arm.armed_event` so frames only flow while armed. All STT / embedding / DSP work runs on a single-worker `ThreadPoolExecutor` so heavy stages never run in parallel and starve the CPU. Capture + VAD run on the asyncio loop. Builds the placeholder title via `_placeholder_title(buffers.arm_app_key, started_at)` and tags the upload `metadata` with `local_llm_used=False`.
 - **`arm/controller.py`** — ArmController state machine. Owns stream lifecycle, hotkey confirmations, whitelist consent, PENDING_CLOSE handling, long-meeting check-ins, meeting-ended watcher. Unit-tested with fake capture / VAD / notifier / injected platform queries.
 - **`arm/detectors.py`** — Pure matching logic against `DetectorSpec` list from config. No OS calls. Skips specs with `disabled=True` (the Meeting Apps pane's off toggle).
 - **`arm/seen_apps.py`** — Persistence for unmatched mic-holders observed by the whitelist watcher. Written to `data_dir/seen_apps.json`. Capped at 20 entries, dedup'd by lower-cased key, scrubbed against the current whitelist on read. Drives the Settings → Meeting Apps "Suggested to add" section.
@@ -176,7 +169,6 @@ These are the rules the conversation detector and gate logic encode. Several wer
 - **`arm/hotkey.py`** — pynput global hotkey listener. Marshals key-press events from pynput's listener thread onto the arm controller's asyncio loop via `call_soon_threadsafe`. Requires Accessibility permission on macOS (graceful fallback: tray menu still works).
 - **`notify.py`** — Desktop notifier with a dedicated background asyncio loop (eager `__init__`) so interactive consent toasts can await button callbacks. `NoopNotifier.ask_consent` always returns the default, for unit-test clean paths.
 - **`settings_store.py`** — JSON load/save for `data_dir/user_settings.json`. The Settings GUI + onboarding write here; `load_config` overlays onto `ArmConfig` defaults (env vars still win over JSON).
-- **`relevance.py`** — Loads Qwen lazily on first use, unloads after `idle_unload_secs` (default 5 min) to free ~2 GB of RAM during idle periods. The system prompt is the contract — modifying it changes the JSON shape downstream.
 - **`capture/system.py`** — Uses PyAudioWPatch for WASAPI loopback capture. Captures at the device's native sample rate (typically 48 kHz) and resamples to 16 kHz via scipy to avoid quality loss.
 - **`speaker.py`** — Greedy cosine clustering for other-speaker labels (avoids a sklearn dependency). Heavy imports (`resemblyzer`) are lazy so unit tests don't need them.
 - **`dsp.py`** — Pure numpy/scipy post-processing applied at session close, before Opus encoding. Butterworth highpass + `noisereduce` spectral-gate denoise (default `prop_decrease=0.5`, dialed down from 0.85 to avoid phasey artifacts) + peak-normalize on mic; light highpass + peak-normalize on system (no denoise — system audio is typically a clean digital stream already, and aggressive denoising damages music / low-volume speech from the far side). Runs on the heavy-worker executor and is fully decoupled from STT: transcription and speaker embedding read the raw `buffers.mic_pcm` upstream, so DSP here has zero impact on whisper accuracy. All stages are config-flagged under `CaptureConfig` — `SAYZO_CAPTURE__DSP_ENABLED=0` restores raw-PCM output byte-for-byte (minus the encoder's `application` setting, which is intrinsic to the sink path). Opus encoder knobs also live in `CaptureConfig` (`opus_bitrate`, `opus_application`). Default is `application="audio"` at 96 kbps stereo — transparent for speech, usable for music. Capture modules no longer apply per-batch RMS normalization (previously `_TARGET_RMS=0.02` caused audible pumping); raw captured levels flow through and DSP's peak-normalize at session close handles final loudness.
@@ -186,7 +178,5 @@ These are the rules the conversation detector and gate logic encode. Several wer
 The current install is fragile by design — it's a dev install, not a distributable. If/when shipping to non-dev users:
 
 - `resemblyzer` forces source-build of `webrtcvad` → replace with a directly-loaded ONNX speaker encoder.
-- `llama-cpp-python` wheels are Python-version-fragile → bundle via PyInstaller/Nuitka instead of relying on pip.
-- Models are downloaded post-install via `huggingface_hub` (cached, idempotent) — this part is fine to keep.
 
 The plan in `~/.claude/plans/linear-squishing-bird.md` (referenced from session history) has the full rationale.

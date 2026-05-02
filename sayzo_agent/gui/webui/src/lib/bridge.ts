@@ -3,7 +3,6 @@
 
 export type SetupStatus = {
   has_token: boolean;
-  has_model: boolean;
   has_mic_permission: boolean | null;
   has_permissions_onboarded: boolean;
   is_complete: boolean;
@@ -18,8 +17,6 @@ export type SetupStatus = {
 
 export type ConfigSnapshot = {
   platform: string;
-  model_filename: string;
-  model_repo: string;
   auth_url: string;
 };
 
@@ -58,7 +55,6 @@ declare global {
     get_config_snapshot(): Promise<ConfigSnapshot>;
     start_login(): Promise<{ started: boolean }>;
     cancel_login(): Promise<{ cancelled: boolean }>;
-    start_model_download(): Promise<{ started: boolean }>;
 
     // Per-permission prompts (one screen each).
     prompt_mic_permission(): Promise<PermissionResult>;
@@ -166,10 +162,6 @@ export const bridge = {
   async cancelLogin() {
     await whenReady();
     return window.pywebview.api.cancel_login();
-  },
-  async startModelDownload() {
-    await whenReady();
-    return window.pywebview.api.start_model_download();
   },
 
   // Permissions.

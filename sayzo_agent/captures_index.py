@@ -142,7 +142,6 @@ _DROPPED_LABELS: dict[str, str] = {
     "gate_failed": "Skipped — not enough conversation",
     "non_english": "Skipped — wasn't English",
     "empty_transcript": "Skipped — nothing was transcribed",
-    "llm_rejected": "Sayzo decided not to keep this",
 }
 
 
@@ -162,8 +161,6 @@ def _detail_text(
             return f"Sayzo only coaches English right now (heard {lang})." if lang else "Sayzo only coaches English right now."
         if reason == "empty_transcript":
             return "Sayzo couldn't make out any speech."
-        if reason == "llm_rejected":
-            return "It didn't look like a real conversation."
         return None
     if status in (
         CaptureStatus.FAILED_TRANSIENT,

@@ -141,7 +141,9 @@ class ConversationDetector:
 
     # ---- session lifecycle -------------------------------------------------
 
-    def open_session_on_arm(self, now: float) -> None:
+    def open_session_on_arm(
+        self, now: float, *, arm_app_key: Optional[str] = None
+    ) -> None:
         """Open a session immediately at arm time, with empty buffers.
 
         Production entrypoint: ``ArmController._arm_internal`` calls this
@@ -151,11 +153,17 @@ class ConversationDetector:
         ``sys_pcm`` via ``on_frame`` with gap-fill bridging the small
         delay between arm and the first real frame.
 
+        ``arm_app_key`` is stashed on the session buffer so app.py can
+        build a placeholder title that names the arm app when known.
+
         Idempotent for repeated calls while OPEN — does nothing.
         """
         if self.state != SessionState.IDLE:
             return
-        self._open_session(now, trigger=None, trigger_start_ts=0.0, t0_mono=now)
+        self._open_session(
+            now, trigger=None, trigger_start_ts=0.0, t0_mono=now,
+            arm_app_key=arm_app_key,
+        )
 
     def _open_session(
         self,
@@ -163,11 +171,13 @@ class ConversationDetector:
         trigger: Optional[Source],
         trigger_start_ts: float,
         t0_mono: Optional[float] = None,
+        arm_app_key: Optional[str] = None,
     ) -> None:
         self.state = SessionState.OPEN
         self._buffers = SessionBuffers(
             started_at=datetime.now(timezone.utc),
             started_monotonic=now,
+            arm_app_key=arm_app_key,
         )
         self._session_start_mono = now
         self._last_voiced_mono["mic"] = now if trigger == "mic" else 0.0

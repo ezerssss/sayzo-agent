@@ -12,7 +12,6 @@ import enum
 import logging
 import os
 import sys
-import threading
 from typing import TYPE_CHECKING, Any
 
 from sayzo_agent.config import Config
@@ -123,8 +122,6 @@ class Bridge:
         """Non-secret config bits the GUI may want for display."""
         return {
             "platform": sys.platform,
-            "model_filename": self._cfg.llm.filename,
-            "model_repo": self._cfg.llm.repo_id,
             "auth_url": self._cfg.auth.auth_url,
         }
 
@@ -153,17 +150,6 @@ class Bridge:
         """Cancel an in-flight PKCE login. Emits ``login_cancelled`` when
         the worker observes the flag. No-op if nothing is pending."""
         return {"cancelled": self._login.cancel()}
-
-    def start_model_download(self) -> dict[str, Any]:
-        """Kick off the LLM weights download on a worker thread.
-
-        Returns immediately. Frontend listens for ``download_progress`` and
-        ``download_done`` / ``download_error`` events.
-        """
-        threading.Thread(
-            target=self._download_worker, name="setup-download", daemon=True
-        ).start()
-        return {"started": True}
 
     # ---- Permissions (new) -------------------------------------------
 
@@ -440,41 +426,3 @@ class Bridge:
 
         os._exit(0)
 
-    # ------------------------------------------------------------------
-    # Worker-thread implementations
-    # ------------------------------------------------------------------
-
-    def _download_worker(self) -> None:
-        import time
-
-        from sayzo_agent.gui.setup.model_download import download_model_with_progress
-
-        # Throttle progress events: at most every 100ms OR every 1% increment,
-        # whichever comes first. Without this, a fast download floods
-        # evaluate_js calls and the UI thread can't keep up.
-        last_emit_ts = 0.0
-        last_emit_pct = -1.0
-        emit_interval_secs = 0.1
-
-        def on_progress(done: int, total: int) -> None:
-            nonlocal last_emit_ts, last_emit_pct
-            now = time.monotonic()
-            pct = (done / total * 100.0) if total > 0 else 0.0
-            if (
-                now - last_emit_ts >= emit_interval_secs
-                or pct - last_emit_pct >= 1.0
-                or (total > 0 and done >= total)  # always emit the final tick
-            ):
-                last_emit_ts = now
-                last_emit_pct = pct
-                self._push_event(
-                    {"type": "download_progress", "done": done, "total": total}
-                )
-
-        try:
-            path = download_model_with_progress(self._cfg, on_progress=on_progress)
-        except Exception as e:
-            log.warning("model download failed", exc_info=True)
-            self._push_event({"type": "download_error", "message": str(e)})
-            return
-        self._push_event({"type": "download_done", "path": str(path)})
