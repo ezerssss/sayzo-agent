@@ -191,9 +191,9 @@ class CaptureSink:
         """Persist a tiny stub for a dropped session — no audio.
 
         Used by `app.py` at each discard point (gate fail, non-English, empty
-        transcript, LLM rejection) so the user can see in Settings → Captures
-        that Sayzo heard them and decided not to keep this one. Returns the
-        stub's record id.
+        transcript) so the user can see in Settings → Captures that Sayzo
+        heard them and decided not to keep this one. Returns the stub's
+        record id.
         """
         rec_id = rec_id or uuid.uuid4().hex[:12]
         rec_dir = self.captures_dir / rec_id

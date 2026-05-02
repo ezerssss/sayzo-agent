@@ -86,7 +86,7 @@ class ConversationConfig(BaseSettings):
     # Density-based STT: when mic_total / elapsed < stt_full_density, transcribe
     # the system stream only in ±stt_context_pad_secs windows around mic VAD
     # segments. Cuts STT cost on passive-media-with-occasional-talk sessions
-    # without changing any discard logic (LLM still judges).
+    # without changing the cheap-gate keep/drop decision upstream.
     stt_full_density: float = 0.05
     stt_context_pad_secs: float = 60.0
     # Pad around each VAD segment (mic or system) when building the final

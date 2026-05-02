@@ -47,10 +47,9 @@ def _format_duration(secs: float) -> str:
 def _placeholder_title(arm_app_key: Optional[str], started_at: datetime) -> str:
     """Build the client-side placeholder title for a kept capture.
 
-    The local relevance LLM used to generate this; with the LLM removed,
-    we ship a deterministic placeholder so the toast / Captures pane have
-    something readable. The server is expected to overwrite this with a
-    generated title on upload (see ``metadata.placeholder_title=True`` in
+    Deterministic so the toast / Captures pane have something readable
+    immediately. The server overwrites this with a generated title in the
+    upload response (see ``metadata.placeholder_title=True`` in
     ``_process_session_inner``).
     """
     stamp = started_at.strftime("%Y-%m-%d %H:%M")
@@ -403,7 +402,7 @@ class Agent:
         # `buffers.mic_segments` and record them on `buffers.mic_echo_segments`.
         # Runs BEFORE the gate so passive "user listens to a podcast" sessions
         # fail substantive-user-turn on real (non-echo-inflated) mic totals,
-        # saving STT cost and keeping polluted transcripts away from the LLM.
+        # saving STT cost and keeping polluted transcripts off the wire.
         eg_report = None
         if self.cfg.echo_guard.enabled:
             eg_report = await loop.run_in_executor(
@@ -501,8 +500,8 @@ class Agent:
         # 2b. Transcribe both sources in the heavy worker.
         # Density branch: when the user was barely present (e.g. passive media
         # + occasional comment), transcribe system audio only in ±pad windows
-        # around mic VAD segments. Cuts STT cost dramatically without changing
-        # discard logic — the LLM is still the source of truth.
+        # around mic VAD segments. Cuts STT cost dramatically; the cheap
+        # pre-STT gate has already decided whether the session is kept.
         elapsed = max(buffers.elapsed(), 1e-6)
         density = gate.mic_total / elapsed
         sys_pcm_full = bytes(buffers.sys_pcm)
@@ -548,7 +547,7 @@ class Agent:
             await self._write_dropped_async(buffers, "empty_transcript", proc_id)
             return
 
-        # 4. (No local relevance LLM — server generates title/summary post-upload.)
+        # 4. Build the placeholder title — the server overwrites it post-upload.
         total_duration = max(len(buffers.mic_pcm), len(buffers.sys_pcm)) / 2 / sr
 
         # 5a. Apply DSP to the raw session PCM. Mic gets the full chain

@@ -333,10 +333,9 @@ These are the strings macOS shows in its own native TCC permission dialogs. They
 
 Not strictly copy, but the log format changes with the armed model. Included here for review.
 
-- Disarmed: `[heartbeat] state=DISARMED waiting for hotkey or meeting detect llm=unloaded kept=0 discarded=0`
-- Armed, no session yet: `[heartbeat] state=ARMED (hotkey) pre_buffer mic=0.0s sys=0.0s llm=unloaded kept=0 discarded=0`
-- Armed, session open: `[heartbeat] state=ARMED (zoom) OPEN elapsed=12.3s mic_voiced=3.1s sys_voiced=8.2s llm=unloaded kept=0 discarded=0`
-- Pending close: `[heartbeat] state=ARMED (zoom) PENDING_CLOSE elapsed=67.3s silence=47.2s llm=unloaded kept=0 discarded=0`
+- Disarmed: `[heartbeat] state=DISARMED waiting for hotkey or meeting detect kept=0 discarded=0`
+- Armed, session open: `[heartbeat] state=ARMED (zoom) OPEN elapsed=12.3s mic_voiced=3.1s sys_voiced=8.2s kept=0 discarded=0`
+- Pending close: `[heartbeat] state=ARMED (zoom) PENDING_CLOSE elapsed=67.3s silence=47.2s kept=0 discarded=0`
 - Startup line: `[agent] running. Shortcut: Ctrl+Alt+S. Ctrl+C to stop.`
 
 ---

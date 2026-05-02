@@ -633,7 +633,7 @@ def replay(audio_file: str, speed: float, channel: str, dump_wav: bool) -> None:
             # Give the ticker a couple seconds to pick up any just-closed session.
             await asyncio.sleep(3.0)
 
-        # Wait for all in-flight processing tasks (STT, LLM, sink) to finish.
+        # Wait for all in-flight processing tasks (STT, sink) to finish.
         if agent._processing_tasks:
             log.info("waiting for %d processing task(s)...", len(agent._processing_tasks))
             await asyncio.gather(*agent._processing_tasks, return_exceptions=True)
@@ -1033,8 +1033,8 @@ def service(force_setup: bool) -> None:
     from . import __version__
     log.warning("sayzo-agent service starting v%s (pid=%d)", __version__, os.getpid())
 
-    # First-run gate. Detect missing setup signals (auth token, LLM weights,
-    # macOS mic permission) and open the GUI setup window if any is missing
+    # First-run gate. Detect missing setup signals (auth token, macOS mic
+    # permission, permissions onboarding) and open the GUI setup window if any is missing
     # — or if the caller forced it via --force-setup (NSIS finish-page), or
     # if this is the very first .app launch on macOS (no marker file). The
     # window blocks the main thread until the user completes setup or
@@ -1049,12 +1049,11 @@ def service(force_setup: bool) -> None:
     )
     log.warning(
         "first-run gate: force_setup=%s mac_first_launch=%s is_complete=%s "
-        "(token=%s model=%s mic=%s onboarded=%s) → show_gui=%s",
+        "(token=%s mic=%s onboarded=%s) → show_gui=%s",
         force_setup,
         mac_first_launch,
         setup_status.is_complete,
         setup_status.has_token,
-        setup_status.has_model,
         setup_status.has_mic_permission,
         setup_status.has_permissions_onboarded,
         should_show_gui,

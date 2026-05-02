@@ -32,8 +32,8 @@ STATUS_FAILED_TRANSIENT = "failed_transient"
 STATUS_FAILED_PERMANENT = "failed_permanent"
 STATUS_CREDIT_BLOCKED = "credit_blocked"
 STATUS_AUTH_BLOCKED = "auth_blocked"
-# Set on dropped-stub records (cheap-gate fail, LLM rejection, non-English,
-# empty transcript). These are local-only audit entries with no audio to
+# Set on dropped-stub records (cheap-gate fail, non-English, empty
+# transcript). These are local-only audit entries with no audio to
 # upload, so the sweep must treat them as terminal and never warn about
 # them. Distinguished from FAILED_PERMANENT so the UI / future analytics
 # can tell the difference between "we tried to upload and gave up" and
@@ -135,10 +135,11 @@ def empty_upload_state() -> dict:
 
 
 def discarded_locally_state() -> dict:
-    """Terminal upload state for dropped-stub records (cheap-gate fail, LLM
-    rejection, etc). The sweep skips these because ``is_terminal`` is True;
-    no warnings, no retries. ``last_error_kind = "discarded_locally"`` is
-    a load-bearing breadcrumb for any future "why was this skipped?" UI.
+    """Terminal upload state for dropped-stub records (cheap-gate fail,
+    non-English, empty transcript). The sweep skips these because
+    ``is_terminal`` is True; no warnings, no retries.
+    ``last_error_kind = "discarded_locally"`` is a load-bearing breadcrumb
+    for any future "why was this skipped?" UI.
     """
     state = empty_upload_state()
     state["status"] = STATUS_DISCARDED_LOCALLY

@@ -18,8 +18,8 @@ content. The script prints session_t0, mic_pcm length, and a PASS /
 FAIL verdict per session — anything off by >2 s of the expected
 capture window is the regression returning.
 
-This intentionally runs without STT, the LLM, or the upload path —
-nothing else is needed to verify the audio buffer behavior.
+This intentionally runs without STT or the upload path — nothing else
+is needed to verify the audio buffer behavior.
 """
 from __future__ import annotations
 

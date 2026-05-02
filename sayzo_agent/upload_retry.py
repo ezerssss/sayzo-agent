@@ -578,12 +578,12 @@ class UploadRetryManager:
             except Exception:
                 log.warning("[upload] skipping corrupt record.json at %s", rec_dir)
                 continue
-            # Dropped-stub records (cheap-gate fail, LLM rejection, etc) have
-            # no audio.opus and were never intended for upload. New stubs
-            # land with metadata.upload.status = STATUS_DISCARDED_LOCALLY
-            # which is_terminal() catches; this extra guard handles legacy
-            # stubs from before that change so we don't re-warn about them
-            # on every sweep.
+            # Dropped-stub records (cheap-gate fail, non-English, empty
+            # transcript) have no audio.opus and were never intended for
+            # upload. New stubs land with metadata.upload.status =
+            # STATUS_DISCARDED_LOCALLY which is_terminal() catches; this
+            # extra guard handles legacy stubs from before that change so
+            # we don't re-warn about them on every sweep.
             if record.metadata.get("dropped"):
                 continue
             upload_state = record.metadata.get("upload")
