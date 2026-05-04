@@ -38,10 +38,12 @@ log = logging.getLogger(__name__)
 
 
 # How long a snapshot stays cached. The arm subsystem polls at
-# ArmConfig.poll_interval_secs (default 2 s); a 1 s cache means we hit the
-# binary at most once per poll while still letting Settings UI calls
-# (which are out-of-band) get fresh data within ~1 s.
-_CACHE_TTL_SECS = 1.0
+# ArmConfig.poll_interval_secs (default 2 s); 1.8 s sits just under the
+# poll interval so consecutive watcher polls reuse the same snapshot
+# (one subprocess invocation per poll instead of two), with enough
+# headroom that asyncio scheduling jitter doesn't cause a cache miss.
+# Settings UI calls bypass with ``force_refresh=True``.
+_CACHE_TTL_SECS = 1.8
 
 
 @dataclass(frozen=True)
@@ -116,7 +118,7 @@ def _warn_missing_binary_once() -> None:
     )
 
 
-def _run_binary(binary: Path, timeout_secs: float = 4.0) -> list[AudioProcess]:
+def _run_binary(binary: Path, timeout_secs: float = 1.5) -> list[AudioProcess]:
     """Invoke ``audio-detect --json`` and parse the output.
 
     Returns an empty list on any failure (timeout, non-zero exit,
@@ -206,7 +208,9 @@ def snapshot(*, force_refresh: bool = False) -> list[AudioProcess]:
 
 
 def reset_cache() -> None:
-    """Clear the snapshot cache (test helper)."""
+    """Clear the snapshot cache + missing-binary warn-once flag (test helper)."""
+    global _binary_warn_fired
     with _cache_lock:
         _cache.snapshot = []
         _cache.expires_at = 0.0
+    _binary_warn_fired = False

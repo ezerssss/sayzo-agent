@@ -288,21 +288,11 @@ def match_whitelist(
     holder_names = {h.process_name.lower() for h in mic.holders}
     holder_bundles = {h.bundle_id.lower() for h in mic.holders if h.bundle_id}
 
-    # Pass 1 — desktop apps via direct mic-session hit. Works on both
-    # platforms now: Windows from pycaw process names, macOS from the
-    # audio-detect Swift helper (bundle ids).
-    #
-    # Two match flavors per spec:
-    #   - Direct: spec.process_names ∩ holder_names, or spec.bundle_ids
-    #     ∩ holder_bundles. The fast path.
-    #   - Helper-bundle prefix: a holder's bundle id starts with
-    #     "<spec.bundle_ids[i]>." (with the dot suffix to prevent false
-    #     positives like "com.foo.app" matching "com.foo.app2"). Catches
-    #     every Electron-based meeting app universally — Discord, Slack,
-    #     Teams desktop, Signal, Skype, etc. — without needing per-app
-    #     helper bundle id lists. Pure backstop: macOS's responsibility
-    #     SPI already attributes most helpers to their main app upstream
-    #     in get_mic_holders, but this catches the cases where it didn't.
+    # Pass 1 — desktop apps via direct mic-session hit. Helper-bundle
+    # prefix is a backstop for Electron apps (Discord, Slack, Teams
+    # desktop, etc.) when get_mic_holders couldn't collapse the helper
+    # to its main bundle via the responsibility SPI. The dot-suffix
+    # prevents "com.foo.app" matching "com.foo.app2".
     for spec in active_specs:
         if spec.is_browser:
             continue
@@ -334,10 +324,8 @@ def match_whitelist(
                 )
 
     # Pass 3 — browsers. Gate on a browser actually holding the mic
-    # (Windows: pycaw attribution; macOS: mic.active + browser-is-foreground).
-    # We no longer require the browser to be foreground on Windows — the user
-    # can Alt+Tab to a terminal during a Meet call and we still want to
-    # attribute the mic-hold to the right browser spec.
+    # (per-process attribution from mic.holders on both platforms;
+    # foreground-independent).
     if _browser_holds_mic(mic, foreground):
         # Pass 3a — when the user is looking at a browser tab, that
         # foreground tab is ground truth for "what they're using right
@@ -417,10 +405,17 @@ def _pids_for_desktop_holders(spec: DetectorSpec, mic: MicState) -> tuple[int, .
 def _pids_for_browser_holders(mic: MicState) -> tuple[int, ...]:
     """PIDs from ``mic.holders`` that belong to any known browser process.
 
-    Used by the browser match path. Per-tab scoping isn't possible (all tabs
-    share the browser's PID tree) — documented as a known limitation.
+    Used by the browser match path. Checks both ``process_name`` (Windows
+    .exe names like ``chrome.exe``) and ``bundle_id`` (macOS bundle ids
+    like ``com.google.Chrome``) so the returned set is platform-uniform.
+    Per-tab scoping isn't possible (all tabs share the browser's PID
+    tree) — documented as a known limitation.
     """
-    pids = {
+    pids: set[int] = {
+        h.pid for h in mic.holders
+        if h.pid > 0 and h.bundle_id and h.bundle_id in _BROWSER_BUNDLE_IDS
+    }
+    pids |= {
         h.pid for h in mic.holders
         if h.pid > 0 and h.process_name.lower() in BROWSER_PROCESS_NAMES
     }
@@ -460,8 +455,6 @@ def arm_app_still_holding_mic(
     specs: list[DetectorSpec],
     mic: MicState,
     foreground: ForegroundInfo,
-    *,
-    arm_pids_alive: Optional[bool] = None,
 ) -> bool:
     """For the meeting-ended watcher: is the arm-app still a mic-holder?
 
@@ -477,13 +470,6 @@ def arm_app_still_holding_mic(
     trip a false meeting-ended toast. The mic-release signal is ground
     truth: hanging up a call drops the browser's capture session,
     removing it from ``mic.holders``.
-
-    ``arm_pids_alive`` is now ignored — ``mic.holders`` is reliable on
-    both platforms (Windows: pycaw; macOS v2.5+: audio-detect helper),
-    so the old "PIDs are alive" tiebreaker isn't needed. The
-    ``whitelist_arm_release_grace_secs`` window in the controller
-    absorbs single-poll transients (failed helper invocation, etc.).
-    Parameter retained for ABI compatibility with existing callers.
     """
     spec = next((s for s in specs if s.app_key == app_key), None)
     if spec is None:

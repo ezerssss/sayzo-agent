@@ -1,0 +1,2222 @@
+commit 08595dc4e717608828ee7f417f4090e1bc20192c
+Author: ezerssss <magbanuaezra@gmail.com>
+Date:   Tue May 5 01:59:16 2026 +0800
+
+    [Feature] macOS detection rewrite — Windows-equivalent attribution (v2.5.0)
+
+diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
+index 5c6c2db..aa3a4fc 100644
+--- a/.github/workflows/build.yml
++++ b/.github/workflows/build.yml
+@@ -101,6 +101,17 @@ jobs:
+             -framework AudioToolbox \
+             -framework AVFoundation
+ 
++      - name: Compile audio-detect Swift binary
++        # Sister helper to audio-tap. Reads kAudioHardwarePropertyProcessObjectList
++        # + the responsibility SPI to give the agent per-process mic
++        # attribution on macOS — pure read-only, no permissions needed.
++        # (See sayzo_agent/arm/audio-detect/main.swift for full rationale.)
++        run: |
++          cd sayzo_agent/arm/audio-detect
++          swiftc -O -o audio-detect main.swift \
++            -framework CoreAudio \
++            -framework Foundation
++
+       - name: Generate logo.icns from logo.png
+         run: |
+           cd installer/assets
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 8ab4f1a..62475e3 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -34,7 +34,7 @@ pip install -e .[dev]
+ **New platform deps as of v1.0** (armed-only model):
+ - `pynput` + `psutil` (all platforms) — global hotkey + process queries.
+ - `pycaw` + `pywin32` (Windows only, marker-conditional) — WASAPI mic-session enumeration + foreground window.
+-- `pyobjc-framework-Cocoa` + `pyobjc-framework-CoreAudio` (macOS only, marker-conditional) — NSWorkspace frontmost-app + CoreAudio mic-active query.
++- `pyobjc-framework-Cocoa` + `pyobjc-framework-ApplicationServices` (macOS only, marker-conditional) — NSWorkspace frontmost-app + AX browser window-title / URL reads. (CoreAudio bindings are no longer used from Python — the `audio-detect` Swift helper owns that surface; pyobjc-framework-CoreAudio dependency was dropped in v2.5.)
+ 
+ These land via the normal `pip install -e .[dev]` step now — no special handling.
+ 
+@@ -124,7 +124,11 @@ UploadClient (NoopUploadClient until user signs in)
+ - **Long-meeting check-in task** (runs while ARMED) — sleeps until each `long_meeting_checkin_marks_secs` mark from session-start, fires "Still in the meeting?" toast. "Wrap up" → disarm with reason `CHECKIN_WRAP_UP`.
+ - **Meeting-ended watcher** (runs while whitelist-armed; NOT for hotkey-armed sessions) — polls mic-holders; if the arm-app hasn't held the mic for `whitelist_arm_release_grace_secs` (default 6 s = three absent polls at the 2 s interval), fires "Looks like your meeting ended" toast. "Keep going" snoozes `meeting_ended_snooze_secs` (default 10 min), then re-fires if still absent. Non-response defaults to Wrap up.
+ 
+-**Detection is mic-holder-based, not window-title-based.** `detectors.match_whitelist()` is pure logic operating on `MicState.holders` (Windows: pycaw WASAPI session enumeration) or `MicState.active + running_processes + foreground` (macOS: `kAudioDevicePropertyDeviceIsRunningSomewhere` + psutil + NSWorkspace). Works for Discord (which never changes window title during calls), survives app updates, mute-tolerant (muted users still have an active capture session).
++**Detection is mic-holder-based, not window-title-based.** `detectors.match_whitelist()` is pure logic operating on `MicState.holders`. Both platforms now populate this with real per-process mic-holders:
++- **Windows**: pycaw WASAPI `IAudioSessionManager2` enumeration in `arm/platform_win.py`.
++- **macOS** (v2.5+): `arm/audio-detect/main.swift` (CoreAudio `kAudioHardwarePropertyProcessObjectList`, macOS 14.4+) + Apple's responsibility SPI to map helper PIDs back to user-facing apps. The Python wrapper in `arm/audio_detect.py` shells out to it. Pre-v2.5 the macOS path was a foreground-coupled proxy (`mic_active_plus_running`) that required the meeting app to be the frontmost window — that constraint is GONE.
++
++Works for Discord (which never changes window title during calls), survives app updates, mute-tolerant (muted users still have an active capture session), foreground-independent on both platforms.
+ 
+ Default whitelist ships with 25 apps (14 desktop + 11 web — Meet/Teams-web/Zoom-web/Webex-web/Whereby/Jitsi/8x8 plus Discord/Slack/Skype/WhatsApp web counterparts of the desktop messaging apps) — see `config.py::default_detector_specs()`. Users edit the list via Settings → Meeting Apps (see `gui/webui/src/settings/MeetingAppsPane.tsx` + `AddAppDialog.tsx`, backed by `gui/settings/bridge.py`): toggle off / remove / one-click-add from a live mic-holder picker (desktop) or a pasted meeting URL (web). The Suggested-to-add section is driven by `arm/seen_apps.py`, which records any unmatched mic-holder the watcher observes while disarmed (capped at 20 entries). The in-app edit writes the full list to `user_settings.json` under `arm.detectors` and nudges the live agent over IPC to reload; `SAYZO_ARM__DETECTORS` env var still wins.
+ 
+@@ -165,7 +169,11 @@ These are the rules the conversation detector and gate logic encode. Several wer
+ - **`arm/controller.py`** — ArmController state machine. Owns stream lifecycle, hotkey confirmations, whitelist consent, PENDING_CLOSE handling, long-meeting check-ins, meeting-ended watcher. Unit-tested with fake capture / VAD / notifier / injected platform queries.
+ - **`arm/detectors.py`** — Pure matching logic against `DetectorSpec` list from config. No OS calls. Skips specs with `disabled=True` (the Meeting Apps pane's off toggle).
+ - **`arm/seen_apps.py`** — Persistence for unmatched mic-holders observed by the whitelist watcher. Written to `data_dir/seen_apps.json`. Capped at 20 entries, dedup'd by lower-cased key, scrubbed against the current whitelist on read. Drives the Settings → Meeting Apps "Suggested to add" section.
+-- **`arm/platform_win.py` / `arm/platform_mac.py`** — Platform-specific OS queries: Windows uses pycaw for mic-session enumeration + `win32gui` for foreground; macOS uses pyobjc CoreAudio for mic-active bit + NSWorkspace for frontmost + AppleScript (cached 2 s) for active tab URL.
++- **`arm/platform_win.py` / `arm/platform_mac.py`** — Platform-specific OS queries:
++  - Windows: pycaw for mic-session enumeration (PIDs + process names), `win32gui` for foreground, UIAutomation for browser tab URLs.
++  - macOS (v2.5+): shells out to the `audio-detect` Swift helper for per-process mic attribution (PIDs + bundle ids, mapped through the responsibility SPI). NSWorkspace for foreground, AX (`AXUIElementCopyAttributeValue` for `kAXTitleAttribute` + `AXURL` on `AXWebArea`) for browser window titles + URLs. AppleScript was deliberately abandoned — it triggered the alarming "Sayzo wants to control your browser" Automation TCC dialog.
++- **`arm/audio-detect/main.swift`** — macOS-only Swift helper, ~250 lines, compiled in CI. Read-only enumeration of `kAudioHardwarePropertyProcessObjectList` (macOS 14.4+) plus the responsibility SPI (`responsibility_get_pid_responsible_for_pid`, the same source the orange privacy indicator uses). Zero permissions required (no `NSAudioCaptureUsageDescription`, no Microphone, no Screen Recording — strictly observation). Outputs JSON via `--json`.
++- **`arm/audio_detect.py`** — Python wrapper around the above. Locates the binary (frozen-bundle path → dev path → `$PATH`), runs `--json` per call with a 1 s cache to avoid hammering subprocess on the 2 s watcher poll. Returns one `AudioProcess` per row with PID, responsible_pid, bundle_id, input/output/running flags.
+ - **`arm/hotkey.py`** — pynput global hotkey listener. Marshals key-press events from pynput's listener thread onto the arm controller's asyncio loop via `call_soon_threadsafe`. Requires Accessibility permission on macOS (graceful fallback: tray menu still works).
+ - **`notify.py`** — Desktop notifier with a dedicated background asyncio loop (eager `__init__`) so interactive consent toasts can await button callbacks. `NoopNotifier.ask_consent` always returns the default, for unit-test clean paths.
+ - **`settings_store.py`** — JSON load/save for `data_dir/user_settings.json`. The Settings GUI + onboarding write here; `load_config` overlays onto `ArmConfig` defaults (env vars still win over JSON).
+diff --git a/pyproject.toml b/pyproject.toml
+index 9d6db33..8ef2000 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
+ 
+ [project]
+ name = "sayzo-agent"
+-version = "2.4.3"
++version = "2.5.0"
+ description = "Armed-only capture agent for Sayzo — records meetings on user consent (hotkey or whitelisted meeting app) and feeds them to downstream English-coaching analysis."
+ requires-python = ">=3.10"
+ dependencies = [
+@@ -48,9 +48,13 @@ dependencies = [
+     # without needing hand-authored title regex fallbacks. Pure-Python
+     # comtypes wrapper; comtypes itself is already pulled in by pycaw.
+     "uiautomation>=2.0; sys_platform == 'win32'",
+-    # macOS: mic-active query via CoreAudio, frontmost app via NSWorkspace.
++    # macOS: NSWorkspace frontmost-app query via AppKit (Cocoa); AX browser
++    # window-title + URL reads via ApplicationServices (kAXWindowsAttribute,
++    # AXURL on AXWebArea, etc.). Per-process mic attribution is owned by
++    # the audio-detect Swift helper now (v2.5+) — pyobjc-framework-CoreAudio
++    # was dropped in v2.5 along with the legacy ctypes-CoreAudio path.
+     "pyobjc-framework-Cocoa>=10.0; sys_platform == 'darwin'",
+-    "pyobjc-framework-CoreAudio>=10.0; sys_platform == 'darwin'",
++    "pyobjc-framework-ApplicationServices>=10.0; sys_platform == 'darwin'",
+     # macOS: idle-time query via Quartz CGEventSourceSecondsSinceLastEventType.
+     # Used by sayzo_agent/idle.py for the daily-drill scheduler's idle gate.
+     "pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'",
+diff --git a/sayzo-agent.spec b/sayzo-agent.spec
+index 93c3ce7..253fc44 100644
+--- a/sayzo-agent.spec
++++ b/sayzo-agent.spec
+@@ -83,6 +83,14 @@ if sys.platform == "darwin":
+     if audio_tap.exists():
+         datas.append((str(audio_tap), "sayzo_agent/capture/audio-tap"))
+ 
++    # macOS: bundle the pre-compiled audio-detect binary (per-process mic
++    # attribution helper). Read-only — no Audio Capture permission needed,
++    # no NSAudioCaptureUsageDescription required. Compiled in CI by the
++    # parallel `Compile audio-detect Swift binary` step.
++    audio_detect = Path("sayzo_agent/arm/audio-detect/audio-detect")
++    if audio_detect.exists():
++        datas.append((str(audio_detect), "sayzo_agent/arm/audio-detect"))
++
+ # First-run GUI assets — built HTML/JS/CSS bundle that the pywebview window
+ # loads. The dev path resolves these via Path(__file__).parent in
+ # sayzo_agent/gui/setup/window.py; the frozen path uses sys._MEIPASS.
+diff --git a/sayzo_agent/arm/audio-detect/main.swift b/sayzo_agent/arm/audio-detect/main.swift
+new file mode 100644
+index 0000000..a750cef
+--- /dev/null
++++ b/sayzo_agent/arm/audio-detect/main.swift
+@@ -0,0 +1,279 @@
++// audio-detect — per-process microphone-attribution helper for Sayzo.
++//
++// Sister binary to sayzo_agent/capture/audio-tap/main.swift. Where audio-tap
++// CAPTURES audio, this binary just READS state: who's currently using the
++// microphone, mapped to the user-facing app responsible for them.
++//
++// Why a separate Swift binary instead of pure Python:
++// - The CoreAudio per-process attribution APIs (kAudioHardwarePropertyProcessObjectList
++//   and friends, macOS 14.4+) return kAudioHardwareUnknownPropertyError ('who?')
++//   when called from an unsigned Python ctypes binding on macOS 26 (Tahoe). The
++//   same APIs work fine from a bare Swift binary — almost certainly a Hardened
++//   Runtime / signing check on the caller's identity.
++// - The responsibility SPI (responsibility_get_pid_responsible_for_pid) used to
++//   walk helper PIDs back to the user-facing app is also easier from native code.
++//
++// CLI:
++//   audio-detect              # one-shot, human-readable table
++//   audio-detect --json       # one-shot, JSON to stdout (the agent's parser)
++//
++// JSON output schema:
++//   [
++//     {"pid": 1234, "responsible_pid": 1200, "bundle_id": "us.zoom.xos",
++//      "input": 1, "output": 0, "running": 1},
++//     ...
++//   ]
++//
++// - pid             — the AudioProcessObject's PID (the helper, often)
++// - responsible_pid — Apple's privacy-attribution PID (the user-facing app);
++//                     -1 if the SPI was unresolvable
++// - bundle_id       — bundle id of the pid (NOT the responsible pid); null if
++//                     the process has none
++// - input / output / running — UInt32 booleans (0 or 1) from the kAudioProcess
++//                              IsRunningInput / IsRunningOutput / IsRunning
++//                              properties
++//
++// Compile (matches the audio-tap recipe):
++//   swiftc -O -o audio-detect main.swift -framework CoreAudio -framework Foundation
++//
++// Permissions: NONE. This binary only reads OS state — it never opens an
++// audio stream and never creates a tap. No Microphone, no Audio Capture,
++// no Screen Recording, no Automation. The orange privacy indicator stays off.
++
++import CoreAudio
++import Foundation
++import Darwin
++
++// ---------------------------------------------------------------------------
++// Responsibility SPI
++//
++// `responsibility_get_pid_responsible_for_pid(pid)` returns the user-facing
++// process responsible for a given pid. macOS itself uses this for privacy
++// indicator attribution — when audio capture happens in a helper process
++// (com.apple.webkit.GPU, com.google.Chrome.helper.gpu, ...) this is what
++// resolves it back to "Safari is using the microphone."
++//
++// Stable since at least macOS 10.10. Declared in the private
++// <sys/responsibility.h>; we resolve it via dlsym at startup so the binary
++// degrades gracefully (returning -1 → the agent falls back to bundle-prefix
++// inference) if Apple ever changes the symbol.
++// ---------------------------------------------------------------------------
++
++typealias ResponsibilityFn = @convention(c) (pid_t) -> pid_t
++
++let gResponsibilityFn: ResponsibilityFn? = {
++    guard let handle = dlopen(nil, RTLD_LAZY) else { return nil }
++    guard let sym = dlsym(handle, "responsibility_get_pid_responsible_for_pid") else {
++        return nil
++    }
++    return unsafeBitCast(sym, to: ResponsibilityFn.self)
++}()
++
++func responsiblePid(for pid: pid_t) -> pid_t? {
++    guard let fn = gResponsibilityFn else { return nil }
++    let result = fn(pid)
++    if result < 0 { return nil }
++    return result
++}
++
++// ---------------------------------------------------------------------------
++// CoreAudio property reads
++// ---------------------------------------------------------------------------
++
++func fourccString(_ value: OSStatus) -> String {
++    let u = UInt32(bitPattern: value)
++    let bytes: [UInt8] = [
++        UInt8((u >> 24) & 0xFF),
++        UInt8((u >> 16) & 0xFF),
++        UInt8((u >> 8) & 0xFF),
++        UInt8(u & 0xFF),
++    ]
++    let printable = bytes.allSatisfy { $0 >= 0x20 && $0 < 0x7F }
++    if printable, let s = String(bytes: bytes, encoding: .ascii) {
++        return "'\(s)'"
++    }
++    return String(value)
++}
++
++// Returns the list of every AudioProcessObject CoreAudio currently knows
++// about, or nil + the OSStatus on failure. Callers log the OSStatus so a
++// `'who?'` (kAudioHardwareUnknownPropertyError, decimal 2003332927) is
++// distinguishable from a transient error — that one means the per-process
++// API is unavailable on this OS / process identity.
++func listProcessObjects() -> ([AudioObjectID]?, OSStatus) {
++    var addr = AudioObjectPropertyAddress(
++        mSelector: kAudioHardwarePropertyProcessObjectList,
++        mScope: kAudioObjectPropertyScopeGlobal,
++        mElement: kAudioObjectPropertyElementMain
++    )
++    var size: UInt32 = 0
++    var status = AudioObjectGetPropertyDataSize(
++        AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size
++    )
++    if status != noErr {
++        return (nil, status)
++    }
++    let count = Int(size) / MemoryLayout<AudioObjectID>.size
++    if count == 0 {
++        return ([], noErr)
++    }
++    var objects = [AudioObjectID](repeating: 0, count: count)
++    status = objects.withUnsafeMutableBufferPointer { buf -> OSStatus in
++        guard let base = buf.baseAddress else { return OSStatus(-1) }
++        return AudioObjectGetPropertyData(
++            AudioObjectID(kAudioObjectSystemObject),
++            &addr, 0, nil, &size, base
++        )
++    }
++    if status != noErr {
++        return (nil, status)
++    }
++    return (objects, noErr)
++}
++
++func readPID(_ obj: AudioObjectID) -> pid_t? {
++    var addr = AudioObjectPropertyAddress(
++        mSelector: kAudioProcessPropertyPID,
++        mScope: kAudioObjectPropertyScopeGlobal,
++        mElement: kAudioObjectPropertyElementMain
++    )
++    var pid: pid_t = 0
++    var size: UInt32 = UInt32(MemoryLayout<pid_t>.size)
++    let status = AudioObjectGetPropertyData(obj, &addr, 0, nil, &size, &pid)
++    return status == noErr ? pid : nil
++}
++
++func readBundleID(_ obj: AudioObjectID) -> String? {
++    var addr = AudioObjectPropertyAddress(
++        mSelector: kAudioProcessPropertyBundleID,
++        mScope: kAudioObjectPropertyScopeGlobal,
++        mElement: kAudioObjectPropertyElementMain
++    )
++    var raw: Unmanaged<CFString>?
++    var size: UInt32 = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
++    let status = withUnsafeMutablePointer(to: &raw) { ptr -> OSStatus in
++        ptr.withMemoryRebound(to: UInt8.self, capacity: Int(size)) { _ in
++            AudioObjectGetPropertyData(obj, &addr, 0, nil, &size, ptr)
++        }
++    }
++    if status != noErr { return nil }
++    return raw?.takeRetainedValue() as String?
++}
++
++func readBool(_ obj: AudioObjectID, _ selector: AudioObjectPropertySelector) -> UInt32? {
++    var addr = AudioObjectPropertyAddress(
++        mSelector: selector,
++        mScope: kAudioObjectPropertyScopeGlobal,
++        mElement: kAudioObjectPropertyElementMain
++    )
++    var value: UInt32 = 0
++    var size: UInt32 = UInt32(MemoryLayout<UInt32>.size)
++    let status = AudioObjectGetPropertyData(obj, &addr, 0, nil, &size, &value)
++    return status == noErr ? value : nil
++}
++
++// ---------------------------------------------------------------------------
++// Output formats
++// ---------------------------------------------------------------------------
++
++struct AudioProcessRow {
++    let pid: Int
++    let responsible: Int  // -1 when the SPI didn't resolve
++    let bundle: String?
++    let input: UInt32
++    let output: UInt32
++    let running: UInt32
++}
++
++func collectRows() -> ([AudioProcessRow]?, OSStatus) {
++    let (objects, status) = listProcessObjects()
++    guard let objects = objects else { return (nil, status) }
++    var rows: [AudioProcessRow] = []
++    rows.reserveCapacity(objects.count)
++    for obj in objects {
++        let pid = readPID(obj).map { Int($0) } ?? -1
++        let bundle = readBundleID(obj)
++        let input = readBool(obj, kAudioProcessPropertyIsRunningInput) ?? 0
++        let output = readBool(obj, kAudioProcessPropertyIsRunningOutput) ?? 0
++        let running = readBool(obj, kAudioProcessPropertyIsRunning) ?? 0
++        let resp: Int
++        if pid > 0, let r = responsiblePid(for: pid_t(pid)) {
++            resp = Int(r)
++        } else {
++            resp = -1
++        }
++        rows.append(AudioProcessRow(
++            pid: pid, responsible: resp, bundle: bundle,
++            input: input, output: output, running: running
++        ))
++    }
++    return (rows, noErr)
++}
++
++func printJSON(_ rows: [AudioProcessRow]) {
++    var entries: [String] = []
++    entries.reserveCapacity(rows.count)
++    for r in rows {
++        let bundleField: String
++        if let b = r.bundle {
++            // JSON-escape: handle backslash, double-quote, control chars.
++            let escaped = b
++                .replacingOccurrences(of: "\\", with: "\\\\")
++                .replacingOccurrences(of: "\"", with: "\\\"")
++            bundleField = "\"\(escaped)\""
++        } else {
++            bundleField = "null"
++        }
++        entries.append(
++            "{\"pid\":\(r.pid),\"responsible_pid\":\(r.responsible)," +
++            "\"bundle_id\":\(bundleField)," +
++            "\"input\":\(r.input),\"output\":\(r.output),\"running\":\(r.running)}"
++        )
++    }
++    print("[\(entries.joined(separator: ","))]")
++}
++
++func printHuman(_ rows: [AudioProcessRow]) {
++    if rows.isEmpty {
++        print("(no audio process objects)")
++        return
++    }
++    print(String(format: "  %6s  %6s  %3s  %3s  %3s  %s",
++                 "pid", "resp", "in", "out", "run", "bundle"))
++    for r in rows {
++        let pidS = r.pid >= 0 ? String(format: "%6d", r.pid) : "     -"
++        let respS = r.responsible >= 0 ? String(format: "%6d", r.responsible) : "     -"
++        let bundle = r.bundle ?? "<none>"
++        print(String(format: "  %@  %@  %3d  %3d  %3d  %@",
++                     pidS, respS, r.input, r.output, r.running, bundle))
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Driver
++// ---------------------------------------------------------------------------
++
++let args = CommandLine.arguments
++let jsonMode = args.contains("--json")
++
++let (rows, status) = collectRows()
++guard let rows = rows else {
++    FileHandle.standardError.write(Data(
++        "audio-detect: ProcessObjectList enumeration failed: OSStatus \(status) \(fourccString(status))\n".utf8
++    ))
++    if jsonMode {
++        // Always emit valid JSON on stdout so the parser doesn't crash.
++        print("[]")
++    }
++    // Exit 1 so the parent can distinguish enumeration failure from
++    // "the system has no audio processes." A 0-length JSON array is fine
++    // when CoreAudio responded but reported no processes; we return non-zero
++    // only on an actual error path.
++    exit(1)
++}
++
++if jsonMode {
++    printJSON(rows)
++} else {
++    printHuman(rows)
++}
+diff --git a/sayzo_agent/arm/audio_detect.py b/sayzo_agent/arm/audio_detect.py
+new file mode 100644
+index 0000000..1577e2b
+--- /dev/null
++++ b/sayzo_agent/arm/audio_detect.py
+@@ -0,0 +1,212 @@
++"""Per-process mic-attribution wrapper around the ``audio-detect`` Swift binary.
++
++Why this module exists:
++
++The current macOS code in :mod:`platform_mac` has historically claimed
++"we can't attribute mic-in-use to a specific process cheaply." That was
++true on macOS < 14.4. Since 14.4, CoreAudio exposes
++``kAudioHardwarePropertyProcessObjectList`` + sibling per-process
++properties (``IsRunningInput``, etc.) that give Windows-equivalent
++attribution. The catch: on macOS 26 (Tahoe) those APIs return
++``kAudioHardwareUnknownPropertyError`` ('who?') when called from an
++unsigned Python ctypes binding, but work fine from a bare Swift binary
++— almost certainly a Hardened Runtime / signing check on the caller.
++
++So we ship a small Swift CLI (``arm/audio-detect/main.swift``, compiled
++in CI), call it via subprocess, parse the JSON. Output is one row per
++``AudioProcessObject`` with PID, responsible PID (Apple's privacy-
++attribution source), bundle id, and the IsRunningInput / Output /
++Running flags.
++
++Cached for a short window so the watcher's 2 s poll doesn't double-cost
++on the helper invocation.
++"""
++from __future__ import annotations
++
++import json
++import logging
++import os
++import subprocess
++import sys
++import threading
++import time
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Optional
++
++log = logging.getLogger(__name__)
++
++
++# How long a snapshot stays cached. The arm subsystem polls at
++# ArmConfig.poll_interval_secs (default 2 s); a 1 s cache means we hit the
++# binary at most once per poll while still letting Settings UI calls
++# (which are out-of-band) get fresh data within ~1 s.
++_CACHE_TTL_SECS = 1.0
++
++
++@dataclass(frozen=True)
++class AudioProcess:
++    """One row from ``audio-detect --json``."""
++
++    pid: int
++    responsible_pid: int  # -1 when the SPI didn't resolve
++    bundle_id: Optional[str]
++    input: bool
++    output: bool
++    running: bool
++
++
++@dataclass
++class _Cache:
++    snapshot: list[AudioProcess] = field(default_factory=list)
++    expires_at: float = 0.0
++
++
++_cache = _Cache()
++_cache_lock = threading.Lock()
++
++
++def _binary_path() -> Optional[Path]:
++    """Locate the audio-detect helper.
++
++    Lookup order, mirroring how :mod:`capture.system_mac` finds audio-tap:
++
++    1. PyInstaller-frozen layout: ``sys._MEIPASS/sayzo_agent/arm/audio-detect/``.
++    2. Dev layout (running from the repo): same path relative to this
++       file's package directory.
++    3. Anything on ``$PATH`` named ``audio-detect`` (escape hatch for
++       hand-installed builds).
++
++    Returns None if nothing executable was found — callers must handle
++    this and degrade gracefully (e.g. return an empty holders list and
++    log once).
++    """
++    candidates: list[Path] = []
++
++    meipass = getattr(sys, "_MEIPASS", None)
++    if meipass:
++        candidates.append(Path(meipass) / "sayzo_agent/arm/audio-detect/audio-detect")
++
++    candidates.append(Path(__file__).parent / "audio-detect" / "audio-detect")
++
++    from shutil import which
++    on_path = which("audio-detect")
++    if on_path:
++        candidates.append(Path(on_path))
++
++    for c in candidates:
++        if c.exists() and os.access(c, os.X_OK):
++            return c
++    return None
++
++
++_binary_warn_fired = False
++
++
++def _warn_missing_binary_once() -> None:
++    global _binary_warn_fired
++    if _binary_warn_fired:
++        return
++    _binary_warn_fired = True
++    log.warning(
++        "[arm.audio_detect] audio-detect binary not found on disk. "
++        "Build it with: cd sayzo_agent/arm/audio-detect && "
++        "swiftc -O -o audio-detect main.swift -framework CoreAudio "
++        "-framework Foundation. macOS meeting detection will be silent until then."
++    )
++
++
++def _run_binary(binary: Path, timeout_secs: float = 4.0) -> list[AudioProcess]:
++    """Invoke ``audio-detect --json`` and parse the output.
++
++    Returns an empty list on any failure (timeout, non-zero exit,
++    malformed JSON). All failure modes are logged at WARNING the first
++    time and DEBUG thereafter — we never raise back to the watcher.
++    """
++    try:
++        proc = subprocess.run(
++            [str(binary), "--json"],
++            capture_output=True,
++            text=True,
++            timeout=timeout_secs,
++        )
++    except subprocess.TimeoutExpired:
++        log.warning("[arm.audio_detect] %s --json timed out after %.1fs",
++                    binary.name, timeout_secs)
++        return []
++    except OSError as exc:
++        log.warning("[arm.audio_detect] launch %s failed: %s", binary, exc)
++        return []
++
++    if proc.stderr.strip():
++        # The Swift binary writes diagnostic warnings (e.g. ProcessObjectList
++        # failures) to stderr. Surface them at DEBUG so they're available
++        # under SAYZO_LOG_LEVEL=debug without spamming the normal log.
++        log.debug("[arm.audio_detect] stderr: %s", proc.stderr.strip())
++
++    if proc.returncode != 0:
++        log.debug("[arm.audio_detect] %s exited %d (stderr: %r)",
++                  binary.name, proc.returncode, proc.stderr.strip())
++        return []
++
++    try:
++        rows = json.loads(proc.stdout)
++    except json.JSONDecodeError as exc:
++        log.debug("[arm.audio_detect] non-JSON output: %s (first 200: %r)",
++                  exc, proc.stdout[:200])
++        return []
++
++    out: list[AudioProcess] = []
++    for r in rows:
++        if not isinstance(r, dict):
++            continue
++        try:
++            out.append(AudioProcess(
++                pid=int(r.get("pid", -1)),
++                responsible_pid=int(r.get("responsible_pid", -1)),
++                bundle_id=r.get("bundle_id"),
++                input=bool(r.get("input", 0)),
++                output=bool(r.get("output", 0)),
++                running=bool(r.get("running", 0)),
++            ))
++        except (TypeError, ValueError):
++            log.debug("[arm.audio_detect] skip malformed row: %r", r)
++            continue
++    return out
++
++
++def snapshot(*, force_refresh: bool = False) -> list[AudioProcess]:
++    """Return the current audio-process list, possibly served from cache.
++
++    ``force_refresh=True`` skips the cache (used by tests + the Settings
++    UI's live mic-holder picker, which needs fresh data on user click).
++    """
++    if sys.platform != "darwin":
++        return []
++
++    now = time.monotonic()
++    if not force_refresh:
++        with _cache_lock:
++            if now < _cache.expires_at:
++                return list(_cache.snapshot)
++
++    binary = _binary_path()
++    if binary is None:
++        _warn_missing_binary_once()
++        with _cache_lock:
++            _cache.snapshot = []
++            _cache.expires_at = now + _CACHE_TTL_SECS
++        return []
++
++    rows = _run_binary(binary)
++    with _cache_lock:
++        _cache.snapshot = rows
++        _cache.expires_at = now + _CACHE_TTL_SECS
++    return list(rows)
++
++
++def reset_cache() -> None:
++    """Clear the snapshot cache (test helper)."""
++    with _cache_lock:
++        _cache.snapshot = []
++        _cache.expires_at = 0.0
+diff --git a/sayzo_agent/arm/detectors.py b/sayzo_agent/arm/detectors.py
+index 0abeabc..458a2dd 100644
+--- a/sayzo_agent/arm/detectors.py
++++ b/sayzo_agent/arm/detectors.py
+@@ -1,15 +1,18 @@
+ """Pure matching logic for the meeting-app whitelist.
+ 
+ The detector inputs come from platform-specific queries (see
+-``platform_win.py`` / ``platform_mac.py``): a list of processes currently
+-holding the default microphone as an active capture session (Windows),
+-or a boolean "is any process capturing from the mic" + list of running
+-whitelisted processes (macOS), plus the frontmost app + (on macOS) the
+-active browser tab URL.
+-
+-This module is pure — no OS calls, no imports beyond the standard library
+-and config types. Tests drive it with synthetic ``ForegroundInfo`` /
+-``MicState`` inputs.
++``platform_win.py`` / ``platform_mac.py``): a list of processes
++currently holding the default microphone as an active capture session,
++plus the frontmost app + active browser tab URL/title. Both platforms
++populate the same :class:`MicState` shape now — Windows from pycaw
++WASAPI session enumeration, macOS from the ``audio-detect`` Swift
++helper (per-process attribution via ``kAudioHardwarePropertyProcessObjectList``
++on macOS 14.4+, mapped through the responsibility SPI to user-facing
++apps).
++
++This module is pure — no OS calls, no imports beyond the standard
++library and config types. Tests drive it with synthetic
++``ForegroundInfo`` / ``MicState`` inputs.
+ """
+ from __future__ import annotations
+ 
+@@ -21,13 +24,13 @@ from ..config import DetectorSpec
+ 
+ 
+ MatchSource = Literal[
+-    # Windows — we saw a whitelisted process as a mic-session holder directly.
++    # Direct mic-holder match. Windows: pycaw WASAPI enumeration.
++    # macOS (v2.5+): per-process attribution via the audio-detect Swift
++    # helper, which maps helper PIDs back to the user-facing app via the
++    # responsibility SPI.
+     "mic_session",
+-    # macOS — mic is active system-wide AND a whitelisted process is running
+-    # AND was frontmost within the configured window.
+-    "mic_active_plus_running",
+-    # Either platform — browser holds the mic AND the active tab URL matches
+-    # a DetectorSpec with is_browser=True.
++    # Browser holds the mic AND the active tab URL/title matches a
++    # DetectorSpec with is_browser=True.
+     "browser_mic_plus_url",
+ ]
+ 
+@@ -72,25 +75,41 @@ class ForegroundInfo:
+ 
+ @dataclass(frozen=True)
+ class MicHolder:
+-    """One process currently holding an active capture session on the default
+-    microphone. Populated on Windows by ``get_mic_holders()``; on macOS the
+-    equivalent is a system-wide "mic-active" bit + psutil running-process
+-    list (see ``platform_mac.py``)."""
++    """One process currently holding an active capture session on the
++    default microphone.
++
++    - ``process_name`` — Windows: executable name (``zoom.exe``).
++      macOS: bundle id of the user-facing app (``us.zoom.xos``); the
++      capturing process may be a helper, but the holder is recorded
++      against its responsible-app PID + bundle for matching.
++    - ``pid`` — Windows: PID of the WASAPI capture session owner.
++      macOS: PID of the user-facing GUI app (resolved from the
++      capturing helper via the responsibility SPI).
++    - ``bundle_id`` — macOS only; same value as ``process_name`` on
++      Mac, ``None`` on Windows. Carried separately so the matcher can
++      check it against ``DetectorSpec.bundle_ids`` without ambiguity.
++    """
+ 
+     process_name: str
+     pid: int = -1
++    bundle_id: Optional[str] = None
+ 
+ 
+ @dataclass(frozen=True)
+ class MicState:
+     """Normalized mic-holder snapshot that works on both platforms.
+ 
+-    Windows: ``holders`` comes directly from WASAPI session enumeration.
+-    macOS: ``active`` is set when ``kAudioDevicePropertyDeviceIsRunningSomewhere``
+-    is True; ``running_processes`` lists psutil-visible process names. The
+-    matcher treats ``active and process_name in running_processes`` as
+-    equivalent to a direct mic-holder match under the
+-    ``mic_active_plus_running`` source.
++    Windows: ``holders`` comes directly from WASAPI session enumeration
++    via pycaw. macOS (v2.5+): ``holders`` comes from the ``audio-detect``
++    Swift helper, which enumerates ``kAudioHardwarePropertyProcessObjectList``
++    (macOS 14.4+) and maps each capturing process to its user-facing
++    app via Apple's responsibility SPI. Either way the matcher only
++    consults ``holders`` for the desktop match path.
++
++    ``active`` and ``running_processes`` are still populated on macOS
++    for the seen-apps recording path (catching unmatched mic-holders
++    that didn't resolve to a known GUI app), but the matcher itself
++    no longer uses them.
+     """
+ 
+     holders: list[MicHolder] = field(default_factory=list)
+@@ -138,14 +157,45 @@ BROWSER_PROCESS_NAMES = frozenset({
+ def _browser_holds_mic(mic: MicState, foreground: ForegroundInfo) -> bool:
+     """True if a browser process currently holds the mic.
+ 
+-    Windows: direct check against ``mic.holders``. macOS has no per-process
+-    mic attribution; treat ``mic.active`` + a browser being frontmost as
+-    the equivalent signal.
++    Both platforms now use direct ``mic.holders`` attribution:
++
++    - Windows: pycaw WASAPI session ownership.
++    - macOS (v2.5+): per-process attribution via the ``audio-detect``
++      Swift helper, which already resolves browser-helper PIDs back to
++      the user-facing browser via the responsibility SPI. So a Chrome
++      audio helper capturing the mic shows up here as a holder with
++      bundle id ``com.google.Chrome``.
++
++    On macOS the holder's ``process_name`` field carries the bundle id
++    (e.g. ``com.google.Chrome``), which won't match
++    ``BROWSER_PROCESS_NAMES`` (Windows ``.exe`` names). We check
++    ``bundle_id`` against the known browser bundle set as a parallel
++    path. The :mod:`platform_mac` module owns that set; importing here
++    would create a cycle, so we hardcode the same id list — both files
++    must stay in sync if a new browser is added.
+     """
+     for h in mic.holders:
+         if h.process_name.lower() in BROWSER_PROCESS_NAMES:
+             return True
+-    return mic.active and foreground.is_browser
++        if h.bundle_id and h.bundle_id in _BROWSER_BUNDLE_IDS:
++            return True
++    return False
++
++
++# Mac browser bundles that count as "a browser is holding the mic" when
++# attributed via the responsibility SPI. Mirrors
++# ``platform_mac._BROWSER_BUNDLES`` keys; kept in sync manually because
++# this is the pure module and can't import platform_mac without a cycle.
++_BROWSER_BUNDLE_IDS = frozenset({
++    "com.google.Chrome",
++    "com.apple.Safari",
++    "com.microsoft.edgemac",
++    "com.brave.Browser",
++    "company.thebrowser.Browser",
++    "org.mozilla.firefox",
++    "com.operasoftware.Opera",
++    "com.vivaldi.Vivaldi",
++})
+ 
+ 
+ def _compile(pattern: str) -> re.Pattern[str]:
+@@ -209,15 +259,16 @@ def match_whitelist(
+ ) -> Optional[MatchResult]:
+     """Return the first high-confidence match across ``specs``, or None.
+ 
+-    Precedence: desktop-app matches (mic_session / mic_active_plus_running)
+-    before browser-URL matches, so if Zoom desktop is running a meeting
+-    while Chrome has Google Meet open in the background, we attribute the
+-    match to Zoom.
++    Precedence: desktop-app matches (``mic_session``) before browser-URL
++    matches, so if Zoom desktop is running a meeting while Chrome has
++    Google Meet open in the background, we attribute the match to Zoom.
+ 
+-    ``MatchResult.target_pids`` is populated on the Windows path directly
+-    from ``mic.holders``. macOS paths leave it empty here; the
+-    ArmController resolves PIDs via a platform helper (psutil +
+-    NSWorkspace) before arming. Empty tuple ⇒ endpoint-wide capture.
++    ``MatchResult.target_pids`` is populated directly from ``mic.holders``
++    on both platforms now. The ArmController's
++    ``resolve_pids_for_spec`` resolver is only consulted for the
++    browser path when ``_pids_for_browser_holders`` returns empty (e.g.
++    a macOS browser holder where the helper PID didn't survive the
++    walk). Empty tuple ⇒ endpoint-wide capture.
+ 
+     ``exclude_app_keys`` lets the caller skip specs that are currently
+     suppressed (release pending after a decline or session end).
+@@ -235,15 +286,46 @@ def match_whitelist(
+     ]
+ 
+     holder_names = {h.process_name.lower() for h in mic.holders}
+-
+-    # Pass 1 — desktop apps via direct mic-session hit (Windows).
++    holder_bundles = {h.bundle_id.lower() for h in mic.holders if h.bundle_id}
++
++    # Pass 1 — desktop apps via direct mic-session hit. Works on both
++    # platforms now: Windows from pycaw process names, macOS from the
++    # audio-detect Swift helper (bundle ids).
++    #
++    # Two match flavors per spec:
++    #   - Direct: spec.process_names ∩ holder_names, or spec.bundle_ids
++    #     ∩ holder_bundles. The fast path.
++    #   - Helper-bundle prefix: a holder's bundle id starts with
++    #     "<spec.bundle_ids[i]>." (with the dot suffix to prevent false
++    #     positives like "com.foo.app" matching "com.foo.app2"). Catches
++    #     every Electron-based meeting app universally — Discord, Slack,
++    #     Teams desktop, Signal, Skype, etc. — without needing per-app
++    #     helper bundle id lists. Pure backstop: macOS's responsibility
++    #     SPI already attributes most helpers to their main app upstream
++    #     in get_mic_holders, but this catches the cases where it didn't.
+     for spec in active_specs:
+         if spec.is_browser:
+             continue
+-        if not spec.process_names:
+-            continue
+-        for proc in spec.process_names:
+-            if proc.lower() in holder_names:
++        spec_names_lower = {p.lower() for p in spec.process_names}
++        spec_bundles_lower = {b.lower() for b in spec.bundle_ids}
++
++        if spec_names_lower & holder_names:
++            return MatchResult(
++                app_key=spec.app_key,
++                display_name=spec.display_name,
++                source="mic_session",
++                target_pids=_pids_for_desktop_holders(spec, mic),
++            )
++        if spec_bundles_lower & holder_bundles:
++            return MatchResult(
++                app_key=spec.app_key,
++                display_name=spec.display_name,
++                source="mic_session",
++                target_pids=_pids_for_desktop_holders(spec, mic),
++            )
++        # Helper-bundle prefix backstop.
++        for spec_bundle in spec_bundles_lower:
++            if any(b.startswith(spec_bundle + ".") for b in holder_bundles):
+                 return MatchResult(
+                     app_key=spec.app_key,
+                     display_name=spec.display_name,
+@@ -251,40 +333,6 @@ def match_whitelist(
+                     target_pids=_pids_for_desktop_holders(spec, mic),
+                 )
+ 
+-    # Pass 2 — macOS proxy. Mic is active system-wide AND a whitelisted
+-    # process is running. This catches Discord voice calls / Zoom meetings
+-    # on macOS where we can't attribute mic-use per-process cheaply.
+-    if mic.active and mic.running_processes:
+-        fg_proc = (foreground.process_name or "").lower()
+-        fg_bundle = (foreground.bundle_id or "").lower()
+-        running_lower = {p.lower() for p in mic.running_processes}
+-        for spec in active_specs:
+-            if spec.is_browser:
+-                continue
+-            targets: list[str] = []
+-            targets.extend(p.lower() for p in spec.process_names)
+-            targets.extend(b.lower() for b in spec.bundle_ids)
+-            if not targets:
+-                continue
+-            if not any(t in running_lower or t == fg_proc or t == fg_bundle
+-                       for t in targets):
+-                continue
+-            # Require the matched app to currently be frontmost (v1 — the
+-            # foreground cache is owned by the caller, so we just check the
+-            # current snapshot here).
+-            if fg_proc and any(t == fg_proc for t in targets):
+-                return MatchResult(
+-                    app_key=spec.app_key,
+-                    display_name=spec.display_name,
+-                    source="mic_active_plus_running",
+-                )
+-            if fg_bundle and any(t == fg_bundle for t in targets):
+-                return MatchResult(
+-                    app_key=spec.app_key,
+-                    display_name=spec.display_name,
+-                    source="mic_active_plus_running",
+-                )
+-
+     # Pass 3 — browsers. Gate on a browser actually holding the mic
+     # (Windows: pycaw attribution; macOS: mic.active + browser-is-foreground).
+     # We no longer require the browser to be foreground on Windows — the user
+@@ -338,16 +386,31 @@ def match_whitelist(
+ 
+ 
+ def _pids_for_desktop_holders(spec: DetectorSpec, mic: MicState) -> tuple[int, ...]:
+-    """PIDs from ``mic.holders`` whose process name matches ``spec``.
+-
+-    Windows path: ``mic.holders`` has real PIDs from pycaw, so we can scope
+-    system-audio capture to exactly those processes. macOS path: empty,
+-    because ``mic.holders`` is always empty on macOS. The ArmController
+-    fills those via a platform resolver (``platform_mac.resolve_pids_for_spec``)
+-    before arming.
++    """PIDs from ``mic.holders`` whose process name OR bundle id matches ``spec``.
++
++    Both platforms now populate ``mic.holders`` with real PIDs (Windows:
++    from pycaw, macOS: from the responsibility SPI). System-audio
++    capture scopes to exactly these processes. Includes helper-bundle
++    prefix matching so Discord's ``com.hnc.Discord.helper.Renderer``
++    contributes its PID to a Discord arm even if get_mic_holders didn't
++    already collapse it to the main bundle.
+     """
+     names = {p.lower() for p in spec.process_names}
+-    pids = {h.pid for h in mic.holders if h.pid > 0 and h.process_name.lower() in names}
++    bundles = {b.lower() for b in spec.bundle_ids}
++    pids: set[int] = set()
++    for h in mic.holders:
++        if h.pid <= 0:
++            continue
++        if h.process_name.lower() in names:
++            pids.add(h.pid)
++            continue
++        if h.bundle_id and h.bundle_id.lower() in bundles:
++            pids.add(h.pid)
++            continue
++        if h.bundle_id:
++            hb = h.bundle_id.lower()
++            if any(hb.startswith(sb + ".") for sb in bundles):
++                pids.add(h.pid)
+     return tuple(sorted(pids))
+ 
+ 
+@@ -402,75 +465,45 @@ def arm_app_still_holding_mic(
+ ) -> bool:
+     """For the meeting-ended watcher: is the arm-app still a mic-holder?
+ 
+-    Returns True if the spec with ``app_key`` is still detectable via the
+-    same signal type we'd use to match it fresh. Used per-poll by the
+-    watcher; a streak of ``False`` longer than the grace window triggers
+-    the meeting-ended toast.
+-
+-    ``arm_pids_alive`` is a precomputed boolean from the controller — True
+-    iff at least one of the browser PIDs we scoped to at arm time is still
+-    a live process. Only consulted on the macOS browser path (where
+-    ``mic.holders`` is always empty so we can't rely on per-process
+-    pycaw attribution); the Windows path uses ``mic.holders`` directly.
+-    Callers without arm context (the disarmed-state suppression-clear
+-    loop) pass ``None`` and get the legacy foreground-dependent behavior.
+-    Kept out of this pure module so detectors.py never imports psutil.
++    Returns True if the spec with ``app_key`` is still detectable via
++    the same signal type we'd use to match it fresh. Used per-poll by
++    the watcher; a streak of ``False`` longer than the grace window
++    triggers the meeting-ended toast.
++
++    Browser specs are intentionally evaluated only at the browser-
++    process level here — we do NOT re-check URL or title. AX (and
++    Windows UIA) typically only see the focused tab; tabbing away from
++    chatgpt-com to read email would otherwise flip the title list and
++    trip a false meeting-ended toast. The mic-release signal is ground
++    truth: hanging up a call drops the browser's capture session,
++    removing it from ``mic.holders``.
++
++    ``arm_pids_alive`` is now ignored — ``mic.holders`` is reliable on
++    both platforms (Windows: pycaw; macOS v2.5+: audio-detect helper),
++    so the old "PIDs are alive" tiebreaker isn't needed. The
++    ``whitelist_arm_release_grace_secs`` window in the controller
++    absorbs single-poll transients (failed helper invocation, etc.).
++    Parameter retained for ABI compatibility with existing callers.
+     """
+     spec = next((s for s in specs if s.app_key == app_key), None)
+     if spec is None:
+         return False
+ 
+     holder_names = {h.process_name.lower() for h in mic.holders}
++    holder_bundles = {h.bundle_id.lower() for h in mic.holders if h.bundle_id}
+ 
+     if not spec.is_browser:
+-        for proc in spec.process_names:
+-            if proc.lower() in holder_names:
++        spec_names = {p.lower() for p in spec.process_names}
++        spec_bundles = {b.lower() for b in spec.bundle_ids}
++        if spec_names & holder_names:
++            return True
++        if spec_bundles & holder_bundles:
++            return True
++        # Helper-bundle prefix backstop (Electron apps).
++        for sb in spec_bundles:
++            if any(b.startswith(sb + ".") for b in holder_bundles):
+                 return True
+-        if mic.active:
+-            running_lower = {p.lower() for p in mic.running_processes}
+-            fg_proc = (foreground.process_name or "").lower()
+-            fg_bundle = (foreground.bundle_id or "").lower()
+-            for target in [*spec.process_names, *spec.bundle_ids]:
+-                t = target.lower()
+-                if t in running_lower or t == fg_proc or t == fg_bundle:
+-                    return True
+         return False
+ 
+-    # Browser spec: once we're armed for this app, the arm session is bound
+-    # to the browser PID at scope time. "Still holding" reduces to "the
+-    # browser still holds the mic" — we deliberately do NOT re-check URL
+-    # or title here:
+-    # - Windows UIAutomation and macOS Accessibility typically only see the
+-    #   focused tab's URL/title. A user tabbing away from chatgpt-com to
+-    #   read email or take notes would otherwise flip the URL list and
+-    #   trip a false meeting-ended toast within the grace window.
+-    # - The mic-release signal is the ground truth: ending a chatgpt voice
+-    #   session (or hanging up a Meet call) releases the browser's WASAPI
+-    #   capture session, dropping its PID from mic.holders. That's the
+-    #   actual "meeting ended" signal we want to act on.
+-    # - Trade-off: if the user rapidly closes one whitelisted site and
+-    #   opens another in the same browser without releasing the mic, we
+-    #   keep capturing under the original arm_reason. The audio is still
+-    #   legitimate user content; only the app_key label is wrong.
+-
+-    # Windows: pycaw populates mic.holders, so _browser_holds_mic gives
+-    # a direct per-process answer regardless of foreground.
+-    if mic.holders:
+-        return _browser_holds_mic(mic, foreground)
+-
+-    # macOS: mic.holders is always empty (no per-process attribution in
+-    # CoreAudio). When the controller has armed for a browser meeting
+-    # it passes arm_pids_alive — True iff any of the browser PIDs we
+-    # scoped to at arm time is still a live process. Combined with
+-    # mic.active (system-wide capture is happening), this is per-PROCESS
+-    # attribution that doesn't depend on foreground, eliminating the
+-    # false meeting-ended toast users hit when Alt+Tabbing from Chrome
+-    # to Notes during a meeting (user report 2026-04-29). Per-tab
+-    # attribution within the browser is a separate documented limitation.
+-    if arm_pids_alive is not None:
+-        return mic.active and arm_pids_alive
+-
+-    # Fallback for callers without arm context (the disarmed-state
+-    # suppression-clear loop) and for legacy unit tests: the original
+-    # foreground-dependent check. Same semantics pre-v2.1.10.
++    # Browser spec — direct mic-holder check. Same path on both platforms.
+     return _browser_holds_mic(mic, foreground)
+diff --git a/sayzo_agent/arm/platform_mac.py b/sayzo_agent/arm/platform_mac.py
+index 1491724..057690d 100644
+--- a/sayzo_agent/arm/platform_mac.py
++++ b/sayzo_agent/arm/platform_mac.py
+@@ -1,27 +1,42 @@
+-"""macOS-specific foreground + mic-active queries for the armed model.
++"""macOS-specific foreground + mic-holder queries for the armed model.
+ 
+ Exports mirror ``platform_win.py``:
+ 
+-- ``is_mic_active()`` → bool, from ``kAudioDevicePropertyDeviceIsRunningSomewhere``
+-  on the default input device. True if any process is currently capturing.
+-- ``get_running_processes()`` → set of psutil-visible process names / bundle
+-  ids (for the macOS proxy path in the matcher).
+-- ``get_foreground_info()`` → frontmost bundle id + (if browser) active tab
+-  title via the Accessibility API. Cached for 2 s per browser.
++- ``get_mic_holders()`` → list of :class:`MicHolder` for every process
++  currently capturing the microphone, attributed to its user-facing app
++  via Apple's responsibility SPI. Powered by the ``audio-detect`` Swift
++  helper (``arm/audio-detect/main.swift``); see :mod:`audio_detect`.
++- ``is_mic_active()`` → bool, True if any process is currently capturing.
++  Derived from ``get_mic_holders()`` so it stays consistent with the
++  per-process attribution path.
++- ``get_running_processes()`` → set of psutil + NSWorkspace bundle ids.
++  Kept for the unmatched-holders "Suggested to add" recording path.
++- ``get_foreground_info()`` → frontmost bundle id + (if browser) active
++  tab title via the Accessibility API. Cached for 2 s per browser.
+ - ``get_browser_window_titles()`` → titles of every visible browser window
+   across all running browsers, also via Accessibility.
+-- ``get_mic_holders()`` → always ``[]`` on macOS; we can't attribute
+-  mic-in-use to a specific process cheaply. Kept for interface symmetry.
++- ``get_browser_window_urls()`` → active-tab URLs via Accessibility for
++  browsers that expose them (Safari yes, Chrome no — handled gracefully
++  via title-pattern fallback in the matcher).
++
++**The macOS rewrite (v2.5+).** Up to v2.4.x this module returned
++``[]`` from ``get_mic_holders`` and relied on a foreground-coupled proxy
++in :mod:`detectors` (``mic_active_plus_running``). That proxy required
++the meeting app to be the frontmost window for matching to fire — Alt-
++tabbing away from Zoom would silently drop detection. The Swift helper
++removes that constraint and brings macOS to Windows-equivalent
++behaviour: any process holding the mic is detected regardless of
++foreground state.
+ 
+ **Why AX, not AppleScript:** earlier versions read browser tab URLs via
+ ``osascript`` which forced macOS to fire the Automation TCC dialog
+-("Sayzo wants to control your browser") — alarming wording for a coaching
+-app, since the OS has no softer phrasing for "read which page is open."
+-Switching to ``AXUIElementCopyAttributeValue`` reuses the Accessibility
+-permission already required for the global hotkey, so no additional TCC
+-prompt ever appears. AX returns the window title (e.g. ``"Meet -
+-abc-defg-hij - Google Chrome"``) which the matcher's ``title_patterns``
+-regexes already handle the same way they do on Windows.
++("Sayzo wants to control your browser") — alarming wording for a
++coaching app, since the OS has no softer phrasing for "read which page
++is open." Switching to ``AXUIElementCopyAttributeValue`` reuses the
++Accessibility permission already required for the global hotkey, so no
++additional TCC prompt ever appears. AX returns the window title
++(e.g. ``"Meet - abc-defg-hij - Google Chrome"``) plus the active tab
++URL on browsers that expose it.
+ """
+ from __future__ import annotations
+ 
+@@ -31,7 +46,7 @@ import sys
+ import time
+ from typing import Optional
+ 
+-from ..config import DetectorSpec
++from . import audio_detect
+ from .detectors import BROWSER_PROCESS_NAMES, ForegroundInfo, MicHolder
+ 
+ log = logging.getLogger(__name__)
+@@ -48,53 +63,283 @@ _BROWSER_BUNDLES = {
+     "com.vivaldi.Vivaldi": "Vivaldi",
+ }
+ 
++
++# Browser audio happens in helper processes whose bundle id can either be
++# under the browser's own namespace (``com.google.Chrome.helper.gpu``)
++# or — for Safari + WebKit-derived embeddings — under
++# ``com.apple.webkit.*``. The responsibility SPI usually maps these back
++# to the user-facing browser, but on Safari it sometimes returns the
++# helper itself (the parent chain is launchd-rooted, no link back). This
++# table is the defensive fallback for the WebKit case.
++#
++# Each entry: (helper_bundle_prefix_lowercase, owning_browser_bundle_id).
++# Lookup uses ``startswith(prefix)`` (case-insensitive on the helper
++# bundle), so adding a new browser is one line.
++_BROWSER_HELPER_PREFIXES: list[tuple[str, str]] = [
++    # WebKit framework helpers (Safari and any WebKit-embedding browser).
++    ("com.apple.webkit.", "com.apple.Safari"),
++    # Chromium-derived browsers — all use ``<browser-bundle>.helper.*``.
++    ("com.google.chrome.helper", "com.google.Chrome"),
++    ("com.microsoft.edgemac.helper", "com.microsoft.edgemac"),
++    ("com.brave.browser.helper", "com.brave.Browser"),
++    ("company.thebrowser.browser.helper", "company.thebrowser.Browser"),
++    ("com.operasoftware.opera.helper", "com.operasoftware.Opera"),
++    ("com.vivaldi.vivaldi.helper", "com.vivaldi.Vivaldi"),
++    # Firefox: WebRTC audio runs in plugin-container; parent IS Firefox so
++    # parent-walking would also work, but prefix matching is uniform.
++    ("org.mozilla.firefox.plugin-container", "org.mozilla.firefox"),
++]
++
++
+ # Title cache per browser bundle so polling every 2 s doesn't re-walk the
+ # AX tree on every sample. {bundle_id: (titles, timestamp)}
+ _TITLES_CACHE: dict[str, tuple[list[str], float]] = {}
+-_TITLES_CACHE_TTL_SECS = 2.0
++_URLS_CACHE: dict[str, tuple[list[str], float]] = {}
++_AX_CACHE_TTL_SECS = 2.0
++
++
++def _browser_for_helper_bundle(bundle: Optional[str]) -> Optional[str]:
++    """If ``bundle`` is a known browser-helper bundle id, return the
++    owning browser's bundle id. Else None.
++
++    Used by :func:`get_mic_holders` as a fallback for the WebKit case
++    where the responsibility SPI returns the helper itself.
++    """
++    if not bundle:
++        return None
++    bl = bundle.lower()
++    for prefix, browser in _BROWSER_HELPER_PREFIXES:
++        if bl.startswith(prefix):
++            return browser
++    return None
++
++
++def _bundle_for_pid(pid: int) -> Optional[str]:
++    """Return the NSRunningApplication bundle id for ``pid``, or None.
++
++    Helpers / services typically don't have an NSRunningApplication entry
++    — they live in a separate launchd domain and only the user-facing
++    GUI app appears in this list. So a None return means "this PID is a
++    helper, walk up to find the responsible app."
++    """
++    try:
++        from AppKit import NSWorkspace  # type: ignore[import-not-found]
++    except Exception:
++        return None
++    try:
++        ws = NSWorkspace.sharedWorkspace()
++        for app in ws.runningApplications():
++            try:
++                if int(app.processIdentifier() or 0) == pid:
++                    bid = str(app.bundleIdentifier() or "") or None
++                    return bid
++            except Exception:
++                continue
++    except Exception:
++        log.debug("[arm.mac] _bundle_for_pid failed for %d", pid, exc_info=True)
++    return None
++
++
++def _running_pid_for_bundle(bundle: str) -> Optional[int]:
++    """First running NSRunningApplication PID for ``bundle``, or None.
++
++    Used by the WebKit fallback: when the SPI returns a helper PID we
++    can't introspect, we know the browser bundle it belongs to and need
++    to find a PID for the actual browser process so the system-audio
++    capture path can scope correctly.
++    """
++    try:
++        from AppKit import NSWorkspace  # type: ignore[import-not-found]
++    except Exception:
++        return None
++    try:
++        ws = NSWorkspace.sharedWorkspace()
++        for app in ws.runningApplications():
++            try:
++                if str(app.bundleIdentifier() or "") == bundle:
++                    pid = int(app.processIdentifier() or 0)
++                    if pid > 0:
++                        return pid
++            except Exception:
++                continue
++    except Exception:
++        log.debug("[arm.mac] _running_pid_for_bundle failed for %s", bundle, exc_info=True)
++    return None
++
++
++def _walk_to_gui_ancestor(start_pid: int, max_depth: int = 6) -> tuple[Optional[int], Optional[str]]:
++    """Walk parent PIDs from ``start_pid`` until we hit a process with an
++    NSRunningApplication entry (a real user-facing GUI app).
++
++    Used to recover the owning app when the responsibility SPI lands on
++    an intermediate helper. Discord's audio path is
++    ``Discord.helper.Renderer → Discord Helper → Discord``; the SPI
++    returns the middle helper, which has no NSRunningApplication entry,
++    and we walk one more parent up to find Discord itself.
++
++    Returns (owner_pid, bundle_id) or (None, None) if the walk falls off
++    into launchd / kernel without finding a GUI ancestor.
++    """
++    cur = start_pid
++    for _ in range(max_depth):
++        bid = _bundle_for_pid(cur)
++        if bid is not None:
++            return cur, bid
++        try:
++            import psutil
++            parent = psutil.Process(cur).parent()
++        except Exception:
++            return None, None
++        if parent is None or parent.pid in (0, 1):
++            return None, None
++        cur = parent.pid
++    return None, None
++
++
++def _resolve_owner(proc: audio_detect.AudioProcess) -> tuple[Optional[int], Optional[str]]:
++    """Map an :class:`audio_detect.AudioProcess` to its user-facing
++    (PID, bundle_id).
++
++    Resolution order:
++
++      1. Responsibility SPI (already done in Swift) → walk to GUI ancestor.
++         Apple's own privacy attribution; what the orange privacy
++         indicator uses.
++      2. Browser-helper bundle prefix → look up the browser's main PID via
++         NSRunningApplication. Defensive fallback for the WebKit case.
++      3. Plain parent-walk from the capturing PID. Catches anything (1)
++         and (2) didn't reach.
++
++    Returns (owner_pid, owner_bundle) or (None, None) if no GUI owner
++    could be resolved.
++    """
++    # Pass 1 — SPI + GUI walk-up.
++    if proc.responsible_pid > 0:
++        owner_pid, bid = _walk_to_gui_ancestor(proc.responsible_pid)
++        if bid is not None:
++            return owner_pid, bid
++
++    # Pass 2 — browser helper prefix.
++    browser_bundle = _browser_for_helper_bundle(proc.bundle_id)
++    if browser_bundle is not None:
++        return _running_pid_for_bundle(browser_bundle), browser_bundle
++
++    # Pass 3 — parent-walk from the capturing PID.
++    if proc.pid > 0:
++        owner_pid, bid = _walk_to_gui_ancestor(proc.pid)
++        if bid is not None:
++            return owner_pid, bid
++
++    return None, None
+ 
+ 
+ def get_mic_holders() -> list[MicHolder]:
+-    """No per-process attribution on macOS. Callers rely on the combination of
+-    ``is_mic_active`` + ``get_running_processes`` + ``get_foreground_info`` for
+-    the ``mic_active_plus_running`` match source."""
+-    return []
++    """Return one :class:`MicHolder` per process currently capturing the mic.
++
++    Each holder carries the user-facing app's PID and bundle id (NOT the
++    helper's), resolved via Apple's responsibility SPI. ``process_name``
++    is set to the bundle id for parity with how the matcher looks up
++    desktop specs (which carry both ``process_names`` and ``bundle_ids``).
+ 
++    Empty list when nothing is capturing, when the Swift helper is
++    missing, or when the per-process API isn't available on this OS.
++    The matcher tolerates an empty list — it just means no whitelist
++    match fires that poll.
++    """
++    if sys.platform != "darwin":
++        return []
+ 
+-# Known browser bundle ids. Used by ``resolve_pids_for_spec`` for browser
+-# specs so per-app system-audio capture can scope to the browser's PID tree
+-# even though we couldn't attribute the mic-hold to a specific browser.
+-# Parallel to ``detectors.BROWSER_PROCESS_NAMES`` (which covers Windows
+-# process executable names).
+-_BROWSER_BUNDLE_IDS = frozenset(_BROWSER_BUNDLES.keys())
++    snapshot = audio_detect.snapshot()
++    holders: list[MicHolder] = []
++    seen_pids: set[int] = set()
+ 
++    for proc in snapshot:
++        if not proc.input:
++            continue
++        owner_pid, owner_bundle = _resolve_owner(proc)
++        if owner_pid is None or owner_bundle is None:
++            # Couldn't map the helper back to a user-facing app. Leave it
++            # out — the seen-apps recorder in the controller will pick
++            # up unmatched bundle ids via the foreground-info path.
++            continue
++        if owner_pid in seen_pids:
++            # Multiple helpers from the same app (Chrome's helper.gpu +
++            # helper.alerts both capturing) collapse to one holder.
++            continue
++        seen_pids.add(owner_pid)
++        holders.append(MicHolder(
++            process_name=owner_bundle,
++            pid=owner_pid,
++            bundle_id=owner_bundle,
++        ))
++    return holders
+ 
+-def resolve_pids_for_spec(spec: "DetectorSpec") -> tuple[int, ...]:
+-    """Enumerate PIDs currently matching ``spec`` via psutil + NSWorkspace.
+ 
+-    Used on macOS (where ``MicHolder.pid`` is unavailable) to populate
+-    ``ArmReason.target_pids`` before arming. For browser specs we return
+-    the PIDs of every running browser process — per-tab scoping isn't
+-    possible without a browser extension, so all tabs in that browser's
+-    PID tree will be captured.
++def is_mic_active() -> bool:
++    """True if any process is currently capturing audio input.
+ 
+-    Empty tuple on any error — caller treats empty as "fall back to
+-    endpoint-wide capture".
++    Derived from :func:`get_mic_holders` so the system-wide bit stays
++    consistent with the per-process attribution. Also picks up captures
++    from processes we couldn't attribute to a GUI owner — important for
++    the seen-apps recorder which should fire when ANY mic activity is
++    happening, not only when we matched it.
++    """
++    if sys.platform != "darwin":
++        return False
++    if get_mic_holders():
++        return True
++    # Holders can be empty even when the mic is in use — e.g. a system
++    # service captured but we couldn't walk to a GUI owner. Fall back to
++    # checking if ANY audio process has IsRunningInput=YES.
++    for proc in audio_detect.snapshot():
++        if proc.input:
++            return True
++    return False
++
++
++def resolve_pids_for_spec(spec) -> tuple[int, ...]:
++    """Enumerate PIDs currently matching ``spec`` for system-audio scoping.
++
++    Used by the ArmController to populate ``ArmReason.target_pids``
++    before arming. Two paths:
++
++    1. **Spec is a desktop app**: prefer PIDs that are currently
++       capturing the mic (from :func:`get_mic_holders`) — those are
++       guaranteed live and matched. If none match, fall back to
++       enumerating every PID for the spec's bundle ids via NSWorkspace.
++    2. **Spec is a browser**: enumerate every PID for the spec's
++       browser bundle. Per-tab scoping isn't possible without an
++       extension; all tabs share the browser's PID tree.
++
++    Empty tuple ⇒ caller falls back to endpoint-wide capture.
+     """
+     if sys.platform != "darwin":
+         return ()
+ 
+     pids: set[int] = set()
++
++    # Desktop spec: match against current mic-holders first (high signal).
++    if not spec.is_browser:
++        spec_bundles = {b.lower() for b in spec.bundle_ids}
++        spec_names = {p.lower() for p in spec.process_names}
++        for holder in get_mic_holders():
++            if holder.bundle_id and holder.bundle_id.lower() in spec_bundles:
++                if holder.pid > 0:
++                    pids.add(holder.pid)
++            elif holder.process_name and holder.process_name.lower() in spec_names:
++                if holder.pid > 0:
++                    pids.add(holder.pid)
++        if pids:
++            return tuple(sorted(pids))
++
++    # Fallback / browser path: enumerate every NSRunningApplication
++    # whose bundle id matches.
+     target_bundles: set[str]
+-    target_names: set[str]
+     if spec.is_browser:
+-        target_bundles = {b.lower() for b in _BROWSER_BUNDLE_IDS}
+-        target_names = {n.lower() for n in BROWSER_PROCESS_NAMES}
++        target_bundles = {b.lower() for b in _BROWSER_BUNDLES.keys()}
+     else:
+         target_bundles = {b.lower() for b in spec.bundle_ids}
+-        target_names = {p.lower() for p in spec.process_names}
+ 
+-    # NSWorkspace: bundle id → PID (cheap; already in-process).
+     if target_bundles:
+         try:
+             from AppKit import NSWorkspace  # type: ignore[import-not-found]
+@@ -118,12 +363,12 @@ def resolve_pids_for_spec(spec: "DetectorSpec") -> tuple[int, ...]:
+                 exc_info=True,
+             )
+ 
+-    # psutil fallback: process name → PID. Catches non-bundled CLI-style
+-    # helpers (e.g. zoom auxiliary processes) that NSWorkspace doesn't
+-    # surface as NSRunningApplication entries.
+-    if target_names:
++    # psutil fallback for non-bundled CLI helpers (e.g. zoom auxiliary
++    # processes) that NSWorkspace doesn't surface.
++    if not spec.is_browser and spec.process_names:
+         try:
+             import psutil
++            target_names = {p.lower() for p in spec.process_names}
+             for p in psutil.process_iter(["pid", "name"]):
+                 try:
+                     name = (p.info.get("name") or "").lower()
+@@ -137,20 +382,16 @@ def resolve_pids_for_spec(spec: "DetectorSpec") -> tuple[int, ...]:
+         except Exception:
+             log.debug(
+                 "[arm.mac] psutil PID enumeration failed for %s",
+-                spec.app_key,
+-                exc_info=True,
++                spec.app_key, exc_info=True,
+             )
+ 
+     return tuple(sorted(pids))
+ 
+ 
+-def _pids_for_bundle(bundle_id: str) -> list[int]:
+-    """Return PIDs of every running process matching ``bundle_id``.
++# ---- AX title / URL reading (browser meeting detection) ------------------
+ 
+-    Used by the AX title reader to walk every browser instance the user
+-    has open (a single Chrome session can have multiple windows under one
+-    PID, but profile-isolated launches show up as multiple PIDs).
+-    """
++def _pids_for_bundle(bundle_id: str) -> list[int]:
++    """Return PIDs of every running process matching ``bundle_id``."""
+     pids: list[int] = []
+     try:
+         from AppKit import NSWorkspace  # type: ignore[import-not-found]
+@@ -165,43 +406,57 @@ def _pids_for_bundle(bundle_id: str) -> list[int]:
+             except Exception:
+                 continue
+     except Exception:
+-        log.debug(
+-            "[arm.mac] PID lookup for %s failed", bundle_id, exc_info=True
+-        )
++        log.debug("[arm.mac] PID lookup for %s failed", bundle_id, exc_info=True)
+     return pids
+ 
+ 
+-def _get_browser_titles_fresh(bundle_id: str) -> list[str]:
+-    """Walk a browser's AX tree to read every visible window's title.
+-
+-    Uses ``AXUIElementCopyAttributeValue`` against ``kAXWindowsAttribute`` /
+-    ``kAXTitleAttribute``. The Accessibility TCC permission already required
+-    for the global hotkey listener (``pynput`` ⇒ ``CGEventTap``) covers this
+-    call too — no separate Automation prompt fires.
+-
+-    If Accessibility isn't granted, the AX call returns
+-    ``kAXErrorAPIDisabled`` (-25211) silently — no dialog, no exception. We
+-    treat any error as "no titles" so the matcher falls through to
+-    title-pattern misses. Same fallback path Windows takes when
+-    UIAutomation can't read a particular tab.
+-    """
+-    pids = _pids_for_bundle(bundle_id)
+-    if not pids:
+-        return []
+-
++def _ax_modules():
++    """Lazy AX import. Returns None on macOS without ApplicationServices
++    bindings — every consumer just degrades to empty results."""
+     try:
+         from ApplicationServices import (  # type: ignore[import-not-found]
+             AXUIElementCreateApplication,
+             AXUIElementCopyAttributeValue,
+             kAXWindowsAttribute,
+             kAXTitleAttribute,
++            kAXChildrenAttribute,
++            kAXRoleAttribute,
++            kAXValueAttribute,
+         )
+     except Exception:
+-        log.debug(
+-            "[arm.mac] ApplicationServices AX bindings unavailable",
+-            exc_info=True,
+-        )
++        return None
++    return (
++        AXUIElementCreateApplication,
++        AXUIElementCopyAttributeValue,
++        kAXWindowsAttribute,
++        kAXTitleAttribute,
++        kAXChildrenAttribute,
++        kAXRoleAttribute,
++        kAXValueAttribute,
++    )
++
++
++def _get_browser_titles_fresh(bundle_id: str) -> list[str]:
++    """Walk a browser's AX tree to read every visible window's title.
++
++    Uses ``AXUIElementCopyAttributeValue`` against ``kAXWindowsAttribute``
++    + ``kAXTitleAttribute``. The Accessibility TCC permission already
++    required for the global hotkey listener (``pynput`` ⇒ ``CGEventTap``)
++    covers this call too — no separate Automation prompt fires.
++
++    Returns ``[]`` on any error (Accessibility not granted, AX bindings
++    missing). The matcher gracefully degrades to "no title-pattern match
++    available."
++    """
++    pids = _pids_for_bundle(bundle_id)
++    if not pids:
+         return []
++    mods = _ax_modules()
++    if mods is None:
++        log.debug("[arm.mac] ApplicationServices AX bindings unavailable", exc_info=True)
++        return []
++    (AXUIElementCreateApplication, AXUIElementCopyAttributeValue,
++     kAXWindowsAttribute, kAXTitleAttribute, *_) = mods
+ 
+     titles: list[str] = []
+     for pid in pids:
+@@ -238,7 +493,7 @@ def _get_browser_titles_fresh(bundle_id: str) -> list[str]:
+ def _get_browser_titles_cached(bundle_id: str) -> list[str]:
+     now = time.monotonic()
+     entry = _TITLES_CACHE.get(bundle_id)
+-    if entry is not None and (now - entry[1]) < _TITLES_CACHE_TTL_SECS:
++    if entry is not None and (now - entry[1]) < _AX_CACHE_TTL_SECS:
+         return entry[0]
+     titles = _get_browser_titles_fresh(bundle_id)
+     _TITLES_CACHE[bundle_id] = (titles, now)
+@@ -246,15 +501,7 @@ def _get_browser_titles_cached(bundle_id: str) -> list[str]:
+ 
+ 
+ def get_browser_window_titles() -> list[str]:
+-    """Aggregate titles from every running browser via the Accessibility API.
+-
+-    Mirrors the Windows ``platform_win.get_browser_window_titles``
+-    behaviour so ``ForegroundInfo.browser_window_titles`` is populated even
+-    when the user has Alt+Tab'd away from the browser holding the mic.
+-    Returns ``[]`` when Accessibility isn't granted or pyobjc bindings
+-    aren't loadable — the matcher gracefully degrades to "no title-pattern
+-    match available".
+-    """
++    """Aggregate titles from every running browser via the Accessibility API."""
+     if sys.platform != "darwin":
+         return []
+     titles: list[str] = []
+@@ -268,179 +515,119 @@ def get_browser_window_titles() -> list[str]:
+     return titles
+ 
+ 
+-def get_browser_window_urls() -> list[str]:
+-    """macOS no longer reads tab URLs (would require the Automation TCC
+-    dialog "Sayzo wants to control your browser", which we explicitly
+-    avoid). Title-based matching via ``get_browser_window_titles`` plus
+-    ``DetectorSpec.title_patterns`` covers web meeting detection on macOS.
+-    Always returns ``[]``.
+-    """
+-    return []
+-
+-
+-# CoreAudio FourCC selectors (from <CoreAudio/AudioHardwareBase.h>). Defined
+-# inline so we don't depend on pyobjc-framework-CoreAudio re-exporting them
+-# under a stable Python name — see ``_load_core_audio`` for why we abandoned
+-# pyobjc here.
+-_kAudioObjectSystemObject = 1
+-_kAudioHardwarePropertyDefaultInputDevice = 0x64496E20  # 'dIn '
+-_kAudioObjectPropertyScopeGlobal = 0x676C6F62  # 'glob'
+-# kAudioObjectPropertyElementMain (renamed from ElementMaster in macOS 12);
+-# both names are 0 — the constant value never changed.
+-_kAudioObjectPropertyElementMain = 0
+-_kAudioDevicePropertyDeviceIsRunningSomewhere = 0x676F696E  # 'goin'
+-
+-
+-class _AudioObjectPropertyAddress(ctypes.Structure):
+-    _fields_ = [
+-        ("mSelector", ctypes.c_uint32),
+-        ("mScope", ctypes.c_uint32),
+-        ("mElement", ctypes.c_uint32),
+-    ]
+-
+-
+-_CORE_AUDIO_LIB: Optional[ctypes.CDLL] = None
+-_CORE_AUDIO_LOAD_FAILED = False
++def _get_browser_urls_fresh(bundle_id: str) -> list[str]:
++    """Read active-tab URLs from a browser via Accessibility.
+ 
++    Two strategies:
+ 
+-def _load_core_audio() -> Optional[ctypes.CDLL]:
+-    """Lazy-load the CoreAudio framework via ctypes and bind argtypes once.
++      A) Find an ``AXTextField`` in the AX tree whose value looks
++         URL-shaped. Catches the omnibox text on browsers that expose it.
++      B) Find an ``AXWebArea`` element and read its ``"AXURL"`` attribute
++         (the property screen readers use to know the page URL).
+ 
+-    pyobjc-framework-CoreAudio was previously used here, but its bindings
+-    don't expose the ``UInt32`` integer type the way our caller assumed
+-    (``CoreAudio.UInt32`` raises AttributeError from pyobjc's lazy-import
+-    layer). Rather than chase pyobjc binding shape across versions, we
+-    call CoreAudio directly: the C ABI is stable since OS X 10.6 and
+-    ``AudioObjectGetPropertyData`` takes only ``UInt32`` / pointer args
+-    that ctypes models exactly.
++    Empirically (probe 05): Safari supports both. Chrome supports
++    NEITHER without an Automation TCC dialog. So this returns useful
++    URLs for Safari and an empty list for Chrome; the matcher then
++    falls back to title patterns for Chrome users.
+     """
+-    global _CORE_AUDIO_LIB, _CORE_AUDIO_LOAD_FAILED
+-    if _CORE_AUDIO_LIB is not None:
+-        return _CORE_AUDIO_LIB
+-    if _CORE_AUDIO_LOAD_FAILED:
+-        return None
+-    try:
+-        lib = ctypes.CDLL(
+-            "/System/Library/Frameworks/CoreAudio.framework/CoreAudio"
+-        )
+-        lib.AudioObjectGetPropertyData.argtypes = [
+-            ctypes.c_uint32,                              # AudioObjectID
+-            ctypes.POINTER(_AudioObjectPropertyAddress),  # address
+-            ctypes.c_uint32,                              # qualifierDataSize
+-            ctypes.c_void_p,                              # qualifierData
+-            ctypes.POINTER(ctypes.c_uint32),              # ioDataSize
+-            ctypes.c_void_p,                              # outData
+-        ]
+-        lib.AudioObjectGetPropertyData.restype = ctypes.c_int32  # OSStatus
+-    except Exception:
+-        _CORE_AUDIO_LOAD_FAILED = True
+-        log.warning(
+-            "[arm.mac] CoreAudio framework unavailable — is_mic_active will "
+-            "always return False (whitelist watcher will never fire)",
+-            exc_info=True,
+-        )
+-        return None
+-    _CORE_AUDIO_LIB = lib
+-    return lib
+-
++    pids = _pids_for_bundle(bundle_id)
++    if not pids:
++        return []
++    mods = _ax_modules()
++    if mods is None:
++        return []
++    (AXUIElementCreateApplication, AXUIElementCopyAttributeValue,
++     kAXWindowsAttribute, _kAXTitleAttribute,
++     kAXChildrenAttribute, kAXRoleAttribute, kAXValueAttribute) = mods
+ 
+-def is_mic_active() -> bool:
+-    """Is any process currently capturing from the default input device?
++    urls: list[str] = []
++    seen: set[str] = set()
+ 
+-    Queries ``kAudioDevicePropertyDeviceIsRunningSomewhere`` on the default
+-    input device via the CoreAudio C API (loaded with ctypes; pyobjc is
+-    not used here — see ``_load_core_audio``). Returns False on any error
+-    (framework missing, no default input, OS denied the call).
+-    """
+-    if sys.platform != "darwin":
+-        return False
+-    lib = _load_core_audio()
+-    if lib is None:
+-        return False
++    def _add(value: object) -> None:
++        if value is None:
++            return
++        try:
++            s = str(value).strip()
++        except Exception:
++            return
++        if not s or s in seen:
++            return
++        if not s.startswith(("http://", "https://", "file://")):
++            return
++        seen.add(s)
++        urls.append(s)
++
++    def _read(elem, attr):
++        try:
++            err, value = AXUIElementCopyAttributeValue(elem, attr, None)
++        except Exception:
++            return None
++        return None if err != 0 else value
++
++    def _walk(elem, depth: int = 0, max_depth: int = 8):
++        yield elem
++        if depth >= max_depth:
++            return
++        children = _read(elem, kAXChildrenAttribute)
++        if not children:
++            return
++        for c in children:
++            yield from _walk(c, depth + 1, max_depth)
+ 
+-    try:
+-        # Step 1: read the default input device's AudioObjectID.
+-        addr_default = _AudioObjectPropertyAddress(
+-            _kAudioHardwarePropertyDefaultInputDevice,
+-            _kAudioObjectPropertyScopeGlobal,
+-            _kAudioObjectPropertyElementMain,
+-        )
+-        default_id = ctypes.c_uint32(0)
+-        size = ctypes.c_uint32(ctypes.sizeof(ctypes.c_uint32))
+-        err = lib.AudioObjectGetPropertyData(
+-            _kAudioObjectSystemObject,
+-            ctypes.byref(addr_default),
+-            0, None,
+-            ctypes.byref(size), ctypes.byref(default_id),
+-        )
+-        if err != 0:
+-            _warn_mic_active_once(
+-                "AudioObjectGetPropertyData(default-input) returned err=%d", err,
+-            )
+-            return False
+-        if default_id.value == 0:
+-            # 0 means "no default input device" — treat as inactive.
+-            return False
+-
+-        # Step 2: read kAudioDevicePropertyDeviceIsRunningSomewhere on it.
+-        addr_running = _AudioObjectPropertyAddress(
+-            _kAudioDevicePropertyDeviceIsRunningSomewhere,
+-            _kAudioObjectPropertyScopeGlobal,
+-            _kAudioObjectPropertyElementMain,
+-        )
+-        running = ctypes.c_uint32(0)
+-        size = ctypes.c_uint32(ctypes.sizeof(ctypes.c_uint32))
+-        err = lib.AudioObjectGetPropertyData(
+-            default_id.value,
+-            ctypes.byref(addr_running),
+-            0, None,
+-            ctypes.byref(size), ctypes.byref(running),
+-        )
+-        if err != 0:
+-            _warn_mic_active_once(
+-                "AudioObjectGetPropertyData(is-running) returned err=%d", err,
+-            )
+-            return False
+-        return bool(running.value)
+-    except Exception as exc:
+-        _warn_mic_active_once(
+-            "is_mic_active CoreAudio call raised: %s",
+-            exc,
+-            exc_info=True,
+-        )
+-        return False
++    for pid in pids:
++        try:
++            app_ref = AXUIElementCreateApplication(pid)
++        except Exception:
++            continue
++        windows = _read(app_ref, kAXWindowsAttribute) or []
++        for window in windows:
++            for elem in _walk(window):
++                role = _read(elem, kAXRoleAttribute)
++                if role == "AXWebArea":
++                    _add(_read(elem, "AXURL"))
++                elif role == "AXTextField":
++                    _add(_read(elem, kAXValueAttribute))
++    return urls
+ 
+ 
+-_MIC_ACTIVE_WARN_FIRED = False
++def _get_browser_urls_cached(bundle_id: str) -> list[str]:
++    now = time.monotonic()
++    entry = _URLS_CACHE.get(bundle_id)
++    if entry is not None and (now - entry[1]) < _AX_CACHE_TTL_SECS:
++        return entry[0]
++    urls = _get_browser_urls_fresh(bundle_id)
++    _URLS_CACHE[bundle_id] = (urls, now)
++    return urls
+ 
+ 
+-def _warn_mic_active_once(fmt: str, *args: object, exc_info: bool = False) -> None:
+-    """Log a one-shot warning the first time ``is_mic_active`` hits a
+-    failure path, then drop to debug for subsequent identical hits.
++def get_browser_window_urls() -> list[str]:
++    """Aggregate active-tab URLs from every running browser via Accessibility.
+ 
+-    Without this throttle we'd spam agent.log at the watcher's poll
+-    cadence (every 2 s) every time the CoreAudio binding is broken;
+-    one warning per agent run is enough to surface the issue.
++    Used by the matcher so user-added URL detectors (the Settings → Web
++    tab UX) match on Mac. Returns ``[]`` for browsers that don't expose
++    URLs via AX (Chrome, mainly) — the matcher's title-pattern fallback
++    handles those.
+     """
+-    global _MIC_ACTIVE_WARN_FIRED
+-    if _MIC_ACTIVE_WARN_FIRED:
+-        log.debug("[arm.mac] " + fmt, *args, exc_info=exc_info)
+-        return
+-    _MIC_ACTIVE_WARN_FIRED = True
+-    log.warning(
+-        "[arm.mac] " + fmt + " — whitelist watcher won't see mic-active "
+-        "until this is resolved",
+-        *args,
+-        exc_info=exc_info,
+-    )
++    if sys.platform != "darwin":
++        return []
++    urls: list[str] = []
++    seen: set[str] = set()
++    for bundle_id in _BROWSER_BUNDLES:
++        for u in _get_browser_urls_cached(bundle_id):
++            if u in seen:
++                continue
++            seen.add(u)
++            urls.append(u)
++    return urls
+ 
+ 
+ def get_running_processes() -> frozenset[str]:
+     """Return lowercased psutil process names + known bundle ids.
+ 
+-    The matcher checks both sets (process name OR bundle id) when evaluating
+-    the ``mic_active_plus_running`` match source. psutil gives us names
+-    cheaply; bundle ids for GUI apps come from NSWorkspace.runningApplications.
++    Kept for the seen-apps recording path in the ArmController, which
++    uses ``mic.running_processes`` to dedup repeat unknown holders.
++    The matcher itself no longer consults this set — Pass 1
++    (``mic_session``) now works on macOS via :func:`get_mic_holders`.
+     """
+     names: set[str] = set()
+     try:
+@@ -494,18 +681,19 @@ def get_foreground_info() -> ForegroundInfo:
+ 
+     is_browser = bool(bundle_id and bundle_id in _BROWSER_BUNDLES)
+     tab_title: Optional[str] = None
++    tab_url: Optional[str] = None
+     if is_browser and bundle_id:
+         # AX returns windows in z-order — the frontmost one first.
+-        cached = _get_browser_titles_cached(bundle_id)
+-        tab_title = cached[0] if cached else None
++        cached_titles = _get_browser_titles_cached(bundle_id)
++        tab_title = cached_titles[0] if cached_titles else None
++        cached_urls = _get_browser_urls_cached(bundle_id)
++        tab_url = cached_urls[0] if cached_urls else None
+ 
+     return ForegroundInfo(
+         process_name=proc_name,
+         bundle_id=bundle_id,
+         window_title=None,
+-        browser_tab_url=None,
++        browser_tab_url=tab_url,
+         browser_tab_title=tab_title,
+         is_browser=is_browser,
+     )
+-
+-
+diff --git a/sayzo_agent/config.py b/sayzo_agent/config.py
+index 73bab15..64bce3d 100644
+--- a/sayzo_agent/config.py
++++ b/sayzo_agent/config.py
+@@ -203,9 +203,11 @@ class DetectorSpec(BaseSettings):
+     - ``process_names`` lists Windows executable names (e.g. ``zoom.exe``)
+       that, when found holding an active capture session, match the rule.
+     - ``bundle_ids`` lists macOS bundle identifiers (e.g. ``us.zoom.xos``)
+-      treated equivalently on macOS. Mac can't attribute mic-in-use to a
+-      specific process cheaply, so a running+recently-foreground check is
+-      used instead (see ``arm/platform_mac.py``).
++      treated equivalently on macOS. As of v2.5+ the matcher gets these
++      from the ``audio-detect`` Swift helper which provides per-process
++      attribution via Apple's responsibility SPI — same Pass 1
++      behaviour as Windows, no foreground requirement (see
++      ``arm/platform_mac.py``).
+     - ``is_browser`` marks rules that only trigger when the browser process
+       holds the mic AND one of ``url_patterns`` matches the active tab.
+       This is how Google Meet / Teams web / Zoom web / Webex / Whereby /
+diff --git a/sayzo_agent/gui/settings/bridge.py b/sayzo_agent/gui/settings/bridge.py
+index 913299f..aa0691b 100644
+--- a/sayzo_agent/gui/settings/bridge.py
++++ b/sayzo_agent/gui/settings/bridge.py
+@@ -797,12 +797,17 @@ class Bridge:
+             else:
+                 detail = "Web"
+         else:
+-            bits: list[str] = []
+-            if spec.process_names:
+-                bits.append(", ".join(spec.process_names))
+-            elif spec.bundle_ids:
+-                bits.append(", ".join(spec.bundle_ids))
+-            detail = ("Desktop · " + bits[0]) if bits else "Desktop"
++            # Show platform-appropriate identifiers in the muted detail
++            # line: bundle ids on macOS (where ``.exe`` names are
++            # meaningless to the user), executable names on Windows.
++            # Falls back to the other side if the platform-preferred
++            # list is empty (e.g. macOS-only FaceTime spec has only
++            # bundle_ids regardless of platform).
++            import sys
++            primary = spec.bundle_ids if sys.platform == "darwin" else spec.process_names
++            secondary = spec.process_names if sys.platform == "darwin" else spec.bundle_ids
++            chosen = primary if primary else secondary
++            detail = ("Desktop · " + ", ".join(chosen)) if chosen else "Desktop"
+         return {
+             "app_key": spec.app_key,
+             "display_name": spec.display_name,
+diff --git a/tests/test_arm_controller.py b/tests/test_arm_controller.py
+index 177f1ed..51e38b6 100644
+--- a/tests/test_arm_controller.py
++++ b/tests/test_arm_controller.py
+@@ -352,10 +352,17 @@ async def test_whitelist_match_fires_consent_and_arms_on_yes():
+ 
+ 
+ async def test_whitelist_arm_uses_resolver_when_match_has_no_pids():
+-    """macOS path: ``match_whitelist`` returns empty target_pids because
+-    ``mic.holders`` is empty on Mac. The controller must fall back to the
+-    injected resolver (``resolve_pids_for_spec``) to fill PIDs before
+-    arming, then pass them to ``sys.start``."""
++    """Browser path: a Mac browser holder may have a PID for the audio
++    helper but no whitelisted browser PIDs in mic.holders directly; the
++    matcher returns ``target_pids=()`` and the controller must fall back
++    to the injected resolver (``resolve_pids_for_spec``) to scope the
++    system-audio capture.
++
++    Pre-v2.5 this exercised the now-deleted macOS proxy path
++    (``mic_active_plus_running``); v2.5+ exercises the equivalent
++    browser-spec path where MatchResult.target_pids can still be empty
++    because ``_pids_for_browser_holders`` only returns Windows-style
++    pycaw PIDs."""
+     notifier = FakeNotifier()
+     notifier.consent_script = ["yes"]
+ 
+@@ -363,7 +370,7 @@ async def test_whitelist_arm_uses_resolver_when_match_has_no_pids():
+ 
+     def fake_resolver(spec) -> tuple[int, ...]:
+         resolver_calls.append(spec.app_key)
+-        if spec.app_key == "zoom":
++        if spec.app_key == "gmeet":
+             return (7777, 8888)
+         return ()
+ 
+@@ -388,17 +395,30 @@ async def test_whitelist_arm_uses_resolver_when_match_has_no_pids():
+     vad_m = FakeVAD()
+     vad_s = FakeVAD()
+ 
++    # Simulate macOS browser path: a Chrome holder with bundle id but a
++    # helper PID (so _pids_for_browser_holders returns ()), plus a Meet
++    # tab title. The matcher returns target_pids=() and the controller
++    # invokes the resolver for the gmeet spec to get the real PIDs.
++    holder = MicHolder(
++        process_name="com.google.Chrome",
++        pid=0,  # 0 → excluded from _pids_for_browser_holders
++        bundle_id="com.google.Chrome",
++    )
++
+     ctrl = ArmController(
+         cfg, detector,
+         mic_capture=mic, sys_capture=sys_cap,
+         vad_mic=vad_m, vad_sys=vad_s,
+         notifier=notifier,
+-        # Simulate the macOS path: mic.active True, no holders, whitelisted
+-        # Zoom is running + frontmost via bundle id.
+-        get_mic_holders=lambda: [],
++        get_mic_holders=lambda: [holder],
+         is_mic_active=lambda: True,
+-        get_running_processes=lambda: frozenset({"us.zoom.xos"}),
+-        get_foreground_info=lambda: ForegroundInfo(bundle_id="us.zoom.xos"),
++        get_running_processes=lambda: frozenset(),
++        get_foreground_info=lambda: ForegroundInfo(
++            process_name="Notes",
++            bundle_id="com.apple.TextEdit",
++            is_browser=False,
++            browser_window_titles=("Meet - abc-defg-hij - Google Chrome",),
++        ),
+         resolve_pids_for_spec=fake_resolver,
+     )
+ 
+@@ -406,10 +426,10 @@ async def test_whitelist_arm_uses_resolver_when_match_has_no_pids():
+     ctrl._whitelist_task = asyncio.create_task(ctrl._run_whitelist_watcher())
+     await asyncio.sleep(0.15)
+     assert ctrl.state == ArmState.ARMED
+-    assert ctrl._reason is not None and ctrl._reason.app_key == "zoom"
++    assert ctrl._reason is not None and ctrl._reason.app_key == "gmeet"
+     assert ctrl._reason.target_pids == (7777, 8888)
+     assert sys_cap.last_target_pids == (7777, 8888)
+-    assert "zoom" in resolver_calls
++    assert "gmeet" in resolver_calls
+ 
+     ctrl._whitelist_task.cancel()
+     try:
+diff --git a/tests/test_meeting_detectors.py b/tests/test_meeting_detectors.py
+index 545d290..b92c30d 100644
+--- a/tests/test_meeting_detectors.py
++++ b/tests/test_meeting_detectors.py
+@@ -221,40 +221,89 @@ def test_teams_web_in_meetup_join_url_matches():
+     assert r.app_key == "teams_web"
+ 
+ 
+-# ---- macOS proxy path --------------------------------------------------
++# ---- macOS bundle-id matching (v2.5+ — Pass 1 now uses real holders) ---
++#
++# The pre-v2.5 macOS proxy (``mic_active_plus_running``) required the
++# meeting app to be foreground, because we had no per-process mic
++# attribution on Mac. v2.5 ships the audio-detect Swift helper which
++# gives us direct holders with bundle ids — so Pass 1 now works on Mac
++# the same way it works on Windows. These tests cover the new path.
+ 
+ 
+-def test_macos_proxy_matches_when_mic_active_and_process_running_and_foreground():
+-    """macOS can't attribute mic to a specific PID cheaply. The proxy is:
+-    mic is active system-wide AND a whitelisted process is running AND is
+-    currently frontmost."""
++def test_macos_zoom_match_via_bundle_id_holder():
++    """macOS holders carry bundle ids (not exe names). Pass 1 matches
++    ``us.zoom.xos`` against the zoom spec's bundle_ids."""
+     fg = ForegroundInfo(bundle_id="us.zoom.xos")
+-    mic = MicState(
+-        active=True,
+-        running_processes=frozenset({"us.zoom.xos"}),
+-    )
++    mic = MicState(holders=[
++        MicHolder(process_name="us.zoom.xos", pid=1234, bundle_id="us.zoom.xos"),
++    ])
++    r = match_whitelist(SPECS, fg, mic)
++    assert r is not None
++    assert r.app_key == "zoom"
++    assert r.source == "mic_session"
++    assert r.target_pids == (1234,)
++
++
++def test_macos_match_independent_of_foreground():
++    """v2.5: the foreground requirement is GONE. Zoom in a meeting +
++    user Alt-tabbed to TextEdit should still match — same as Windows."""
++    fg = ForegroundInfo(bundle_id="com.apple.TextEdit")
++    mic = MicState(holders=[
++        MicHolder(process_name="us.zoom.xos", pid=1234, bundle_id="us.zoom.xos"),
++    ])
+     r = match_whitelist(SPECS, fg, mic)
+     assert r is not None
+     assert r.app_key == "zoom"
+-    assert r.source == "mic_active_plus_running"
+ 
+ 
+-def test_macos_proxy_no_match_when_mic_inactive():
++def test_macos_no_match_when_no_holders():
++    """No mic activity → no match. Foreground irrelevant."""
+     fg = ForegroundInfo(bundle_id="us.zoom.xos")
+-    mic = MicState(active=False, running_processes=frozenset({"us.zoom.xos"}))
++    mic = MicState()  # holders=[] regardless of running_processes
+     assert match_whitelist(SPECS, fg, mic) is None
+ 
+ 
+-def test_macos_proxy_no_match_when_whitelisted_app_not_frontmost():
+-    """Whitelisted app is running and mic is active, but the user is focused
+-    on something else — could be a browser with Gmeet (handled elsewhere)
+-    or something unrelated. Only the direct-frontmost check should match."""
++def test_macos_discord_helper_bundle_prefix_matches_discord():
++    """Electron apps capture via ``<app-bundle>.helper.<role>`` processes.
++    The matcher's helper-bundle prefix backstop catches them even if the
++    SPI walk-up didn't already collapse them to the main bundle."""
+     fg = ForegroundInfo(bundle_id="com.apple.TextEdit")
+-    mic = MicState(
+-        active=True,
+-        running_processes=frozenset({"us.zoom.xos"}),
++    mic = MicState(holders=[
++        MicHolder(
++            process_name="com.hnc.Discord.helper.Renderer",
++            pid=5555,
++            bundle_id="com.hnc.Discord.helper.Renderer",
++        ),
++    ])
++    r = match_whitelist(SPECS, fg, mic)
++    assert r is not None
++    assert r.app_key == "discord"
++    assert r.source == "mic_session"
++
++
++def test_macos_browser_match_via_chrome_bundle_holder():
++    """Chrome capturing the mic on macOS shows up as a holder with
++    bundle id ``com.google.Chrome`` (after the Swift helper resolves
++    the audio helper to its responsible browser). Combined with a
++    matching meeting URL/title in any browser window, this fires the
++    browser-spec match — no browser-foreground requirement."""
++    fg = ForegroundInfo(
++        process_name="Notes",
++        bundle_id="com.apple.TextEdit",
++        is_browser=False,
++        browser_window_titles=("Meet - abc-defg-hij - Google Chrome",),
+     )
+-    assert match_whitelist(SPECS, fg, mic) is None
++    mic = MicState(holders=[
++        MicHolder(
++            process_name="com.google.Chrome",
++            pid=7777,
++            bundle_id="com.google.Chrome",
++        ),
++    ])
++    r = match_whitelist(SPECS, fg, mic)
++    assert r is not None
++    assert r.app_key == "gmeet"
++    assert r.source == "browser_mic_plus_url"
+ 
+ 
+ # ---- arm_app_still_holding_mic -----------------------------------------
+@@ -321,47 +370,51 @@ def test_arm_app_browser_released_when_browser_drops_mic():
+ 
+ 
+ def test_arm_app_browser_macos_alt_tab_still_holding():
+-    """macOS sim: empty mic.holders, foreground is a non-browser app
+-    (Notes), but the browser PIDs we armed for are still alive AND
+-    mic.active is True. Pre-v2.1.10 this returned False (foreground
+-    isn't browser → fired false meeting-ended toast). With
+-    arm_pids_alive=True passed by the controller, we correctly stay
+-    True throughout the Alt+Tab."""
++    """macOS v2.5+: mic.holders carries Chrome's bundle id whenever
++    Chrome is capturing (resolved via the responsibility SPI). Alt-
++    tabbing to Notes during a Meet call leaves holders unchanged; the
++    meeting-ended watcher correctly sees we're still holding."""
+     fg = ForegroundInfo(
+         process_name="Notes",
++        bundle_id="com.apple.TextEdit",
+         is_browser=False,
+         browser_tab_url=None,
+     )
+-    mic = MicState(holders=[], active=True)
+-    assert arm_app_still_holding_mic(
+-        "gmeet", SPECS, mic, fg, arm_pids_alive=True,
+-    ) is True
++    mic = MicState(holders=[
++        MicHolder(
++            process_name="com.google.Chrome",
++            pid=1111,
++            bundle_id="com.google.Chrome",
++        ),
++    ])
++    assert arm_app_still_holding_mic("gmeet", SPECS, mic, fg) is True
+ 
+ 
+-def test_arm_app_browser_macos_pids_dead_returns_false():
+-    """macOS sim: mic.holders empty, browser PIDs are gone (user
+-    closed Chrome) → arm_pids_alive=False → release."""
++def test_arm_app_browser_macos_no_holder_returns_false():
++    """macOS v2.5+: when the meeting actually ends, the browser drops
++    its capture session and disappears from mic.holders. That's the
++    ground-truth signal — regardless of whether the browser process
++    is still alive (user might leave Chrome open)."""
+     fg = ForegroundInfo(
+         process_name="Notes",
++        bundle_id="com.apple.TextEdit",
+         is_browser=False,
+-        browser_tab_url=None,
+     )
+-    mic = MicState(holders=[], active=True)
+-    assert arm_app_still_holding_mic(
+-        "gmeet", SPECS, mic, fg, arm_pids_alive=False,
+-    ) is False
++    mic = MicState(holders=[])
++    assert arm_app_still_holding_mic("gmeet", SPECS, mic, fg) is False
+ 
+ 
+-def test_arm_app_browser_macos_mic_inactive_returns_false():
+-    """macOS sim: browser PIDs alive but mic.active is False (no
+-    process is currently capturing). The session has effectively
+-    ended."""
++def test_arm_app_browser_arm_pids_alive_does_not_override_empty_holders():
++    """v2.5: arm_pids_alive is now a no-op (parameter retained for ABI
++    compat). mic.holders is reliable on both platforms now, so a
++    generous PIDs-alive override would just delay legitimate
++    meeting-ended detection."""
+     fg = ForegroundInfo(
+-        process_name="Google Chrome",
+-        is_browser=True,
+-        browser_tab_url=None,
++        process_name="Notes",
++        bundle_id="com.apple.TextEdit",
++        is_browser=False,
+     )
+-    mic = MicState(holders=[], active=False)
++    mic = MicState(holders=[])
+     assert arm_app_still_holding_mic(
+         "gmeet", SPECS, mic, fg, arm_pids_alive=True,
+     ) is False
+@@ -665,19 +718,19 @@ def test_exclude_app_keys_returns_none_when_only_match_is_excluded():
+     assert r is None
+ 
+ 
+-def test_macos_proxy_match_has_empty_target_pids():
+-    """macOS proxy path can't attribute PIDs inline (``mic.holders=[]``);
+-    the ArmController resolves them via a platform helper before arming.
+-    The MatchResult itself comes back with an empty tuple."""
++def test_macos_match_has_target_pids_from_holders():
++    """v2.5: macOS holders carry real PIDs (resolved via the
++    responsibility SPI), so MatchResult.target_pids comes back populated
++    inline — same as Windows. The ArmController no longer needs to
++    re-resolve via a platform helper for the desktop case."""
+     fg = ForegroundInfo(bundle_id="us.zoom.xos")
+-    mic = MicState(
+-        active=True,
+-        running_processes=frozenset({"us.zoom.xos"}),
+-    )
++    mic = MicState(holders=[
++        MicHolder(process_name="us.zoom.xos", pid=4242, bundle_id="us.zoom.xos"),
++    ])
+     r = match_whitelist(SPECS, fg, mic)
+     assert r is not None
+-    assert r.source == "mic_active_plus_running"
+-    assert r.target_pids == ()
++    assert r.source == "mic_session"
++    assert r.target_pids == (4242,)
+ 
+ 
+ def test_custom_url_spec_arm_app_still_holding_via_browser_pid():

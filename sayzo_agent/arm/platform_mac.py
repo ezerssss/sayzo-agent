@@ -40,14 +40,15 @@ URL on browsers that expose it.
 """
 from __future__ import annotations
 
-import ctypes
 import logging
 import sys
 import time
 from typing import Optional
 
+import psutil
+
 from . import audio_detect
-from .detectors import BROWSER_PROCESS_NAMES, ForegroundInfo, MicHolder
+from .detectors import ForegroundInfo, MicHolder
 
 log = logging.getLogger(__name__)
 
@@ -72,30 +73,73 @@ _BROWSER_BUNDLES = {
 # helper itself (the parent chain is launchd-rooted, no link back). This
 # table is the defensive fallback for the WebKit case.
 #
-# Each entry: (helper_bundle_prefix_lowercase, owning_browser_bundle_id).
-# Lookup uses ``startswith(prefix)`` (case-insensitive on the helper
-# bundle), so adding a new browser is one line.
-_BROWSER_HELPER_PREFIXES: list[tuple[str, str]] = [
+# Key: helper-bundle-id prefix (lowercase). Value: owning browser bundle id.
+# Lookup is ``startswith(prefix)`` per entry, so order doesn't matter.
+_BROWSER_HELPER_PREFIXES: dict[str, str] = {
     # WebKit framework helpers (Safari and any WebKit-embedding browser).
-    ("com.apple.webkit.", "com.apple.Safari"),
+    "com.apple.webkit.": "com.apple.Safari",
     # Chromium-derived browsers — all use ``<browser-bundle>.helper.*``.
-    ("com.google.chrome.helper", "com.google.Chrome"),
-    ("com.microsoft.edgemac.helper", "com.microsoft.edgemac"),
-    ("com.brave.browser.helper", "com.brave.Browser"),
-    ("company.thebrowser.browser.helper", "company.thebrowser.Browser"),
-    ("com.operasoftware.opera.helper", "com.operasoftware.Opera"),
-    ("com.vivaldi.vivaldi.helper", "com.vivaldi.Vivaldi"),
+    "com.google.chrome.helper": "com.google.Chrome",
+    "com.microsoft.edgemac.helper": "com.microsoft.edgemac",
+    "com.brave.browser.helper": "com.brave.Browser",
+    "company.thebrowser.browser.helper": "company.thebrowser.Browser",
+    "com.operasoftware.opera.helper": "com.operasoftware.Opera",
+    "com.vivaldi.vivaldi.helper": "com.vivaldi.Vivaldi",
     # Firefox: WebRTC audio runs in plugin-container; parent IS Firefox so
     # parent-walking would also work, but prefix matching is uniform.
-    ("org.mozilla.firefox.plugin-container", "org.mozilla.firefox"),
-]
+    "org.mozilla.firefox.plugin-container": "org.mozilla.firefox",
+}
 
 
-# Title cache per browser bundle so polling every 2 s doesn't re-walk the
-# AX tree on every sample. {bundle_id: (titles, timestamp)}
-_TITLES_CACHE: dict[str, tuple[list[str], float]] = {}
-_URLS_CACHE: dict[str, tuple[list[str], float]] = {}
+# Per-browser AX cache. One entry per bundle id holds (titles, urls) +
+# the last-fresh timestamp so the watcher's 2 s poll doesn't re-walk
+# the AX tree on every sample.
+_AX_CACHE: dict[str, tuple[tuple[list[str], list[str]], float]] = {}
 _AX_CACHE_TTL_SECS = 2.0
+
+
+def _iter_running_apps() -> list[tuple[int, str]]:
+    """Snapshot ``NSWorkspace.runningApplications()`` once and return a
+    flat list of ``(pid, bundle_id)`` for every app with both fields set.
+
+    The four lookup helpers below (`_bundle_for_pid`,
+    `_running_pid_for_bundle`, `_pids_for_bundle`, plus the bundle
+    branch of `resolve_pids_for_spec`) used to each open this same
+    iterator independently — meaning a single `get_mic_holders()` call
+    could walk the runningApplications list 6+ times for an N-helper
+    capture set. Materializing once and reusing avoids that.
+    """
+    try:
+        from AppKit import NSWorkspace  # type: ignore[import-not-found]
+    except Exception:
+        log.debug("[arm.mac] AppKit unavailable", exc_info=True)
+        return []
+    out: list[tuple[int, str]] = []
+    try:
+        ws = NSWorkspace.sharedWorkspace()
+        for app in ws.runningApplications():
+            try:
+                bid = app.bundleIdentifier()
+                pid = int(app.processIdentifier() or 0)
+            except Exception:
+                continue
+            if not bid or pid <= 0:
+                continue
+            out.append((pid, str(bid)))
+    except Exception:
+        log.debug("[arm.mac] NSWorkspace.runningApplications failed", exc_info=True)
+    return out
+
+
+def _bundle_by_pid_map() -> dict[int, str]:
+    return {pid: bid for pid, bid in _iter_running_apps()}
+
+
+def _pids_by_bundle_map() -> dict[str, list[int]]:
+    out: dict[str, list[int]] = {}
+    for pid, bid in _iter_running_apps():
+        out.setdefault(bid, []).append(pid)
+    return out
 
 
 def _browser_for_helper_bundle(bundle: Optional[str]) -> Optional[str]:
@@ -108,39 +152,30 @@ def _browser_for_helper_bundle(bundle: Optional[str]) -> Optional[str]:
     if not bundle:
         return None
     bl = bundle.lower()
-    for prefix, browser in _BROWSER_HELPER_PREFIXES:
+    for prefix, browser in _BROWSER_HELPER_PREFIXES.items():
         if bl.startswith(prefix):
             return browser
     return None
 
 
-def _bundle_for_pid(pid: int) -> Optional[str]:
+def _bundle_for_pid(pid: int, *, bundle_by_pid: Optional[dict[int, str]] = None) -> Optional[str]:
     """Return the NSRunningApplication bundle id for ``pid``, or None.
 
     Helpers / services typically don't have an NSRunningApplication entry
     — they live in a separate launchd domain and only the user-facing
     GUI app appears in this list. So a None return means "this PID is a
     helper, walk up to find the responsible app."
+
+    ``bundle_by_pid`` lets callers in a hot loop pre-materialize the map
+    once via :func:`_bundle_by_pid_map` and pass it in, avoiding O(N)
+    re-walks of NSWorkspace per parent-walk hop.
     """
-    try:
-        from AppKit import NSWorkspace  # type: ignore[import-not-found]
-    except Exception:
-        return None
-    try:
-        ws = NSWorkspace.sharedWorkspace()
-        for app in ws.runningApplications():
-            try:
-                if int(app.processIdentifier() or 0) == pid:
-                    bid = str(app.bundleIdentifier() or "") or None
-                    return bid
-            except Exception:
-                continue
-    except Exception:
-        log.debug("[arm.mac] _bundle_for_pid failed for %d", pid, exc_info=True)
-    return None
+    if bundle_by_pid is not None:
+        return bundle_by_pid.get(pid)
+    return _bundle_by_pid_map().get(pid)
 
 
-def _running_pid_for_bundle(bundle: str) -> Optional[int]:
+def _running_pid_for_bundle(bundle: str, *, pids_by_bundle: Optional[dict[str, list[int]]] = None) -> Optional[int]:
     """First running NSRunningApplication PID for ``bundle``, or None.
 
     Used by the WebKit fallback: when the SPI returns a helper PID we
@@ -148,26 +183,17 @@ def _running_pid_for_bundle(bundle: str) -> Optional[int]:
     to find a PID for the actual browser process so the system-audio
     capture path can scope correctly.
     """
-    try:
-        from AppKit import NSWorkspace  # type: ignore[import-not-found]
-    except Exception:
-        return None
-    try:
-        ws = NSWorkspace.sharedWorkspace()
-        for app in ws.runningApplications():
-            try:
-                if str(app.bundleIdentifier() or "") == bundle:
-                    pid = int(app.processIdentifier() or 0)
-                    if pid > 0:
-                        return pid
-            except Exception:
-                continue
-    except Exception:
-        log.debug("[arm.mac] _running_pid_for_bundle failed for %s", bundle, exc_info=True)
-    return None
+    src = pids_by_bundle if pids_by_bundle is not None else _pids_by_bundle_map()
+    pids = src.get(bundle)
+    return pids[0] if pids else None
 
 
-def _walk_to_gui_ancestor(start_pid: int, max_depth: int = 6) -> tuple[Optional[int], Optional[str]]:
+def _walk_to_gui_ancestor(
+    start_pid: int,
+    *,
+    bundle_by_pid: dict[int, str],
+    max_depth: int = 6,
+) -> tuple[Optional[int], Optional[str]]:
     """Walk parent PIDs from ``start_pid`` until we hit a process with an
     NSRunningApplication entry (a real user-facing GUI app).
 
@@ -182,11 +208,10 @@ def _walk_to_gui_ancestor(start_pid: int, max_depth: int = 6) -> tuple[Optional[
     """
     cur = start_pid
     for _ in range(max_depth):
-        bid = _bundle_for_pid(cur)
+        bid = bundle_by_pid.get(cur)
         if bid is not None:
             return cur, bid
         try:
-            import psutil
             parent = psutil.Process(cur).parent()
         except Exception:
             return None, None
@@ -196,7 +221,12 @@ def _walk_to_gui_ancestor(start_pid: int, max_depth: int = 6) -> tuple[Optional[
     return None, None
 
 
-def _resolve_owner(proc: audio_detect.AudioProcess) -> tuple[Optional[int], Optional[str]]:
+def _resolve_owner(
+    proc: audio_detect.AudioProcess,
+    *,
+    bundle_by_pid: dict[int, str],
+    pids_by_bundle: dict[str, list[int]],
+) -> tuple[Optional[int], Optional[str]]:
     """Map an :class:`audio_detect.AudioProcess` to its user-facing
     (PID, bundle_id).
 
@@ -213,20 +243,22 @@ def _resolve_owner(proc: audio_detect.AudioProcess) -> tuple[Optional[int], Opti
     Returns (owner_pid, owner_bundle) or (None, None) if no GUI owner
     could be resolved.
     """
-    # Pass 1 — SPI + GUI walk-up.
     if proc.responsible_pid > 0:
-        owner_pid, bid = _walk_to_gui_ancestor(proc.responsible_pid)
+        owner_pid, bid = _walk_to_gui_ancestor(
+            proc.responsible_pid, bundle_by_pid=bundle_by_pid,
+        )
         if bid is not None:
             return owner_pid, bid
 
-    # Pass 2 — browser helper prefix.
     browser_bundle = _browser_for_helper_bundle(proc.bundle_id)
     if browser_bundle is not None:
-        return _running_pid_for_bundle(browser_bundle), browser_bundle
+        pids = pids_by_bundle.get(browser_bundle)
+        return (pids[0] if pids else None), browser_bundle
 
-    # Pass 3 — parent-walk from the capturing PID.
     if proc.pid > 0:
-        owner_pid, bid = _walk_to_gui_ancestor(proc.pid)
+        owner_pid, bid = _walk_to_gui_ancestor(
+            proc.pid, bundle_by_pid=bundle_by_pid,
+        )
         if bid is not None:
             return owner_pid, bid
 
@@ -250,13 +282,28 @@ def get_mic_holders() -> list[MicHolder]:
         return []
 
     snapshot = audio_detect.snapshot()
+    if not any(p.input for p in snapshot):
+        return []
+
+    # One NSWorkspace walk per get_mic_holders() call, shared across every
+    # capturing process's parent-walk + browser-helper resolution.
+    bundle_by_pid: dict[int, str] = {}
+    pids_by_bundle: dict[str, list[int]] = {}
+    for pid, bid in _iter_running_apps():
+        bundle_by_pid[pid] = bid
+        pids_by_bundle.setdefault(bid, []).append(pid)
+
     holders: list[MicHolder] = []
     seen_pids: set[int] = set()
 
     for proc in snapshot:
         if not proc.input:
             continue
-        owner_pid, owner_bundle = _resolve_owner(proc)
+        owner_pid, owner_bundle = _resolve_owner(
+            proc,
+            bundle_by_pid=bundle_by_pid,
+            pids_by_bundle=pids_by_bundle,
+        )
         if owner_pid is None or owner_bundle is None:
             # Couldn't map the helper back to a user-facing app. Leave it
             # out — the seen-apps recorder in the controller will pick
@@ -341,33 +388,14 @@ def resolve_pids_for_spec(spec) -> tuple[int, ...]:
         target_bundles = {b.lower() for b in spec.bundle_ids}
 
     if target_bundles:
-        try:
-            from AppKit import NSWorkspace  # type: ignore[import-not-found]
-            ws = NSWorkspace.sharedWorkspace()
-            for app in ws.runningApplications():
-                try:
-                    bid = app.bundleIdentifier()
-                    if not bid:
-                        continue
-                    if str(bid).lower() not in target_bundles:
-                        continue
-                    pid = int(app.processIdentifier() or 0)
-                    if pid > 0:
-                        pids.add(pid)
-                except Exception:
-                    continue
-        except Exception:
-            log.debug(
-                "[arm.mac] NSWorkspace PID enumeration failed for %s",
-                spec.app_key,
-                exc_info=True,
-            )
+        for pid, bid in _iter_running_apps():
+            if bid.lower() in target_bundles:
+                pids.add(pid)
 
     # psutil fallback for non-bundled CLI helpers (e.g. zoom auxiliary
     # processes) that NSWorkspace doesn't surface.
     if not spec.is_browser and spec.process_names:
         try:
-            import psutil
             target_names = {p.lower() for p in spec.process_names}
             for p in psutil.process_iter(["pid", "name"]):
                 try:
@@ -392,22 +420,7 @@ def resolve_pids_for_spec(spec) -> tuple[int, ...]:
 
 def _pids_for_bundle(bundle_id: str) -> list[int]:
     """Return PIDs of every running process matching ``bundle_id``."""
-    pids: list[int] = []
-    try:
-        from AppKit import NSWorkspace  # type: ignore[import-not-found]
-        ws = NSWorkspace.sharedWorkspace()
-        for app in ws.runningApplications():
-            try:
-                bid = app.bundleIdentifier()
-                if bid and str(bid) == bundle_id:
-                    pid = int(app.processIdentifier() or 0)
-                    if pid > 0:
-                        pids.append(pid)
-            except Exception:
-                continue
-    except Exception:
-        log.debug("[arm.mac] PID lookup for %s failed", bundle_id, exc_info=True)
-    return pids
+    return [pid for pid, bid in _iter_running_apps() if bid == bundle_id]
 
 
 def _ax_modules():
@@ -424,6 +437,7 @@ def _ax_modules():
             kAXValueAttribute,
         )
     except Exception:
+        log.debug("[arm.mac] ApplicationServices bindings unavailable", exc_info=True)
         return None
     return (
         AXUIElementCreateApplication,
@@ -436,126 +450,40 @@ def _ax_modules():
     )
 
 
-def _get_browser_titles_fresh(bundle_id: str) -> list[str]:
-    """Walk a browser's AX tree to read every visible window's title.
+def _get_browser_axdata_fresh(bundle_id: str) -> tuple[list[str], list[str]]:
+    """One AX tree walk per browser; returns ``(titles, urls)``.
 
-    Uses ``AXUIElementCopyAttributeValue`` against ``kAXWindowsAttribute``
-    + ``kAXTitleAttribute``. The Accessibility TCC permission already
-    required for the global hotkey listener (``pynput`` ⇒ ``CGEventTap``)
-    covers this call too — no separate Automation prompt fires.
+    For each window:
+      - Title from ``kAXTitleAttribute`` on the window itself.
+      - URL from ``AXURL`` on any ``AXWebArea`` descendant (Safari and
+        the few other browsers that expose it for screen readers).
+      - URL from ``AXValue`` on any ``AXTextField`` descendant whose
+        value parses as a URL (omnibox text — backstop for browsers
+        that don't expose AXWebArea.AXURL).
 
-    Returns ``[]`` on any error (Accessibility not granted, AX bindings
-    missing). The matcher gracefully degrades to "no title-pattern match
-    available."
+    Empirically (probe 05): Safari exposes both URL paths; Chrome
+    exposes NEITHER without an Automation TCC dialog. So this returns
+    populated URLs for Safari users and an empty URL list for Chrome
+    users — the matcher's title-pattern fallback handles Chrome.
+
+    Returns ``([], [])`` on any error (Accessibility not granted, AX
+    bindings missing, no PIDs for this bundle). The matcher tolerates
+    empty results — it just means no title- or URL-pattern match
+    fires for that browser this poll.
     """
     pids = _pids_for_bundle(bundle_id)
     if not pids:
-        return []
+        return [], []
     mods = _ax_modules()
     if mods is None:
-        log.debug("[arm.mac] ApplicationServices AX bindings unavailable", exc_info=True)
-        return []
+        return [], []
     (AXUIElementCreateApplication, AXUIElementCopyAttributeValue,
-     kAXWindowsAttribute, kAXTitleAttribute, *_) = mods
-
-    titles: list[str] = []
-    for pid in pids:
-        try:
-            app_ref = AXUIElementCreateApplication(pid)
-        except Exception:
-            continue
-        try:
-            err, windows = AXUIElementCopyAttributeValue(
-                app_ref, kAXWindowsAttribute, None
-            )
-        except Exception:
-            continue
-        if err != 0 or not windows:
-            continue
-        for window in windows:
-            try:
-                err, title = AXUIElementCopyAttributeValue(
-                    window, kAXTitleAttribute, None
-                )
-            except Exception:
-                continue
-            if err != 0 or not title:
-                continue
-            try:
-                title_str = str(title).strip()
-            except Exception:
-                continue
-            if title_str:
-                titles.append(title_str)
-    return titles
-
-
-def _get_browser_titles_cached(bundle_id: str) -> list[str]:
-    now = time.monotonic()
-    entry = _TITLES_CACHE.get(bundle_id)
-    if entry is not None and (now - entry[1]) < _AX_CACHE_TTL_SECS:
-        return entry[0]
-    titles = _get_browser_titles_fresh(bundle_id)
-    _TITLES_CACHE[bundle_id] = (titles, now)
-    return titles
-
-
-def get_browser_window_titles() -> list[str]:
-    """Aggregate titles from every running browser via the Accessibility API."""
-    if sys.platform != "darwin":
-        return []
-    titles: list[str] = []
-    seen: set[str] = set()
-    for bundle_id in _BROWSER_BUNDLES:
-        for t in _get_browser_titles_cached(bundle_id):
-            if t in seen:
-                continue
-            seen.add(t)
-            titles.append(t)
-    return titles
-
-
-def _get_browser_urls_fresh(bundle_id: str) -> list[str]:
-    """Read active-tab URLs from a browser via Accessibility.
-
-    Two strategies:
-
-      A) Find an ``AXTextField`` in the AX tree whose value looks
-         URL-shaped. Catches the omnibox text on browsers that expose it.
-      B) Find an ``AXWebArea`` element and read its ``"AXURL"`` attribute
-         (the property screen readers use to know the page URL).
-
-    Empirically (probe 05): Safari supports both. Chrome supports
-    NEITHER without an Automation TCC dialog. So this returns useful
-    URLs for Safari and an empty list for Chrome; the matcher then
-    falls back to title patterns for Chrome users.
-    """
-    pids = _pids_for_bundle(bundle_id)
-    if not pids:
-        return []
-    mods = _ax_modules()
-    if mods is None:
-        return []
-    (AXUIElementCreateApplication, AXUIElementCopyAttributeValue,
-     kAXWindowsAttribute, _kAXTitleAttribute,
+     kAXWindowsAttribute, kAXTitleAttribute,
      kAXChildrenAttribute, kAXRoleAttribute, kAXValueAttribute) = mods
 
+    titles: list[str] = []
     urls: list[str] = []
-    seen: set[str] = set()
-
-    def _add(value: object) -> None:
-        if value is None:
-            return
-        try:
-            s = str(value).strip()
-        except Exception:
-            return
-        if not s or s in seen:
-            return
-        if not s.startswith(("http://", "https://", "file://")):
-            return
-        seen.add(s)
-        urls.append(s)
+    seen_urls: set[str] = set()
 
     def _read(elem, attr):
         try:
@@ -563,6 +491,20 @@ def _get_browser_urls_fresh(bundle_id: str) -> list[str]:
         except Exception:
             return None
         return None if err != 0 else value
+
+    def _add_url(value: object) -> None:
+        if value is None:
+            return
+        try:
+            s = str(value).strip()
+        except Exception:
+            return
+        if not s or s in seen_urls:
+            return
+        if not s.startswith(("http://", "https://", "file://")):
+            return
+        seen_urls.add(s)
+        urls.append(s)
 
     def _walk(elem, depth: int = 0, max_depth: int = 8):
         yield elem
@@ -581,23 +523,60 @@ def _get_browser_urls_fresh(bundle_id: str) -> list[str]:
             continue
         windows = _read(app_ref, kAXWindowsAttribute) or []
         for window in windows:
+            title = _read(window, kAXTitleAttribute)
+            if title:
+                try:
+                    title_str = str(title).strip()
+                except Exception:
+                    title_str = ""
+                if title_str:
+                    titles.append(title_str)
             for elem in _walk(window):
                 role = _read(elem, kAXRoleAttribute)
                 if role == "AXWebArea":
-                    _add(_read(elem, "AXURL"))
+                    _add_url(_read(elem, "AXURL"))
                 elif role == "AXTextField":
-                    _add(_read(elem, kAXValueAttribute))
-    return urls
+                    _add_url(_read(elem, kAXValueAttribute))
+    return titles, urls
+
+
+def _get_browser_axdata_cached(bundle_id: str) -> tuple[list[str], list[str]]:
+    """Cached per-bundle ``(titles, urls)``.
+
+    The two consumer pairs (titles + URLs) used to walk the AX tree
+    independently — one walk per bundle for titles, another for URLs.
+    Combining halves the AX work in the watcher's hot path.
+    """
+    now = time.monotonic()
+    entry = _AX_CACHE.get(bundle_id)
+    if entry is not None and (now - entry[1]) < _AX_CACHE_TTL_SECS:
+        return entry[0]
+    data = _get_browser_axdata_fresh(bundle_id)
+    _AX_CACHE[bundle_id] = (data, now)
+    return data
+
+
+def _get_browser_titles_cached(bundle_id: str) -> list[str]:
+    return _get_browser_axdata_cached(bundle_id)[0]
 
 
 def _get_browser_urls_cached(bundle_id: str) -> list[str]:
-    now = time.monotonic()
-    entry = _URLS_CACHE.get(bundle_id)
-    if entry is not None and (now - entry[1]) < _AX_CACHE_TTL_SECS:
-        return entry[0]
-    urls = _get_browser_urls_fresh(bundle_id)
-    _URLS_CACHE[bundle_id] = (urls, now)
-    return urls
+    return _get_browser_axdata_cached(bundle_id)[1]
+
+
+def get_browser_window_titles() -> list[str]:
+    """Aggregate titles from every running browser via the Accessibility API."""
+    if sys.platform != "darwin":
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for bundle_id in _BROWSER_BUNDLES:
+        for t in _get_browser_titles_cached(bundle_id):
+            if t in seen:
+                continue
+            seen.add(t)
+            out.append(t)
+    return out
 
 
 def get_browser_window_urls() -> list[str]:
@@ -610,15 +589,15 @@ def get_browser_window_urls() -> list[str]:
     """
     if sys.platform != "darwin":
         return []
-    urls: list[str] = []
+    out: list[str] = []
     seen: set[str] = set()
     for bundle_id in _BROWSER_BUNDLES:
         for u in _get_browser_urls_cached(bundle_id):
             if u in seen:
                 continue
             seen.add(u)
-            urls.append(u)
-    return urls
+            out.append(u)
+    return out
 
 
 def get_running_processes() -> frozenset[str]:
@@ -631,7 +610,6 @@ def get_running_processes() -> frozenset[str]:
     """
     names: set[str] = set()
     try:
-        import psutil
         for p in psutil.process_iter(["name"]):
             try:
                 n = p.info.get("name")
@@ -642,18 +620,8 @@ def get_running_processes() -> frozenset[str]:
     except Exception:
         log.debug("[arm.mac] psutil process iter failed", exc_info=True)
 
-    try:
-        from AppKit import NSWorkspace  # type: ignore[import-not-found]
-        ws = NSWorkspace.sharedWorkspace()
-        for app in ws.runningApplications():
-            try:
-                bid = app.bundleIdentifier()
-                if bid:
-                    names.add(str(bid).lower())
-            except Exception:
-                continue
-    except Exception:
-        log.debug("[arm.mac] NSWorkspace running apps failed", exc_info=True)
+    for _pid, bid in _iter_running_apps():
+        names.add(bid.lower())
 
     return frozenset(names)
 

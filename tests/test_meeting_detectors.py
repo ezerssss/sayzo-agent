@@ -366,7 +366,7 @@ def test_arm_app_browser_released_when_browser_drops_mic():
     assert arm_app_still_holding_mic("gmeet", SPECS, mic, fg) is False
 
 
-# ---- macOS arm_pids_alive PID-binding (v2.1.10) ------------------------
+# ---- macOS PID-binding via mic.holders ---------------------------------
 
 
 def test_arm_app_browser_macos_alt_tab_still_holding():
@@ -378,7 +378,6 @@ def test_arm_app_browser_macos_alt_tab_still_holding():
         process_name="Notes",
         bundle_id="com.apple.TextEdit",
         is_browser=False,
-        browser_tab_url=None,
     )
     mic = MicState(holders=[
         MicHolder(
@@ -391,10 +390,10 @@ def test_arm_app_browser_macos_alt_tab_still_holding():
 
 
 def test_arm_app_browser_macos_no_holder_returns_false():
-    """macOS v2.5+: when the meeting actually ends, the browser drops
-    its capture session and disappears from mic.holders. That's the
-    ground-truth signal — regardless of whether the browser process
-    is still alive (user might leave Chrome open)."""
+    """When the meeting actually ends, the browser drops its capture
+    session and disappears from mic.holders. That's the ground-truth
+    signal — regardless of whether the browser process is still alive
+    (user might leave Chrome open)."""
     fg = ForegroundInfo(
         process_name="Notes",
         bundle_id="com.apple.TextEdit",
@@ -402,38 +401,6 @@ def test_arm_app_browser_macos_no_holder_returns_false():
     )
     mic = MicState(holders=[])
     assert arm_app_still_holding_mic("gmeet", SPECS, mic, fg) is False
-
-
-def test_arm_app_browser_arm_pids_alive_does_not_override_empty_holders():
-    """v2.5: arm_pids_alive is now a no-op (parameter retained for ABI
-    compat). mic.holders is reliable on both platforms now, so a
-    generous PIDs-alive override would just delay legitimate
-    meeting-ended detection."""
-    fg = ForegroundInfo(
-        process_name="Notes",
-        bundle_id="com.apple.TextEdit",
-        is_browser=False,
-    )
-    mic = MicState(holders=[])
-    assert arm_app_still_holding_mic(
-        "gmeet", SPECS, mic, fg, arm_pids_alive=True,
-    ) is False
-
-
-def test_arm_app_browser_arm_pids_alive_ignored_when_mic_holders_present():
-    """Windows path: mic.holders has the browser, so we get a direct
-    per-process answer — arm_pids_alive is irrelevant. (Defending
-    against a future refactor that confused the precedence.)"""
-    fg = ForegroundInfo(
-        process_name="WindowsTerminal.exe",
-        is_browser=False,
-        browser_tab_url=None,
-    )
-    mic = MicState(holders=[MicHolder("chrome.exe", 1234)], active=False)
-    # arm_pids_alive=False would falsely return False if it took precedence.
-    assert arm_app_still_holding_mic(
-        "gmeet", SPECS, mic, fg, arm_pids_alive=False,
-    ) is True
 
 
 # ---- disabled flag -----------------------------------------------------
