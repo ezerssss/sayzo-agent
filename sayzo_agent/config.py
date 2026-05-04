@@ -366,6 +366,36 @@ def default_detector_specs() -> list[DetectorSpec]:
             url_patterns=[r"^https://8x8\.vc/[^/]+"],
             title_patterns=[r"(?i)\b8x8\b"],
         ),
+
+        # Web counterparts for the desktop messaging / meeting apps above.
+        # Same display_name as the desktop spec so the consent-toast copy
+        # doesn't surface the implementation detail of "is this the
+        # desktop or web one"; users just see "Sayzo is ready to coach
+        # you in Discord" either way. Whitelist watcher attributes the
+        # match to whichever spec fired first — desktop apps run before
+        # browser specs in match_whitelist's pass order, so a user with
+        # both Discord desktop and discord.com open in a browser
+        # attributes to the desktop app first.
+        DetectorSpec(
+            app_key="discord_web", display_name="Discord", is_browser=True,
+            url_patterns=[r"^https://discord\.com/channels/"],
+            title_patterns=[r"(?i)\bDiscord\b"],
+        ),
+        DetectorSpec(
+            app_key="slack_web", display_name="Slack", is_browser=True,
+            url_patterns=[r"^https://app\.slack\.com/client/"],
+            title_patterns=[r"(?i)\bSlack\b"],
+        ),
+        DetectorSpec(
+            app_key="skype_web", display_name="Skype", is_browser=True,
+            url_patterns=[r"^https://web\.skype\.com/"],
+            title_patterns=[r"(?i)\bSkype\b"],
+        ),
+        DetectorSpec(
+            app_key="whatsapp_web", display_name="WhatsApp", is_browser=True,
+            url_patterns=[r"^https://web\.whatsapp\.com/"],
+            title_patterns=[r"(?i)\bWhatsApp\b"],
+        ),
     ]
 
 

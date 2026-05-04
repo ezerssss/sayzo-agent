@@ -58,6 +58,9 @@ try:
         AXUIElementCopyAttributeValue,
         kAXWindowsAttribute,
         kAXTitleAttribute,
+        kAXChildrenAttribute,
+        kAXRoleAttribute,
+        kAXValueAttribute,
     )
 except ImportError:
     print("ERROR: pip install pyobjc-framework-ApplicationServices")
@@ -83,6 +86,21 @@ SPECS: list[Spec] = [
          bundle_ids=["com.microsoft.teams", "com.microsoft.teams2"]),
     Spec("discord", "Discord", bundle_ids=["com.hnc.Discord"]),
     Spec("slack", "Slack", bundle_ids=["com.tinyspeck.slackmacgap"]),
+    # Web counterparts for the desktop meeting apps. Same display_name as
+    # the desktop spec so the consent-toast copy doesn't surface the
+    # implementation detail of "is this the desktop or web one".
+    Spec("discord_web", "Discord", is_browser=True,
+         url_patterns=[r"^https://discord\.com/channels/"],
+         title_patterns=[r"(?i)\bDiscord\b"]),
+    Spec("slack_web", "Slack", is_browser=True,
+         url_patterns=[r"^https://app\.slack\.com/client/"],
+         title_patterns=[r"(?i)\bSlack\b"]),
+    Spec("skype_web", "Skype", is_browser=True,
+         url_patterns=[r"^https://web\.skype\.com/"],
+         title_patterns=[r"(?i)\bSkype\b"]),
+    Spec("whatsapp_web", "WhatsApp", is_browser=True,
+         url_patterns=[r"^https://web\.whatsapp\.com/"],
+         title_patterns=[r"(?i)\bWhatsApp\b"]),
     Spec("webex", "Webex",
          bundle_ids=["Cisco-Systems.Spark", "com.webex.meetingmanager"]),
     Spec("skype", "Skype", bundle_ids=["com.skype.skype"]),
@@ -237,11 +255,35 @@ def _running_pid_for_bundle(bundle: str) -> Optional[int]:
     return None
 
 
+def _walk_to_gui_ancestor(
+    start_pid: int, max_depth: int = 6,
+) -> tuple[Optional[int], Optional[str]]:
+    """Walk parent PIDs from ``start_pid`` until we hit a process that
+    has an ``NSRunningApplication`` entry (a real user-facing GUI app).
+
+    Returns ``(found_pid, bundle_id)`` or ``(None, None)`` if the walk
+    falls off into launchd / kernel without finding a GUI ancestor.
+    """
+    cur = start_pid
+    for _ in range(max_depth):
+        bid = _bundle_for_pid(cur)
+        if bid is not None:
+            return cur, bid
+        try:
+            parent = psutil.Process(cur).parent()
+        except Exception:
+            return None, None
+        if parent is None or parent.pid in (0, 1):
+            return None, None
+        cur = parent.pid
+    return None, None
+
+
 def find_owning_app(
     pid: int,
     capturing_bundle: Optional[str],
     responsible_pid: Optional[int],
-    max_depth: int = 4,
+    max_depth: int = 6,
 ) -> tuple[Optional[int], Optional[str], str]:
     """Identify the GUI app that owns the audio-capturing process.
 
@@ -251,23 +293,27 @@ def find_owning_app(
 
     Resolution order, most authoritative first:
 
-      1. Responsibility SPI (Swift-side). The OS itself uses this to
-         decide which app the privacy indicator attributes to. If the
-         Swift helper resolved a responsible_pid, we just look up its
-         NSRunningApplication bundle. Zero heuristics. This is the path
-         we'd ship in production.
+      1. Responsibility SPI (Swift-side) → walk-up to GUI ancestor.
+         The SPI is the OS's own privacy-attribution source; when it
+         points to a deep helper that has no NSRunningApplication entry
+         (e.g. Discord's Renderer → Discord Helper), we keep walking up
+         until we hit the user-facing app. This is the production path.
       2. Bundle-id prefix → known browser. Defensive fallback for the
-         rare case the SPI returns -1 (sandboxed processes, OS regression).
-         Brittle long-term but harmless when only used as a backstop.
-      3. Parent-PID walk. Catches desktop apps that fork their own
-         helpers and stay parented (Discord Helper → Discord), in case
-         (1) and (2) both fail.
+         WebKit case where the SPI returns the helper itself and the
+         parent chain is launchd-rooted (no link to Safari).
+      3. Plain parent-walk from the capturing PID. Catches anything (1)
+         and (2) didn't reach.
     """
-    # Pass 1 — responsibility SPI.
+    # Pass 1 — responsibility SPI, with walk-up to GUI ancestor.
     if responsible_pid and responsible_pid > 0:
-        bid = _bundle_for_pid(responsible_pid)
+        owner_pid, bid = _walk_to_gui_ancestor(responsible_pid, max_depth=max_depth)
         if bid is not None:
-            return responsible_pid, bid, "responsibility-spi"
+            source = (
+                "responsibility-spi"
+                if owner_pid == responsible_pid
+                else "spi+parent-walk"
+            )
+            return owner_pid, bid, source
 
     # Pass 2 — bundle-id prefix → known browser (fallback).
     browser_bundle = browser_for_helper_bundle(capturing_bundle)
@@ -278,20 +324,12 @@ def find_owning_app(
             "browser-helper-prefix-fallback",
         )
 
-    # Pass 3 — parent-walk (last resort).
-    cur_pid = pid
-    for _ in range(max_depth):
-        bid = _bundle_for_pid(cur_pid)
-        if bid is not None:
-            return cur_pid, bid, "parent-walk"
-        try:
-            parent = psutil.Process(cur_pid).parent()
-        except Exception:
-            return None, None, "no-owner"
-        if parent is None or parent.pid in (0, 1):
-            return None, None, "no-owner"
-        cur_pid = parent.pid
-    return cur_pid, None, "no-owner"
+    # Pass 3 — parent-walk from the capturing PID itself.
+    owner_pid, bid = _walk_to_gui_ancestor(pid, max_depth=max_depth)
+    if bid is not None:
+        return owner_pid, bid, "parent-walk"
+
+    return None, None, "no-owner"
 
 
 # ---- AX titles for a browser bundle ------------------------------------
@@ -340,14 +378,93 @@ def ax_titles_for_bundle(bundle: str) -> list[str]:
     return titles
 
 
+def _ax_attr(elem, attr):
+    try:
+        err, value = AXUIElementCopyAttributeValue(elem, attr, None)
+    except Exception:
+        return None
+    return None if err != 0 else value
+
+
+def _walk_ax(elem, depth: int = 0, max_depth: int = 8):
+    yield depth, elem
+    if depth >= max_depth:
+        return
+    children = _ax_attr(elem, kAXChildrenAttribute)
+    if not children:
+        return
+    for c in children:
+        yield from _walk_ax(c, depth + 1, max_depth)
+
+
+def ax_urls_for_bundle(bundle: str) -> list[str]:
+    """Read active-tab URLs from a browser via Accessibility.
+
+    Two strategies, run per browser process:
+      A) AXURL attribute on AXWebArea elements (semantically correct;
+         what screen readers use). Works for Safari and a few others.
+      B) AXValue on AXTextField elements that look URL-shaped (the
+         omnibox text). Backup that catches Edge sometimes.
+
+    Probe 05 confirmed Safari supports A and B; Chrome supports
+    NEITHER without an Automation TCC prompt. So this returns useful
+    URLs for Safari/Edge/Brave/Arc with mixed luck and an empty list
+    for Chrome — the matcher then falls back to title patterns for
+    Chrome users.
+    """
+    urls: list[str] = []
+    seen: set[str] = set()
+
+    def _add(u: object) -> None:
+        if u is None:
+            return
+        try:
+            s = str(u).strip()
+        except Exception:
+            return
+        if not s or s in seen:
+            return
+        if not s.startswith(("http://", "https://", "file://")):
+            return
+        seen.add(s)
+        urls.append(s)
+
+    for pid in _pids_for_bundle(bundle):
+        try:
+            app_ref = AXUIElementCreateApplication(pid)
+        except Exception:
+            continue
+        windows = _ax_attr(app_ref, kAXWindowsAttribute) or []
+        for window in windows:
+            for _depth, elem in _walk_ax(window, max_depth=8):
+                role = _ax_attr(elem, kAXRoleAttribute)
+                if role == "AXWebArea":
+                    _add(_ax_attr(elem, "AXURL"))
+                elif role == "AXTextField":
+                    _add(_ax_attr(elem, kAXValueAttribute))
+    return urls
+
+
 # ---- matcher -----------------------------------------------------------
 
-def match_browser_title(titles: list[str]) -> Optional[Spec]:
+def match_browser_spec(urls: list[str], titles: list[str]) -> Optional[Spec]:
+    """Match every browser DetectorSpec against a flat list of URLs and
+    titles harvested from a browser's AX tree.
+
+    URL patterns are tried against ``urls`` first (preferred — works for
+    user-added custom detectors that only have URL patterns) and then
+    against ``titles`` as a legacy fallback. Title patterns are tried
+    against ``titles`` only. Same precedence as the agent's existing
+    ``_browser_spec_matches`` in ``arm/detectors.py``.
+    """
     for spec in SPECS:
         if not spec.is_browser:
             continue
         for pat in spec.url_patterns:
             rx = re.compile(pat)
+            for u in urls:
+                if rx.search(u):
+                    return spec
             for t in titles:
                 if rx.search(t):
                     return spec
@@ -360,12 +477,21 @@ def match_browser_title(titles: list[str]) -> Optional[Spec]:
 
 
 def desktop_spec_for_bundle(bundle: str) -> Optional[Spec]:
+    """Match a bundle id against the desktop DetectorSpecs.
+
+    Handles helper-bundle ids by prefix (e.g. ``com.hnc.Discord.helper.Renderer``
+    matches the ``com.hnc.Discord`` spec) so we don't depend solely on the
+    SPI walk-up to find Discord when its capturing process is a Renderer
+    helper. Belt-and-suspenders with ``find_owning_app``.
+    """
     bl = bundle.lower()
     for spec in SPECS:
         if spec.is_browser:
             continue
-        if bl in {b.lower() for b in spec.bundle_ids}:
-            return spec
+        for spec_bundle in spec.bundle_ids:
+            sb = spec_bundle.lower()
+            if bl == sb or bl.startswith(sb + "."):
+                return spec
     return None
 
 
@@ -416,17 +542,22 @@ def _print_one_pass(binary_path: str) -> None:
         if owner_bundle in BROWSER_BUNDLES:
             browser_name = BROWSER_BUNDLES[owner_bundle]
             titles = ax_titles_for_bundle(owner_bundle)
+            urls = ax_urls_for_bundle(owner_bundle)
             print(f"    {browser_name} window titles: {titles}")
-            if not titles:
-                print(f"    → browser is capturing but AX returned no titles")
+            print(f"    {browser_name} AX URLs:       {urls if urls else '(none — AX URL not exposed by this browser)'}")
+            if not titles and not urls:
+                print(f"    → browser is capturing but AX returned no titles OR urls")
                 print(f"      (Accessibility permission may not be granted)")
                 continue
-            spec = match_browser_title(titles)
+            spec = match_browser_spec(urls, titles)
             if spec is not None:
+                via = "url" if (
+                    urls and any(re.search(p, u) for p in spec.url_patterns for u in urls)
+                ) else "title"
                 print(f"    → browser match: {spec.app_key} ({spec.display_name})")
-                matched_apps.append((spec, f"browser via {browser_name} title"))
+                matched_apps.append((spec, f"browser via {browser_name} {via}"))
             else:
-                print(f"    → browser is capturing but no title matched any spec")
+                print(f"    → browser is capturing but no url/title matched any spec")
         else:
             print(f"    → owner is neither a known browser nor a known meeting app")
 
