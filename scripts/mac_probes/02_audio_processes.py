@@ -112,9 +112,12 @@ def main() -> None:
             rows = snapshot_audio_processes()
         except OSError as exc:
             print(f"\n  ERROR enumerating ProcessObjectList: {exc}")
-            print("\n  If OSStatus=560227702 (kAudioHardwareUnknownPropertyError),")
-            print("  this macOS is < 14.4 and the per-process API isn't available.")
-            print("  Run: sw_vers -productVersion")
+            print("\n  Common OSStatus values:")
+            print("    2003332927 = 'who?' = kAudioHardwareUnknownPropertyError")
+            print("       → property selector not recognized. Either macOS < 14.4")
+            print("         or (on macOS 14.4+) the API is gated behind an entitlement")
+            print("         or Info.plist key that an unsigned Python script lacks.")
+            print("    Run: sw_vers -productVersion")
             return
         if not args.no_enrich:
             _enrich_with_proc_name(rows)

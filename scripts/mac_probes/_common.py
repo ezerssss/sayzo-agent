@@ -98,6 +98,146 @@ kAudioProcessPropertyIsRunningOutput = fourcc("piro")
 # Aggregate-IO query that some older code paths use as a fallback.
 kAudioDevicePropertyDeviceIsRunning = fourcc("goon")
 
+# Device enumeration + introspection.
+kAudioHardwarePropertyDevices = fourcc("dev#")
+kAudioObjectPropertyName = fourcc("lnam")
+kAudioDevicePropertyDeviceUID = fourcc("uid ")
+kAudioDevicePropertyTransportType = fourcc("tran")
+kAudioDevicePropertyStreams = fourcc("stm#")
+kAudioDevicePropertyHogMode = fourcc("oink")
+kAudioObjectPropertyScopeInput = fourcc("inpt")
+kAudioObjectPropertyScopeOutput = fourcc("outp")
+
+# Transport-type FourCC → human label. Catches the common ones; unknown
+# values are printed as the FourCC itself.
+_TRANSPORT_LABELS = {
+    fourcc("bltn"): "built-in",
+    fourcc("aggr"): "aggregate",
+    fourcc("virt"): "virtual",
+    fourcc("usb "): "usb",
+    fourcc("blue"): "bluetooth",
+    fourcc("blea"): "bluetooth-le",
+    fourcc("1394"): "firewire",
+    fourcc("airp"): "airplay",
+    fourcc("avb "): "avb",
+    fourcc("hdmi"): "hdmi",
+    fourcc("dply"): "displayport",
+    fourcc("thnd"): "thunderbolt",
+    fourcc("pci "): "pci",
+    fourcc("cont"): "continuity-camera",
+    0: "unknown",
+}
+
+
+def transport_label(value: int | None) -> str:
+    if value is None:
+        return "?"
+    if value in _TRANSPORT_LABELS:
+        return _TRANSPORT_LABELS[value]
+    # Decode fourcc.
+    try:
+        b = bytes([
+            (value >> 24) & 0xFF,
+            (value >> 16) & 0xFF,
+            (value >> 8) & 0xFF,
+            value & 0xFF,
+        ])
+        return b.decode("ascii", errors="replace").strip() or str(value)
+    except Exception:
+        return str(value)
+
+
+def list_audio_devices() -> list[int]:
+    addr = AudioObjectPropertyAddress(
+        kAudioHardwarePropertyDevices,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain,
+    )
+    size = c_uint32(0)
+    err = _CoreAudio.AudioObjectGetPropertyDataSize(
+        kAudioObjectSystemObject, byref(addr), 0, None, byref(size)
+    )
+    if err != 0:
+        raise OSError(f"AudioObjectGetPropertyDataSize(Devices) OSStatus={err}")
+    if size.value == 0:
+        return []
+    count = size.value // sizeof(c_uint32)
+    array = (c_uint32 * count)()
+    err = _CoreAudio.AudioObjectGetPropertyData(
+        kAudioObjectSystemObject, byref(addr), 0, None, byref(size), array
+    )
+    if err != 0:
+        raise OSError(f"AudioObjectGetPropertyData(Devices) OSStatus={err}")
+    return [int(array[i]) for i in range(count)]
+
+
+def device_has_streams_in_scope(device_id: int, scope: int) -> bool:
+    """Returns True if the device has at least one stream in ``scope``
+    (input or output). Used to filter the device list to inputs only."""
+    addr = AudioObjectPropertyAddress(
+        kAudioDevicePropertyStreams,
+        scope,
+        kAudioObjectPropertyElementMain,
+    )
+    size = c_uint32(0)
+    err = _CoreAudio.AudioObjectGetPropertyDataSize(
+        device_id, byref(addr), 0, None, byref(size)
+    )
+    if err != 0:
+        return False
+    return size.value > 0
+
+
+def read_uint32_with_scope(obj_id: int, selector: int, scope: int) -> int | None:
+    addr = AudioObjectPropertyAddress(
+        selector,
+        scope,
+        kAudioObjectPropertyElementMain,
+    )
+    out = c_uint32(0)
+    size = c_uint32(sizeof(c_uint32))
+    err = _CoreAudio.AudioObjectGetPropertyData(
+        obj_id, byref(addr), 0, None, byref(size), byref(out)
+    )
+    if err != 0:
+        return None
+    return int(out.value)
+
+
+def read_int32_with_scope(obj_id: int, selector: int, scope: int) -> int | None:
+    addr = AudioObjectPropertyAddress(
+        selector,
+        scope,
+        kAudioObjectPropertyElementMain,
+    )
+    out = c_int32(0)
+    size = c_uint32(sizeof(c_int32))
+    err = _CoreAudio.AudioObjectGetPropertyData(
+        obj_id, byref(addr), 0, None, byref(size), byref(out)
+    )
+    if err != 0:
+        return None
+    return int(out.value)
+
+
+def read_cfstring_with_scope(obj_id: int, selector: int, scope: int) -> str | None:
+    addr = AudioObjectPropertyAddress(
+        selector,
+        scope,
+        kAudioObjectPropertyElementMain,
+    )
+    cfstr = c_void_p(0)
+    size = c_uint32(sizeof(c_void_p))
+    err = _CoreAudio.AudioObjectGetPropertyData(
+        obj_id, byref(addr), 0, None, byref(size), byref(cfstr)
+    )
+    if err != 0 or not cfstr.value:
+        return None
+    try:
+        return cfstring_to_str(cfstr.value)
+    finally:
+        cfrelease(cfstr.value)
+
 kCFStringEncodingUTF8 = 0x08000100
 
 
