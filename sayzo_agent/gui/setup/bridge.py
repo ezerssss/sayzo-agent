@@ -8,10 +8,12 @@ itself returns immediately.
 """
 from __future__ import annotations
 
+import asyncio
 import enum
 import logging
 import os
 import sys
+import webbrowser
 from typing import TYPE_CHECKING, Any
 
 from sayzo_agent.config import Config
@@ -296,6 +298,105 @@ class Bridge:
 
     def save_hotkey(self, binding: str) -> dict[str, Any]:
         return hotkey_helpers.save_hotkey(self._cfg, binding)
+
+    # ---- Web-onboarding gate ----------------------------------------
+
+    def recheck_account_status(self) -> dict[str, Any]:
+        """Re-fetch ``GET /api/me`` and return the updated SetupStatus.
+
+        Called by the FinishSignup screen — both manually (the "I've
+        finished" button) and via an 8 s auto-poll while the screen is
+        visible. Also fires once after a successful PKCE login completes,
+        so the React app routes to FinishSignup or to permissions based
+        on a fresh server response rather than a stale cache.
+
+        The fetch happens inline on this thread — pywebview already calls
+        JS-callable bridge methods on a worker thread, so blocking briefly
+        here doesn't freeze the UI. On any non-``ok`` outcome the cache is
+        updated; on auth/transient failures the cache is left alone so a
+        flaky network can't downgrade a previously-positive state.
+        """
+        from sayzo_agent.account import refresh_and_cache
+        from sayzo_agent.auth.client import make_auth_client
+
+        client = make_auth_client(self._cfg)
+        if client is None:
+            log.info(
+                "[bridge.account] recheck: no auth client (signed-out or no server_url)"
+            )
+            return self._account_status_payload(fetch_status="auth_required")
+
+        try:
+            response = asyncio.run(refresh_and_cache(client, self._cfg))
+        except Exception as exc:
+            log.warning(
+                "[bridge.account] recheck raised: %r", exc, exc_info=True
+            )
+            return self._account_status_payload(
+                fetch_status="unknown_error", error=repr(exc)
+            )
+
+        return self._account_status_payload(
+            fetch_status=response.status,
+            onboarding_url=response.onboarding_url,
+        )
+
+    def open_onboarding_url(self) -> dict[str, Any]:
+        """Open the web-onboarding URL from the cache in the default browser.
+
+        Falls back to ``server_url + /onboarding`` if no cache exists yet
+        (e.g. user clicked the button before the first recheck landed).
+        Returns ``{"opened": bool, "url": <url-or-null>}`` so the frontend
+        can render an inline copyable URL on failure.
+        """
+        url = self._resolve_onboarding_url(self._safe_read_cache())
+        if not url:
+            return {"opened": False, "url": None}
+        try:
+            opened = webbrowser.open(url, new=2)
+        except Exception:
+            log.warning(
+                "[bridge.account] webbrowser.open failed for %s", url, exc_info=True
+            )
+            opened = False
+        return {"opened": bool(opened), "url": url}
+
+    def _safe_read_cache(self):
+        from sayzo_agent.account import read_cache
+        try:
+            return read_cache(self._cfg)
+        except Exception:
+            log.warning("[bridge.account] cache read failed", exc_info=True)
+            return None
+
+    def _resolve_onboarding_url(self, cached) -> str | None:
+        if cached is not None and cached.onboarding_url:
+            return cached.onboarding_url
+        base = self._cfg.auth.effective_server_url
+        return (base.rstrip("/") + "/onboarding") if base else None
+
+    def _account_status_payload(
+        self,
+        *,
+        fetch_status: str,
+        onboarding_url: str | None = None,
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        """Combined response: fresh SetupStatus snapshot + the fetch outcome.
+
+        The frontend uses ``fetch_status`` to drive the FinishSignup screen
+        UX (e.g. show a retry button on transient_error, bounce to Welcome
+        on auth_required) without having to re-call ``get_status()``.
+        """
+        cached = self._safe_read_cache()
+        status = detect_setup(self._cfg).to_dict()
+        status["resume_at"] = self._consume_resume_marker()
+        return {
+            "status": status,
+            "fetch_status": fetch_status,
+            "onboarding_url": onboarding_url or self._resolve_onboarding_url(cached),
+            "error": error,
+        }
 
     # ---- Setup-completion marker ------------------------------------
 

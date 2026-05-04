@@ -33,6 +33,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Literal, Optional
 
+from ..account import AccountGateDecision
 from ..config import ArmConfig, DetectorSpec
 from ..conversation import ConversationDetector, SessionState
 from ..models import SessionCloseReason
@@ -44,6 +45,7 @@ from .hotkey import HotkeySource
 
 
 ArmSource = Literal["hotkey", "whitelist"]
+AccountGateFn = Callable[[], AccountGateDecision]
 
 log = logging.getLogger(__name__)
 
@@ -176,6 +178,11 @@ class ArmController:
         # result doesn't already carry them (macOS path; Windows gets
         # PIDs directly from ``mic.holders`` so this returns ()).
         resolve_pids_for_spec: Optional[Callable[[DetectorSpec], tuple[int, ...]]] = None,
+        # Web-onboarding gate. Called synchronously (no I/O — reads the
+        # cached /api/me result) before flipping into ARMED on either the
+        # hotkey or the whitelist consent path. ``None`` ⇒ no gating
+        # (test default; production wires this from ``__main__``).
+        account_gate_fn: Optional[AccountGateFn] = None,
     ) -> None:
         self.cfg = cfg
         self.detector = detector
@@ -239,6 +246,13 @@ class ArmController:
         # Used by __main__'s _tray_bridge to push the new state to the tray
         # immediately instead of waiting for the next 0.5 s poll.
         self._state_change_callback: Optional[Callable[[], None]] = None
+
+        # Web-onboarding gate (see _arm_internal + _run_whitelist_watcher).
+        self.account_gate_fn: Optional[AccountGateFn] = account_gate_fn
+        # Per-app_key dedup for the watcher's "skipped because gated" log,
+        # so a long meeting in a blocked-account state doesn't spam at the
+        # 2 s poll cadence.
+        self._gated_log_keys: set[str] = set()
 
         # Wire the detector's pending-close hook.
         self.detector.on_pending_close = self._on_pending_close
@@ -503,6 +517,29 @@ class ArmController:
         """
         if self.state == ArmState.ARMED:
             return
+
+        # Web-onboarding gate. Synchronous read of the cached /api/me
+        # state — block here BEFORE any state mutation or stream open so
+        # a gated arm leaves the controller cleanly in DISARMED. The
+        # toast tells the user where to go next; for whitelist arms the
+        # watcher already filtered upstream so this is the hotkey path's
+        # last-line backstop.
+        if self.account_gate_fn is not None:
+            try:
+                decision = self.account_gate_fn()
+            except Exception:
+                log.warning("[arm] account gate raised; allowing", exc_info=True)
+                decision = AccountGateDecision(allowed=True)
+            if not decision.allowed:
+                log.info(
+                    "[arm] gated by account-state %s — refusing to arm",
+                    decision.reason,
+                )
+                if decision.toast_title and decision.toast_body:
+                    self.notifier.notify(
+                        decision.toast_title, decision.toast_body
+                    )
+                return
 
         # Fresh-start invariant: VAD counter + detector epoch rewind so the
         # next frame behaves as the first frame of a cold-started source.
@@ -774,6 +811,36 @@ class ArmController:
                         match.display_name, match.app_key, match.source,
                     )
                     last_match_key = match.app_key
+
+                # Web-onboarding gate. Skip the consent toast silently —
+                # we don't want to ask the user to start recording when
+                # we'd refuse to arm even on Yes. The hotkey path's gate
+                # is what tells the user about onboarding (it's their
+                # explicit ask). Dedup'd per app_key transition so a long
+                # blocked session doesn't spam the log at the 2 s poll.
+                if self.account_gate_fn is not None:
+                    try:
+                        decision = self.account_gate_fn()
+                    except Exception:
+                        log.warning(
+                            "[arm] account gate raised in watcher; allowing",
+                            exc_info=True,
+                        )
+                        decision = AccountGateDecision(allowed=True)
+                    if not decision.allowed:
+                        if match.app_key not in self._gated_log_keys:
+                            log.info(
+                                "[arm] whitelist watcher: skipped consent for "
+                                "%s — account gated (%s)",
+                                match.app_key, decision.reason,
+                            )
+                            self._gated_log_keys.add(match.app_key)
+                        continue
+                    elif self._gated_log_keys:
+                        # Account became OK — clear the dedup so a future
+                        # gating event logs again.
+                        self._gated_log_keys.clear()
+
                 log.info("[arm] firing consent toast for %s", match.app_key)
                 # Show consent toast.
                 result = await self._ask_consent(

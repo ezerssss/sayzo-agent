@@ -49,6 +49,7 @@ from pathlib import Path
 
 from PIL import Image
 
+from ..account import BLOCKED_ACCOUNT_STATES, CachedAccountStatus
 from .fs import open_folder
 
 log = logging.getLogger(__name__)
@@ -128,6 +129,15 @@ class TrayState:
     # thread; the bridge polls and calls scheduler.fire_now(ignore_gates).
     test_drill_event: threading.Event = field(default_factory=threading.Event)
 
+    # Last observed /api/me result, pushed here by the boot refresh task.
+    # ``None`` ⇒ never checked yet; the tray renders a normal armed /
+    # disarmed UI in that case (the arm-time gate is forgiving on
+    # missing-cache too — see decide_arm_gate).
+    _cached_account: CachedAccountStatus | None = None
+    # Tray-thread → asyncio-loop signal: user clicked the "Finish setup at
+    # sayzo.app →" item, agent should open the cached onboarding_url.
+    finish_setup_event: threading.Event = field(default_factory=threading.Event)
+
     def set_status(self, status: Status, error_message: str = "") -> None:
         with self._lock:
             self.status = status
@@ -160,6 +170,33 @@ class TrayState:
     def get_eod_drill_label(self) -> str | None:
         with self._lock:
             return self._eod_drill_label
+
+    def set_cached_account(self, cached: CachedAccountStatus | None) -> bool:
+        """Update the cached account snapshot. Returns ``True`` iff the
+        gate-relevant state actually changed — callers use the return
+        value to skip an otherwise wasted ``tray.update()`` rebuild."""
+        with self._lock:
+            prev = self._cached_account
+            if prev is not None and cached is not None and (
+                prev.account_state == cached.account_state
+                and prev.onboarding_url == cached.onboarding_url
+            ):
+                return False
+            if prev is None and cached is None:
+                return False
+            self._cached_account = cached
+            return True
+
+    def get_cached_account(self) -> CachedAccountStatus | None:
+        with self._lock:
+            return self._cached_account
+
+    def is_account_blocked(self) -> bool:
+        with self._lock:
+            return (
+                self._cached_account is not None
+                and self._cached_account.account_state in BLOCKED_ACCOUNT_STATES
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +393,12 @@ class TrayIcon:
         hotkey = self.state.get_hotkey_display()
         if status == Status.ERROR and error_msg:
             return f"Sayzo — {error_msg}"
+        # Account-blocked supersedes everything except an active arming —
+        # if we're already capturing we don't pull the rug out (the gate
+        # only fires at the next arm attempt). Disarmed-and-blocked is
+        # the common case where this matters.
+        if status != Status.ARMED and self.state.is_account_blocked():
+            return "Sayzo — finish setup at sayzo.app to start recording."
         if status == Status.ARMED:
             return f"Sayzo — capturing. Press {hotkey} to stop."
         # Everything else (DISARMED and legacy aliases) → disarmed tooltip.
@@ -402,6 +445,12 @@ class TrayIcon:
             hotkey = self.state.get_hotkey_display()
             if status_now == Status.ARMED:
                 return f"Stop recording   ({hotkey})"
+            # When the account isn't ready, the click still routes through
+            # the gate (which fires the toast). pystray can't reliably
+            # disable items across backends, so we re-label instead — the
+            # label is the truth about what'll happen on click.
+            if self.state.is_account_blocked():
+                return "Finish setup to record"
             # "Start recording" keeps parity with the hotkey confirmation
             # toast and the Stop label — avoids the "Arm Sayzo" jargon, which
             # reads as technical to a non-dev user.
@@ -426,6 +475,16 @@ class TrayIcon:
         def on_test_drill(icon, item):
             self.state.test_drill_event.set()
 
+        def finish_setup_visible(item) -> bool:
+            return self.state.is_account_blocked()
+
+        def on_finish_setup(icon, item):
+            # Open the cached onboarding URL on the asyncio loop side via
+            # the bridge — keeps webbrowser.open off the tray thread (no
+            # known issues, just consistent with how settings_event is
+            # handled).
+            self.state.finish_setup_event.set()
+
         # The Debug submenu only renders when SAYZO_DEBUG_TRAY=1 is in the
         # env — keeps the production menu clean. The CLI command
         # `sayzo-agent test-drill-notification` is the supported path for
@@ -440,6 +499,15 @@ class TrayIcon:
         # explicit menu click makes the intent unambiguous and lets the
         # label always be the ground truth for what happens next.
         menu = pystray.Menu(
+            # Account-blocked CTA sits ABOVE the arm row so a user staring
+            # at the menu after a denied hotkey press lands on it first.
+            # Visible only while the cached account_state is one of the
+            # three blocked values; invisible (zero-height) otherwise.
+            pystray.MenuItem(
+                "Finish setup at sayzo.app",
+                on_finish_setup,
+                visible=finish_setup_visible,
+            ),
             pystray.MenuItem(arm_label, on_arm_toggle),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(

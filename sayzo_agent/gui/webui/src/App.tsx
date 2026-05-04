@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
-import { bridge, SetupStatus, ConfigSnapshot } from "./lib/bridge";
+import { bridge, SetupStatus, ConfigSnapshot, AccountState } from "./lib/bridge";
 import { subscribe, SayzoEvent } from "./lib/events";
 import { Welcome } from "./screens/Welcome";
+import { FinishSignup } from "./screens/FinishSignup";
 import { Microphone } from "./screens/Microphone";
 import { AudioCapture } from "./screens/AudioCapture";
 import { Accessibility } from "./screens/Accessibility";
@@ -21,15 +22,31 @@ import { Alert } from "./components/ui/Alert";
 //   screen, since reading browser tab URLs would force the scary
 //   "Sayzo wants to control your browser" TCC dialog.)
 // Windows (4): welcome → notifications → shortcut → done
+//
+// "finish-signup" is an out-of-sequence screen inserted between welcome
+// and the first permission screen whenever the server reports the
+// signed-in user hasn't finished web onboarding (or is suspended /
+// deleted). It blocks setup completion until the account becomes "ok".
 type Screen =
   | "loading"
   | "welcome"
+  | "finish-signup"
   | "microphone"
   | "audio-capture"
   | "accessibility"
   | "notifications"
   | "shortcut"
   | "done";
+
+const ACCOUNT_BLOCKED_STATES: ReadonlyArray<AccountState> = [
+  "onboarding_required",
+  "suspended",
+  "deleted",
+];
+
+function isAccountBlocked(state: AccountState): boolean {
+  return ACCOUNT_BLOCKED_STATES.includes(state);
+}
 
 function sequenceFor(platform: string): Screen[] {
   if (platform === "darwin") {
@@ -51,6 +68,13 @@ function initialScreen(
   sequence: Screen[],
 ): Screen {
   if (!status.has_token) return "welcome";
+  // Web-onboarding gate: signed in but the server says the account isn't
+  // ready. Route to FinishSignup regardless of platform — it blocks the
+  // permission screens until the account becomes "ok" (or the user closes
+  // the window and finishes on the web later).
+  if (isAccountBlocked(status.account_state)) {
+    return "finish-signup";
+  }
   // One-shot resume after Restart-Sayzo from the Accessibility screen.
   // The backend writes a marker before exit and clears it on this read,
   // so we only honor it when the target screen is actually in this
@@ -114,13 +138,25 @@ export function App() {
   useEffect(() => {
     return subscribe(async (evt: SayzoEvent) => {
       if (evt.type === "login_done" && config) {
-        const s = await bridge.getStatus();
+        // Refresh /api/me before advancing so the routing decision is
+        // made on a fresh server response, not a stale cache. The bridge
+        // returns the SetupStatus inline, so no follow-up getStatus().
+        let s: SetupStatus;
+        try {
+          const payload = await bridge.recheckAccountStatus();
+          s = payload.status;
+        } catch {
+          // Network failures are non-fatal — the gate is forgiving on a
+          // missing cache. Fall back to a plain status read.
+          s = await bridge.getStatus();
+        }
         setStatus(s);
-        // After login, advance to the first post-welcome screen in this
-        // platform's sequence.
+        if (isAccountBlocked(s.account_state)) {
+          setScreen("finish-signup");
+          return;
+        }
         const seq = sequenceFor(config.platform);
-        const postWelcome = seq[1] ?? "done";
-        setScreen(postWelcome);
+        setScreen(seq[1] ?? "done");
       }
     });
   }, [config]);
@@ -172,12 +208,33 @@ export function App() {
             // no-op safety hook in case events get lost.
             void bridge.getStatus().then((s) => {
               setStatus(s);
+              if (isAccountBlocked(s.account_state)) {
+                setScreen("finish-signup");
+                return;
+              }
               const seq = sequenceFor(config.platform);
               const postWelcome = seq[1] ?? "done";
               setScreen(postWelcome);
             });
           }}
           onCancel={handleCancel}
+        />
+      );
+    case "finish-signup":
+      return (
+        <FinishSignup
+          initialAccountState={status.account_state}
+          onAccountReady={() => {
+            // Status is now "ok" — refresh and advance into the platform
+            // sequence as if the user had just landed post-login.
+            void bridge.getStatus().then((s) => {
+              setStatus(s);
+              const seq = sequenceFor(config.platform);
+              const postWelcome = seq[1] ?? "done";
+              setScreen(postWelcome);
+            });
+          }}
+          onClose={handleCancel}
         />
       );
     case "microphone":

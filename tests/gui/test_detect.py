@@ -230,11 +230,117 @@ def test_status_to_dict_includes_all_fields() -> None:
         has_token=True,
         has_mic_permission=None,
         has_permissions_onboarded=True,
+        account_state="ok",
         is_complete=True,
     )
     assert s.to_dict() == {
         "has_token": True,
         "has_mic_permission": None,
         "has_permissions_onboarded": True,
+        "account_state": "ok",
         "is_complete": True,
     }
+
+
+# ---------------------------------------------------------------------------
+# Account-state gating (web-onboarding requirement)
+# ---------------------------------------------------------------------------
+
+
+def _write_account_cache(cfg: Config, account_state: str) -> None:
+    from sayzo_agent.account.cache import (
+        CACHE_FILENAME,
+        CACHE_SCHEMA_VERSION,
+    )
+
+    payload = {
+        "version": CACHE_SCHEMA_VERSION,
+        "account_state": account_state,
+        "onboarding_complete": account_state == "ok",
+        "onboarding_url": "https://sayzo.app/onboarding",
+        "email": "user@example.com",
+        "user_id": "usr_x",
+        "fetched_at": "2026-05-04T12:00:00+00:00",
+    }
+    (cfg.data_dir / CACHE_FILENAME).write_text(
+        json.dumps(payload), encoding="utf-8"
+    )
+
+
+def test_account_state_unknown_does_not_block(cfg: Config) -> None:
+    """No cache yet → ``unknown`` → setup-complete proceeds. The arm gate
+    falls back to allow when the cache is missing, so this matches."""
+    _write_token(cfg)
+    _write_onboarded_marker(cfg)
+    with patch("sayzo_agent.gui.setup.detect.sys.platform", "win32"):
+        status = detect_setup(cfg)
+    assert status.account_state == "unknown"
+    assert status.is_complete is True
+
+
+def test_account_state_ok_passes(cfg: Config) -> None:
+    _write_token(cfg)
+    _write_onboarded_marker(cfg)
+    _write_account_cache(cfg, "ok")
+    with patch("sayzo_agent.gui.setup.detect.sys.platform", "win32"):
+        status = detect_setup(cfg)
+    assert status.account_state == "ok"
+    assert status.is_complete is True
+
+
+def test_account_state_onboarding_required_blocks(cfg: Config) -> None:
+    """Cache says the user hasn't finished web onboarding → setup is not
+    complete, so the GUI re-opens at FinishSignup on next launch."""
+    _write_token(cfg)
+    _write_onboarded_marker(cfg)
+    _write_account_cache(cfg, "onboarding_required")
+    with patch("sayzo_agent.gui.setup.detect.sys.platform", "win32"):
+        status = detect_setup(cfg)
+    assert status.account_state == "onboarding_required"
+    assert status.is_complete is False
+
+
+def test_account_state_suspended_blocks(cfg: Config) -> None:
+    _write_token(cfg)
+    _write_onboarded_marker(cfg)
+    _write_account_cache(cfg, "suspended")
+    with patch("sayzo_agent.gui.setup.detect.sys.platform", "win32"):
+        status = detect_setup(cfg)
+    assert status.is_complete is False
+
+
+def test_account_state_deleted_blocks(cfg: Config) -> None:
+    _write_token(cfg)
+    _write_onboarded_marker(cfg)
+    _write_account_cache(cfg, "deleted")
+    with patch("sayzo_agent.gui.setup.detect.sys.platform", "win32"):
+        status = detect_setup(cfg)
+    assert status.is_complete is False
+
+
+def test_kill_switch_disables_account_gate(cfg: Config) -> None:
+    """SAYZO_AUTH__ACCOUNT_CHECK_ENABLED=0 → account_state is reported but
+    not factored into is_complete. Lets us roll back the gate without
+    shipping a new agent if the endpoint goes sideways."""
+    _write_token(cfg)
+    _write_onboarded_marker(cfg)
+    _write_account_cache(cfg, "onboarding_required")
+    cfg.auth.account_check_enabled = False
+    with patch("sayzo_agent.gui.setup.detect.sys.platform", "win32"):
+        status = detect_setup(cfg)
+    assert status.account_state == "onboarding_required"
+    assert status.is_complete is True
+
+
+def test_corrupt_cache_treated_as_unknown(cfg: Config) -> None:
+    """Garbled JSON in the cache file should NOT lock the user out — the
+    detector treats it as ``unknown`` and the boot refresh repopulates."""
+    from sayzo_agent.account.cache import CACHE_FILENAME
+
+    (cfg.data_dir / CACHE_FILENAME).write_text("not json", encoding="utf-8")
+    _write_token(cfg)
+    _write_onboarded_marker(cfg)
+    with patch("sayzo_agent.gui.setup.detect.sys.platform", "win32"):
+        status = detect_setup(cfg)
+    assert status.account_state == "unknown"
+    assert status.is_complete is True

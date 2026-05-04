@@ -458,6 +458,20 @@ class AuthConfig(BaseSettings):
     redirect_port: int = 17223  # Preferred port for PKCE localhost redirect
     login_timeout_secs: int = 120
 
+    # When True the agent calls GET /api/me at service start + on a
+    # background tick and refuses to arm if the server reports the
+    # signed-in user hasn't finished onboarding at sayzo.app. Killable
+    # via SAYZO_AUTH__ACCOUNT_CHECK_ENABLED=0 in case the endpoint is
+    # unavailable or returning bad data and we need to roll back without
+    # shipping a new agent.
+    account_check_enabled: bool = True
+    # Background refresh cadence for /api/me. Set to match the cache TTL so
+    # the next refresh fires right as the cache would otherwise go stale —
+    # no over-fetching, no stale window. The user-visible "I just finished
+    # onboarding" path is handled by the FinishSignup screen's 8 s polling,
+    # not this background tick. ~2.5 KB/req → ~10 KB/day/agent at 6h.
+    account_refresh_interval_secs: float = 21600.0  # 6 hours
+
     @property
     def effective_server_url(self) -> str:
         """Base URL for API calls. Falls back to deriving from auth_url."""

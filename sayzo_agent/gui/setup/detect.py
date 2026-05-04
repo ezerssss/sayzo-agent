@@ -13,6 +13,9 @@ The detection probes:
     dialog to appear only after the GUI has shown the user an explanation.
     The probe is still useful from the GUI itself (``recheck_mac_permission``
     bridge call) when the user has been told what's about to happen.
+  - web-onboarding gate: the cached ``GET /api/me`` result. Reads ONLY the
+    on-disk cache here — keeps detect_setup fast, sync, and side-effect
+    free. The bridge fires the actual refresh from the GUI thread.
 """
 from __future__ import annotations
 
@@ -20,8 +23,9 @@ import logging
 import subprocess
 import sys
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
+from sayzo_agent.account import read_cache
 from sayzo_agent.auth.store import TokenStore
 from sayzo_agent.config import Config
 
@@ -39,6 +43,15 @@ _MAC_PROBE_TIMEOUT_SECS = 1.5
 # we can force a re-onboard later by bumping the suffix if the screen
 # materially changes (e.g. adds a new permission).
 _PERMISSIONS_MARKER_NAME = ".permissions_onboarded_v1"
+
+
+AccountState = Literal[
+    "unknown",  # no cache yet — detect-layer treats as pass, arm gate as allow
+    "ok",
+    "onboarding_required",
+    "suspended",
+    "deleted",
+]
 
 
 @dataclass
@@ -59,6 +72,12 @@ class SetupStatus:
     Notifications → Shortcut flow. The field name is historical — it
     predates folding the tkinter onboarding into the pywebview window.
 
+    ``account_state`` is the last observed result of ``GET /api/me``. The
+    gate logic treats ``"unknown"`` (no cache yet) as "pass" so a brand-new
+    install isn't blocked while the boot refresh races to populate the
+    cache; everything other than ``"ok"`` / ``"unknown"`` blocks setup
+    completion and reroutes the GUI to FinishSignup.
+
     ``is_complete`` is computed once at detection time rather than derived
     lazily, so the snapshot is stable across platform patches in tests and
     across platform-detection branches elsewhere.
@@ -67,6 +86,7 @@ class SetupStatus:
     has_token: bool
     has_mic_permission: bool | None
     has_permissions_onboarded: bool
+    account_state: AccountState
     is_complete: bool
 
     def to_dict(self) -> dict[str, Any]:
@@ -74,6 +94,7 @@ class SetupStatus:
             "has_token": self.has_token,
             "has_mic_permission": self.has_mic_permission,
             "has_permissions_onboarded": self.has_permissions_onboarded,
+            "account_state": self.account_state,
             "is_complete": self.is_complete,
         }
 
@@ -83,6 +104,8 @@ def _compute_is_complete(
     has_token: bool,
     has_mic_permission: bool | None,
     has_permissions_onboarded: bool,
+    account_state: AccountState,
+    account_check_enabled: bool,
 ) -> bool:
     if not has_token:
         return False
@@ -93,6 +116,13 @@ def _compute_is_complete(
     if not has_permissions_onboarded:
         return False
     if sys.platform == "darwin" and has_mic_permission is False:
+        return False
+    # Web-onboarding gate. ``unknown`` is the no-cache-yet sentinel — pass
+    # here so a fresh install with valid tokens (and a marker, if it
+    # somehow exists) doesn't get stuck in setup before the boot refresh
+    # has had a chance to populate the cache. Anything else explicitly
+    # bad blocks completion so the GUI reopens at FinishSignup.
+    if account_check_enabled and account_state not in ("ok", "unknown"):
         return False
     return True
 
@@ -150,6 +180,18 @@ def _check_mac_mic_permission() -> bool | None:
     return None
 
 
+def _check_account_state(cfg: Config) -> AccountState:
+    try:
+        cached = read_cache(cfg)
+    except Exception:
+        log.warning("[detect] account-cache read raised; treating as unknown",
+                    exc_info=True)
+        return "unknown"
+    if cached is None:
+        return "unknown"
+    return cached.account_state
+
+
 def detect_setup(cfg: Config, *, probe_mac_permission: bool = False) -> SetupStatus:
     """Return a :class:`SetupStatus` snapshot for ``cfg``.
 
@@ -167,14 +209,18 @@ def detect_setup(cfg: Config, *, probe_mac_permission: bool = False) -> SetupSta
     # Check the marker on BOTH platforms now — Windows also needs to walk
     # the shortcut + notifications screens, so the gate fires the same way.
     has_permissions_onboarded = _check_permissions_onboarded(cfg)
+    account_state = _check_account_state(cfg)
     is_complete = _compute_is_complete(
         has_token=has_token,
         has_mic_permission=has_mic_permission,
         has_permissions_onboarded=has_permissions_onboarded,
+        account_state=account_state,
+        account_check_enabled=cfg.auth.account_check_enabled,
     )
     return SetupStatus(
         has_token=has_token,
         has_mic_permission=has_mic_permission,
         has_permissions_onboarded=has_permissions_onboarded,
+        account_state=account_state,
         is_complete=is_complete,
     )

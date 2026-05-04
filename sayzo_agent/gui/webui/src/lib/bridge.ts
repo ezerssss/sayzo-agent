@@ -1,10 +1,30 @@
 // Typed wrapper around the Python `Bridge` exposed via `window.pywebview.api`.
 // All methods are async and round-trip through pywebview's IPC.
 
+export type AccountState =
+  | "unknown"
+  | "ok"
+  | "onboarding_required"
+  | "suspended"
+  | "deleted";
+
+export type FetchStatus =
+  | "ok"
+  | "onboarding_required"
+  | "suspended"
+  | "deleted"
+  | "auth_required"
+  | "transient_error"
+  | "unknown_error";
+
 export type SetupStatus = {
   has_token: boolean;
   has_mic_permission: boolean | null;
   has_permissions_onboarded: boolean;
+  // Last observed result of GET /api/me (cached). "unknown" = no cache yet
+  // and is treated as pass at the detect layer; everything other than
+  // "ok" / "unknown" routes the GUI to the FinishSignup screen.
+  account_state: AccountState;
   is_complete: boolean;
   // One-shot resume hint set by Bridge.restart_app() before it hard-exits
   // (currently only "accessibility"). App.tsx's initialScreen() reads this
@@ -13,6 +33,18 @@ export type SetupStatus = {
   // the user to the default sequence[2] (Microphone). Cleared by the
   // backend on read.
   resume_at: "accessibility" | null;
+};
+
+export type AccountStatusPayload = {
+  status: SetupStatus;
+  fetch_status: FetchStatus;
+  onboarding_url: string | null;
+  error: string | null;
+};
+
+export type OpenOnboardingResult = {
+  opened: boolean;
+  url: string | null;
 };
 
 export type ConfigSnapshot = {
@@ -81,6 +113,10 @@ declare global {
     finish(): Promise<null>;
     quit_app(): Promise<null>;
     restart_app(): Promise<null>;
+
+    // Web-onboarding gate.
+    recheck_account_status(): Promise<AccountStatusPayload>;
+    open_onboarding_url(): Promise<OpenOnboardingResult>;
   }
 
   interface Window {
@@ -236,5 +272,15 @@ export const bridge = {
   async restartApp() {
     await whenReady();
     return window.pywebview.api.restart_app();
+  },
+
+  // Web-onboarding gate.
+  async recheckAccountStatus() {
+    await whenReady();
+    return window.pywebview.api.recheck_account_status();
+  },
+  async openOnboardingUrl() {
+    await whenReady();
+    return window.pywebview.api.open_onboarding_url();
   },
 };

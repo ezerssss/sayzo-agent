@@ -1117,17 +1117,13 @@ def service(force_setup: bool) -> None:
     from .auth.store import TokenStore
     from .gui.tray import TrayIcon, TrayState, Status
 
+    from .auth.client import make_auth_client
+    auth_client = make_auth_client(cfg)
+    store = auth_client.store if auth_client is not None else TokenStore(cfg.auth_path)
     upload_client = None
-    auth_client = None
-    store = TokenStore(cfg.auth_path)
-    if store.has_tokens() and cfg.auth.effective_server_url:
-        from .auth.client import AuthenticatedClient
-        from .auth.server import HttpAuthServer
+    if auth_client is not None:
         from .upload import AuthenticatedUploadClient
 
-        auth_server = HttpAuthServer(cfg.auth.auth_url, cfg.auth.client_id, cfg.auth.scopes)
-        store = TokenStore(cfg.auth_path, auth_server=auth_server)
-        auth_client = AuthenticatedClient(cfg.auth.effective_server_url, store)
         upload_client = AuthenticatedUploadClient(auth_client, cfg.captures_dir)
         log.warning("uploads enabled → %s", cfg.auth.effective_server_url)
 
@@ -1214,6 +1210,20 @@ def service(force_setup: bool) -> None:
         auth_client=auth_client,
         daily_drill_scheduler=daily_drill,
     )
+
+    from .account import decide_arm_gate, read_cache as _read_account_cache
+
+    def _account_gate_fn():
+        try:
+            cached = _read_account_cache(cfg)
+        except Exception:
+            log.warning("[arm] account cache read raised; allowing", exc_info=True)
+            cached = None
+        return decide_arm_gate(
+            cached, enabled=cfg.auth.account_check_enabled
+        )
+
+    agent.arm.account_gate_fn = _account_gate_fn
 
     async def _main() -> None:
         loop = asyncio.get_running_loop()
@@ -1591,6 +1601,22 @@ def service(force_setup: bool) -> None:
                                 "[daily_drill] EOD tray click handler raised",
                                 exc_info=True,
                             )
+                if tray_state.finish_setup_event.is_set():
+                    tray_state.finish_setup_event.clear()
+                    cached = tray_state.get_cached_account()
+                    url = (cached.onboarding_url if cached else None) or (
+                        cfg.auth.effective_server_url.rstrip("/") + "/onboarding"
+                        if cfg.auth.effective_server_url else None
+                    )
+                    if url:
+                        try:
+                            import webbrowser as _wb
+                            _wb.open(url, new=2)
+                        except Exception:
+                            log.warning(
+                                "[tray] webbrowser.open failed for %s", url,
+                                exc_info=True,
+                            )
                 # Daily-drill manual test trigger (Debug submenu).
                 if tray_state.test_drill_event.is_set():
                     tray_state.test_drill_event.clear()
@@ -1671,8 +1697,58 @@ def service(force_setup: bool) -> None:
                 except asyncio.CancelledError:
                     return
 
+        async def _account_refresh() -> None:
+            """Background /api/me refresh. The arm-time gate reads from the
+            on-disk cache that this task populates — so a slow first fetch
+            never blocks arming, and a flaky network never locks the user
+            out (the gate falls through to "allow" on missing cache)."""
+            if not cfg.auth.account_check_enabled:
+                log.info(
+                    "[account] check disabled (SAYZO_AUTH__ACCOUNT_CHECK_ENABLED=0)"
+                )
+                return
+            if auth_client is None:
+                log.info(
+                    "[account] no auth client (not signed in) — skipping refresh"
+                )
+                return
+
+            from .account import read_cache as _read_cache, refresh_and_cache
+
+            try:
+                seed = _read_cache(cfg)
+                if seed is not None:
+                    tray_state.set_cached_account(seed)
+                    tray.update()
+            except Exception:
+                log.debug("[account] tray seed from cache raised", exc_info=True)
+
+            interval = max(60.0, float(cfg.auth.account_refresh_interval_secs))
+            while not agent._stop.is_set():
+                try:
+                    response = await refresh_and_cache(auth_client, cfg)
+                    log.info(
+                        "[account] refresh: status=%s onboarding_complete=%s",
+                        response.status, response.onboarding_complete,
+                    )
+                    if response.is_persistable:
+                        # Re-read the cache so the tray reflects exactly
+                        # what the gate will read; also lets us skip the
+                        # tray rebuild when the persisted state hasn't
+                        # actually changed.
+                        fresh = _read_cache(cfg)
+                        if fresh is not None and tray_state.set_cached_account(fresh):
+                            tray.update()
+                except Exception:
+                    log.warning("[account] refresh raised", exc_info=True)
+                try:
+                    await asyncio.sleep(interval)
+                except asyncio.CancelledError:
+                    return
+
         asyncio.create_task(_tray_bridge())
         asyncio.create_task(_update_check())
+        asyncio.create_task(_account_refresh())
         try:
             await agent.run()
         finally:
