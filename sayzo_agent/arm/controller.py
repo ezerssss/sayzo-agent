@@ -1330,7 +1330,15 @@ def _default_get_mic_holders():
     if sys.platform == "win32":
         from .platform_win import get_mic_holders as fn
         return fn
-    # macOS can't attribute per-process; return empty always.
+    if sys.platform == "darwin":
+        # v2.5+: real per-process attribution via the audio-detect Swift
+        # helper. Pre-v2.5 this returned ``lambda: []`` because macOS
+        # had no per-process API; that legacy stub was the reason
+        # detection silently produced zero holders in the v2.5.0/v2.5.1
+        # production builds even though platform_mac.get_mic_holders
+        # was implemented correctly.
+        from .platform_mac import get_mic_holders as fn
+        return fn
     return lambda: []
 
 
@@ -1338,9 +1346,9 @@ def _default_is_mic_active():
     if sys.platform == "darwin":
         from .platform_mac import is_mic_active as fn
         return fn
-    # On Windows we infer activeness from holders being non-empty (cheaper
-    # than a separate query). The matcher handles the "active + running"
-    # proxy only when is_mic_active=True, so returning False on Win is fine.
+    # Windows infers activeness from mic.holders being non-empty (cheaper
+    # than a separate query); _snapshot_mic_state short-circuits to True
+    # when holders is non-empty so this only fires when holders is empty.
     return lambda: False
 
 
