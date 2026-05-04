@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from "react";
-import { ExternalLink, RefreshCw } from "lucide-react";
 import { Button } from "../components/ui/Button";
 import { Alert } from "../components/ui/Alert";
 import { Layout } from "../components/Layout";
@@ -30,7 +29,7 @@ const COPY: Record<
   suspended: {
     title: "Your Sayzo account is paused",
     subtitle:
-      "Visit sayzo.app to reactivate your account. Once it's active, come back here and click \"I've finished\".",
+      "Visit sayzo.app to reactivate your account. Once it's active, come back here and click \"Check now\".",
     cta: "Manage your account",
   },
   deleted: {
@@ -136,31 +135,34 @@ export function FinishSignup({
       footer={
         <>
           <Button variant="ghost" onClick={onClose}>
-            Close — I'll come back later
-          </Button>
-          <Button
-            variant="secondary"
-            onClick={() => void runRecheck()}
-            disabled={rechecking || opening}
-          >
-            <RefreshCw
-              className={`h-4 w-4 ${rechecking ? "animate-spin" : ""}`}
-            />
-            {rechecking ? "Checking…" : "I've finished"}
+            Close
           </Button>
           <Button onClick={handleOpen} disabled={opening}>
-            <ExternalLink className="h-4 w-4" />
             {opening ? "Opening…" : copy.cta}
           </Button>
         </>
       }
     >
       <div className="space-y-4">
+        <div className="flex items-center gap-2 text-xs text-ink-muted">
+          <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-accent" />
+          <span>
+            We'll check automatically.{" "}
+            <button
+              type="button"
+              onClick={() => void runRecheck()}
+              disabled={rechecking || opening}
+              className="underline hover:text-ink disabled:opacity-50"
+            >
+              {rechecking ? "Checking…" : "Check now"}
+            </button>
+          </span>
+        </div>
+
         {openedUrl && (
           <div className="rounded-md border border-ink-border bg-gray-50 p-3 text-xs text-ink-muted">
             Opened <span className="font-mono text-ink">{openedUrl}</span> in
-            your browser. We'll check back automatically — once you're done,
-            this window will move on.
+            your browser. Once you're done, this window will move on.
           </div>
         )}
 
