@@ -83,6 +83,14 @@ if sys.platform == "darwin":
     if audio_tap.exists():
         datas.append((str(audio_tap), "sayzo_agent/capture/audio-tap"))
 
+    # macOS: bundle the pre-compiled audio-detect binary (per-process mic
+    # attribution helper). Read-only — no Audio Capture permission needed,
+    # no NSAudioCaptureUsageDescription required. Compiled in CI by the
+    # parallel `Compile audio-detect Swift binary` step.
+    audio_detect = Path("sayzo_agent/arm/audio-detect/audio-detect")
+    if audio_detect.exists():
+        datas.append((str(audio_detect), "sayzo_agent/arm/audio-detect"))
+
 # First-run GUI assets — built HTML/JS/CSS bundle that the pywebview window
 # loads. The dev path resolves these via Path(__file__).parent in
 # sayzo_agent/gui/setup/window.py; the frozen path uses sys._MEIPASS.

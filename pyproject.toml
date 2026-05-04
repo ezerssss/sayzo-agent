@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sayzo-agent"
-version = "2.4.3"
+version = "2.5.0"
 description = "Armed-only capture agent for Sayzo — records meetings on user consent (hotkey or whitelisted meeting app) and feeds them to downstream English-coaching analysis."
 requires-python = ">=3.10"
 dependencies = [
@@ -48,9 +48,13 @@ dependencies = [
     # without needing hand-authored title regex fallbacks. Pure-Python
     # comtypes wrapper; comtypes itself is already pulled in by pycaw.
     "uiautomation>=2.0; sys_platform == 'win32'",
-    # macOS: mic-active query via CoreAudio, frontmost app via NSWorkspace.
+    # macOS: NSWorkspace frontmost-app query via AppKit (Cocoa); AX browser
+    # window-title + URL reads via ApplicationServices (kAXWindowsAttribute,
+    # AXURL on AXWebArea, etc.). Per-process mic attribution is owned by
+    # the audio-detect Swift helper now (v2.5+) — pyobjc-framework-CoreAudio
+    # was dropped in v2.5 along with the legacy ctypes-CoreAudio path.
     "pyobjc-framework-Cocoa>=10.0; sys_platform == 'darwin'",
-    "pyobjc-framework-CoreAudio>=10.0; sys_platform == 'darwin'",
+    "pyobjc-framework-ApplicationServices>=10.0; sys_platform == 'darwin'",
     # macOS: idle-time query via Quartz CGEventSourceSecondsSinceLastEventType.
     # Used by sayzo_agent/idle.py for the daily-drill scheduler's idle gate.
     "pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'",

@@ -203,9 +203,11 @@ class DetectorSpec(BaseSettings):
     - ``process_names`` lists Windows executable names (e.g. ``zoom.exe``)
       that, when found holding an active capture session, match the rule.
     - ``bundle_ids`` lists macOS bundle identifiers (e.g. ``us.zoom.xos``)
-      treated equivalently on macOS. Mac can't attribute mic-in-use to a
-      specific process cheaply, so a running+recently-foreground check is
-      used instead (see ``arm/platform_mac.py``).
+      treated equivalently on macOS. As of v2.5+ the matcher gets these
+      from the ``audio-detect`` Swift helper which provides per-process
+      attribution via Apple's responsibility SPI — same Pass 1
+      behaviour as Windows, no foreground requirement (see
+      ``arm/platform_mac.py``).
     - ``is_browser`` marks rules that only trigger when the browser process
       holds the mic AND one of ``url_patterns`` matches the active tab.
       This is how Google Meet / Teams web / Zoom web / Webex / Whereby /

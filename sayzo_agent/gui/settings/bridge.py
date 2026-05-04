@@ -797,12 +797,17 @@ class Bridge:
             else:
                 detail = "Web"
         else:
-            bits: list[str] = []
-            if spec.process_names:
-                bits.append(", ".join(spec.process_names))
-            elif spec.bundle_ids:
-                bits.append(", ".join(spec.bundle_ids))
-            detail = ("Desktop · " + bits[0]) if bits else "Desktop"
+            # Show platform-appropriate identifiers in the muted detail
+            # line: bundle ids on macOS (where ``.exe`` names are
+            # meaningless to the user), executable names on Windows.
+            # Falls back to the other side if the platform-preferred
+            # list is empty (e.g. macOS-only FaceTime spec has only
+            # bundle_ids regardless of platform).
+            import sys
+            primary = spec.bundle_ids if sys.platform == "darwin" else spec.process_names
+            secondary = spec.process_names if sys.platform == "darwin" else spec.bundle_ids
+            chosen = primary if primary else secondary
+            detail = ("Desktop · " + ", ".join(chosen)) if chosen else "Desktop"
         return {
             "app_key": spec.app_key,
             "display_name": spec.display_name,

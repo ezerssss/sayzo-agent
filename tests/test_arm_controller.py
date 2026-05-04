@@ -352,10 +352,17 @@ async def test_whitelist_match_fires_consent_and_arms_on_yes():
 
 
 async def test_whitelist_arm_uses_resolver_when_match_has_no_pids():
-    """macOS path: ``match_whitelist`` returns empty target_pids because
-    ``mic.holders`` is empty on Mac. The controller must fall back to the
-    injected resolver (``resolve_pids_for_spec``) to fill PIDs before
-    arming, then pass them to ``sys.start``."""
+    """Browser path: a Mac browser holder may have a PID for the audio
+    helper but no whitelisted browser PIDs in mic.holders directly; the
+    matcher returns ``target_pids=()`` and the controller must fall back
+    to the injected resolver (``resolve_pids_for_spec``) to scope the
+    system-audio capture.
+
+    Pre-v2.5 this exercised the now-deleted macOS proxy path
+    (``mic_active_plus_running``); v2.5+ exercises the equivalent
+    browser-spec path where MatchResult.target_pids can still be empty
+    because ``_pids_for_browser_holders`` only returns Windows-style
+    pycaw PIDs."""
     notifier = FakeNotifier()
     notifier.consent_script = ["yes"]
 
@@ -363,7 +370,7 @@ async def test_whitelist_arm_uses_resolver_when_match_has_no_pids():
 
     def fake_resolver(spec) -> tuple[int, ...]:
         resolver_calls.append(spec.app_key)
-        if spec.app_key == "zoom":
+        if spec.app_key == "gmeet":
             return (7777, 8888)
         return ()
 
@@ -388,17 +395,30 @@ async def test_whitelist_arm_uses_resolver_when_match_has_no_pids():
     vad_m = FakeVAD()
     vad_s = FakeVAD()
 
+    # Simulate macOS browser path: a Chrome holder with bundle id but a
+    # helper PID (so _pids_for_browser_holders returns ()), plus a Meet
+    # tab title. The matcher returns target_pids=() and the controller
+    # invokes the resolver for the gmeet spec to get the real PIDs.
+    holder = MicHolder(
+        process_name="com.google.Chrome",
+        pid=0,  # 0 → excluded from _pids_for_browser_holders
+        bundle_id="com.google.Chrome",
+    )
+
     ctrl = ArmController(
         cfg, detector,
         mic_capture=mic, sys_capture=sys_cap,
         vad_mic=vad_m, vad_sys=vad_s,
         notifier=notifier,
-        # Simulate the macOS path: mic.active True, no holders, whitelisted
-        # Zoom is running + frontmost via bundle id.
-        get_mic_holders=lambda: [],
+        get_mic_holders=lambda: [holder],
         is_mic_active=lambda: True,
-        get_running_processes=lambda: frozenset({"us.zoom.xos"}),
-        get_foreground_info=lambda: ForegroundInfo(bundle_id="us.zoom.xos"),
+        get_running_processes=lambda: frozenset(),
+        get_foreground_info=lambda: ForegroundInfo(
+            process_name="Notes",
+            bundle_id="com.apple.TextEdit",
+            is_browser=False,
+            browser_window_titles=("Meet - abc-defg-hij - Google Chrome",),
+        ),
         resolve_pids_for_spec=fake_resolver,
     )
 
@@ -406,10 +426,10 @@ async def test_whitelist_arm_uses_resolver_when_match_has_no_pids():
     ctrl._whitelist_task = asyncio.create_task(ctrl._run_whitelist_watcher())
     await asyncio.sleep(0.15)
     assert ctrl.state == ArmState.ARMED
-    assert ctrl._reason is not None and ctrl._reason.app_key == "zoom"
+    assert ctrl._reason is not None and ctrl._reason.app_key == "gmeet"
     assert ctrl._reason.target_pids == (7777, 8888)
     assert sys_cap.last_target_pids == (7777, 8888)
-    assert "zoom" in resolver_calls
+    assert "gmeet" in resolver_calls
 
     ctrl._whitelist_task.cancel()
     try:

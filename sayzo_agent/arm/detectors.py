@@ -1,15 +1,18 @@
 """Pure matching logic for the meeting-app whitelist.
 
 The detector inputs come from platform-specific queries (see
-``platform_win.py`` / ``platform_mac.py``): a list of processes currently
-holding the default microphone as an active capture session (Windows),
-or a boolean "is any process capturing from the mic" + list of running
-whitelisted processes (macOS), plus the frontmost app + (on macOS) the
-active browser tab URL.
+``platform_win.py`` / ``platform_mac.py``): a list of processes
+currently holding the default microphone as an active capture session,
+plus the frontmost app + active browser tab URL/title. Both platforms
+populate the same :class:`MicState` shape now — Windows from pycaw
+WASAPI session enumeration, macOS from the ``audio-detect`` Swift
+helper (per-process attribution via ``kAudioHardwarePropertyProcessObjectList``
+on macOS 14.4+, mapped through the responsibility SPI to user-facing
+apps).
 
-This module is pure — no OS calls, no imports beyond the standard library
-and config types. Tests drive it with synthetic ``ForegroundInfo`` /
-``MicState`` inputs.
+This module is pure — no OS calls, no imports beyond the standard
+library and config types. Tests drive it with synthetic
+``ForegroundInfo`` / ``MicState`` inputs.
 """
 from __future__ import annotations
 
@@ -21,13 +24,13 @@ from ..config import DetectorSpec
 
 
 MatchSource = Literal[
-    # Windows — we saw a whitelisted process as a mic-session holder directly.
+    # Direct mic-holder match. Windows: pycaw WASAPI enumeration.
+    # macOS (v2.5+): per-process attribution via the audio-detect Swift
+    # helper, which maps helper PIDs back to the user-facing app via the
+    # responsibility SPI.
     "mic_session",
-    # macOS — mic is active system-wide AND a whitelisted process is running
-    # AND was frontmost within the configured window.
-    "mic_active_plus_running",
-    # Either platform — browser holds the mic AND the active tab URL matches
-    # a DetectorSpec with is_browser=True.
+    # Browser holds the mic AND the active tab URL/title matches a
+    # DetectorSpec with is_browser=True.
     "browser_mic_plus_url",
 ]
 
@@ -72,25 +75,41 @@ class ForegroundInfo:
 
 @dataclass(frozen=True)
 class MicHolder:
-    """One process currently holding an active capture session on the default
-    microphone. Populated on Windows by ``get_mic_holders()``; on macOS the
-    equivalent is a system-wide "mic-active" bit + psutil running-process
-    list (see ``platform_mac.py``)."""
+    """One process currently holding an active capture session on the
+    default microphone.
+
+    - ``process_name`` — Windows: executable name (``zoom.exe``).
+      macOS: bundle id of the user-facing app (``us.zoom.xos``); the
+      capturing process may be a helper, but the holder is recorded
+      against its responsible-app PID + bundle for matching.
+    - ``pid`` — Windows: PID of the WASAPI capture session owner.
+      macOS: PID of the user-facing GUI app (resolved from the
+      capturing helper via the responsibility SPI).
+    - ``bundle_id`` — macOS only; same value as ``process_name`` on
+      Mac, ``None`` on Windows. Carried separately so the matcher can
+      check it against ``DetectorSpec.bundle_ids`` without ambiguity.
+    """
 
     process_name: str
     pid: int = -1
+    bundle_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
 class MicState:
     """Normalized mic-holder snapshot that works on both platforms.
 
-    Windows: ``holders`` comes directly from WASAPI session enumeration.
-    macOS: ``active`` is set when ``kAudioDevicePropertyDeviceIsRunningSomewhere``
-    is True; ``running_processes`` lists psutil-visible process names. The
-    matcher treats ``active and process_name in running_processes`` as
-    equivalent to a direct mic-holder match under the
-    ``mic_active_plus_running`` source.
+    Windows: ``holders`` comes directly from WASAPI session enumeration
+    via pycaw. macOS (v2.5+): ``holders`` comes from the ``audio-detect``
+    Swift helper, which enumerates ``kAudioHardwarePropertyProcessObjectList``
+    (macOS 14.4+) and maps each capturing process to its user-facing
+    app via Apple's responsibility SPI. Either way the matcher only
+    consults ``holders`` for the desktop match path.
+
+    ``active`` and ``running_processes`` are still populated on macOS
+    for the seen-apps recording path (catching unmatched mic-holders
+    that didn't resolve to a known GUI app), but the matcher itself
+    no longer uses them.
     """
 
     holders: list[MicHolder] = field(default_factory=list)
@@ -138,14 +157,45 @@ BROWSER_PROCESS_NAMES = frozenset({
 def _browser_holds_mic(mic: MicState, foreground: ForegroundInfo) -> bool:
     """True if a browser process currently holds the mic.
 
-    Windows: direct check against ``mic.holders``. macOS has no per-process
-    mic attribution; treat ``mic.active`` + a browser being frontmost as
-    the equivalent signal.
+    Both platforms now use direct ``mic.holders`` attribution:
+
+    - Windows: pycaw WASAPI session ownership.
+    - macOS (v2.5+): per-process attribution via the ``audio-detect``
+      Swift helper, which already resolves browser-helper PIDs back to
+      the user-facing browser via the responsibility SPI. So a Chrome
+      audio helper capturing the mic shows up here as a holder with
+      bundle id ``com.google.Chrome``.
+
+    On macOS the holder's ``process_name`` field carries the bundle id
+    (e.g. ``com.google.Chrome``), which won't match
+    ``BROWSER_PROCESS_NAMES`` (Windows ``.exe`` names). We check
+    ``bundle_id`` against the known browser bundle set as a parallel
+    path. The :mod:`platform_mac` module owns that set; importing here
+    would create a cycle, so we hardcode the same id list — both files
+    must stay in sync if a new browser is added.
     """
     for h in mic.holders:
         if h.process_name.lower() in BROWSER_PROCESS_NAMES:
             return True
-    return mic.active and foreground.is_browser
+        if h.bundle_id and h.bundle_id in _BROWSER_BUNDLE_IDS:
+            return True
+    return False
+
+
+# Mac browser bundles that count as "a browser is holding the mic" when
+# attributed via the responsibility SPI. Mirrors
+# ``platform_mac._BROWSER_BUNDLES`` keys; kept in sync manually because
+# this is the pure module and can't import platform_mac without a cycle.
+_BROWSER_BUNDLE_IDS = frozenset({
+    "com.google.Chrome",
+    "com.apple.Safari",
+    "com.microsoft.edgemac",
+    "com.brave.Browser",
+    "company.thebrowser.Browser",
+    "org.mozilla.firefox",
+    "com.operasoftware.Opera",
+    "com.vivaldi.Vivaldi",
+})
 
 
 def _compile(pattern: str) -> re.Pattern[str]:
@@ -209,15 +259,16 @@ def match_whitelist(
 ) -> Optional[MatchResult]:
     """Return the first high-confidence match across ``specs``, or None.
 
-    Precedence: desktop-app matches (mic_session / mic_active_plus_running)
-    before browser-URL matches, so if Zoom desktop is running a meeting
-    while Chrome has Google Meet open in the background, we attribute the
-    match to Zoom.
+    Precedence: desktop-app matches (``mic_session``) before browser-URL
+    matches, so if Zoom desktop is running a meeting while Chrome has
+    Google Meet open in the background, we attribute the match to Zoom.
 
-    ``MatchResult.target_pids`` is populated on the Windows path directly
-    from ``mic.holders``. macOS paths leave it empty here; the
-    ArmController resolves PIDs via a platform helper (psutil +
-    NSWorkspace) before arming. Empty tuple ⇒ endpoint-wide capture.
+    ``MatchResult.target_pids`` is populated directly from ``mic.holders``
+    on both platforms now. The ArmController's
+    ``resolve_pids_for_spec`` resolver is only consulted for the
+    browser path when ``_pids_for_browser_holders`` returns empty (e.g.
+    a macOS browser holder where the helper PID didn't survive the
+    walk). Empty tuple ⇒ endpoint-wide capture.
 
     ``exclude_app_keys`` lets the caller skip specs that are currently
     suppressed (release pending after a decline or session end).
@@ -235,54 +286,51 @@ def match_whitelist(
     ]
 
     holder_names = {h.process_name.lower() for h in mic.holders}
+    holder_bundles = {h.bundle_id.lower() for h in mic.holders if h.bundle_id}
 
-    # Pass 1 — desktop apps via direct mic-session hit (Windows).
+    # Pass 1 — desktop apps via direct mic-session hit. Works on both
+    # platforms now: Windows from pycaw process names, macOS from the
+    # audio-detect Swift helper (bundle ids).
+    #
+    # Two match flavors per spec:
+    #   - Direct: spec.process_names ∩ holder_names, or spec.bundle_ids
+    #     ∩ holder_bundles. The fast path.
+    #   - Helper-bundle prefix: a holder's bundle id starts with
+    #     "<spec.bundle_ids[i]>." (with the dot suffix to prevent false
+    #     positives like "com.foo.app" matching "com.foo.app2"). Catches
+    #     every Electron-based meeting app universally — Discord, Slack,
+    #     Teams desktop, Signal, Skype, etc. — without needing per-app
+    #     helper bundle id lists. Pure backstop: macOS's responsibility
+    #     SPI already attributes most helpers to their main app upstream
+    #     in get_mic_holders, but this catches the cases where it didn't.
     for spec in active_specs:
         if spec.is_browser:
             continue
-        if not spec.process_names:
-            continue
-        for proc in spec.process_names:
-            if proc.lower() in holder_names:
+        spec_names_lower = {p.lower() for p in spec.process_names}
+        spec_bundles_lower = {b.lower() for b in spec.bundle_ids}
+
+        if spec_names_lower & holder_names:
+            return MatchResult(
+                app_key=spec.app_key,
+                display_name=spec.display_name,
+                source="mic_session",
+                target_pids=_pids_for_desktop_holders(spec, mic),
+            )
+        if spec_bundles_lower & holder_bundles:
+            return MatchResult(
+                app_key=spec.app_key,
+                display_name=spec.display_name,
+                source="mic_session",
+                target_pids=_pids_for_desktop_holders(spec, mic),
+            )
+        # Helper-bundle prefix backstop.
+        for spec_bundle in spec_bundles_lower:
+            if any(b.startswith(spec_bundle + ".") for b in holder_bundles):
                 return MatchResult(
                     app_key=spec.app_key,
                     display_name=spec.display_name,
                     source="mic_session",
                     target_pids=_pids_for_desktop_holders(spec, mic),
-                )
-
-    # Pass 2 — macOS proxy. Mic is active system-wide AND a whitelisted
-    # process is running. This catches Discord voice calls / Zoom meetings
-    # on macOS where we can't attribute mic-use per-process cheaply.
-    if mic.active and mic.running_processes:
-        fg_proc = (foreground.process_name or "").lower()
-        fg_bundle = (foreground.bundle_id or "").lower()
-        running_lower = {p.lower() for p in mic.running_processes}
-        for spec in active_specs:
-            if spec.is_browser:
-                continue
-            targets: list[str] = []
-            targets.extend(p.lower() for p in spec.process_names)
-            targets.extend(b.lower() for b in spec.bundle_ids)
-            if not targets:
-                continue
-            if not any(t in running_lower or t == fg_proc or t == fg_bundle
-                       for t in targets):
-                continue
-            # Require the matched app to currently be frontmost (v1 — the
-            # foreground cache is owned by the caller, so we just check the
-            # current snapshot here).
-            if fg_proc and any(t == fg_proc for t in targets):
-                return MatchResult(
-                    app_key=spec.app_key,
-                    display_name=spec.display_name,
-                    source="mic_active_plus_running",
-                )
-            if fg_bundle and any(t == fg_bundle for t in targets):
-                return MatchResult(
-                    app_key=spec.app_key,
-                    display_name=spec.display_name,
-                    source="mic_active_plus_running",
                 )
 
     # Pass 3 — browsers. Gate on a browser actually holding the mic
@@ -338,16 +386,31 @@ def match_whitelist(
 
 
 def _pids_for_desktop_holders(spec: DetectorSpec, mic: MicState) -> tuple[int, ...]:
-    """PIDs from ``mic.holders`` whose process name matches ``spec``.
+    """PIDs from ``mic.holders`` whose process name OR bundle id matches ``spec``.
 
-    Windows path: ``mic.holders`` has real PIDs from pycaw, so we can scope
-    system-audio capture to exactly those processes. macOS path: empty,
-    because ``mic.holders`` is always empty on macOS. The ArmController
-    fills those via a platform resolver (``platform_mac.resolve_pids_for_spec``)
-    before arming.
+    Both platforms now populate ``mic.holders`` with real PIDs (Windows:
+    from pycaw, macOS: from the responsibility SPI). System-audio
+    capture scopes to exactly these processes. Includes helper-bundle
+    prefix matching so Discord's ``com.hnc.Discord.helper.Renderer``
+    contributes its PID to a Discord arm even if get_mic_holders didn't
+    already collapse it to the main bundle.
     """
     names = {p.lower() for p in spec.process_names}
-    pids = {h.pid for h in mic.holders if h.pid > 0 and h.process_name.lower() in names}
+    bundles = {b.lower() for b in spec.bundle_ids}
+    pids: set[int] = set()
+    for h in mic.holders:
+        if h.pid <= 0:
+            continue
+        if h.process_name.lower() in names:
+            pids.add(h.pid)
+            continue
+        if h.bundle_id and h.bundle_id.lower() in bundles:
+            pids.add(h.pid)
+            continue
+        if h.bundle_id:
+            hb = h.bundle_id.lower()
+            if any(hb.startswith(sb + ".") for sb in bundles):
+                pids.add(h.pid)
     return tuple(sorted(pids))
 
 
@@ -402,75 +465,45 @@ def arm_app_still_holding_mic(
 ) -> bool:
     """For the meeting-ended watcher: is the arm-app still a mic-holder?
 
-    Returns True if the spec with ``app_key`` is still detectable via the
-    same signal type we'd use to match it fresh. Used per-poll by the
-    watcher; a streak of ``False`` longer than the grace window triggers
-    the meeting-ended toast.
+    Returns True if the spec with ``app_key`` is still detectable via
+    the same signal type we'd use to match it fresh. Used per-poll by
+    the watcher; a streak of ``False`` longer than the grace window
+    triggers the meeting-ended toast.
 
-    ``arm_pids_alive`` is a precomputed boolean from the controller — True
-    iff at least one of the browser PIDs we scoped to at arm time is still
-    a live process. Only consulted on the macOS browser path (where
-    ``mic.holders`` is always empty so we can't rely on per-process
-    pycaw attribution); the Windows path uses ``mic.holders`` directly.
-    Callers without arm context (the disarmed-state suppression-clear
-    loop) pass ``None`` and get the legacy foreground-dependent behavior.
-    Kept out of this pure module so detectors.py never imports psutil.
+    Browser specs are intentionally evaluated only at the browser-
+    process level here — we do NOT re-check URL or title. AX (and
+    Windows UIA) typically only see the focused tab; tabbing away from
+    chatgpt-com to read email would otherwise flip the title list and
+    trip a false meeting-ended toast. The mic-release signal is ground
+    truth: hanging up a call drops the browser's capture session,
+    removing it from ``mic.holders``.
+
+    ``arm_pids_alive`` is now ignored — ``mic.holders`` is reliable on
+    both platforms (Windows: pycaw; macOS v2.5+: audio-detect helper),
+    so the old "PIDs are alive" tiebreaker isn't needed. The
+    ``whitelist_arm_release_grace_secs`` window in the controller
+    absorbs single-poll transients (failed helper invocation, etc.).
+    Parameter retained for ABI compatibility with existing callers.
     """
     spec = next((s for s in specs if s.app_key == app_key), None)
     if spec is None:
         return False
 
     holder_names = {h.process_name.lower() for h in mic.holders}
+    holder_bundles = {h.bundle_id.lower() for h in mic.holders if h.bundle_id}
 
     if not spec.is_browser:
-        for proc in spec.process_names:
-            if proc.lower() in holder_names:
+        spec_names = {p.lower() for p in spec.process_names}
+        spec_bundles = {b.lower() for b in spec.bundle_ids}
+        if spec_names & holder_names:
+            return True
+        if spec_bundles & holder_bundles:
+            return True
+        # Helper-bundle prefix backstop (Electron apps).
+        for sb in spec_bundles:
+            if any(b.startswith(sb + ".") for b in holder_bundles):
                 return True
-        if mic.active:
-            running_lower = {p.lower() for p in mic.running_processes}
-            fg_proc = (foreground.process_name or "").lower()
-            fg_bundle = (foreground.bundle_id or "").lower()
-            for target in [*spec.process_names, *spec.bundle_ids]:
-                t = target.lower()
-                if t in running_lower or t == fg_proc or t == fg_bundle:
-                    return True
         return False
 
-    # Browser spec: once we're armed for this app, the arm session is bound
-    # to the browser PID at scope time. "Still holding" reduces to "the
-    # browser still holds the mic" — we deliberately do NOT re-check URL
-    # or title here:
-    # - Windows UIAutomation and macOS Accessibility typically only see the
-    #   focused tab's URL/title. A user tabbing away from chatgpt-com to
-    #   read email or take notes would otherwise flip the URL list and
-    #   trip a false meeting-ended toast within the grace window.
-    # - The mic-release signal is the ground truth: ending a chatgpt voice
-    #   session (or hanging up a Meet call) releases the browser's WASAPI
-    #   capture session, dropping its PID from mic.holders. That's the
-    #   actual "meeting ended" signal we want to act on.
-    # - Trade-off: if the user rapidly closes one whitelisted site and
-    #   opens another in the same browser without releasing the mic, we
-    #   keep capturing under the original arm_reason. The audio is still
-    #   legitimate user content; only the app_key label is wrong.
-
-    # Windows: pycaw populates mic.holders, so _browser_holds_mic gives
-    # a direct per-process answer regardless of foreground.
-    if mic.holders:
-        return _browser_holds_mic(mic, foreground)
-
-    # macOS: mic.holders is always empty (no per-process attribution in
-    # CoreAudio). When the controller has armed for a browser meeting
-    # it passes arm_pids_alive — True iff any of the browser PIDs we
-    # scoped to at arm time is still a live process. Combined with
-    # mic.active (system-wide capture is happening), this is per-PROCESS
-    # attribution that doesn't depend on foreground, eliminating the
-    # false meeting-ended toast users hit when Alt+Tabbing from Chrome
-    # to Notes during a meeting (user report 2026-04-29). Per-tab
-    # attribution within the browser is a separate documented limitation.
-    if arm_pids_alive is not None:
-        return mic.active and arm_pids_alive
-
-    # Fallback for callers without arm context (the disarmed-state
-    # suppression-clear loop) and for legacy unit tests: the original
-    # foreground-dependent check. Same semantics pre-v2.1.10.
+    # Browser spec — direct mic-holder check. Same path on both platforms.
     return _browser_holds_mic(mic, foreground)

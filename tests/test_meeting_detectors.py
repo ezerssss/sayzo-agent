@@ -221,40 +221,89 @@ def test_teams_web_in_meetup_join_url_matches():
     assert r.app_key == "teams_web"
 
 
-# ---- macOS proxy path --------------------------------------------------
+# ---- macOS bundle-id matching (v2.5+ — Pass 1 now uses real holders) ---
+#
+# The pre-v2.5 macOS proxy (``mic_active_plus_running``) required the
+# meeting app to be foreground, because we had no per-process mic
+# attribution on Mac. v2.5 ships the audio-detect Swift helper which
+# gives us direct holders with bundle ids — so Pass 1 now works on Mac
+# the same way it works on Windows. These tests cover the new path.
 
 
-def test_macos_proxy_matches_when_mic_active_and_process_running_and_foreground():
-    """macOS can't attribute mic to a specific PID cheaply. The proxy is:
-    mic is active system-wide AND a whitelisted process is running AND is
-    currently frontmost."""
+def test_macos_zoom_match_via_bundle_id_holder():
+    """macOS holders carry bundle ids (not exe names). Pass 1 matches
+    ``us.zoom.xos`` against the zoom spec's bundle_ids."""
     fg = ForegroundInfo(bundle_id="us.zoom.xos")
-    mic = MicState(
-        active=True,
-        running_processes=frozenset({"us.zoom.xos"}),
-    )
+    mic = MicState(holders=[
+        MicHolder(process_name="us.zoom.xos", pid=1234, bundle_id="us.zoom.xos"),
+    ])
     r = match_whitelist(SPECS, fg, mic)
     assert r is not None
     assert r.app_key == "zoom"
-    assert r.source == "mic_active_plus_running"
+    assert r.source == "mic_session"
+    assert r.target_pids == (1234,)
 
 
-def test_macos_proxy_no_match_when_mic_inactive():
-    fg = ForegroundInfo(bundle_id="us.zoom.xos")
-    mic = MicState(active=False, running_processes=frozenset({"us.zoom.xos"}))
-    assert match_whitelist(SPECS, fg, mic) is None
-
-
-def test_macos_proxy_no_match_when_whitelisted_app_not_frontmost():
-    """Whitelisted app is running and mic is active, but the user is focused
-    on something else — could be a browser with Gmeet (handled elsewhere)
-    or something unrelated. Only the direct-frontmost check should match."""
+def test_macos_match_independent_of_foreground():
+    """v2.5: the foreground requirement is GONE. Zoom in a meeting +
+    user Alt-tabbed to TextEdit should still match — same as Windows."""
     fg = ForegroundInfo(bundle_id="com.apple.TextEdit")
-    mic = MicState(
-        active=True,
-        running_processes=frozenset({"us.zoom.xos"}),
-    )
+    mic = MicState(holders=[
+        MicHolder(process_name="us.zoom.xos", pid=1234, bundle_id="us.zoom.xos"),
+    ])
+    r = match_whitelist(SPECS, fg, mic)
+    assert r is not None
+    assert r.app_key == "zoom"
+
+
+def test_macos_no_match_when_no_holders():
+    """No mic activity → no match. Foreground irrelevant."""
+    fg = ForegroundInfo(bundle_id="us.zoom.xos")
+    mic = MicState()  # holders=[] regardless of running_processes
     assert match_whitelist(SPECS, fg, mic) is None
+
+
+def test_macos_discord_helper_bundle_prefix_matches_discord():
+    """Electron apps capture via ``<app-bundle>.helper.<role>`` processes.
+    The matcher's helper-bundle prefix backstop catches them even if the
+    SPI walk-up didn't already collapse them to the main bundle."""
+    fg = ForegroundInfo(bundle_id="com.apple.TextEdit")
+    mic = MicState(holders=[
+        MicHolder(
+            process_name="com.hnc.Discord.helper.Renderer",
+            pid=5555,
+            bundle_id="com.hnc.Discord.helper.Renderer",
+        ),
+    ])
+    r = match_whitelist(SPECS, fg, mic)
+    assert r is not None
+    assert r.app_key == "discord"
+    assert r.source == "mic_session"
+
+
+def test_macos_browser_match_via_chrome_bundle_holder():
+    """Chrome capturing the mic on macOS shows up as a holder with
+    bundle id ``com.google.Chrome`` (after the Swift helper resolves
+    the audio helper to its responsible browser). Combined with a
+    matching meeting URL/title in any browser window, this fires the
+    browser-spec match — no browser-foreground requirement."""
+    fg = ForegroundInfo(
+        process_name="Notes",
+        bundle_id="com.apple.TextEdit",
+        is_browser=False,
+        browser_window_titles=("Meet - abc-defg-hij - Google Chrome",),
+    )
+    mic = MicState(holders=[
+        MicHolder(
+            process_name="com.google.Chrome",
+            pid=7777,
+            bundle_id="com.google.Chrome",
+        ),
+    ])
+    r = match_whitelist(SPECS, fg, mic)
+    assert r is not None
+    assert r.app_key == "gmeet"
+    assert r.source == "browser_mic_plus_url"
 
 
 # ---- arm_app_still_holding_mic -----------------------------------------
@@ -321,47 +370,51 @@ def test_arm_app_browser_released_when_browser_drops_mic():
 
 
 def test_arm_app_browser_macos_alt_tab_still_holding():
-    """macOS sim: empty mic.holders, foreground is a non-browser app
-    (Notes), but the browser PIDs we armed for are still alive AND
-    mic.active is True. Pre-v2.1.10 this returned False (foreground
-    isn't browser → fired false meeting-ended toast). With
-    arm_pids_alive=True passed by the controller, we correctly stay
-    True throughout the Alt+Tab."""
+    """macOS v2.5+: mic.holders carries Chrome's bundle id whenever
+    Chrome is capturing (resolved via the responsibility SPI). Alt-
+    tabbing to Notes during a Meet call leaves holders unchanged; the
+    meeting-ended watcher correctly sees we're still holding."""
     fg = ForegroundInfo(
         process_name="Notes",
+        bundle_id="com.apple.TextEdit",
         is_browser=False,
         browser_tab_url=None,
     )
-    mic = MicState(holders=[], active=True)
-    assert arm_app_still_holding_mic(
-        "gmeet", SPECS, mic, fg, arm_pids_alive=True,
-    ) is True
+    mic = MicState(holders=[
+        MicHolder(
+            process_name="com.google.Chrome",
+            pid=1111,
+            bundle_id="com.google.Chrome",
+        ),
+    ])
+    assert arm_app_still_holding_mic("gmeet", SPECS, mic, fg) is True
 
 
-def test_arm_app_browser_macos_pids_dead_returns_false():
-    """macOS sim: mic.holders empty, browser PIDs are gone (user
-    closed Chrome) → arm_pids_alive=False → release."""
+def test_arm_app_browser_macos_no_holder_returns_false():
+    """macOS v2.5+: when the meeting actually ends, the browser drops
+    its capture session and disappears from mic.holders. That's the
+    ground-truth signal — regardless of whether the browser process
+    is still alive (user might leave Chrome open)."""
     fg = ForegroundInfo(
         process_name="Notes",
+        bundle_id="com.apple.TextEdit",
         is_browser=False,
-        browser_tab_url=None,
     )
-    mic = MicState(holders=[], active=True)
-    assert arm_app_still_holding_mic(
-        "gmeet", SPECS, mic, fg, arm_pids_alive=False,
-    ) is False
+    mic = MicState(holders=[])
+    assert arm_app_still_holding_mic("gmeet", SPECS, mic, fg) is False
 
 
-def test_arm_app_browser_macos_mic_inactive_returns_false():
-    """macOS sim: browser PIDs alive but mic.active is False (no
-    process is currently capturing). The session has effectively
-    ended."""
+def test_arm_app_browser_arm_pids_alive_does_not_override_empty_holders():
+    """v2.5: arm_pids_alive is now a no-op (parameter retained for ABI
+    compat). mic.holders is reliable on both platforms now, so a
+    generous PIDs-alive override would just delay legitimate
+    meeting-ended detection."""
     fg = ForegroundInfo(
-        process_name="Google Chrome",
-        is_browser=True,
-        browser_tab_url=None,
+        process_name="Notes",
+        bundle_id="com.apple.TextEdit",
+        is_browser=False,
     )
-    mic = MicState(holders=[], active=False)
+    mic = MicState(holders=[])
     assert arm_app_still_holding_mic(
         "gmeet", SPECS, mic, fg, arm_pids_alive=True,
     ) is False
@@ -665,19 +718,19 @@ def test_exclude_app_keys_returns_none_when_only_match_is_excluded():
     assert r is None
 
 
-def test_macos_proxy_match_has_empty_target_pids():
-    """macOS proxy path can't attribute PIDs inline (``mic.holders=[]``);
-    the ArmController resolves them via a platform helper before arming.
-    The MatchResult itself comes back with an empty tuple."""
+def test_macos_match_has_target_pids_from_holders():
+    """v2.5: macOS holders carry real PIDs (resolved via the
+    responsibility SPI), so MatchResult.target_pids comes back populated
+    inline — same as Windows. The ArmController no longer needs to
+    re-resolve via a platform helper for the desktop case."""
     fg = ForegroundInfo(bundle_id="us.zoom.xos")
-    mic = MicState(
-        active=True,
-        running_processes=frozenset({"us.zoom.xos"}),
-    )
+    mic = MicState(holders=[
+        MicHolder(process_name="us.zoom.xos", pid=4242, bundle_id="us.zoom.xos"),
+    ])
     r = match_whitelist(SPECS, fg, mic)
     assert r is not None
-    assert r.source == "mic_active_plus_running"
-    assert r.target_pids == ()
+    assert r.source == "mic_session"
+    assert r.target_pids == (4242,)
 
 
 def test_custom_url_spec_arm_app_still_holding_via_browser_pid():

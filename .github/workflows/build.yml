@@ -101,6 +101,17 @@ jobs:
             -framework AudioToolbox \
             -framework AVFoundation
 
+      - name: Compile audio-detect Swift binary
+        # Sister helper to audio-tap. Reads kAudioHardwarePropertyProcessObjectList
+        # + the responsibility SPI to give the agent per-process mic
+        # attribution on macOS — pure read-only, no permissions needed.
+        # (See sayzo_agent/arm/audio-detect/main.swift for full rationale.)
+        run: |
+          cd sayzo_agent/arm/audio-detect
+          swiftc -O -o audio-detect main.swift \
+            -framework CoreAudio \
+            -framework Foundation
+
       - name: Generate logo.icns from logo.png
         run: |
           cd installer/assets
