@@ -103,6 +103,23 @@ def _binary_path() -> Optional[Path]:
 
 
 _binary_warn_fired = False
+_binary_path_logged: Optional[Path] = None
+_stderr_seen: set[str] = set()
+
+
+def _log_binary_path_once(path: Path) -> None:
+    global _binary_path_logged
+    if _binary_path_logged == path:
+        return
+    _binary_path_logged = path
+    log.info("[arm.audio_detect] using binary: %s", path)
+
+
+def _log_stderr_once(msg: str) -> None:
+    if msg in _stderr_seen:
+        return
+    _stderr_seen.add(msg)
+    log.info("[arm.audio_detect] stderr: %s", msg)
 
 
 def _warn_missing_binary_once() -> None:
@@ -141,14 +158,15 @@ def _run_binary(binary: Path, timeout_secs: float = 1.5) -> list[AudioProcess]:
         return []
 
     if proc.stderr.strip():
-        # The Swift binary writes diagnostic warnings (e.g. ProcessObjectList
-        # failures) to stderr. Surface them at DEBUG so they're available
-        # under SAYZO_LOG_LEVEL=debug without spamming the normal log.
-        log.debug("[arm.audio_detect] stderr: %s", proc.stderr.strip())
+        # Swift binary writes diagnostic warnings (e.g. ProcessObjectList
+        # failures, signing complaints) to stderr. Log once-per-distinct
+        # message at INFO so production diagnostics surface without
+        # needing DEBUG, but a long meeting doesn't spam.
+        _log_stderr_once(proc.stderr.strip())
 
     if proc.returncode != 0:
-        log.debug("[arm.audio_detect] %s exited %d (stderr: %r)",
-                  binary.name, proc.returncode, proc.stderr.strip())
+        log.warning("[arm.audio_detect] %s exited %d (stderr: %r)",
+                    binary.name, proc.returncode, proc.stderr.strip())
         return []
 
     try:
@@ -200,6 +218,7 @@ def snapshot(*, force_refresh: bool = False) -> list[AudioProcess]:
             _cache.expires_at = now + _CACHE_TTL_SECS
         return []
 
+    _log_binary_path_once(binary)
     rows = _run_binary(binary)
     with _cache_lock:
         _cache.snapshot = rows

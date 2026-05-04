@@ -221,14 +221,16 @@ def _walk_to_gui_ancestor(
     return None, None
 
 
-def _resolve_owner(
-    proc: audio_detect.AudioProcess,
+def _resolve_owner_with_bundle(
     *,
+    pid: int,
+    responsible_pid: int,
+    bundle_id: Optional[str],
     bundle_by_pid: dict[int, str],
     pids_by_bundle: dict[str, list[int]],
 ) -> tuple[Optional[int], Optional[str]]:
-    """Map an :class:`audio_detect.AudioProcess` to its user-facing
-    (PID, bundle_id).
+    """Map an audio process (pid + responsible_pid + maybe-known bundle id)
+    to its user-facing (PID, bundle_id).
 
     Resolution order:
 
@@ -243,26 +245,54 @@ def _resolve_owner(
     Returns (owner_pid, owner_bundle) or (None, None) if no GUI owner
     could be resolved.
     """
-    if proc.responsible_pid > 0:
+    if responsible_pid > 0:
         owner_pid, bid = _walk_to_gui_ancestor(
-            proc.responsible_pid, bundle_by_pid=bundle_by_pid,
+            responsible_pid, bundle_by_pid=bundle_by_pid,
         )
         if bid is not None:
             return owner_pid, bid
 
-    browser_bundle = _browser_for_helper_bundle(proc.bundle_id)
+    browser_bundle = _browser_for_helper_bundle(bundle_id)
     if browser_bundle is not None:
         pids = pids_by_bundle.get(browser_bundle)
         return (pids[0] if pids else None), browser_bundle
 
-    if proc.pid > 0:
+    if pid > 0:
         owner_pid, bid = _walk_to_gui_ancestor(
-            proc.pid, bundle_by_pid=bundle_by_pid,
+            pid, bundle_by_pid=bundle_by_pid,
         )
         if bid is not None:
             return owner_pid, bid
 
     return None, None
+
+
+_empty_holders_log_signature: Optional[tuple] = None
+
+
+def _warn_empty_holders_once(capturing: list) -> None:
+    """Log a one-shot INFO summary of audio_detect.snapshot when it has
+    input-active processes but get_mic_holders couldn't produce any
+    attributable holders.
+
+    Dedup'd on the (pid, bundle_id) shape of the snapshot so a long
+    meeting in the same broken state doesn't spam the watcher's 2 s
+    poll cadence.
+    """
+    global _empty_holders_log_signature
+    sig = tuple(sorted((p.pid, p.responsible_pid, p.bundle_id) for p in capturing))
+    if sig == _empty_holders_log_signature:
+        return
+    _empty_holders_log_signature = sig
+    summary = ", ".join(
+        f"pid={p.pid}/resp={p.responsible_pid}/bundle={p.bundle_id!r}"
+        for p in capturing
+    )
+    log.info(
+        "[arm.mac] audio_detect saw %d capturing process(es) but produced "
+        "0 holders — entries: %s",
+        len(capturing), summary,
+    )
 
 
 def get_mic_holders() -> list[MicHolder]:
@@ -282,7 +312,8 @@ def get_mic_holders() -> list[MicHolder]:
         return []
 
     snapshot = audio_detect.snapshot()
-    if not any(p.input for p in snapshot):
+    capturing = [p for p in snapshot if p.input]
+    if not capturing:
         return []
 
     # One NSWorkspace walk per get_mic_holders() call, shared across every
@@ -309,12 +340,20 @@ def get_mic_holders() -> list[MicHolder]:
     holders: list[MicHolder] = []
     seen_keys: set[tuple[int, str]] = set()
 
-    for proc in snapshot:
-        if not proc.input:
-            continue
+    for proc in capturing:
+        # Recover bundle_id from NSWorkspace if the Swift helper didn't
+        # populate it. We've seen production cases where the bundled
+        # binary's CFString reads return null while NSWorkspace's bundle
+        # lookup by PID still works fine for the same processes
+        # (different API surface, different gating). Prefer the
+        # NSWorkspace value over null so _resolve_owner has something to
+        # work with.
+        recovered_bundle = proc.bundle_id or bundle_by_pid.get(proc.pid)
 
-        owner_pid, owner_bundle = _resolve_owner(
-            proc,
+        owner_pid, owner_bundle = _resolve_owner_with_bundle(
+            pid=proc.pid,
+            responsible_pid=proc.responsible_pid,
+            bundle_id=recovered_bundle,
             bundle_by_pid=bundle_by_pid,
             pids_by_bundle=pids_by_bundle,
         )
@@ -331,18 +370,27 @@ def get_mic_holders() -> list[MicHolder]:
             ))
             continue
 
-        # _resolve_owner returned (None, None) — fully unattributable.
-        if not proc.bundle_id or proc.pid <= 0:
+        # No attribution worked — surface the recovered bundle (or
+        # raw helper bundle) so the matcher's helper-bundle-prefix
+        # backstop has a chance.
+        if not recovered_bundle or proc.pid <= 0:
             continue
-        key = (proc.pid, proc.bundle_id.lower())
+        key = (proc.pid, recovered_bundle.lower())
         if key in seen_keys:
             continue
         seen_keys.add(key)
         holders.append(MicHolder(
-            process_name=proc.bundle_id,
+            process_name=recovered_bundle,
             pid=proc.pid,
-            bundle_id=proc.bundle_id,
+            bundle_id=recovered_bundle,
         ))
+
+    # One-shot diagnostic when audio_detect saw input-active processes
+    # but we produced zero holders. Lets a user paste a normal log and
+    # have us see exactly what the Swift helper returned.
+    if not holders:
+        _warn_empty_holders_once(capturing)
+
     return holders
 
 
