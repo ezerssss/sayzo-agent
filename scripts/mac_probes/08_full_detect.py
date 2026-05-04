@@ -143,6 +143,47 @@ BROWSER_BUNDLES: dict[str, str] = {
 }
 
 
+# Browser audio happens in helper processes whose bundle id starts with a
+# recognizable prefix. We can't rely on parent-PID walking because most
+# browsers (Safari/WebKit definitely, Chrome/Chromium often) launch their
+# helpers via launchd, so the parent chain is just (helper → launchd) and
+# we lose the connection to the actual browser. Prefix matching is the
+# fast, reliable identification path.
+#
+# Each entry: (helper_bundle_prefix_lowercase, owning_browser_bundle_id).
+# Order matters — first match wins. We list more-specific prefixes first
+# so e.g. ``com.google.Chrome.helper.alerts`` matches the Chrome entry
+# before falling through.
+BROWSER_HELPER_PREFIXES: list[tuple[str, str]] = [
+    # Safari: WebKit framework helpers. Apple uses both 'webkit' (lower)
+    # and 'WebKit' (mixed) in different macOS versions; lowercase compare.
+    ("com.apple.webkit.", "com.apple.Safari"),
+    # Chrome / Chromium-derived: helper.gpu, helper.alerts, helper.renderer, etc.
+    ("com.google.chrome.helper", "com.google.Chrome"),
+    ("com.microsoft.edgemac.helper", "com.microsoft.edgemac"),
+    ("com.brave.browser.helper", "com.brave.Browser"),
+    ("company.thebrowser.browser.helper", "company.thebrowser.Browser"),
+    ("com.operasoftware.opera.helper", "com.operasoftware.Opera"),
+    ("com.vivaldi.vivaldi.helper", "com.vivaldi.Vivaldi"),
+    # Firefox: WebRTC audio runs in the plugin-container helper. The parent
+    # process IS firefox so parent-walking would also work, but prefix
+    # matching keeps the code path uniform.
+    ("org.mozilla.firefox.plugin-container", "org.mozilla.firefox"),
+]
+
+
+def browser_for_helper_bundle(bundle: Optional[str]) -> Optional[str]:
+    """If ``bundle`` is a known browser helper bundle id, return the
+    owning browser's bundle id. Else None."""
+    if not bundle:
+        return None
+    bl = bundle.lower()
+    for prefix, browser in BROWSER_HELPER_PREFIXES:
+        if bl.startswith(prefix):
+            return browser
+    return None
+
+
 # ---- Swift helper invocation -------------------------------------------
 
 def run_swift_helper(binary_path: str) -> list[dict]:
@@ -183,21 +224,47 @@ def _bundle_for_pid(pid: int) -> Optional[str]:
     return None
 
 
-def find_owning_app(pid: int, max_depth: int = 4) -> tuple[Optional[int], Optional[str]]:
-    """Walk up parent PIDs until we find a process that has an
-    NSRunningApplication entry (i.e. a real GUI app, not a helper).
+def _running_pid_for_bundle(bundle: str) -> Optional[int]:
+    ws = NSWorkspace.sharedWorkspace()
+    for app in ws.runningApplications():
+        try:
+            if str(app.bundleIdentifier() or "") == bundle:
+                pid = int(app.processIdentifier() or 0)
+                if pid > 0:
+                    return pid
+        except Exception:
+            continue
+    return None
 
-    Returns (owning_pid, bundle_id). Either may be None if we can't
-    resolve. ``max_depth`` bounds the walk so a daemon-deep chain
-    doesn't run away.
+
+def find_owning_app(
+    pid: int, capturing_bundle: Optional[str], max_depth: int = 4,
+) -> tuple[Optional[int], Optional[str]]:
+    """Identify the GUI app that owns the audio-capturing process.
+
+    Resolution order:
+      1. If the capturing process's own bundle id matches a known
+         browser-helper prefix (``com.apple.webkit.*``,
+         ``com.google.Chrome.helper*``, ...), return the owning
+         browser's bundle id directly. This is the path that handles
+         WebKit/Chromium helpers, which are launchd-spawned and so have
+         no parent-PID link back to the browser.
+      2. Otherwise, walk up parent PIDs until we find a process that
+         has an NSRunningApplication entry (a real GUI app). Handles
+         desktop apps that capture via a helper but whose parent IS the
+         user-facing app (e.g. Discord Helper → Discord).
     """
+    # Pass 1: bundle-id prefix → known browser.
+    browser_bundle = browser_for_helper_bundle(capturing_bundle)
+    if browser_bundle is not None:
+        return _running_pid_for_bundle(browser_bundle), browser_bundle
+
+    # Pass 2: parent-walk for everything else.
     cur_pid = pid
     for _ in range(max_depth):
-        # First check if this pid IS a GUI app.
         bid = _bundle_for_pid(cur_pid)
         if bid is not None:
             return cur_pid, bid
-        # Otherwise try the parent.
         try:
             parent = psutil.Process(cur_pid).parent()
         except Exception:
@@ -314,7 +381,7 @@ def _print_one_pass(binary_path: str) -> None:
         # Pass B: walk to owning app. If owning is a known browser,
         # try title matching. If owning is a desktop meeting app
         # (some apps capture via a helper), match too.
-        owner_pid, owner_bundle = find_owning_app(pid)
+        owner_pid, owner_bundle = find_owning_app(pid, bundle)
         print(f"    owning app: pid={owner_pid} bundle={owner_bundle!r}")
         if owner_bundle is None:
             print(f"    → no known owner — skipping")
