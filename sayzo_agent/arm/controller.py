@@ -770,13 +770,13 @@ class ArmController:
                 if match is None:
                     last_match_key = None
                     # Diagnostic for "watcher silently doesn't fire" reports:
-                    # when the user has a browser open with mic active and
-                    # nothing matched, log the titles we tried. Dedup'd on
-                    # (bundle, sorted-titles) so a long meeting in the same
+                    # whenever the mic is active but nothing matched, log
+                    # what we saw. Dedup'd on (foreground bundle, holder
+                    # bundles, sorted-titles) so a long meeting in the same
                     # state doesn't spam at the 2 s poll cadence. Cleared on
                     # any uninteresting tick or successful match so the next
                     # interesting state logs again.
-                    if mic.active and fg.is_browser:
+                    if mic.active:
                         sig_titles = tuple(
                             sorted({
                                 fg.browser_tab_title or "",
@@ -784,14 +784,21 @@ class ArmController:
                                 *fg.browser_window_titles,
                             } - {""})
                         )
-                        signature = (fg.bundle_id, sig_titles)
+                        holder_summary = tuple(sorted(
+                            f"{h.bundle_id or h.process_name}#{h.pid}"
+                            for h in mic.holders
+                        ))
+                        signature = (fg.bundle_id, holder_summary, sig_titles)
                         if signature != last_no_match_signature:
                             last_no_match_signature = signature
                             log.info(
-                                "[arm] no whitelist match: fg.bundle=%s "
+                                "[arm] no whitelist match: holders=%s "
+                                "fg.bundle=%s fg.is_browser=%s "
                                 "tab_title=%r win_titles=%r url=%r — "
                                 "active_specs=%d (suppressed=%d)",
+                                list(holder_summary) or "[]",
                                 fg.bundle_id,
+                                fg.is_browser,
                                 fg.browser_tab_title,
                                 list(sig_titles),
                                 fg.browser_tab_url,

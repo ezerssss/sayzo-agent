@@ -61,25 +61,15 @@ _MAC_PERMISSION_ROWS: tuple[dict[str, str], ...] = (
         "label": "Accessibility",
         "description": "Lets the global shortcut work when another app is focused.",
     },
-    {
-        "key": "automation",
-        "label": "Automation (browsers)",
-        "description": "Lets Sayzo read the current tab's URL to detect web meetings.",
-    },
 )
 
-# Direct deep-links for permissions that aren't grant-by-probe (Accessibility
-# + Automation can only be toggled by the user in System Settings, no
-# programmatic flow). ``mac_permissions`` already owns mic / audio-capture /
-# notifications deep-links so we reuse those.
+# Direct deep-links for permissions that can only be toggled in System
+# Settings (Accessibility has no programmatic grant flow). mic /
+# audio_capture / notifications use the deep-links inside ``mac_permissions``.
 _MAC_PERMISSION_DEEPLINKS: dict[str, str] = {
     "accessibility": (
         "x-apple.systempreferences:com.apple.preference.security"
         "?Privacy_Accessibility"
-    ),
-    "automation": (
-        "x-apple.systempreferences:com.apple.preference.security"
-        "?Privacy_Automation"
     ),
 }
 
@@ -113,6 +103,31 @@ _NOTIFICATION_KEYS: dict[str, dict] = {
         "cfg_attr": ("notifications", "daily_drill_enabled"),
     },
 }
+
+
+def _diagnostics_log_tail(logs_dir, max_lines: int = 200) -> str:
+    """Read the tail of the agent's log file for the diagnostics blob.
+
+    Returns a section header + the last N log lines (newest at the bottom).
+    Best-effort: if the log file is missing or unreadable, return a stub
+    explaining what was attempted so the support-channel reader can tell
+    "no log available" apart from "the diagnostics shipped without it."
+    """
+    from pathlib import Path
+
+    candidates = [Path(logs_dir) / "agent.log", Path(logs_dir) / "service.log"]
+    for path in candidates:
+        try:
+            if not path.exists():
+                continue
+            with open(path, encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+            tail = lines[-max_lines:]
+            return f"--- log tail ({path.name}, last {len(tail)} of {len(lines)} lines) ---\n" + "".join(tail)
+        except Exception:
+            log.debug("[settings.bridge] log tail read failed for %s", path, exc_info=True)
+            continue
+    return f"--- log tail unavailable (looked in {logs_dir}) ---"
 
 
 class Bridge:
@@ -212,12 +227,17 @@ class Bridge:
     def get_diagnostics(self) -> dict[str, str]:
         """Diagnostic blob for the About pane's "Copy diagnostics" button.
 
+        Short env header + the tail of the agent log. The header is the
+        minimum needed to identify "what version was running on what
+        platform when this log was captured" — everything else lives in
+        the log.
+
         React copies the returned ``text`` to the clipboard via the browser's
         ``navigator.clipboard`` API — Settings runs in pywebview's webview
         which exposes a working clipboard in both backends.
         """
         signed_in = self._has_tokens()
-        text = "\n".join([
+        header = "\n".join([
             f"Sayzo {__version__}",
             f"Platform:  {sys.platform} ({platform.platform()})",
             f"Python:    {sys.version.split()[0]}",
@@ -226,7 +246,7 @@ class Bridge:
             f"Logs:      {self._cfg.logs_dir}",
             f"Signed in: {'yes' if signed_in else 'no'}",
         ])
-        return {"text": text}
+        return {"text": header + "\n\n" + _diagnostics_log_tail(self._cfg.logs_dir)}
 
     # ------------------------------------------------------------------
     # JS-callable methods — Captures pane
@@ -483,9 +503,9 @@ class Bridge:
         """Fire the macOS TCC prompt for ``key``.
 
         Mic + audio_capture perform a one-shot probe the OS intercepts to
-        surface the dialog. Accessibility + automation have no programmatic
-        grant — ``request_permission`` returns ``granted=null`` and the
-        React caller falls back to ``open_permission_settings``.
+        surface the dialog. Accessibility has no programmatic grant —
+        ``request_permission`` returns ``granted=null`` and the React
+        caller falls back to ``open_permission_settings``.
         """
         if sys.platform != "darwin":
             return {"granted": None}

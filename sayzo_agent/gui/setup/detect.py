@@ -68,8 +68,8 @@ class SetupStatus:
     ``has_permissions_onboarded`` is the "user reached the Done screen"
     gate on both platforms. On Windows it's still checked (the user needs
     to walk the shortcut + notifications screens), and on macOS it covers
-    the fuller Mic → Audio Capture → Accessibility → Automation →
-    Notifications → Shortcut flow. The field name is historical — it
+    the fuller Mic → Audio Capture → Accessibility → Notifications →
+    Shortcut flow. The field name is historical — it
     predates folding the tkinter onboarding into the pywebview window.
 
     ``account_state`` is the last observed result of ``GET /api/me``. The

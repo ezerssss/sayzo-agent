@@ -293,31 +293,55 @@ def get_mic_holders() -> list[MicHolder]:
         bundle_by_pid[pid] = bid
         pids_by_bundle.setdefault(bid, []).append(pid)
 
+    # Mirrors scripts/mac_probes/08_full_detect.py — the probe the user
+    # validated end-to-end. Two important properties:
+    #
+    # 1. Trust ``owner_bundle`` from _resolve_owner even when
+    #    ``owner_pid`` is None. Pass 2 of _resolve_owner (browser-helper
+    #    prefix) can return ("com.apple.Safari", None) when NSWorkspace
+    #    doesn't have a PID for Safari yet but we still know the helper
+    #    belongs to it. The matcher gates on bundle_id, not pid; the
+    #    helper pid is fine as a placeholder for system-audio scoping.
+    # 2. When _resolve_owner returns (None, None) entirely, surface the
+    #    raw capturing-process bundle as a last resort. The matcher's
+    #    helper-bundle-prefix backstop in detectors.py will still catch
+    #    things like ``com.hnc.Discord.helper.Renderer`` → discord spec.
     holders: list[MicHolder] = []
-    seen_pids: set[int] = set()
+    seen_keys: set[tuple[int, str]] = set()
 
     for proc in snapshot:
         if not proc.input:
             continue
+
         owner_pid, owner_bundle = _resolve_owner(
             proc,
             bundle_by_pid=bundle_by_pid,
             pids_by_bundle=pids_by_bundle,
         )
-        if owner_pid is None or owner_bundle is None:
-            # Couldn't map the helper back to a user-facing app. Leave it
-            # out — the seen-apps recorder in the controller will pick
-            # up unmatched bundle ids via the foreground-info path.
+        if owner_bundle is not None:
+            pid = owner_pid if owner_pid is not None else proc.pid
+            key = (pid, owner_bundle.lower())
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            holders.append(MicHolder(
+                process_name=owner_bundle,
+                pid=pid,
+                bundle_id=owner_bundle,
+            ))
             continue
-        if owner_pid in seen_pids:
-            # Multiple helpers from the same app (Chrome's helper.gpu +
-            # helper.alerts both capturing) collapse to one holder.
+
+        # _resolve_owner returned (None, None) — fully unattributable.
+        if not proc.bundle_id or proc.pid <= 0:
             continue
-        seen_pids.add(owner_pid)
+        key = (proc.pid, proc.bundle_id.lower())
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
         holders.append(MicHolder(
-            process_name=owner_bundle,
-            pid=owner_pid,
-            bundle_id=owner_bundle,
+            process_name=proc.bundle_id,
+            pid=proc.pid,
+            bundle_id=proc.bundle_id,
         ))
     return holders
 
