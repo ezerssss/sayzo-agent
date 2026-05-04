@@ -19,9 +19,10 @@
 //       -framework CoreAudio -framework Foundation
 //
 // Run:
-//   ./07_swift_audio_detect           # one-shot
+//   ./07_swift_audio_detect           # one-shot, human-readable
 //   ./07_swift_audio_detect --watch   # poll every 1 s
 //   ./07_swift_audio_detect --all     # show every audio process, not just is_running_input=YES
+//   ./07_swift_audio_detect --json    # one-shot JSON, parseable by probe 08
 //
 // While running: join Zoom / Meet / Discord and watch for the meeting
 // app's bundle id to appear with `in=YES`. Same expectation as Python
@@ -172,13 +173,52 @@ func snapshot(showAll: Bool) {
     }
 }
 
+// ---- JSON output for probe 08's Python wrapper -------------------------
+
+func snapshotJSON() {
+    let (objects, status) = listProcessObjects()
+    guard let objects = objects else {
+        FileHandle.standardError.write(Data(
+            "audio-detect: ProcessObjectList failed: OSStatus \(status) \(fourccString(status))\n".utf8
+        ))
+        print("[]")
+        return
+    }
+    var entries: [String] = []
+    for obj in objects {
+        let pid = readPID(obj).map { Int($0) } ?? -1
+        let bundleRaw = readBundleID(obj)
+        let inp = readBool(obj, kAudioProcessPropertyIsRunningInput) ?? 0
+        let outp = readBool(obj, kAudioProcessPropertyIsRunningOutput) ?? 0
+        let run = readBool(obj, kAudioProcessPropertyIsRunning) ?? 0
+        // JSON-escape the bundle id (handles backslashes, quotes, control chars).
+        let bundleField: String
+        if let b = bundleRaw {
+            let escaped = b
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"")
+            bundleField = "\"\(escaped)\""
+        } else {
+            bundleField = "null"
+        }
+        entries.append(
+            "{\"pid\":\(pid),\"bundle_id\":\(bundleField)," +
+            "\"input\":\(inp),\"output\":\(outp),\"running\":\(run)}"
+        )
+    }
+    print("[\(entries.joined(separator: ","))]")
+}
+
 // ---- driver -------------------------------------------------------------
 
 let args = CommandLine.arguments
 let watch = args.contains("--watch")
 let showAll = args.contains("--all")
+let jsonMode = args.contains("--json")
 
-if watch {
+if jsonMode {
+    snapshotJSON()
+} else if watch {
     print("Watching audio processes from Swift. Ctrl-C to stop.")
     print("Try: join Zoom / Discord / Meet — look for is_running_input=YES")
     while true {

@@ -1,0 +1,390 @@
+#!/usr/bin/env python3
+"""Probe 8 — End-to-end meeting detection using the Swift helper + AX titles.
+
+Closes the loop on the new architecture by composing every piece we
+verified separately:
+
+  1. Run ``./07_swift_audio_detect --json`` to get every audio process
+     with ``is_running_input=YES``. Per-process attribution that probe 07
+     proved works on this Mac.
+  2. For each capturing process, walk parent PIDs (psutil) until we find
+     either a known browser or a known meeting app. (Browser audio
+     happens in helper processes like ``com.apple.webkit.GPU``; the
+     parent or grandparent is the actual browser.)
+  3. If the owner is a desktop meeting app → MATCH (Pass 1, Windows-equivalent).
+  4. If the owner is a browser → read every AX window title for that
+     browser → match against meeting URL/title patterns → MATCH.
+
+NO foreground requirement at any step. Works for Safari, Chrome, Edge,
+Brave, Arc, Firefox.
+
+Prereqs (in this directory):
+  - 07_swift_audio_detect compiled (the binary, not just the source)
+  - psutil + pyobjc-framework-Cocoa + pyobjc-framework-ApplicationServices
+  - Accessibility granted to whichever Python runs this script
+
+Usage:
+    python3 08_full_detect.py
+    python3 08_full_detect.py --watch
+    python3 08_full_detect.py --binary /path/to/07_swift_audio_detect
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from typing import Optional
+
+try:
+    import psutil
+except ImportError:
+    print("ERROR: pip install psutil")
+    sys.exit(1)
+
+try:
+    from AppKit import NSWorkspace
+except ImportError:
+    print("ERROR: pip install pyobjc-framework-Cocoa")
+    sys.exit(1)
+
+try:
+    from ApplicationServices import (  # type: ignore[import-not-found]
+        AXUIElementCreateApplication,
+        AXUIElementCopyAttributeValue,
+        kAXWindowsAttribute,
+        kAXTitleAttribute,
+    )
+except ImportError:
+    print("ERROR: pip install pyobjc-framework-ApplicationServices")
+    sys.exit(1)
+
+
+# ---- vendored matcher (same as probe 04, browser specs only) ------------
+
+@dataclass
+class Spec:
+    app_key: str
+    display_name: str
+    process_names: list[str] = field(default_factory=list)
+    bundle_ids: list[str] = field(default_factory=list)
+    is_browser: bool = False
+    url_patterns: list[str] = field(default_factory=list)
+    title_patterns: list[str] = field(default_factory=list)
+
+
+SPECS: list[Spec] = [
+    Spec("zoom", "Zoom", bundle_ids=["us.zoom.xos"]),
+    Spec("teams_desktop", "Microsoft Teams",
+         bundle_ids=["com.microsoft.teams", "com.microsoft.teams2"]),
+    Spec("discord", "Discord", bundle_ids=["com.hnc.Discord"]),
+    Spec("slack", "Slack", bundle_ids=["com.tinyspeck.slackmacgap"]),
+    Spec("webex", "Webex",
+         bundle_ids=["Cisco-Systems.Spark", "com.webex.meetingmanager"]),
+    Spec("skype", "Skype", bundle_ids=["com.skype.skype"]),
+    Spec("facetime", "FaceTime", bundle_ids=["com.apple.FaceTime"]),
+    Spec("whatsapp", "WhatsApp", bundle_ids=["net.whatsapp.WhatsApp"]),
+    Spec("signal", "Signal",
+         bundle_ids=["org.whispersystems.signal-desktop"]),
+    Spec("gotomeeting", "GoTo", bundle_ids=["com.logmein.GoToMeeting"]),
+    Spec("bluejeans", "BlueJeans", bundle_ids=["com.bluejeans.app"]),
+    Spec("chime", "Amazon Chime", bundle_ids=["com.amazon.Chime"]),
+    Spec("ringcentral", "RingCentral",
+         bundle_ids=["com.ringcentral.rcoffice"]),
+    Spec("dialpad", "Dialpad", bundle_ids=["co.dialpad.dialpad"]),
+
+    Spec("gmeet", "Google Meet", is_browser=True,
+         url_patterns=[
+             r"^https://meet\.google\.com/[a-z]{3,4}-[a-z]{3,4}-[a-z]{3,4}",
+         ],
+         title_patterns=[
+             r"(?i)\bGoogle Meet\b", r"(?i)\bgmeet\b",
+             r"\bMeet - [a-z]{3,4}-[a-z]{3,4}-[a-z]{3,4}\b",
+         ]),
+    Spec("teams_web", "Microsoft Teams", is_browser=True,
+         url_patterns=[
+             r"teams\.microsoft\.com/.+/l/meetup-join/",
+             r"teams\.microsoft\.com/_#/conversations/.+/meeting",
+         ],
+         title_patterns=[r"(?i)\bMicrosoft Teams\b"]),
+    Spec("zoom_web", "Zoom", is_browser=True,
+         url_patterns=[r"^https://[^/]+\.zoom\.us/wc/join/",
+                       r"^https://[^/]+\.zoom\.us/j/\d+"],
+         title_patterns=[r"(?i)\bZoom Meeting\b"]),
+    Spec("webex_web", "Webex", is_browser=True,
+         url_patterns=[r"^https://[^/]+\.webex\.com/(meet|wbxmjs|webappng)/"],
+         title_patterns=[r"(?i)\bwebex\b"]),
+    Spec("whereby", "Whereby", is_browser=True,
+         url_patterns=[r"^https://whereby\.com/[^/]+"],
+         title_patterns=[r"(?i)\bwhereby\b"]),
+    Spec("jitsi", "Jitsi Meet", is_browser=True,
+         url_patterns=[r"^https://meet\.jit\.si/[^/]+"],
+         title_patterns=[r"(?i)\bjitsi\b"]),
+    Spec("8x8", "8x8 Meet", is_browser=True,
+         url_patterns=[r"^https://8x8\.vc/[^/]+"],
+         title_patterns=[r"(?i)\b8x8\b"]),
+]
+
+
+# Browser bundle id → display name. Same set as platform_mac.py.
+BROWSER_BUNDLES: dict[str, str] = {
+    "com.google.Chrome": "Google Chrome",
+    "com.apple.Safari": "Safari",
+    "com.microsoft.edgemac": "Microsoft Edge",
+    "com.brave.Browser": "Brave Browser",
+    "company.thebrowser.Browser": "Arc",
+    "org.mozilla.firefox": "Firefox",
+    "com.operasoftware.Opera": "Opera",
+    "com.vivaldi.Vivaldi": "Vivaldi",
+}
+
+
+# ---- Swift helper invocation -------------------------------------------
+
+def run_swift_helper(binary_path: str) -> list[dict]:
+    proc = subprocess.run(
+        [binary_path, "--json"], capture_output=True, text=True, timeout=10,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"Swift helper exited {proc.returncode}\n  stderr: {proc.stderr}"
+        )
+    if proc.stderr.strip():
+        # The Swift binary writes diagnostic warnings to stderr. Surface
+        # them so we don't silently miss "ProcessObjectList failed".
+        sys.stderr.write(proc.stderr)
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"Swift helper produced non-JSON output: {exc}\n"
+            f"  stdout (first 500): {proc.stdout[:500]!r}"
+        )
+
+
+# ---- parent PID walk → owning app --------------------------------------
+
+def _bundle_for_pid(pid: int) -> Optional[str]:
+    """Return the running NSRunningApplication bundle id for ``pid``,
+    or None if no GUI app owns it (helper processes typically don't
+    appear here themselves; their parent does)."""
+    ws = NSWorkspace.sharedWorkspace()
+    for app in ws.runningApplications():
+        try:
+            if int(app.processIdentifier() or 0) == pid:
+                bid = str(app.bundleIdentifier() or "") or None
+                return bid
+        except Exception:
+            continue
+    return None
+
+
+def find_owning_app(pid: int, max_depth: int = 4) -> tuple[Optional[int], Optional[str]]:
+    """Walk up parent PIDs until we find a process that has an
+    NSRunningApplication entry (i.e. a real GUI app, not a helper).
+
+    Returns (owning_pid, bundle_id). Either may be None if we can't
+    resolve. ``max_depth`` bounds the walk so a daemon-deep chain
+    doesn't run away.
+    """
+    cur_pid = pid
+    for _ in range(max_depth):
+        # First check if this pid IS a GUI app.
+        bid = _bundle_for_pid(cur_pid)
+        if bid is not None:
+            return cur_pid, bid
+        # Otherwise try the parent.
+        try:
+            parent = psutil.Process(cur_pid).parent()
+        except Exception:
+            return None, None
+        if parent is None or parent.pid in (0, 1):
+            return None, None
+        cur_pid = parent.pid
+    return cur_pid, None
+
+
+# ---- AX titles for a browser bundle ------------------------------------
+
+def _pids_for_bundle(bundle: str) -> list[int]:
+    ws = NSWorkspace.sharedWorkspace()
+    out = []
+    for app in ws.runningApplications():
+        try:
+            if str(app.bundleIdentifier() or "") == bundle:
+                pid = int(app.processIdentifier() or 0)
+                if pid > 0:
+                    out.append(pid)
+        except Exception:
+            continue
+    return out
+
+
+def ax_titles_for_bundle(bundle: str) -> list[str]:
+    titles: list[str] = []
+    for pid in _pids_for_bundle(bundle):
+        try:
+            app_ref = AXUIElementCreateApplication(pid)
+        except Exception:
+            continue
+        try:
+            err, windows = AXUIElementCopyAttributeValue(
+                app_ref, kAXWindowsAttribute, None
+            )
+        except Exception:
+            continue
+        if err != 0 or not windows:
+            continue
+        for window in windows:
+            try:
+                err, title = AXUIElementCopyAttributeValue(
+                    window, kAXTitleAttribute, None
+                )
+            except Exception:
+                continue
+            if err != 0 or not title:
+                continue
+            t = str(title).strip()
+            if t:
+                titles.append(t)
+    return titles
+
+
+# ---- matcher -----------------------------------------------------------
+
+def match_browser_title(titles: list[str]) -> Optional[Spec]:
+    for spec in SPECS:
+        if not spec.is_browser:
+            continue
+        for pat in spec.url_patterns:
+            rx = re.compile(pat)
+            for t in titles:
+                if rx.search(t):
+                    return spec
+        for pat in spec.title_patterns:
+            rx = re.compile(pat)
+            for t in titles:
+                if rx.search(t):
+                    return spec
+    return None
+
+
+def desktop_spec_for_bundle(bundle: str) -> Optional[Spec]:
+    bl = bundle.lower()
+    for spec in SPECS:
+        if spec.is_browser:
+            continue
+        if bl in {b.lower() for b in spec.bundle_ids}:
+            return spec
+    return None
+
+
+# ---- driver -------------------------------------------------------------
+
+def _print_one_pass(binary_path: str) -> None:
+    try:
+        procs = run_swift_helper(binary_path)
+    except Exception as exc:
+        print(f"  Swift helper invocation failed: {exc}")
+        return
+
+    capturing = [p for p in procs if p.get("input") == 1]
+    print(f"  audio processes capturing input: {len(capturing)}")
+    if not capturing:
+        print("  → NO MATCH (nothing is using the mic)")
+        return
+
+    matched_apps: list[tuple[Spec, str]] = []
+    for proc in capturing:
+        pid = proc.get("pid", -1)
+        bundle = proc.get("bundle_id") or ""
+        print(f"\n  capturing pid={pid} bundle={bundle!r}")
+
+        # Pass A: direct desktop match by capturing-process bundle.
+        spec = desktop_spec_for_bundle(bundle)
+        if spec is not None:
+            print(f"    → desktop match: {spec.app_key} ({spec.display_name})")
+            matched_apps.append((spec, "desktop direct"))
+            continue
+
+        # Pass B: walk to owning app. If owning is a known browser,
+        # try title matching. If owning is a desktop meeting app
+        # (some apps capture via a helper), match too.
+        owner_pid, owner_bundle = find_owning_app(pid)
+        print(f"    owning app: pid={owner_pid} bundle={owner_bundle!r}")
+        if owner_bundle is None:
+            print(f"    → no known owner — skipping")
+            continue
+
+        spec = desktop_spec_for_bundle(owner_bundle)
+        if spec is not None:
+            print(f"    → desktop match via owner: {spec.app_key}")
+            matched_apps.append((spec, "desktop via owner"))
+            continue
+
+        if owner_bundle in BROWSER_BUNDLES:
+            browser_name = BROWSER_BUNDLES[owner_bundle]
+            titles = ax_titles_for_bundle(owner_bundle)
+            print(f"    {browser_name} window titles: {titles}")
+            if not titles:
+                print(f"    → browser is capturing but AX returned no titles")
+                print(f"      (Accessibility permission may not be granted)")
+                continue
+            spec = match_browser_title(titles)
+            if spec is not None:
+                print(f"    → browser match: {spec.app_key} ({spec.display_name})")
+                matched_apps.append((spec, f"browser via {browser_name} title"))
+            else:
+                print(f"    → browser is capturing but no title matched any spec")
+        else:
+            print(f"    → owner is neither a known browser nor a known meeting app")
+
+    print()
+    if matched_apps:
+        for spec, source in matched_apps:
+            print(f"  >>> WOULD ARM for: {spec.app_key} ({spec.display_name})")
+            print(f"      via {source}")
+    else:
+        print("  >>> NO MATCH this pass — see per-process diagnostics above")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--watch", action="store_true")
+    ap.add_argument("--interval", type=float, default=2.0)
+    ap.add_argument("--binary", default="./07_swift_audio_detect",
+                    help="Path to the compiled Swift helper")
+    args = ap.parse_args()
+
+    if not os.path.exists(args.binary):
+        print(f"ERROR: Swift helper not found at {args.binary}")
+        print("Compile it first:")
+        print("  swiftc -O -o 07_swift_audio_detect 07_swift_audio_detect.swift \\")
+        print("      -framework CoreAudio -framework Foundation")
+        sys.exit(1)
+
+    if not args.watch:
+        print(f"[{time.strftime('%H:%M:%S')}]")
+        _print_one_pass(args.binary)
+        return
+
+    print("Full meeting-detection flow (Swift audio + AX titles).")
+    print("Try: join Zoom (no foreground), join Meet in Safari (no foreground),")
+    print("Discord call, Teams web, etc. Ctrl-C to stop.")
+    try:
+        while True:
+            print("\n" + "=" * 72)
+            print(f"[{time.strftime('%H:%M:%S')}]")
+            _print_one_pass(args.binary)
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print("\nstopped")
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
