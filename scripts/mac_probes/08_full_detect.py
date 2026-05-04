@@ -238,41 +238,60 @@ def _running_pid_for_bundle(bundle: str) -> Optional[int]:
 
 
 def find_owning_app(
-    pid: int, capturing_bundle: Optional[str], max_depth: int = 4,
-) -> tuple[Optional[int], Optional[str]]:
+    pid: int,
+    capturing_bundle: Optional[str],
+    responsible_pid: Optional[int],
+    max_depth: int = 4,
+) -> tuple[Optional[int], Optional[str], str]:
     """Identify the GUI app that owns the audio-capturing process.
 
-    Resolution order:
-      1. If the capturing process's own bundle id matches a known
-         browser-helper prefix (``com.apple.webkit.*``,
-         ``com.google.Chrome.helper*``, ...), return the owning
-         browser's bundle id directly. This is the path that handles
-         WebKit/Chromium helpers, which are launchd-spawned and so have
-         no parent-PID link back to the browser.
-      2. Otherwise, walk up parent PIDs until we find a process that
-         has an NSRunningApplication entry (a real GUI app). Handles
-         desktop apps that capture via a helper but whose parent IS the
-         user-facing app (e.g. Discord Helper → Discord).
+    Returns ``(owning_pid, bundle_id, source)`` where ``source`` records
+    which resolution path won — useful for telling responsibility-SPI
+    hits apart from fallback heuristics.
+
+    Resolution order, most authoritative first:
+
+      1. Responsibility SPI (Swift-side). The OS itself uses this to
+         decide which app the privacy indicator attributes to. If the
+         Swift helper resolved a responsible_pid, we just look up its
+         NSRunningApplication bundle. Zero heuristics. This is the path
+         we'd ship in production.
+      2. Bundle-id prefix → known browser. Defensive fallback for the
+         rare case the SPI returns -1 (sandboxed processes, OS regression).
+         Brittle long-term but harmless when only used as a backstop.
+      3. Parent-PID walk. Catches desktop apps that fork their own
+         helpers and stay parented (Discord Helper → Discord), in case
+         (1) and (2) both fail.
     """
-    # Pass 1: bundle-id prefix → known browser.
+    # Pass 1 — responsibility SPI.
+    if responsible_pid and responsible_pid > 0:
+        bid = _bundle_for_pid(responsible_pid)
+        if bid is not None:
+            return responsible_pid, bid, "responsibility-spi"
+
+    # Pass 2 — bundle-id prefix → known browser (fallback).
     browser_bundle = browser_for_helper_bundle(capturing_bundle)
     if browser_bundle is not None:
-        return _running_pid_for_bundle(browser_bundle), browser_bundle
+        return (
+            _running_pid_for_bundle(browser_bundle),
+            browser_bundle,
+            "browser-helper-prefix-fallback",
+        )
 
-    # Pass 2: parent-walk for everything else.
+    # Pass 3 — parent-walk (last resort).
     cur_pid = pid
     for _ in range(max_depth):
         bid = _bundle_for_pid(cur_pid)
         if bid is not None:
-            return cur_pid, bid
+            return cur_pid, bid, "parent-walk"
         try:
             parent = psutil.Process(cur_pid).parent()
         except Exception:
-            return None, None
+            return None, None, "no-owner"
         if parent is None or parent.pid in (0, 1):
-            return None, None
+            return None, None, "no-owner"
         cur_pid = parent.pid
-    return cur_pid, None
+    return cur_pid, None, "no-owner"
 
 
 # ---- AX titles for a browser bundle ------------------------------------
@@ -369,7 +388,8 @@ def _print_one_pass(binary_path: str) -> None:
     for proc in capturing:
         pid = proc.get("pid", -1)
         bundle = proc.get("bundle_id") or ""
-        print(f"\n  capturing pid={pid} bundle={bundle!r}")
+        responsible = proc.get("responsible_pid", -1)
+        print(f"\n  capturing pid={pid} responsible_pid={responsible} bundle={bundle!r}")
 
         # Pass A: direct desktop match by capturing-process bundle.
         spec = desktop_spec_for_bundle(bundle)
@@ -381,8 +401,8 @@ def _print_one_pass(binary_path: str) -> None:
         # Pass B: walk to owning app. If owning is a known browser,
         # try title matching. If owning is a desktop meeting app
         # (some apps capture via a helper), match too.
-        owner_pid, owner_bundle = find_owning_app(pid, bundle)
-        print(f"    owning app: pid={owner_pid} bundle={owner_bundle!r}")
+        owner_pid, owner_bundle, source = find_owning_app(pid, bundle, responsible)
+        print(f"    owning app: pid={owner_pid} bundle={owner_bundle!r}  [{source}]")
         if owner_bundle is None:
             print(f"    → no known owner — skipping")
             continue

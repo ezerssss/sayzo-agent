@@ -33,6 +33,41 @@ import CoreAudio
 import Foundation
 import Darwin
 
+// ---- responsibility SPI -------------------------------------------------
+//
+// `responsibility_get_pid_responsible_for_pid(pid)` returns the user-facing
+// process responsible for a given pid. Apple uses this internally to
+// attribute the privacy indicator ("Safari is using the microphone")
+// when audio capture happens in a helper process like
+// `com.apple.webkit.GPU`. Stable since at least macOS 10.10.
+//
+// It's a private SPI declared in <sys/responsibility.h>, so we resolve it
+// via dlsym at startup and fall back to returning the input pid (the
+// caller then does its own helper-bundle inference) if the symbol is
+// missing on this OS.
+//
+// Source-of-truth identification: this is what the OS itself uses, so we
+// never have to maintain a list of "Chrome's helper bundle ids look like
+// X, Edge's look like Y." Whatever Apple's own privacy attribution
+// reports, we'll get the same answer.
+
+typealias ResponsibilityFn = @convention(c) (pid_t) -> pid_t
+
+let gResponsibilityFn: ResponsibilityFn? = {
+    guard let handle = dlopen(nil, RTLD_LAZY) else { return nil }
+    guard let sym = dlsym(handle, "responsibility_get_pid_responsible_for_pid") else {
+        return nil
+    }
+    return unsafeBitCast(sym, to: ResponsibilityFn.self)
+}()
+
+func responsiblePid(for pid: pid_t) -> pid_t? {
+    guard let fn = gResponsibilityFn else { return nil }
+    let result = fn(pid)
+    if result < 0 { return nil }
+    return result
+}
+
 // ---- helpers -------------------------------------------------------------
 
 func fourccString(_ value: OSStatus) -> String {
@@ -136,6 +171,9 @@ func boolCell(_ v: UInt32?) -> String {
 func snapshot(showAll: Bool) {
     let timestamp = ISO8601DateFormatter().string(from: Date())
     print("\n[\(timestamp)]")
+    if gResponsibilityFn == nil {
+        print("  WARN: responsibility SPI not resolvable on this OS; responsible_pid will be empty")
+    }
 
     let (objects, status) = listProcessObjects()
     guard let objects = objects else {
@@ -150,15 +188,21 @@ func snapshot(showAll: Bool) {
     }
     print("  Found \(objects.count) audio process objects.")
 
-    var rows: [(pid: Int, bundle: String, inp: UInt32?, outp: UInt32?, run: UInt32?)] = []
+    var rows: [(pid: Int, resp: Int, bundle: String, inp: UInt32?, outp: UInt32?, run: UInt32?)] = []
     for obj in objects {
         let pid = readPID(obj).map { Int($0) } ?? -1
         let bundle = readBundleID(obj) ?? "<no bundle>"
         let inp = readBool(obj, kAudioProcessPropertyIsRunningInput)
         let outp = readBool(obj, kAudioProcessPropertyIsRunningOutput)
         let run = readBool(obj, kAudioProcessPropertyIsRunning)
+        let resp: Int
+        if pid > 0, let r = responsiblePid(for: pid_t(pid)) {
+            resp = Int(r)
+        } else {
+            resp = -1
+        }
         if !showAll && (inp ?? 0) == 0 { continue }
-        rows.append((pid, bundle, inp, outp, run))
+        rows.append((pid, resp, bundle, inp, outp, run))
     }
 
     if rows.isEmpty {
@@ -166,10 +210,11 @@ func snapshot(showAll: Bool) {
         return
     }
 
-    print("    PID    in  out  run  bundle")
+    print("    PID   resp    in  out  run  bundle")
     for r in rows {
         let pidS = r.pid >= 0 ? String(format: "%6d", r.pid) : "     -"
-        print("  \(pidS)  \(boolCell(r.inp))  \(boolCell(r.outp))  \(boolCell(r.run))  \(r.bundle)")
+        let respS = r.resp >= 0 ? String(format: "%6d", r.resp) : "     -"
+        print("  \(pidS)  \(respS)  \(boolCell(r.inp))  \(boolCell(r.outp))  \(boolCell(r.run))  \(r.bundle)")
     }
 }
 
@@ -191,6 +236,12 @@ func snapshotJSON() {
         let inp = readBool(obj, kAudioProcessPropertyIsRunningInput) ?? 0
         let outp = readBool(obj, kAudioProcessPropertyIsRunningOutput) ?? 0
         let run = readBool(obj, kAudioProcessPropertyIsRunning) ?? 0
+        let resp: Int
+        if pid > 0, let r = responsiblePid(for: pid_t(pid)) {
+            resp = Int(r)
+        } else {
+            resp = -1
+        }
         // JSON-escape the bundle id (handles backslashes, quotes, control chars).
         let bundleField: String
         if let b = bundleRaw {
@@ -202,7 +253,7 @@ func snapshotJSON() {
             bundleField = "null"
         }
         entries.append(
-            "{\"pid\":\(pid),\"bundle_id\":\(bundleField)," +
+            "{\"pid\":\(pid),\"responsible_pid\":\(resp),\"bundle_id\":\(bundleField)," +
             "\"input\":\(inp),\"output\":\(outp),\"running\":\(run)}"
         )
     }
