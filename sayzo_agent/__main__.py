@@ -1033,6 +1033,16 @@ def service(force_setup: bool) -> None:
     from . import __version__
     log.warning("sayzo-agent service starting v%s (pid=%d)", __version__, os.getpid())
 
+    # macOS bundle self-heal: strip quarantine + ad-hoc-sign Swift
+    # helpers so DMG-drag-and-drop installs work on MDM-managed Macs
+    # (Rippling/Jamf/Intune) where Gatekeeper SIGABRTs unsigned-and-
+    # quarantined helpers at subprocess spawn time. No-op on Linux /
+    # Windows, on dev (non-frozen) runs, and on already-healed bundles.
+    # Must run before the first-run gate, which spawns audio-tap.
+    if sys.platform == "darwin":
+        from .macos_bundle_heal import heal_bundle
+        heal_bundle()
+
     # First-run gate. Detect missing setup signals (auth token, macOS mic
     # permission, permissions onboarding) and open the GUI setup window if any is missing
     # — or if the caller forced it via --force-setup (NSIS finish-page), or

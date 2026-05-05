@@ -55,6 +55,23 @@ else
     exit 1
 fi
 hdiutil detach "/Volumes/${APP_NAME}" -quiet
+
+# Strip quarantine + ad-hoc sign every Mach-O inside the bundle. Files
+# copied from a mounted DMG inherit `com.apple.quarantine`, and on
+# MDM-managed Macs (Rippling / Jamf / Intune / etc.) Gatekeeper assesses
+# every subprocess spawn against that flag — unsigned-and-quarantined
+# helpers like `audio-tap` get SIGABRT'd before they execute their first
+# instruction. The parent `sayzo-agent` survives only because we exec it
+# directly below (LaunchServices / `open` would fail too).
+#
+# On stock unmanaged Macs both calls are no-ops; on managed Macs they're
+# the difference between "audio-tap probe times out" and "agent works".
+# `--sign -` is ad-hoc signing — no Apple Developer account needed; it
+# just attaches a self-signed code directory so dyld + Gatekeeper stop
+# bailing on Apple Silicon's mandatory-signature loader path.
+xattr -cr "$APP_PATH" 2>/dev/null || true
+codesign --force --deep --sign - "$APP_PATH" 2>/dev/null || true
+
 echo "  Installed to ${APP_PATH}"
 
 # Launch the inner binary directly (NOT `open` on the .app bundle) so we

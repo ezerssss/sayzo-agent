@@ -197,9 +197,24 @@ def prompt_audio_capture() -> Optional[bool]:
         return False
     if result.returncode == 0:
         return True
+    # Negative return codes mean the binary was killed by a signal
+    # (subprocess returncode == -signum). On macOS the common one is
+    # `-6` = SIGABRT, which on MDM-managed Macs typically means
+    # Gatekeeper / library-validation aborted an unsigned-and-
+    # quarantined helper before it could execute. Surface stderr too so
+    # the agent.log captures whatever the OS or the binary itself
+    # printed before dying — the difference between "PPPC denied" and
+    # "Gatekeeper killed it" is the difference between a product fix
+    # and a packaging fix.
+    stderr_text = (
+        result.stderr.decode("utf-8", errors="replace")[:500]
+        if result.stderr
+        else ""
+    )
     log.warning(
-        "[mac_permissions] audio-tap exited with code %d (inconclusive)",
+        "[mac_permissions] audio-tap exited with code %d (inconclusive); stderr=%r",
         result.returncode,
+        stderr_text,
     )
     return None
 
