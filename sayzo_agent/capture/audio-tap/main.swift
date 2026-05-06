@@ -32,8 +32,13 @@
 // On permission denied: prints message to stderr and exits with code 77.
 //
 // Compile (macOS 14.4+):
-//   swiftc -O -o audio-tap main.swift \
+//   swiftc -O -target arm64-apple-macos14.4 -o audio-tap main.swift \
 //       -framework CoreAudio -framework AudioToolbox -framework AVFoundation
+//
+// The `-target` pin is load-bearing: without it, swiftc defaults to the
+// host SDK's deployment target (macOS 15+ on current toolchains) and the
+// resulting binary links against Swift runtime libraries that ship only
+// on macOS 15 (libswift_stdio.dylib) — dyld SIGABRTs at spawn on 14.x.
 //
 // Test (global tap):
 //   ./audio-tap | python3 -c 'import sys, struct

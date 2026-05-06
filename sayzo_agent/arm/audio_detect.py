@@ -130,8 +130,9 @@ def _warn_missing_binary_once() -> None:
     log.warning(
         "[arm.audio_detect] audio-detect binary not found on disk. "
         "Build it with: cd sayzo_agent/arm/audio-detect && "
-        "swiftc -O -o audio-detect main.swift -framework CoreAudio "
-        "-framework Foundation. macOS meeting detection will be silent until then."
+        "swiftc -O -target arm64-apple-macos14.4 -o audio-detect main.swift "
+        "-framework CoreAudio -framework Foundation. macOS meeting detection "
+        "will be silent until then."
     )
 
 

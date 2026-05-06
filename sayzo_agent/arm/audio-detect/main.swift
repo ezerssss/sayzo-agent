@@ -34,7 +34,11 @@
 //                              properties
 //
 // Compile (matches the audio-tap recipe):
-//   swiftc -O -o audio-detect main.swift -framework CoreAudio -framework Foundation
+//   swiftc -O -target arm64-apple-macos14.4 -o audio-detect main.swift \
+//       -framework CoreAudio -framework Foundation
+//
+// The `-target` pin is load-bearing — see the same note in
+// sayzo_agent/capture/audio-tap/main.swift.
 //
 // Permissions: NONE. This binary only reads OS state — it never opens an
 // audio stream and never creates a tap. No Microphone, no Audio Capture,

@@ -10,7 +10,7 @@ pushes normalised frames into the same asyncio queue interface that
 The Swift binary must be compiled separately on a Mac::
 
     cd sayzo_agent/capture/audio-tap
-    swiftc -O -o audio-tap main.swift \\
+    swiftc -O -target arm64-apple-macos14.4 -o audio-tap main.swift \\
         -framework CoreAudio -framework AudioToolbox -framework AVFoundation
 
 Binary lookup order:
@@ -117,7 +117,7 @@ def _find_audio_tap() -> str:
     raise FileNotFoundError(
         "audio-tap binary not found.  Compile it on macOS with:\n"
         "  cd sayzo_agent/capture/audio-tap\n"
-        "  swiftc -O -o audio-tap main.swift "
+        "  swiftc -O -target arm64-apple-macos14.4 -o audio-tap main.swift "
         "-framework CoreAudio -framework AudioToolbox "
         "-framework AVFoundation"
     )

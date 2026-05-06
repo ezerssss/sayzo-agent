@@ -94,9 +94,16 @@ jobs:
           npm run build
 
       - name: Compile audio-tap Swift binary
+        # `-target arm64-apple-macos14.4` pins the deployment target to our
+        # documented minimum (CoreAudio Process Taps require macOS 14.4+).
+        # Without this, swiftc inherits the macos-latest runner's SDK
+        # default — currently macOS 15 — and the resulting binary depends
+        # on Swift runtime libraries (e.g. `libswift_stdio.dylib`) that
+        # don't exist on macOS 14, so dyld SIGABRT's at spawn time on any
+        # 14.x user's Mac.
         run: |
           cd sayzo_agent/capture/audio-tap
-          swiftc -O -o audio-tap main.swift \
+          swiftc -O -target arm64-apple-macos14.4 -o audio-tap main.swift \
             -framework CoreAudio \
             -framework AudioToolbox \
             -framework AVFoundation
@@ -106,9 +113,10 @@ jobs:
         # + the responsibility SPI to give the agent per-process mic
         # attribution on macOS — pure read-only, no permissions needed.
         # (See sayzo_agent/arm/audio-detect/main.swift for full rationale.)
+        # Same `-target arm64-apple-macos14.4` pin as audio-tap.
         run: |
           cd sayzo_agent/arm/audio-detect
-          swiftc -O -o audio-detect main.swift \
+          swiftc -O -target arm64-apple-macos14.4 -o audio-detect main.swift \
             -framework CoreAudio \
             -framework Foundation
 
