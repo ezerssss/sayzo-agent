@@ -1,0 +1,58 @@
+name: Check Notarization
+
+# Manual-trigger workflow for poking at Apple's notary service from a
+# macOS runner — useful because:
+#   - `xcrun notarytool` is the only way to query notarization history
+#     and per-submission status, and it's macOS-only (no Linux/Windows
+#     binary). The user's dev machine is Windows, so a runner is the
+#     only path to invoke it.
+#   - Apple has no web dashboard for notarization. You either watch a
+#     `--wait` from a submitting build, or you ask notarytool yourself.
+#
+# Usage:
+#   GitHub → Actions → "Check Notarization" → "Run workflow"
+#     - Leave `submission_id` blank → lists the most recent submissions
+#       (status, created/updated timestamps, name).
+#     - Paste a submission ID (look for `id:` in a build's Notarize step
+#       log) → prints `info` (Accepted / In Progress / Invalid) plus
+#       the full `log` JSON, which contains the per-issue list when a
+#       submission was rejected.
+
+on:
+  workflow_dispatch:
+    inputs:
+      submission_id:
+        description: "Submission ID (optional). Leave blank to list recent submissions."
+        required: false
+        default: ""
+
+jobs:
+  check:
+    runs-on: macos-latest
+    steps:
+      - name: Query notarytool
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          SUBMISSION_ID: ${{ github.event.inputs.submission_id }}
+        run: |
+          if [ -z "$SUBMISSION_ID" ]; then
+            echo "==> Recent submissions (last 10):"
+            xcrun notarytool history \
+              --apple-id "$APPLE_ID" \
+              --team-id "$APPLE_TEAM_ID" \
+              --password "$APPLE_APP_PASSWORD"
+          else
+            echo "==> Submission $SUBMISSION_ID — info:"
+            xcrun notarytool info "$SUBMISSION_ID" \
+              --apple-id "$APPLE_ID" \
+              --team-id "$APPLE_TEAM_ID" \
+              --password "$APPLE_APP_PASSWORD"
+            echo ""
+            echo "==> Submission $SUBMISSION_ID — full log (issues array if rejected):"
+            xcrun notarytool log "$SUBMISSION_ID" \
+              --apple-id "$APPLE_ID" \
+              --team-id "$APPLE_TEAM_ID" \
+              --password "$APPLE_APP_PASSWORD"
+          fi
