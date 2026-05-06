@@ -50,9 +50,14 @@ jobs:
               --team-id "$APPLE_TEAM_ID" \
               --password "$APPLE_APP_PASSWORD"
             echo ""
-            echo "==> Submission $SUBMISSION_ID — full log (issues array if rejected):"
+            echo "==> Submission $SUBMISSION_ID — full log (only generated once status is Accepted/Invalid/Rejected):"
+            # Don't fail the step when the log isn't yet generated — that's
+            # the expected case for an In Progress submission, not an error.
+            # `notarytool log` returns exit 69 in that case; swallow it so a
+            # mid-flight status check still shows green.
             xcrun notarytool log "$SUBMISSION_ID" \
               --apple-id "$APPLE_ID" \
               --team-id "$APPLE_TEAM_ID" \
-              --password "$APPLE_APP_PASSWORD"
+              --password "$APPLE_APP_PASSWORD" \
+              || echo "(log not yet available — submission likely still In Progress)"
           fi
