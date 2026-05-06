@@ -1,21 +1,25 @@
-"""macOS bundle self-heal for DMG-drag-and-drop installs on managed Macs.
+"""macOS bundle self-heal for DMG-drag-and-drop installs.
 
-PyInstaller's macOS bundler ad-hoc-signs entries it puts in ``binaries``
-but NOT files it adds via ``datas``. The Swift helpers ``audio-tap`` and
-``audio-detect`` ship via ``datas`` and arrive on the user's Mac unsigned.
-On Apple Silicon the dyld loader requires *some* signature to load any
-Mach-O, and on MDM-managed Macs (Rippling / Jamf / Intune / etc.)
-Gatekeeper SIGABRTs an unsigned-and-quarantined helper at subprocess
-spawn time — before the helper executes its first instruction, so it
-never reaches its ``AudioHardwareCreateProcessTap`` call and the user
-gets stuck on the Audio Capture step of onboarding with no TCC prompt.
+Production builds are Developer-ID-signed in CI with ``codesign --deep``,
+which recursively signs every Mach-O inside the bundle — including the
+Swift helpers ``audio-tap`` and ``audio-detect`` that PyInstaller adds
+via ``datas`` (those entries used to arrive unsigned, since PyInstaller
+only ad-hoc-signs ``binaries``-class entries). The DMG is then
+notarized and stapled. On a properly-built release this module's
+``codesign`` step finds each helper already validly signed and skips —
+the only work it does is the ``xattr -cr`` quarantine strip below,
+which is harmless and useful on managed Macs (Rippling / Jamf / Intune)
+where Gatekeeper assesses the quarantine flag on every subprocess
+spawn.
 
-The terminal one-liner installer (``installer/install.sh``) handles this
-at install time. Users who instead drag the .app out of the DMG in
-Finder bypass that script entirely; we self-heal at parent startup so
-both install paths reach the same working state. The parent already has
-TCC clearance and write access to its own bundle by the time this runs,
-so no privilege escalation is required.
+The ad-hoc ``codesign --sign -`` fallback is retained for unsigned dev
+builds run locally (``pyinstaller sayzo-agent.spec`` without the CI
+signing step). On those, the Swift helpers arrive unsigned and would
+SIGABRT under Apple Silicon's mandatory-signature loader. We re-sign
+ad-hoc ONLY when the existing signature is missing or invalid — never
+on a Developer-ID-signed helper, since replacing a valid signature
+with an ad-hoc one would break the parent bundle's notarization
+assessment.
 
 Best-effort: every failure is logged but never blocks the agent from
 starting. No-op on Linux / Windows and on dev (non-frozen) runs.
@@ -92,17 +96,48 @@ def heal_bundle() -> None:
     except Exception:
         log.warning("[mac_heal] xattr -cr failed", exc_info=True)
 
-    # 2. Ad-hoc sign the Swift helpers individually. We deliberately do
-    #    NOT --deep sign the whole bundle: the parent agent is already
-    #    running, and replacing its on-disk signature mid-execution can
-    #    surprise hardened-runtime / library-validation checks on macOS
-    #    versions that enforce them. Targeting just the two known
-    #    PyInstaller-data helpers gets the user unstuck without that risk.
+    # 2. Ad-hoc sign the Swift helpers individually IF they aren't
+    #    already validly signed. On a Developer-ID-signed + notarized
+    #    production build, ``codesign --deep`` in CI has already signed
+    #    these helpers, so ``codesign --verify`` succeeds and we skip
+    #    the ad-hoc resign. Re-signing a Developer-ID-signed binary
+    #    with ``--sign -`` would replace the notarization-assessable
+    #    signature with an ad-hoc one and break Gatekeeper acceptance
+    #    of the bundle.
+    #
+    #    For unsigned dev builds (no CI signing), the verify call
+    #    fails and we fall through to the ad-hoc sign path so the
+    #    helpers can spawn under Apple Silicon's mandatory-signature
+    #    loader.
+    #
+    #    We deliberately do NOT --deep sign the whole bundle either:
+    #    the parent agent is already running, and replacing its on-disk
+    #    signature mid-execution can surprise hardened-runtime /
+    #    library-validation checks on macOS versions that enforce them.
     for rel in _HELPER_RELATIVE_PATHS:
         helper = bundle / rel
         if not helper.exists():
             log.info("[mac_heal] %s missing, skipping", rel)
             continue
+        try:
+            verify = subprocess.run(
+                ["codesign", "--verify", "--strict", str(helper)],
+                capture_output=True,
+                timeout=_SUBPROCESS_TIMEOUT_SECS,
+            )
+            if verify.returncode == 0:
+                log.info(
+                    "[mac_heal] codesign %s already valid, skipping resign",
+                    helper.name,
+                )
+                continue
+        except Exception:
+            log.warning(
+                "[mac_heal] codesign --verify %s failed; will attempt ad-hoc resign",
+                helper.name,
+                exc_info=True,
+            )
+
         try:
             result = subprocess.run(
                 ["codesign", "--force", "--sign", "-", str(helper)],
@@ -117,7 +152,7 @@ def heal_bundle() -> None:
                     result.stderr.decode("utf-8", errors="replace")[:200],
                 )
             else:
-                log.info("[mac_heal] codesign %s ok", helper.name)
+                log.info("[mac_heal] codesign %s ok (ad-hoc)", helper.name)
         except Exception:
             log.warning(
                 "[mac_heal] codesign %s failed", helper.name, exc_info=True

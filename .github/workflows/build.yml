@@ -142,6 +142,44 @@ jobs:
       - name: Build with PyInstaller
         run: pyinstaller sayzo-agent.spec
 
+      - name: Import signing certificate
+        # GitHub-hosted macOS runners ship without our Developer ID cert.
+        # We decode the .p12 from a base64 secret into an ephemeral keychain
+        # so the codesign step below can find the identity. The keychain
+        # dies with the runner, so no cleanup needed.
+        if: env.APPLE_CERT_P12_BASE64 != ''
+        env:
+          APPLE_CERT_P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          APPLE_CERT_P12_PASSWORD: ${{ secrets.APPLE_CERT_P12_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
+          KEYCHAIN_PASSWORD=$(uuidgen)
+          CERT_PATH="$RUNNER_TEMP/cert.p12"
+
+          echo "$APPLE_CERT_P12_BASE64" | base64 --decode > "$CERT_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          security import "$CERT_PATH" \
+            -P "$APPLE_CERT_P12_PASSWORD" \
+            -A -t cert -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+
+          # Required since macOS 10.12 — without this, codesign blocks on
+          # a GUI keychain-access prompt that no one can answer on a CI
+          # runner, and the job hangs until timeout.
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Append our keychain to the user search list so codesign finds
+          # the identity (login keychain stays first; ours is added after).
+          security list-keychain -d user -s "$KEYCHAIN_PATH" $(security list-keychain -d user | tr -d '"')
+
+          rm -f "$CERT_PATH"
+
       - name: Sign app bundle
         if: env.APPLE_DEVELOPER_ID != ''
         env:

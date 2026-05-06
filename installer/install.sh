@@ -56,48 +56,27 @@ else
 fi
 hdiutil detach "/Volumes/${APP_NAME}" -quiet
 
-# Strip quarantine + ad-hoc sign every Mach-O inside the bundle. Files
-# copied from a mounted DMG inherit `com.apple.quarantine`, and on
-# MDM-managed Macs (Rippling / Jamf / Intune / etc.) Gatekeeper assesses
-# every subprocess spawn against that flag — unsigned-and-quarantined
-# helpers like `audio-tap` get SIGABRT'd before they execute their first
-# instruction. The parent `sayzo-agent` survives only because we exec it
-# directly below (LaunchServices / `open` would fail too).
-#
-# On stock unmanaged Macs both calls are no-ops; on managed Macs they're
-# the difference between "audio-tap probe times out" and "agent works".
-# `--sign -` is ad-hoc signing — no Apple Developer account needed; it
-# just attaches a self-signed code directory so dyld + Gatekeeper stop
-# bailing on Apple Silicon's mandatory-signature loader path.
+# Strip com.apple.quarantine recursively. Files copied from a mounted DMG
+# inherit this xattr, and even though the DMG itself ships with a stapled
+# Apple notarization ticket (Gatekeeper accepts it), removing the flag
+# suppresses the standard Finder "downloaded from the internet, are you
+# sure you want to open it?" dialog on first launch. No-op when already
+# clean.
 xattr -cr "$APP_PATH" 2>/dev/null || true
-codesign --force --deep --sign - "$APP_PATH" 2>/dev/null || true
 
 echo "  Installed to ${APP_PATH}"
 
-# Launch the inner binary directly (NOT `open` on the .app bundle) so we
-# bypass Gatekeeper's notarization check. Without an Apple notarization
-# stamp, `spctl` rejects the .app and `open` silently refuses to launch —
-# no dialog, no error, the app just doesn't start. Invoking the Mach-O
-# binary directly from the shell skips LaunchServices and therefore skips
-# Gatekeeper. The launchd LaunchAgent we register during first-run uses the
-# same path, so subsequent auto-starts on login also bypass Gatekeeper.
-#
-# Trade-off: double-clicking the .app from Finder will still be blocked
-# until the release is properly notarized. Users should interact via the
-# tray/menu bar icon for day-to-day control, not by re-opening the .app.
-#
-# Detach so the shell can return — `nohup … &` + `disown` keeps the agent
-# running after this script exits.
-SAYZO_BIN="${APP_PATH}/Contents/MacOS/sayzo-agent"
-if [ -x "$SAYZO_BIN" ]; then
-    echo ""
-    echo "  Opening Sayzo..."
-    nohup "$SAYZO_BIN" service --force-setup >/tmp/sayzo-agent-bootstrap.log 2>&1 &
-    disown
-else
-    echo "  Warning: could not find $SAYZO_BIN" >&2
+# Launch via LaunchServices. The bundle is Developer-ID-signed and
+# Apple-notarized in CI (see .github/workflows/build.yml — the
+# codesign / notarytool / stapler steps), so spctl accepts it and `open`
+# launches the .app cleanly. The earlier "spawn the inner Mach-O directly
+# to bypass spctl" hack is gone with notarization.
+echo ""
+echo "  Opening Sayzo..."
+open "$APP_PATH" --args service --force-setup || {
+    echo "  Warning: 'open' failed to launch Sayzo." >&2
     echo "  Try opening Sayzo from Applications manually." >&2
-fi
+}
 
 echo ""
 echo "  Done! Complete setup in the window that appears."

@@ -726,8 +726,11 @@ def diagnose_notifications() -> None:
         "is set (NOT 'None'); Focus mode is off; toggle Allow off+on.\n"
         "  • Windows: Settings → System → Notifications → Sayzo is on; "
         "Focus assist is off.\n"
-        "  • In agent.log, look for `[notify] bundle is_signed=False` "
-        "(macOS) or `[notify] backend init failed`.\n"
+        "  • In agent.log, look for `[notify] backend init failed`. On "
+        "macOS, a shipped release should log `is_signed=True`; "
+        "`is_signed=False` on a release build means TCC has a stale "
+        "entry from a prior unsigned/ad-hoc build — toggle Sayzo off "
+        "and on in System Settings → Notifications to refresh it.\n"
     )
 
 
@@ -1033,12 +1036,15 @@ def service(force_setup: bool) -> None:
     from . import __version__
     log.warning("sayzo-agent service starting v%s (pid=%d)", __version__, os.getpid())
 
-    # macOS bundle self-heal: strip quarantine + ad-hoc-sign Swift
-    # helpers so DMG-drag-and-drop installs work on MDM-managed Macs
-    # (Rippling/Jamf/Intune) where Gatekeeper SIGABRTs unsigned-and-
-    # quarantined helpers at subprocess spawn time. No-op on Linux /
-    # Windows, on dev (non-frozen) runs, and on already-healed bundles.
-    # Must run before the first-run gate, which spawns audio-tap.
+    # macOS bundle self-heal: strip the com.apple.quarantine xattr and,
+    # for unsigned dev builds only, ad-hoc-sign the Swift helpers so
+    # they can spawn under Apple Silicon's mandatory-signature loader.
+    # Production builds are Developer-ID-signed by `codesign --deep`
+    # in CI; the heal step verifies each helper and skips the ad-hoc
+    # resign when the existing signature is valid (replacing a
+    # Developer-ID sig with ad-hoc would break notarization). No-op on
+    # Linux / Windows and on dev (non-frozen) runs. Must run before the
+    # first-run gate, which spawns audio-tap.
     if sys.platform == "darwin":
         from .macos_bundle_heal import heal_bundle
         heal_bundle()

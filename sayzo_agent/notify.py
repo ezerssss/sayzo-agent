@@ -324,9 +324,12 @@ class DesktopNotifier:
 
         # macOS-only: log NSBundle identity + codesign verdict so a
         # user's agent.log immediately tells us whether UNN is going to
-        # accept anything we send. ``is_signed=False`` is the single
-        # most common silent-failure mode (re-signed build vs. cached
-        # TCC entry, dev run from python.org Python with no bundle, etc).
+        # accept anything we send. On a production release this should
+        # always read ``is_signed=True`` (CI signs + notarizes). Seeing
+        # ``is_signed=False`` here on a shipped build means something
+        # mangled the signature post-install — typically a manager-Mac
+        # quarantine policy or a stale TCC entry from a prior unsigned
+        # build; on a dev source-run it just means no signing happened.
         if sys.platform == "darwin" and not self._init_failed:
             try:
                 self._bundle_info = _capture_macos_bundle_info()
@@ -433,11 +436,15 @@ class DesktopNotifier:
 
         On **macOS** this dispatches to a modal dialog (``osascript
         display dialog`` via :mod:`sayzo_agent.consent_modal`) rather
-        than a notification. Notifications on macOS go to Notification
-        Center and are silently suppressed when Banner Style is
-        ``None`` or Focus mode is on — too unreliable for decisions
-        the user must see. Modals always appear, work without bundle
-        signing, and don't depend on any OS notification preference.
+        than a notification — for **visibility**. macOS notifications
+        get silently suppressed under Banner Style: None or Focus
+        mode (they land in Notification Center where the user has to
+        click the menu-bar clock to find them); a consent prompt that
+        the user might not see is worse than no prompt at all. Modals
+        are a window, not a notification, so Banner Style + Focus
+        don't apply — and as a side benefit they're independent of
+        bundle signing / notification permissions, which keeps dev
+        builds working too.
 
         On **Windows** we keep using the notification path — WinRT
         toasts with action buttons are reliable enough that a modal
@@ -849,16 +856,20 @@ def make_notifier(app_name: str = APP_AUMID) -> Notifier:
     On macOS, ``UNUserNotificationCenter`` (the only backend
     ``desktop-notifier`` ships) silently drops every notification when
     the host bundle is unsigned. We can't fix that from Python — it's
-    the OS notification daemon refusing to render. As a stop-gap we
-    detect the unsigned-bundle case and route through
-    :class:`MacUnsignedNotifier`, which uses the older
-    ``NSUserNotification`` API (deprecated since macOS 11 but still
-    functional and signing-lax through macOS 15).
+    the OS notification daemon refusing to render.
 
-    The proper fix is to sign + notarise: populate ``APPLE_DEVELOPER_ID``
-    + the notarytool secrets in CI and the existing pipeline takes
-    over. This factory then naturally falls through to the modern
-    ``DesktopNotifier`` with no further code change.
+    Production releases are Developer-ID-signed + Apple-notarized in CI
+    (see ``.github/workflows/build.yml``), so ``is_signed_bundle()``
+    returns True and we go through ``DesktopNotifier`` /
+    ``UNUserNotificationCenter`` — the modern, supported path.
+
+    For unsigned dev builds (running from source, or a local PyInstaller
+    build that skipped CI signing), we detect the unsigned-bundle case
+    and route through :class:`MacUnsignedNotifier`, which uses the older
+    ``NSUserNotification`` API (deprecated since macOS 11 but still
+    functional and signing-lax through macOS 15). This keeps dev
+    workflows visible without requiring an Apple Developer account
+    locally.
     """
     if sys.platform == "darwin":
         try:
@@ -879,7 +890,8 @@ def make_notifier(app_name: str = APP_AUMID) -> Notifier:
                     "[notify] Bundle is UNSIGNED — UNUserNotificationCenter "
                     "would silently drop every toast. Falling back to "
                     "NSUserNotification (deprecated but functional). "
-                    "Sign + notarise the .app to use the modern backend."
+                    "This path is for dev builds only; production releases "
+                    "are signed + notarized in CI."
                 )
                 from .notify_mac_unsigned import MacUnsignedNotifier
 

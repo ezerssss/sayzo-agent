@@ -1,4 +1,4 @@
-"""NSUserNotification-based notifier for unsigned macOS bundles.
+"""NSUserNotification-based notifier for unsigned macOS bundles (dev fallback).
 
 Why this exists
 ---------------
@@ -16,18 +16,26 @@ the ``Info.plist`` carries a ``CFBundleIdentifier``. Ours does
 (``com.sayzo.agent`` set in ``sayzo-agent.spec``), so we can route
 toasts through this older API and they actually appear.
 
-This is a stop-gap. The proper fix is signing + notarisation: populate
-``APPLE_DEVELOPER_ID`` and the notarytool secrets in CI and the
-existing build pipeline (``.github/workflows/build.yml``) takes care
-of the rest. With a signed bundle, ``DesktopNotifier`` in
-``notify.py`` Just Works and this module is no-op'd.
+When this module gets used (and when it doesn't)
+------------------------------------------------
+
+Production releases are Developer-ID-signed and Apple-notarized in CI
+(see ``.github/workflows/build.yml``), so ``is_signed_bundle()`` returns
+True and ``notify.make_notifier`` falls through to the modern
+``DesktopNotifier`` / ``UNUserNotificationCenter`` path — this module
+is dead code on shipped builds. It's exercised when a developer runs
+the agent from source, or builds a local PyInstaller bundle without
+the CI signing steps. Keeping it lets dev workflows still get visible
+toasts without forcing every contributor to set up an Apple Developer
+account.
 
 Trade-offs
 ----------
 
 * **Deprecation risk** — Apple has telegraphed ``NSUserNotification``
   removal for years; macOS 15 still has it. A future macOS may drop it.
-  Sign sooner rather than later.
+  Production builds avoid this risk entirely by going through the
+  modern ``UNUserNotificationCenter`` backend.
 * **One button on consent toasts** — only the action button renders
   reliably across Banner / Alert styles. ``ask_consent`` therefore
   shows a single "Yes" button; user dismiss / banner timeout / Other
