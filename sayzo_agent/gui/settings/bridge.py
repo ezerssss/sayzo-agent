@@ -517,15 +517,23 @@ class Bridge:
             return {"granted": None}
 
         if key == "mic":
-            mic_result = mac_permissions.prompt_microphone()
+            result = mac_permissions.prompt_microphone()
             return {
-                "granted": mic_result.granted,
-                "stale_tcc_likely": mic_result.stale_tcc_likely,
+                "granted": result.granted,
+                "stale_tcc_likely": result.stale_tcc_likely,
             }
         if key == "audio_capture":
-            return {"granted": mac_permissions.prompt_audio_capture()}
+            result = mac_permissions.prompt_audio_capture()
+            return {
+                "granted": result.granted,
+                "stale_tcc_likely": result.stale_tcc_likely,
+            }
         if key == "notifications":
-            return {"granted": mac_permissions.prompt_notifications()}
+            result = mac_permissions.prompt_notifications()
+            return {
+                "granted": result.granted,
+                "stale_tcc_likely": result.stale_tcc_likely,
+            }
         return {"granted": None}
 
     def open_permission_settings(self, key: str) -> dict[str, bool]:

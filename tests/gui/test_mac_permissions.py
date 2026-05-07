@@ -503,25 +503,61 @@ def test_prompt_audio_capture_returns_true_on_success_line():
     patches = _patch_for_audio_tap(fake)
     _enter_all(patches)
     try:
-        assert mac_permissions.prompt_audio_capture() is True
+        result = mac_permissions.prompt_audio_capture()
+        assert result.granted is True
+        assert result.stale_tcc_likely is False
         assert fake._terminated  # Helper SIGTERM'd the still-running binary.
     finally:
         _exit_all(patches)
 
 
 def test_prompt_audio_capture_returns_false_on_exit_77():
-    """Denied path: stderr emits the 'AudioHardwareCreateProcessTap failed'
-    line and the binary exits with 77. We confirm via exit code."""
+    """Denied path with a real human click delay: stderr emits the
+    'AudioHardwareCreateProcessTap failed' line and the binary exits with
+    77 after the user clicks Don't Allow. The helper returns False with
+    stale_tcc_likely=False since the elapsed time exceeds the threshold —
+    a real click can't happen sub-500 ms.
+    """
     fake = _FakeAudioTapProc(
         stderr_lines=[
             "audio-tap: AudioHardwareCreateProcessTap failed (OSStatus -1719).\n",
         ],
         exit_code=77,
+        # Hold the dialog open past the 500 ms stale-TCC threshold.
+        line_delay_secs=0.6,
     )
     patches = _patch_for_audio_tap(fake)
     _enter_all(patches)
     try:
-        assert mac_permissions.prompt_audio_capture() is False
+        result = mac_permissions.prompt_audio_capture()
+        assert result.granted is False
+        assert result.stale_tcc_likely is False
+    finally:
+        _exit_all(patches)
+
+
+def test_prompt_audio_capture_flags_stale_tcc_on_fast_silent_deny():
+    """Stale-TCC fingerprint: pre-v2.6.0 ad-hoc-signed audio-tap left
+    a TCC entry whose code-requirement no longer matches the current
+    Developer-ID-signed binary. macOS silently denies without ever
+    presenting a dialog, so the binary exits 77 in milliseconds. The
+    helper flags stale_tcc_likely so the GUI can show the targeted
+    "remove from System Settings → Audio Capture, then retry" copy
+    instead of the misleading "open Settings, turn it on" message.
+    """
+    fake = _FakeAudioTapProc(
+        stderr_lines=[
+            "audio-tap: AudioHardwareCreateProcessTap failed (OSStatus -1719).\n",
+        ],
+        exit_code=77,
+        line_delay_secs=0.0,  # Instant deny — no dialog.
+    )
+    patches = _patch_for_audio_tap(fake)
+    _enter_all(patches)
+    try:
+        result = mac_permissions.prompt_audio_capture()
+        assert result.granted is False
+        assert result.stale_tcc_likely is True
     finally:
         _exit_all(patches)
 
@@ -542,7 +578,9 @@ def test_prompt_audio_capture_returns_none_when_dialog_times_out():
             "sayzo_agent.gui.setup.mac_permissions._TCC_REQUEST_TIMEOUT_SECS",
             0.05,
         ):
-            assert mac_permissions.prompt_audio_capture() is None
+            result = mac_permissions.prompt_audio_capture()
+            assert result.granted is None
+            assert result.stale_tcc_likely is False
         assert fake._terminated
     finally:
         _exit_all(patches)
@@ -560,7 +598,9 @@ def test_prompt_audio_capture_returns_none_on_unexpected_exit():
     patches = _patch_for_audio_tap(fake)
     _enter_all(patches)
     try:
-        assert mac_permissions.prompt_audio_capture() is None
+        result = mac_permissions.prompt_audio_capture()
+        assert result.granted is None
+        assert result.stale_tcc_likely is False
     finally:
         _exit_all(patches)
 
@@ -572,21 +612,27 @@ def test_prompt_audio_capture_returns_none_when_binary_missing():
         "sayzo_agent.capture.system_mac._find_audio_tap",
         side_effect=FileNotFoundError("no binary"),
     ):
-        assert mac_permissions.prompt_audio_capture() is None
+        result = mac_permissions.prompt_audio_capture()
+        assert result.granted is None
+        assert result.stale_tcc_likely is False
 
 
 def test_prompt_audio_capture_returns_none_on_spawn_failure():
     patches = _patch_for_audio_tap(OSError("permission denied"))
     _enter_all(patches)
     try:
-        assert mac_permissions.prompt_audio_capture() is None
+        result = mac_permissions.prompt_audio_capture()
+        assert result.granted is None
+        assert result.stale_tcc_likely is False
     finally:
         _exit_all(patches)
 
 
 def test_prompt_audio_capture_returns_none_on_non_darwin():
     with patch("sayzo_agent.gui.setup.mac_permissions.sys.platform", "win32"):
-        assert mac_permissions.prompt_audio_capture() is None
+        result = mac_permissions.prompt_audio_capture()
+        assert result.granted is None
+        assert result.stale_tcc_likely is False
 
 
 # ---------------------------------------------------------------------------
@@ -610,24 +656,59 @@ def _patch_notifier(authorise_return: bool | Exception):
 def test_prompt_notifications_returns_true_when_granted():
     sys_modules_patch, _ = _patch_notifier(True)
     with patch("sayzo_agent.gui.setup.mac_permissions.sys.platform", "darwin"), sys_modules_patch:
-        assert mac_permissions.prompt_notifications() is True
+        result = mac_permissions.prompt_notifications()
+        assert result.granted is True
+        assert result.stale_tcc_likely is False
 
 
-def test_prompt_notifications_returns_false_when_denied():
+def test_prompt_notifications_returns_false_when_denied_slowly():
+    """Real human-click denial: stale_tcc_likely stays False because the
+    elapsed time exceeds the 500 ms threshold."""
+    fake = MagicMock()
+
+    def _slow_deny():
+        import time as _t
+        _t.sleep(0.6)
+        return False
+
+    fake.request_authorisation.side_effect = _slow_deny
+    module = SimpleNamespace(DesktopNotifierSync=MagicMock(return_value=fake))
+    with patch(
+        "sayzo_agent.gui.setup.mac_permissions.sys.platform", "darwin"
+    ), patch.dict("sys.modules", {"desktop_notifier.sync": module}):
+        result = mac_permissions.prompt_notifications()
+        assert result.granted is False
+        assert result.stale_tcc_likely is False
+
+
+def test_prompt_notifications_flags_stale_tcc_on_fast_silent_deny():
+    """Stale UNN entry from a previous Sayzo install with a different
+    signing identity silently denies without UI. request_authorisation
+    returns False instantly. The helper flags stale_tcc_likely so the
+    bridge payload exposes it (the React Notifications screen still falls
+    back to the existing waiting-state polling, since the System Settings
+    Notifications toggle DOES re-record under the new CR — but the flag
+    is plumbed through for diagnostics + future refinement)."""
     sys_modules_patch, _ = _patch_notifier(False)
     with patch("sayzo_agent.gui.setup.mac_permissions.sys.platform", "darwin"), sys_modules_patch:
-        assert mac_permissions.prompt_notifications() is False
+        result = mac_permissions.prompt_notifications()
+        assert result.granted is False
+        assert result.stale_tcc_likely is True
 
 
 def test_prompt_notifications_returns_none_on_backend_error():
     sys_modules_patch, _ = _patch_notifier(RuntimeError("boom"))
     with patch("sayzo_agent.gui.setup.mac_permissions.sys.platform", "darwin"), sys_modules_patch:
-        assert mac_permissions.prompt_notifications() is None
+        result = mac_permissions.prompt_notifications()
+        assert result.granted is None
+        assert result.stale_tcc_likely is False
 
 
 def test_prompt_notifications_returns_none_on_non_darwin():
     with patch("sayzo_agent.gui.setup.mac_permissions.sys.platform", "win32"):
-        assert mac_permissions.prompt_notifications() is None
+        result = mac_permissions.prompt_notifications()
+        assert result.granted is None
+        assert result.stale_tcc_likely is False
 
 
 def test_prompt_notifications_returns_none_when_init_fails():
@@ -638,7 +719,9 @@ def test_prompt_notifications_returns_none_when_init_fails():
     with patch(
         "sayzo_agent.gui.setup.mac_permissions.sys.platform", "darwin"
     ), patch.dict("sys.modules", {"desktop_notifier.sync": module}):
-        assert mac_permissions.prompt_notifications() is None
+        result = mac_permissions.prompt_notifications()
+        assert result.granted is None
+        assert result.stale_tcc_likely is False
 
 
 # ---------------------------------------------------------------------------

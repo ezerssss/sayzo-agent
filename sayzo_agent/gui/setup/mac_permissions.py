@@ -5,9 +5,9 @@ API on demand so the TCC dialog appears *after* the in-app explanation,
 not during service startup. Most return ``bool | None`` (True=granted,
 False=denied, None=inconclusive) and never raise — failures are logged
 and flattened to ``None`` so the GUI can surface a neutral message
-instead of crashing the bridge. ``prompt_microphone`` returns a richer
-:class:`MicPromptResult` so the GUI can distinguish a true denial from
-a stale-TCC silent-deny.
+instead of crashing the bridge. ``prompt_microphone`` and
+``prompt_audio_capture`` return a richer :class:`TccPromptResult` so the
+GUI can distinguish a true denial from a stale-TCC silent-deny.
 """
 from __future__ import annotations
 
@@ -58,8 +58,8 @@ _AV_AUTH_AUTHORIZED = 3
 _STALE_TCC_THRESHOLD_SECS = 0.5
 
 
-class MicPromptResult(NamedTuple):
-    """Outcome of :func:`prompt_microphone`.
+class TccPromptResult(NamedTuple):
+    """Outcome of :func:`prompt_microphone` and :func:`prompt_audio_capture`.
 
     ``granted`` is the bool/None tri-state every other ``prompt_*`` helper
     returns. ``stale_tcc_likely`` is True when the heuristic fingerprints a
@@ -67,10 +67,20 @@ class MicPromptResult(NamedTuple):
     message for the targeted "remove from System Settings, then retry"
     recovery steps. False on every other outcome (including legitimate
     denials, timeouts, and granted).
+
+    Both Microphone (AVFoundation) and Audio Capture (CoreAudio Process
+    Taps via the Swift audio-tap helper) can hit the same root cause: a
+    TCC entry from a pre-v2.6.0 ad-hoc-signed Sayzo install whose code
+    requirement no longer matches the current Developer-ID-signed bundle.
     """
 
     granted: Optional[bool]
     stale_tcc_likely: bool
+
+
+# Backward-compat alias — earlier this module exposed the type as
+# MicPromptResult before the audio-capture path adopted the same shape.
+MicPromptResult = TccPromptResult
 
 # x-apple.systempreferences URIs for the three Privacy & Security sub-panes
 # we care about. There's no public Audio Capture sub-pane URI, so the tap
@@ -160,7 +170,7 @@ def _get_notifier():
     return _NOTIFIER
 
 
-def prompt_microphone() -> MicPromptResult:
+def prompt_microphone() -> TccPromptResult:
     """Read or trigger the macOS Microphone TCC decision and return the
     actual outcome plus a stale-TCC hint.
 
@@ -189,14 +199,14 @@ def prompt_microphone() -> MicPromptResult:
     silently denying the request without presenting the dialog. The GUI
     surfaces a targeted recovery message for this case.
 
-    Returns a :class:`MicPromptResult`:
+    Returns a :class:`TccPromptResult`:
         granted=True   — authorized
         granted=False  — denied / restricted / declined in the dialog
         granted=None   — AVFoundation unavailable or dialog timeout
         stale_tcc_likely=True only when the silent-deny pattern fires.
     """
     if sys.platform != "darwin":
-        return MicPromptResult(granted=None, stale_tcc_likely=False)
+        return TccPromptResult(granted=None, stale_tcc_likely=False)
 
     try:
         # AVFoundation framework binding from pyobjc-framework-AVFoundation.
@@ -212,7 +222,7 @@ def prompt_microphone() -> MicPromptResult:
             "[mac_permissions] AVFoundation import failed — cannot read mic TCC",
             exc_info=True,
         )
-        return MicPromptResult(granted=None, stale_tcc_likely=False)
+        return TccPromptResult(granted=None, stale_tcc_likely=False)
 
     try:
         status = AVCaptureDevice.authorizationStatusForMediaType_(
@@ -223,7 +233,7 @@ def prompt_microphone() -> MicPromptResult:
             "[mac_permissions] authorizationStatusForMediaType_ raised",
             exc_info=True,
         )
-        return MicPromptResult(granted=None, stale_tcc_likely=False)
+        return TccPromptResult(granted=None, stale_tcc_likely=False)
 
     log.info(
         "[mac_permissions] microphone TCC: status=%r media_type=%r thread=%s",
@@ -234,18 +244,18 @@ def prompt_microphone() -> MicPromptResult:
 
     if status == _AV_AUTH_AUTHORIZED:
         log.info("[mac_permissions] microphone TCC: already authorized")
-        return MicPromptResult(granted=True, stale_tcc_likely=False)
+        return TccPromptResult(granted=True, stale_tcc_likely=False)
     if status == _AV_AUTH_DENIED:
         log.info("[mac_permissions] microphone TCC: previously denied")
-        return MicPromptResult(granted=False, stale_tcc_likely=False)
+        return TccPromptResult(granted=False, stale_tcc_likely=False)
     if status == _AV_AUTH_RESTRICTED:
         log.info("[mac_permissions] microphone TCC: restricted (MDM/parental)")
-        return MicPromptResult(granted=False, stale_tcc_likely=False)
+        return TccPromptResult(granted=False, stale_tcc_likely=False)
     if status != _AV_AUTH_NOT_DETERMINED:
         log.warning(
             "[mac_permissions] microphone TCC: unexpected status=%r", status
         )
-        return MicPromptResult(granted=None, stale_tcc_likely=False)
+        return TccPromptResult(granted=None, stale_tcc_likely=False)
 
     # NotDetermined → fire the dialog from the MAIN thread. AVFoundation's
     # requestAccessForMediaType_completionHandler_ doesn't reliably present
@@ -266,7 +276,7 @@ def prompt_microphone() -> MicPromptResult:
             "[mac_permissions] Foundation import failed — cannot dispatch TCC request",
             exc_info=True,
         )
-        return MicPromptResult(granted=None, stale_tcc_likely=False)
+        return TccPromptResult(granted=None, stale_tcc_likely=False)
 
     log.info(
         "[mac_permissions] microphone TCC: requesting (dispatching to main queue)"
@@ -303,7 +313,7 @@ def prompt_microphone() -> MicPromptResult:
             "[mac_permissions] addOperationWithBlock_ failed — cannot fire dialog",
             exc_info=True,
         )
-        return MicPromptResult(granted=None, stale_tcc_likely=False)
+        return TccPromptResult(granted=None, stale_tcc_likely=False)
 
     if not event.wait(timeout=_TCC_REQUEST_TIMEOUT_SECS):
         log.warning(
@@ -311,7 +321,7 @@ def prompt_microphone() -> MicPromptResult:
             "(no callback fired — likely no dialog actually presented)",
             _TCC_REQUEST_TIMEOUT_SECS,
         )
-        return MicPromptResult(granted=None, stale_tcc_likely=False)
+        return TccPromptResult(granted=None, stale_tcc_likely=False)
 
     elapsed = time.monotonic() - request_started
     result = granted_holder[0]
@@ -330,10 +340,10 @@ def prompt_microphone() -> MicPromptResult:
         elapsed,
         stale_tcc_likely,
     )
-    return MicPromptResult(granted=result, stale_tcc_likely=stale_tcc_likely)
+    return TccPromptResult(granted=result, stale_tcc_likely=stale_tcc_likely)
 
 
-def prompt_audio_capture() -> Optional[bool]:
+def prompt_audio_capture() -> TccPromptResult:
     """Spawn the audio-tap Swift binary and wait for its actual TCC
     decision before returning.
 
@@ -356,21 +366,31 @@ def prompt_audio_capture() -> Optional[bool]:
     flagged ("sometimes even if I haven't clicked yes it cheerfully
     updates the gui that it is accepted").
 
+    Stale-TCC detection: a TCC entry from a pre-v2.6.0 (ad-hoc-signed)
+    audio-tap binary won't match the current Developer-ID-signed binary's
+    code requirement, so the OS silent-denies without presenting UI. The
+    fingerprint is the same as the mic path: a False answer arriving
+    faster than a human read+click. The GUI uses
+    ``stale_tcc_likely=True`` to swap the generic "blocked" copy for the
+    "remove from System Settings, then retry" recovery flow.
+
     Returns:
-        True   — binary printed the success line (TCC granted)
-        False  — binary exited with code 77 (TCC denied)
-        None   — binary missing, spawn failed, or dialog timed out
+        granted=True   — binary printed the success line (TCC granted)
+        granted=False  — binary exited with code 77 (TCC denied)
+        granted=None   — binary missing, spawn failed, or dialog timed out
+        stale_tcc_likely=True only when the silent-deny pattern fires.
     """
     if sys.platform != "darwin":
-        return None
+        return TccPromptResult(granted=None, stale_tcc_likely=False)
     try:
         from sayzo_agent.capture.system_mac import _find_audio_tap
 
         binary = _find_audio_tap()
     except (FileNotFoundError, ImportError) as e:
         log.warning("[mac_permissions] audio-tap not found: %s", e)
-        return None
+        return TccPromptResult(granted=None, stale_tcc_likely=False)
 
+    request_started = time.monotonic()
     try:
         proc = subprocess.Popen(
             [binary],
@@ -383,7 +403,7 @@ def prompt_audio_capture() -> Optional[bool]:
         )
     except OSError as e:
         log.warning("[mac_permissions] audio-tap spawn failed: %s", e)
-        return None
+        return TccPromptResult(granted=None, stale_tcc_likely=False)
 
     log.info(
         "[mac_permissions] audio-tap TCC: probe spawned (pid=%d), waiting for user decision",
@@ -432,14 +452,14 @@ def prompt_audio_capture() -> Optional[bool]:
             _TCC_REQUEST_TIMEOUT_SECS,
         )
         _terminate(proc)
-        return None
+        return TccPromptResult(granted=None, stale_tcc_likely=False)
 
     if granted_holder[0] is True:
         log.info(
             "[mac_permissions] audio-tap TCC: granted (saw success line on stderr)"
         )
         _terminate(proc)
-        return True
+        return TccPromptResult(granted=True, stale_tcc_likely=False)
 
     # Either reader saw the deny needle or stderr hit EOF. Either way the
     # binary is on its way out — wait briefly for the actual exit code.
@@ -450,11 +470,22 @@ def prompt_audio_capture() -> Optional[bool]:
             "[mac_permissions] audio-tap TCC: stderr signaled but process still alive — terminating"
         )
         _terminate(proc)
-        return None
+        return TccPromptResult(granted=None, stale_tcc_likely=False)
 
     if rc == _MAC_EXIT_PERMISSION_DENIED:
-        log.info("[mac_permissions] audio-tap TCC: denied (exit 77)")
-        return False
+        elapsed = time.monotonic() - request_started
+        # Same heuristic as prompt_microphone: a sub-500 ms denial means
+        # no TCC dialog was presented — the OS silently denied because of
+        # a CR mismatch with a stale entry from a previous Sayzo install.
+        stale_tcc_likely = elapsed < _STALE_TCC_THRESHOLD_SECS
+        log.info(
+            "[mac_permissions] audio-tap TCC: denied (exit 77, elapsed=%.3fs, stale_tcc_likely=%s)",
+            elapsed,
+            stale_tcc_likely,
+        )
+        return TccPromptResult(
+            granted=False, stale_tcc_likely=stale_tcc_likely
+        )
 
     # Negative return codes mean the binary was killed by a signal
     # (subprocess returncode == -signum). On MDM-managed Macs the common
@@ -468,7 +499,7 @@ def prompt_audio_capture() -> Optional[bool]:
         rc,
         stderr_tail[-5:],
     )
-    return None
+    return TccPromptResult(granted=None, stale_tcc_likely=False)
 
 
 def _terminate(proc: subprocess.Popen) -> None:
@@ -493,22 +524,40 @@ def _terminate(proc: subprocess.Popen) -> None:
         log.debug("[mac_permissions] proc.kill raised", exc_info=True)
 
 
-def prompt_notifications() -> Optional[bool]:
+def prompt_notifications() -> TccPromptResult:
     """Call ``DesktopNotifierSync.request_authorisation`` — first call on
-    macOS triggers the UNUserNotificationCenter dialog. Returns True on
-    grant, False on deny, None on error."""
+    macOS triggers the UNUserNotificationCenter dialog.
+
+    Stale-TCC detection mirrors the mic + audio-capture paths: a UNN
+    entry from a pre-v2.6.0 (ad-hoc-signed) Sayzo install whose code
+    requirement no longer matches the current bundle silently denies
+    without presenting UI. The same sub-500 ms-False fingerprint applies
+    here. Returns a :class:`TccPromptResult`.
+    """
     if sys.platform != "darwin":
-        return None
+        return TccPromptResult(granted=None, stale_tcc_likely=False)
     notifier = _get_notifier()
     if notifier is None:
-        return None
+        return TccPromptResult(granted=None, stale_tcc_likely=False)
+    request_started = time.monotonic()
     try:
-        return bool(notifier.request_authorisation())
+        granted = bool(notifier.request_authorisation())
     except Exception:
         log.warning(
             "[mac_permissions] request_authorisation failed", exc_info=True
         )
-        return None
+        return TccPromptResult(granted=None, stale_tcc_likely=False)
+    elapsed = time.monotonic() - request_started
+    stale_tcc_likely = (
+        granted is False and elapsed < _STALE_TCC_THRESHOLD_SECS
+    )
+    log.info(
+        "[mac_permissions] notifications TCC: user response → %s (elapsed=%.3fs, stale_tcc_likely=%s)",
+        granted,
+        elapsed,
+        stale_tcc_likely,
+    )
+    return TccPromptResult(granted=granted, stale_tcc_likely=stale_tcc_likely)
 
 
 def is_notification_authorised() -> Optional[bool]:

@@ -10,7 +10,14 @@ interface Props {
   onCancel: () => void;
 }
 
-type State = "idle" | "pending" | "granted" | "denied";
+// "stale_tcc" splits off from "denied" so we can show targeted recovery
+// copy. The generic "blocked, open settings, turn it on" message is
+// actively misleading in the stale-TCC case because System Settings shows
+// the toggle ON — the user has nothing left to flip. Same root cause as
+// the Microphone screen: a TCC entry from a pre-v2.6.0 ad-hoc-signed
+// audio-tap binary whose CR no longer matches the current Developer-ID-
+// signed binary.
+type State = "idle" | "pending" | "granted" | "denied" | "stale_tcc";
 
 export function AudioCapture({ step, onNext, onCancel }: Props) {
   const [state, setState] = useState<State>("idle");
@@ -18,8 +25,17 @@ export function AudioCapture({ step, onNext, onCancel }: Props) {
   async function handleAllow() {
     setState("pending");
     try {
-      const { granted } = await bridge.promptAudioCapturePermission();
-      setState(granted === true ? "granted" : granted === false ? "denied" : "idle");
+      const { granted, stale_tcc_likely } =
+        await bridge.promptAudioCapturePermission();
+      if (granted === true) {
+        setState("granted");
+      } else if (granted === false && stale_tcc_likely) {
+        setState("stale_tcc");
+      } else if (granted === false) {
+        setState("denied");
+      } else {
+        setState("idle");
+      }
     } catch {
       setState("idle");
     }
@@ -44,6 +60,16 @@ export function AudioCapture({ step, onNext, onCancel }: Props) {
             >
               Open Settings
             </Button>
+          ) : state === "stale_tcc" ? (
+            <>
+              <Button
+                variant="secondary"
+                onClick={() => bridge.openAudioCaptureSettings()}
+              >
+                Open Settings
+              </Button>
+              <Button onClick={handleAllow}>Try Again</Button>
+            </>
           ) : (
             <Button onClick={handleAllow} disabled={state === "pending"}>
               {state === "pending" ? "Requesting…" : "Allow"}
@@ -66,6 +92,23 @@ export function AudioCapture({ step, onNext, onCancel }: Props) {
             Looks like macOS blocked system audio. Open System Settings, turn
             it on for Sayzo, then come back.
           </span>
+        </div>
+      )}
+      {state === "stale_tcc" && (
+        <div className="flex items-start gap-2 text-sm text-amber-800">
+          <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
+          <div className="space-y-2">
+            <p className="font-medium">
+              macOS still has a system-audio entry from a previous Sayzo
+              install — that's why you don't see a dialog.
+            </p>
+            <p>
+              Open System Settings → Privacy &amp; Security → Audio Capture,
+              click <span className="font-mono">Sayzo</span> in the list,
+              then click the <span className="font-mono">−</span> button at
+              the bottom to remove it. Come back here and click Try Again.
+            </p>
+          </div>
         </div>
       )}
     </Layout>

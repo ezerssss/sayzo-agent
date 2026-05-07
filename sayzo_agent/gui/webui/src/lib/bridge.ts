@@ -56,18 +56,23 @@ export type PermissionResult = {
   granted: boolean | null;
 };
 
-// Microphone-specific result. The stale_tcc_likely flag is set by
-// mac_permissions.prompt_microphone when it fingerprints a stale TCC
-// entry — a previous Sayzo install (typically pre-v2.6.0 ad-hoc-signed)
-// recorded a permission entry whose code-requirement no longer matches
-// the current Developer-ID-signed bundle, so the new request silently
-// denies without presenting UI. The Microphone screen shows targeted
-// recovery copy in that case (the System Settings toggle being ON makes
-// the generic "blocked" message misleading).
-export type MicPermissionResult = {
+// Permission result that also carries the stale-TCC heuristic flag.
+// stale_tcc_likely is set by the Python helper when it fingerprints a
+// previous-install TCC entry silently denying the request without ever
+// presenting UI. Affects mic, audio capture, and notifications on macOS
+// (all three go through TCC and key entries by signing identity, so all
+// three break when the signing identity changes between installs — as
+// it did at v2.6.0 when we added Developer-ID signing). The on-screen
+// Settings toggle being ON makes the generic "blocked" copy actively
+// misleading in that case, so the screens swap in targeted recovery
+// steps when this flag is true.
+export type TccPermissionResult = {
   granted: boolean | null;
   stale_tcc_likely: boolean;
 };
+
+/** @deprecated Use TccPermissionResult — same shape, generic name. */
+export type MicPermissionResult = TccPermissionResult;
 
 export type HotkeyState = {
   binding: string;
@@ -102,9 +107,9 @@ declare global {
     cancel_login(): Promise<{ cancelled: boolean }>;
 
     // Per-permission prompts (one screen each).
-    prompt_mic_permission(): Promise<MicPermissionResult>;
-    prompt_audio_capture_permission(): Promise<PermissionResult>;
-    prompt_notification_permission(): Promise<PermissionResult>;
+    prompt_mic_permission(): Promise<TccPermissionResult>;
+    prompt_audio_capture_permission(): Promise<TccPermissionResult>;
+    prompt_notification_permission(): Promise<TccPermissionResult>;
     check_notification_permission(): Promise<PermissionResult>;
     send_test_notification(): Promise<{ sent: boolean }>;
 

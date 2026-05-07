@@ -180,26 +180,51 @@ class Bridge:
 
     def prompt_audio_capture_permission(self) -> dict[str, Any]:
         """User clicked Grant on the Audio Capture row. Fires the macOS
-        Audio Capture TCC dialog on first call."""
+        Audio Capture TCC dialog on first call.
+
+        Returns ``{"granted": bool|None, "stale_tcc_likely": bool}`` —
+        same shape as the mic prompt for the same reason: a stale entry
+        from a pre-v2.6.0 install silently denies, so the GUI needs the
+        flag to swap "blocked" copy for "remove from System Settings,
+        then retry" copy.
+        """
         if sys.platform != "darwin":
-            return {"granted": None}
+            return {"granted": None, "stale_tcc_likely": False}
         from sayzo_agent.gui.setup import mac_permissions
 
-        return {"granted": mac_permissions.prompt_audio_capture()}
+        result = mac_permissions.prompt_audio_capture()
+        return {
+            "granted": result.granted,
+            "stale_tcc_likely": result.stale_tcc_likely,
+        }
 
     def prompt_notification_permission(self) -> dict[str, Any]:
         """User clicked Allow on the Notifications row. On macOS, fires the
         UNUserNotificationCenter dialog on first call. On Windows, just
-        returns current toast-authorization status (non-prompting)."""
+        returns current toast-authorization status (non-prompting).
+
+        macOS payload includes ``stale_tcc_likely`` so the Notifications
+        screen can show the same recovery flow when a pre-v2.6.0 UNN
+        entry silent-denies the request. Windows always returns
+        ``stale_tcc_likely=False`` since the failure mode doesn't apply
+        there.
+        """
         if sys.platform == "darwin":
             from sayzo_agent.gui.setup import mac_permissions
 
-            return {"granted": mac_permissions.prompt_notifications()}
+            result = mac_permissions.prompt_notifications()
+            return {
+                "granted": result.granted,
+                "stale_tcc_likely": result.stale_tcc_likely,
+            }
         if sys.platform == "win32":
             from sayzo_agent.gui.setup import win_permissions
 
-            return {"granted": win_permissions.has_notification_permission()}
-        return {"granted": None}
+            return {
+                "granted": win_permissions.has_notification_permission(),
+                "stale_tcc_likely": False,
+            }
+        return {"granted": None, "stale_tcc_likely": False}
 
     def check_notification_permission(self) -> dict[str, Any]:
         """Non-prompting current-state probe. Polled by the Notifications
