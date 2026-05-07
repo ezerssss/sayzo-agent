@@ -13,19 +13,39 @@ import logging
 import subprocess
 import sys
 import threading
-import time
 from typing import Optional
 
 log = logging.getLogger(__name__)
 
 # Mirrors _EXIT_PERMISSION_DENIED in sayzo_agent/capture/system_mac.py.
 _MAC_EXIT_PERMISSION_DENIED = 77
-# Matches the real capture's startup budget — long enough for the tap to
-# pass the permission gate, short enough that a UI click doesn't stall.
-_AUDIO_TAP_PROBE_TIMEOUT_SECS = 1.5
-# Give the mic stream a beat to actually open before tearing it down. On
-# macOS this is also when TCC blocks waiting on the user.
-_MIC_OPEN_SETTLE_SECS = 0.1
+
+# Upper bound on how long we'll block the bridge waiting for the user to
+# answer a TCC dialog. The dialog is system-modal (foreground), so 2 minutes
+# is generous for read-and-click; anything longer almost certainly means the
+# dialog never appeared (signing / bundle config issue) and we should
+# surface "inconclusive" so the GUI can route to the Open-Settings escape.
+_TCC_REQUEST_TIMEOUT_SECS = 120.0
+
+# audio-tap stderr signature emitted from main.swift after
+# AudioHardwareCreateProcessTap and AudioDeviceStart succeed (= TCC granted).
+# If we see this line, the binary is past the TCC gate and capturing.
+_AUDIO_TAP_SUCCESS_NEEDLE = "capturing system audio"
+
+# Substring of audio-tap stderr emitted just before exit(77) on TCC denial.
+# Used as a secondary signal in case exit code is observed via an unusual
+# path (e.g. test harness intercepting wait()).
+_AUDIO_TAP_DENIED_NEEDLE = "AudioHardwareCreateProcessTap failed"
+
+# Hard kill grace after we send SIGTERM during teardown.
+_PROBE_TERMINATE_GRACE_SECS = 2.0
+
+# AVAuthorizationStatus enum (AVFoundation/AVCaptureDevice.h). Stable across
+# macOS releases.
+_AV_AUTH_NOT_DETERMINED = 0
+_AV_AUTH_RESTRICTED = 1
+_AV_AUTH_DENIED = 2
+_AV_AUTH_AUTHORIZED = 3
 
 # x-apple.systempreferences URIs for the three Privacy & Security sub-panes
 # we care about. There's no public Audio Capture sub-pane URI, so the tap
@@ -116,60 +136,144 @@ def _get_notifier():
 
 
 def prompt_microphone() -> Optional[bool]:
-    """Briefly open a sounddevice InputStream to trigger the Microphone TCC
-    dialog on first call. On subsequent calls the OS silently honors the
-    previously-recorded decision (no dialog re-appears).
+    """Read or trigger the macOS Microphone TCC decision and return the
+    actual outcome.
 
-    Returns True on success, False on PortAudioError (explicit deny or the
-    device is otherwise unavailable), None on unexpected failure.
+    Uses ``AVCaptureDevice``'s public TCC API:
+
+    - ``authorizationStatusForMediaType:`` is a sync read of the recorded
+      TCC state — never prompts. If the user has already decided we
+      short-circuit and return without firing a dialog.
+    - ``requestAccessForMediaType:completionHandler:`` only fires the
+      dialog when the recorded status is NotDetermined. The completion
+      handler runs on a background queue when the user clicks; we block
+      this thread on a ``threading.Event`` so the bridge call only returns
+      *after* the user has actually decided.
+
+    Replaces the old "open sounddevice, sleep 0.1s, return True" path,
+    which cheerfully returned ``granted=True`` while the dialog was still
+    on screen — and silently returned ``True`` on a denied bundle because
+    sounddevice opens a "permission denied" stream and reads zeros instead
+    of raising. That bug is what made the v2.6.0 macOS hotkey path record
+    audio_dur > 0 with mic_total = 0.
+
+    Returns:
+        True   — authorized
+        False  — denied / restricted / declined in the dialog
+        None   — AVFoundation unavailable or dialog timeout
     """
     if sys.platform != "darwin":
         return None
-    try:
-        import sounddevice as sd
-    except Exception:
-        log.warning("[mac_permissions] sounddevice import failed", exc_info=True)
-        return None
 
-    stream = None
     try:
-        stream = sd.InputStream(
-            samplerate=16000, channels=1, blocksize=160, dtype="float32"
+        # AVFoundation framework binding from pyobjc-framework-AVFoundation.
+        # Bundled on the build host; on a dev machine without the binding,
+        # we fall back to None so the GUI can still show the Open-Settings
+        # path instead of crashing the bridge.
+        from AVFoundation import (  # type: ignore[import-not-found]
+            AVCaptureDevice,
+            AVMediaTypeAudio,
         )
-        stream.start()
-        # Let the stream fully open so TCC (if it's going to block) has time
-        # to actually surface the dialog before we tear the stream down.
-        time.sleep(_MIC_OPEN_SETTLE_SECS)
-        return True
-    except sd.PortAudioError:
+    except Exception:
         log.warning(
-            "[mac_permissions] mic stream open failed (likely denied)",
+            "[mac_permissions] AVFoundation import failed — cannot read mic TCC",
             exc_info=True,
         )
-        return False
+        return None
+
+    try:
+        status = AVCaptureDevice.authorizationStatusForMediaType_(
+            AVMediaTypeAudio
+        )
     except Exception:
         log.warning(
-            "[mac_permissions] mic probe unexpected failure", exc_info=True
+            "[mac_permissions] authorizationStatusForMediaType_ raised",
+            exc_info=True,
         )
         return None
-    finally:
-        if stream is not None:
-            try:
-                stream.stop()
-                stream.close()
-            except Exception:
-                pass
+
+    if status == _AV_AUTH_AUTHORIZED:
+        log.info("[mac_permissions] microphone TCC: already authorized")
+        return True
+    if status == _AV_AUTH_DENIED:
+        log.info("[mac_permissions] microphone TCC: previously denied")
+        return False
+    if status == _AV_AUTH_RESTRICTED:
+        log.info("[mac_permissions] microphone TCC: restricted (MDM/parental)")
+        return False
+    if status != _AV_AUTH_NOT_DETERMINED:
+        log.warning(
+            "[mac_permissions] microphone TCC: unexpected status=%r", status
+        )
+        return None
+
+    # NotDetermined → fire the dialog and block on the user's response. The
+    # bridge call runs on pywebview's worker thread, so blocking here is
+    # exactly what we want — the React screen sits in "Requesting…" state
+    # until the user has actually clicked.
+    log.info("[mac_permissions] microphone TCC: requesting (firing dialog)")
+    event = threading.Event()
+    granted_holder: list[Optional[bool]] = [None]
+
+    def completion(granted) -> None:
+        # Always set the event, even if the bool coercion blows up. The
+        # main thread must not sit on Event.wait() forever.
+        try:
+            granted_holder[0] = bool(granted)
+        finally:
+            event.set()
+
+    try:
+        AVCaptureDevice.requestAccessForMediaType_completionHandler_(
+            AVMediaTypeAudio, completion
+        )
+    except Exception:
+        log.warning(
+            "[mac_permissions] requestAccessForMediaType_completionHandler_ raised",
+            exc_info=True,
+        )
+        return None
+
+    if not event.wait(timeout=_TCC_REQUEST_TIMEOUT_SECS):
+        log.warning(
+            "[mac_permissions] microphone TCC: dialog timed out after %.0fs "
+            "(no callback fired — likely no dialog actually presented)",
+            _TCC_REQUEST_TIMEOUT_SECS,
+        )
+        return None
+
+    result = granted_holder[0]
+    log.info("[mac_permissions] microphone TCC: user response → %s", result)
+    return result
 
 
 def prompt_audio_capture() -> Optional[bool]:
-    """Spawn the audio-tap Swift binary briefly. First call triggers the
-    Audio Capture TCC dialog (via AudioHardwareCreateProcessTap).
+    """Spawn the audio-tap Swift binary and wait for its actual TCC
+    decision before returning.
+
+    On first launch ``AudioHardwareCreateProcessTap`` (inside the Swift
+    binary) blocks on the system Audio Capture TCC dialog. Two outcomes
+    we can observe from the calling Python process:
+
+    - **Granted**: the binary proceeds past the API call, calls
+      ``AudioDeviceStart``, and prints
+      ``"audio-tap: capturing system audio …"`` to stderr. We see that
+      line, send SIGTERM to the still-running probe, and report True.
+    - **Denied**: the API returns non-zero, the binary prints a hint to
+      stderr and ``exit(77)``. We observe the exit code, report False.
+
+    The previous implementation — ``subprocess.run`` with a 1.5 s timeout,
+    treating any timeout as success — was a placebo: the TCC dialog
+    almost always takes longer than 1.5 s for a human to read and click,
+    so we returned ``granted=True`` while the binary was still sitting on
+    the blocker waiting for the user. That is exactly the bug the user
+    flagged ("sometimes even if I haven't clicked yes it cheerfully
+    updates the gui that it is accepted").
 
     Returns:
-      - True  → probe survived the timeout window (permission granted; the
-                tap would keep running if we didn't kill it)
-      - False → exit 77 (explicit deny from the Swift binary)
-      - None  → binary missing, spawn failed, or unknown exit code
+        True   — binary printed the success line (TCC granted)
+        False  — binary exited with code 77 (TCC denied)
+        None   — binary missing, spawn failed, or dialog timed out
     """
     if sys.platform != "darwin":
         return None
@@ -182,41 +286,125 @@ def prompt_audio_capture() -> Optional[bool]:
         return None
 
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             [binary],
-            capture_output=True,
-            timeout=_AUDIO_TAP_PROBE_TIMEOUT_SECS,
+            # We don't care about the PCM bytes for permission probing,
+            # and not draining stdout would eventually block the binary
+            # on a full pipe. DEVNULL discards them safely.
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
         )
-    except subprocess.TimeoutExpired:
-        return True
     except OSError as e:
         log.warning("[mac_permissions] audio-tap spawn failed: %s", e)
         return None
 
-    if result.returncode == _MAC_EXIT_PERMISSION_DENIED:
-        return False
-    if result.returncode == 0:
-        return True
-    # Negative return codes mean the binary was killed by a signal
-    # (subprocess returncode == -signum). On macOS the common one is
-    # `-6` = SIGABRT, which on MDM-managed Macs typically means
-    # Gatekeeper / library-validation aborted an unsigned-and-
-    # quarantined helper before it could execute. Surface stderr too so
-    # the agent.log captures whatever the OS or the binary itself
-    # printed before dying — the difference between "PPPC denied" and
-    # "Gatekeeper killed it" is the difference between a product fix
-    # and a packaging fix.
-    stderr_text = (
-        result.stderr.decode("utf-8", errors="replace")[:500]
-        if result.stderr
-        else ""
+    log.info(
+        "[mac_permissions] audio-tap TCC: probe spawned (pid=%d), waiting for user decision",
+        proc.pid,
     )
+
+    granted_event = threading.Event()
+    granted_holder: list[Optional[bool]] = [None]
+    stderr_tail: list[str] = []
+
+    def reader() -> None:
+        """Stream stderr until we see the success line or hit EOF."""
+        try:
+            assert proc.stderr is not None
+            for line in proc.stderr:
+                # Keep the last few lines for diagnostic logging on
+                # inconclusive exits; cap the buffer so a chatty binary
+                # can't grow it without bound.
+                stderr_tail.append(line.rstrip())
+                if len(stderr_tail) > 20:
+                    del stderr_tail[0]
+                if _AUDIO_TAP_SUCCESS_NEEDLE in line:
+                    granted_holder[0] = True
+                    granted_event.set()
+                    return
+                if _AUDIO_TAP_DENIED_NEEDLE in line:
+                    # Likely about to exit 77 — flag it, but let the
+                    # main thread confirm via exit code below.
+                    granted_holder[0] = False
+        finally:
+            # Always signal the main thread, even on EOF without a
+            # decisive line — the main thread will then read exit code.
+            granted_event.set()
+
+    reader_thread = threading.Thread(
+        target=reader, daemon=True, name="audio-tap-stderr"
+    )
+    reader_thread.start()
+
+    got_signal = granted_event.wait(timeout=_TCC_REQUEST_TIMEOUT_SECS)
+
+    if not got_signal:
+        log.warning(
+            "[mac_permissions] audio-tap TCC: timed out after %.0fs — "
+            "dialog likely never presented",
+            _TCC_REQUEST_TIMEOUT_SECS,
+        )
+        _terminate(proc)
+        return None
+
+    if granted_holder[0] is True:
+        log.info(
+            "[mac_permissions] audio-tap TCC: granted (saw success line on stderr)"
+        )
+        _terminate(proc)
+        return True
+
+    # Either reader saw the deny needle or stderr hit EOF. Either way the
+    # binary is on its way out — wait briefly for the actual exit code.
+    try:
+        rc = proc.wait(timeout=_PROBE_TERMINATE_GRACE_SECS)
+    except subprocess.TimeoutExpired:
+        log.warning(
+            "[mac_permissions] audio-tap TCC: stderr signaled but process still alive — terminating"
+        )
+        _terminate(proc)
+        return None
+
+    if rc == _MAC_EXIT_PERMISSION_DENIED:
+        log.info("[mac_permissions] audio-tap TCC: denied (exit 77)")
+        return False
+
+    # Negative return codes mean the binary was killed by a signal
+    # (subprocess returncode == -signum). On MDM-managed Macs the common
+    # one is `-6` = SIGABRT, which typically means Gatekeeper / library-
+    # validation aborted an unsigned-and-quarantined helper before it
+    # could execute. Surface stderr tail so agent.log captures whatever
+    # the binary printed before dying — the difference between "PPPC
+    # denied" and "Gatekeeper killed it" is product fix vs packaging fix.
     log.warning(
-        "[mac_permissions] audio-tap exited with code %d (inconclusive); stderr=%r",
-        result.returncode,
-        stderr_text,
+        "[mac_permissions] audio-tap TCC: inconclusive exit (rc=%d); stderr_tail=%r",
+        rc,
+        stderr_tail[-5:],
     )
     return None
+
+
+def _terminate(proc: subprocess.Popen) -> None:
+    """Best-effort SIGTERM-then-SIGKILL teardown. Never raises."""
+    if proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+    except Exception:
+        log.debug("[mac_permissions] proc.terminate raised", exc_info=True)
+    try:
+        proc.wait(timeout=_PROBE_TERMINATE_GRACE_SECS)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    except Exception:
+        log.debug("[mac_permissions] proc.wait raised", exc_info=True)
+    try:
+        proc.kill()
+        proc.wait(timeout=_PROBE_TERMINATE_GRACE_SECS)
+    except Exception:
+        log.debug("[mac_permissions] proc.kill raised", exc_info=True)
 
 
 def prompt_notifications() -> Optional[bool]:

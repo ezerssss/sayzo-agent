@@ -195,6 +195,10 @@ if sys.platform == "darwin":
         "Foundation",
         "AppKit",
         "WebKit",
+        # AVFoundation → AVCaptureDevice for Microphone TCC. Loaded lazily
+        # by gui/setup/mac_permissions.prompt_microphone so PyInstaller's
+        # static scanner doesn't see it without an explicit hint.
+        "AVFoundation",
     ]
 
 # ---------------------------------------------------------------------------
@@ -373,3 +377,27 @@ if sys.platform == "darwin":
             "LSApplicationCategoryType": "public.app-category.productivity",
         },
     )
+
+    # SMAppService.agent requires the LaunchAgent plist to live inside the
+    # app bundle at Contents/Library/LaunchAgents/<label>.plist. When the
+    # plist is registered through SMAppService instead of being dropped
+    # straight into ~/Library/LaunchAgents/, macOS attributes the BTM
+    # "Background items added — '…' added items that can run in the
+    # background" notification (and the System Settings -> Login Items
+    # entry) to the OWNING APP rather than the Developer-ID team
+    # identity. Without this file in this exact location, SMAppService
+    # falls back to the team name ("Sheen Santos Capadngan") which is
+    # confusing for end users.
+    #
+    # PyInstaller's BUNDLE() only writes Info.plist; auxiliary plists
+    # have to be copied in post-build. Doing it here in the spec means
+    # the plist is in place BEFORE the CI signs and notarizes the
+    # bundle (codesign hashes everything under Contents/, including
+    # Library/LaunchAgents/, so the file must exist pre-sign).
+    _bundle_path = Path("dist") / "Sayzo.app"
+    _launch_agents_dir = _bundle_path / "Contents" / "Library" / "LaunchAgents"
+    _launch_agents_dir.mkdir(parents=True, exist_ok=True)
+    _src_plist = Path("installer/macos/com.sayzo.agent.plist")
+    _dst_plist = _launch_agents_dir / "com.sayzo.agent.plist"
+    _dst_plist.write_bytes(_src_plist.read_bytes())
+    print(f"sayzo-agent.spec: bundled LaunchAgent plist at {_dst_plist}")

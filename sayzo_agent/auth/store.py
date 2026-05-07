@@ -42,7 +42,11 @@ class TokenStore:
             self._tokens = TokenSet(**data)
             return self._tokens
         except Exception:
-            log.warning("failed to read auth tokens from %s", self._path)
+            log.warning(
+                "failed to read auth tokens from %s — user will be treated "
+                "as signed-out and prompted to log in again",
+                self._path, exc_info=True,
+            )
             return None
 
     def save(self, tokens: TokenSet) -> None:
@@ -98,8 +102,8 @@ class TokenStore:
                 new_tokens = await self._server.refresh_token(tokens.refresh_token)
                 self.save(new_tokens)
                 return new_tokens.access_token
-            except Exception:
-                log.warning("token refresh failed")
+            except Exception as exc:
+                log.warning("token refresh failed", exc_info=True)
                 raise AuthenticationRequired(
                     "Session expired. Run `sayzo-agent login`."
-                )
+                ) from exc

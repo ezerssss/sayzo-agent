@@ -208,18 +208,23 @@ def _compile(pattern: str) -> re.Pattern[str]:
 
 
 def _collect_browser_titles(foreground: ForegroundInfo) -> list[str]:
-    """Flatten every title-ish field on ForegroundInfo into a deduped list.
-    Used by browser-spec matching so we can try regexes against every
-    available title without worrying about which field the platform layer
-    happened to populate.
+    """Browser-tab-ish titles only.
+
+    ``foreground.window_title`` is the foreground window's title regardless
+    of which app owns it. We include it only when ``is_browser`` is True;
+    otherwise it's a non-browser app's window leaking into the title pool,
+    which let Discord desktop's ``"#channel | Server - Discord"`` title
+    hit ``discord_web``'s lax ``(?i)\\bDiscord\\b`` regex (user report
+    2026-05-07). Background browser windows still contribute via
+    ``browser_window_titles`` regardless of which app is foreground.
     """
     out: list[str] = []
     seen: set[str] = set()
-    for t in (
-        foreground.browser_tab_title,
-        foreground.window_title,
-        *foreground.browser_window_titles,
-    ):
+    candidates: list[Optional[str]] = [foreground.browser_tab_title]
+    if foreground.is_browser:
+        candidates.append(foreground.window_title)
+    candidates.extend(foreground.browser_window_titles)
+    for t in candidates:
         if not t:
             continue
         if t in seen:

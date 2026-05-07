@@ -255,6 +255,10 @@ class CaptureSink:
                 with rec_json.open("r", encoding="utf-8") as f:
                     data = json.load(f)
             except Exception:
+                log.debug(
+                    "[sink] dropped-stub prune skipped %s (read/parse failed)",
+                    rec_json, exc_info=True,
+                )
                 continue
             metadata = data.get("metadata") or {}
             if not metadata.get("dropped"):

@@ -577,14 +577,16 @@ class ArmController:
         except Exception as exc:
             log.warning("[arm] capture start failed: %s", exc, exc_info=True)
             # Best-effort close whatever did open so we don't leak streams.
+            # Log at debug — the parent log.warning above already named the
+            # primary failure; this is "did the cleanup also fail?" signal.
             try:
                 await self.mic.stop()
             except Exception:
-                pass
+                log.debug("[arm] mic.stop during start-rollback failed", exc_info=True)
             try:
                 await self.sys.stop()
             except Exception:
-                pass
+                log.debug("[arm] sys.stop during start-rollback failed", exc_info=True)
             # Roll back the optimistic state flip. Tray briefly flashed
             # "Recording" — acceptable for this rare case; the error toast
             # plus the revert make the failure unambiguous.
@@ -771,26 +773,36 @@ class ArmController:
                     last_match_key = None
                     # Diagnostic for "watcher silently doesn't fire" reports:
                     # whenever the mic is active but nothing matched, log
-                    # what we saw. Dedup'd on (foreground bundle, holder
-                    # bundles, sorted-titles) so a long meeting in the same
-                    # state doesn't spam at the 2 s poll cadence. Cleared on
-                    # any uninteresting tick or successful match so the next
-                    # interesting state logs again.
+                    # what we saw. Dedup signature deliberately excludes
+                    # window titles — editors that animate spinners
+                    # ("⠂ ⠐ ⠐ ✳ …") flip a title every poll, defeating
+                    # dedup and producing one log line per 2 s tick (user
+                    # report 2026-05-07). Holder set + foreground app +
+                    # tab URL are the signals that actually drive matching;
+                    # titles are a fallback we still log in the message
+                    # body for context, just not in the dedup key.
                     if mic.active:
-                        sig_titles = tuple(
-                            sorted({
-                                fg.browser_tab_title or "",
-                                fg.window_title or "",
-                                *fg.browser_window_titles,
-                            } - {""})
-                        )
                         holder_summary = tuple(sorted(
                             f"{h.bundle_id or h.process_name}#{h.pid}"
                             for h in mic.holders
                         ))
-                        signature = (fg.bundle_id, holder_summary, sig_titles)
+                        sorted_browser_urls = tuple(sorted(set(fg.browser_window_urls)))
+                        signature = (
+                            holder_summary,
+                            fg.bundle_id,
+                            fg.is_browser,
+                            fg.browser_tab_url,
+                            sorted_browser_urls,
+                        )
                         if signature != last_no_match_signature:
                             last_no_match_signature = signature
+                            sig_titles = tuple(
+                                sorted({
+                                    fg.browser_tab_title or "",
+                                    fg.window_title or "",
+                                    *fg.browser_window_titles,
+                                } - {""})
+                            )
                             log.info(
                                 "[arm] no whitelist match: holders=%s "
                                 "fg.bundle=%s fg.is_browser=%s "

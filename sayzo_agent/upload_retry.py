@@ -151,7 +151,7 @@ class UploadRetryManager:
         except Exception:
             log.warning(
                 "[upload] %s is corrupt; starting with empty pause state",
-                self._pause_state_path,
+                self._pause_state_path, exc_info=True,
             )
             return PauseState()
 
@@ -542,7 +542,10 @@ class UploadRetryManager:
             try:
                 record = read_record_from_dir(rec_dir)
             except Exception:
-                log.warning("[upload] skipping corrupt record.json at %s", rec_dir)
+                log.warning(
+                    "[upload] skipping corrupt record.json at %s during reconcile",
+                    rec_dir, exc_info=True,
+                )
                 continue
             upload_state = record.metadata.get("upload")
             if upload_state is None:
@@ -576,7 +579,10 @@ class UploadRetryManager:
             try:
                 record = read_record_from_dir(rec_dir)
             except Exception:
-                log.warning("[upload] skipping corrupt record.json at %s", rec_dir)
+                log.warning(
+                    "[upload] skipping corrupt record.json at %s during sweep",
+                    rec_dir, exc_info=True,
+                )
                 continue
             # Dropped-stub records (cheap-gate fail, non-English, empty
             # transcript) have no audio.opus and were never intended for

@@ -250,35 +250,33 @@ def _mac_unload_launchd_agent() -> None:
     Without this, launchd's ``KeepAlive`` resurrects the process seconds
     after a menu-bar Quit — the user sees the app close and instantly
     reopen. ``bootout`` removes the job from launchd's registry for the
-    current user session; the plist stays on disk and re-loads on next
-    login, so auto-start still works tomorrow.
+    current user session; the SMAppService registration (or, on a
+    pre-v2.7.0 upgrade still in progress, the legacy ``~/Library/
+    LaunchAgents/`` plist) persists, so auto-start still works at next
+    login.
 
-    Falls back to the legacy ``launchctl unload`` form on older macOS.
+    Uses the label-only form ``launchctl bootout gui/<uid>/<label>`` so
+    the same call works whether the plist lives inside the app bundle
+    (SMAppService, v2.7.0+) or in the user's home (legacy v2.6.x and
+    earlier — only relevant during the upgrade window where this process
+    is still supervised by the legacy registration).
+
     Best-effort: any failure is logged and swallowed so Quit still exits.
     """
     if sys.platform != "darwin":
-        return
-    plist = Path.home() / "Library" / "LaunchAgents" / "com.sayzo.agent.plist"
-    if not plist.exists():
         return
     try:
         uid = os.getuid()
     except AttributeError:
         return
     try:
-        r = subprocess.run(
-            ["launchctl", "bootout", f"gui/{uid}", str(plist)],
+        subprocess.run(
+            ["launchctl", "bootout", f"gui/{uid}/com.sayzo.agent"],
             capture_output=True,
             timeout=5,
         )
-        if r.returncode != 0:
-            subprocess.run(
-                ["launchctl", "unload", str(plist)],
-                capture_output=True,
-                timeout=5,
-            )
     except Exception:
-        log.exception("launchctl unload failed")
+        log.exception("launchctl bootout failed")
 
 
 class TrayIcon:

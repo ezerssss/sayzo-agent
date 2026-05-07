@@ -53,7 +53,7 @@ async def device_code_flow(
         except AuthenticationFailed:
             raise
         except Exception:
-            log.debug("device code poll error, retrying")
+            log.debug("device code poll error, retrying", exc_info=True)
             continue
 
         if tokens is not None:

@@ -94,7 +94,12 @@ class SystemCapture:
         try:
             loopback = self._find_loopback_device(pa)
         except Exception:
-            log.exception("failed to find system loopback device")
+            log.error(
+                "system capture: failed to find WASAPI loopback device — "
+                "the system audio stream will NOT run for this session "
+                "(captures will only contain mic audio)",
+                exc_info=True,
+            )
             pa.terminate()
             return
 

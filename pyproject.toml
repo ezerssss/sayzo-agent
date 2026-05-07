@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sayzo-agent"
-version = "2.6.0"
+version = "2.7.0"
 description = "Armed-only capture agent for Sayzo — records meetings on user consent (hotkey or whitelisted meeting app) and feeds them to downstream English-coaching analysis."
 requires-python = ">=3.10"
 dependencies = [
@@ -55,9 +55,20 @@ dependencies = [
     # was dropped in v2.5 along with the legacy ctypes-CoreAudio path.
     "pyobjc-framework-Cocoa>=10.0; sys_platform == 'darwin'",
     "pyobjc-framework-ApplicationServices>=10.0; sys_platform == 'darwin'",
+    # macOS: AVCaptureDevice authorization status / requestAccess for the
+    # Microphone TCC dialog. Used by gui/setup/mac_permissions.prompt_microphone
+    # to read and trigger the real TCC decision (the legacy sounddevice-open
+    # heuristic happily reported "granted" while the dialog was still showing
+    # and even when the OS had silently denied — bug v2.6.0).
+    "pyobjc-framework-AVFoundation>=10.0; sys_platform == 'darwin'",
     # macOS: idle-time query via Quartz CGEventSourceSecondsSinceLastEventType.
     # Used by sayzo_agent/idle.py for the daily-drill scheduler's idle gate.
     "pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'",
+    # macOS: SMAppService.agent registration so the BTM "running in the
+    # background" notification + System Settings -> Login Items entry are
+    # attributed to the Sayzo app, not to the Developer-ID team identity.
+    # Used by sayzo_agent/gui/setup/launchd.py.
+    "pyobjc-framework-ServiceManagement>=10.0; sys_platform == 'darwin'",
 ]
 
 [project.optional-dependencies]

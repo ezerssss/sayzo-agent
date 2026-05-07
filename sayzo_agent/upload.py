@@ -64,6 +64,11 @@ class AuthenticatedUploadClient:
             try:
                 parsed = resp.json()
             except Exception:
+                log.warning(
+                    "[upload] response Content-Type was JSON but body did not "
+                    "parse (id=%s) — server-side title/summary won't be applied",
+                    record.id, exc_info=True,
+                )
                 parsed = None
             if isinstance(parsed, dict):
                 body = parsed

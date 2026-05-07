@@ -751,7 +751,16 @@ async def test_meeting_ended_keep_going_resets_on_mic_return():
     """After 'Keep going', if the arm-app comes back into mic-holders
     the absence counter resets — we don't force-close on cumulative
     absence, only consecutive. Without this, brief mic-release blips
-    after Keep going would still trigger force-close eventually."""
+    after Keep going would still trigger force-close eventually.
+
+    Force-close threshold is intentionally far larger than the test's
+    real-time window so Windows asyncio scheduling jitter (sleep
+    granularity ≈ 15 ms, run_in_executor thread-pool roundtrip) can't
+    push absence over the threshold before the holder-restoration
+    sleep returns. The test isn't validating that force-close fires —
+    only that holder return resets the counter, so any value greater
+    than the total wallclock budget keeps the assertion deterministic.
+    """
     notifier = FakeNotifier()
     notifier.consent_script = ["yes", "no"]  # arm, then Keep going
     ctrl, _, *_ = _make_controller(
@@ -760,8 +769,9 @@ async def test_meeting_ended_keep_going_resets_on_mic_return():
         cfg_overrides={
             "poll_interval_secs": 0.01,
             "whitelist_arm_release_grace_secs": 0.02,
-            # Threshold is generous; we'll bounce the holder list before it trips.
-            "force_close_after_keep_going_secs": 0.20,
+            # Far larger than the test's wallclock window so jitter can't
+            # trip force-close before the holder is restored.
+            "force_close_after_keep_going_secs": 2.0,
             "meeting_ended_toast_timeout_secs": 0.02,
         },
     )

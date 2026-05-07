@@ -101,7 +101,7 @@ class _PynputHotkeySource:
         try:
             from pynput.keyboard import GlobalHotKeys
         except Exception as exc:
-            log.warning("[arm.hotkey] pynput unavailable: %s", exc)
+            log.warning("[arm.hotkey] pynput unavailable: %s", exc, exc_info=True)
             return f"pynput unavailable: {exc}"
 
         try:
@@ -109,7 +109,11 @@ class _PynputHotkeySource:
             listener = GlobalHotKeys({pynput_combo: self._on_fire})
             listener.start()
         except Exception as exc:
-            log.warning("[arm.hotkey] register %r failed: %s", binding, exc)
+            log.warning(
+                "[arm.hotkey] register %r failed: %s — tray menu remains the "
+                "only way to start/stop capture",
+                binding, exc, exc_info=True,
+            )
             return str(exc)
 
         self._binding = binding

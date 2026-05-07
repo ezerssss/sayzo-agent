@@ -326,3 +326,106 @@ def test_script_escapes_label_quotes_and_backslashes(monkeypatch):
     # The literal label round-trips into the buttons + default-button clauses.
     assert '"Yes"' in script
     assert '"No"' in script
+
+
+# ---------------------------------------------------------------------------
+# Icon: bundled .icns when present, fallback to built-in note otherwise.
+# ---------------------------------------------------------------------------
+
+
+def test_script_uses_bundled_icns_when_resolver_returns_path(monkeypatch):
+    """When ``_sayzo_icns_path`` finds the bundled logo, the AppleScript
+    must point at it via ``POSIX file`` instead of the generic ``note``
+    glyph — that's the only way to get the Sayzo logo into the dialog."""
+    _patch_platform_darwin(monkeypatch)
+    monkeypatch.setattr(
+        consent_modal,
+        "_sayzo_icns_path",
+        lambda: "/Applications/Sayzo.app/Contents/Resources/logo.icns",
+    )
+    captured = _patch_subprocess(
+        monkeypatch,
+        _FakeCompleted(returncode=0, stdout="button returned:Yes, gave up:false"),
+    )
+    consent_modal_macos("T", "B", "Yes", "No", 5.0, "no")
+    script = captured[0][2]
+    assert (
+        'with icon (POSIX file "/Applications/Sayzo.app/Contents/Resources/logo.icns")'
+        in script
+    )
+    # And the fallback clause is NOT also present.
+    assert "with icon note" not in script
+
+
+def test_script_falls_back_to_note_when_no_icns_on_disk(monkeypatch):
+    """Dev runs (no .icns generated yet) should still produce a valid
+    dialog — we just lose the logo and use AppleScript's built-in note."""
+    _patch_platform_darwin(monkeypatch)
+    monkeypatch.setattr(consent_modal, "_sayzo_icns_path", lambda: None)
+    captured = _patch_subprocess(
+        monkeypatch,
+        _FakeCompleted(returncode=0, stdout="button returned:Yes, gave up:false"),
+    )
+    consent_modal_macos("T", "B", "Yes", "No", 5.0, "no")
+    script = captured[0][2]
+    assert "with icon note" in script
+    assert "POSIX file" not in script
+
+
+def test_script_escapes_quotes_in_icns_path(monkeypatch):
+    """An app installed under a path containing a quote (vanishingly rare
+    but possible — e.g. ``~/Applications/"work"/Sayzo.app``) must not
+    break the AppleScript out of its icon clause."""
+    _patch_platform_darwin(monkeypatch)
+    monkeypatch.setattr(
+        consent_modal,
+        "_sayzo_icns_path",
+        lambda: '/path/with "quote"/logo.icns',
+    )
+    captured = _patch_subprocess(
+        monkeypatch,
+        _FakeCompleted(returncode=0, stdout="button returned:Yes, gave up:false"),
+    )
+    consent_modal_macos("T", "B", "Yes", "No", 5.0, "no")
+    script = captured[0][2]
+    assert '"/path/with \\"quote\\"/logo.icns"' in script
+
+
+def test_sayzo_icns_path_returns_none_off_platform(monkeypatch):
+    """The resolver short-circuits on non-darwin so callers on Windows
+    / Linux never spend a stat on a path that can't matter to them."""
+    monkeypatch.setattr(consent_modal.sys, "platform", "win32")
+    assert consent_modal._sayzo_icns_path() is None
+
+
+def test_sayzo_icns_path_finds_dev_tree_file(monkeypatch, tmp_path):
+    """When a developer has generated ``installer/assets/logo.icns``
+    locally (e.g. by running the CI's iconutil step), the dev path must
+    pick it up so they can preview the modal with the real logo."""
+    _patch_platform_darwin(monkeypatch)
+    # Pretend the module lives under tmp_path/sayzo_agent/consent_modal.py
+    fake_pkg = tmp_path / "sayzo_agent"
+    fake_pkg.mkdir()
+    fake_module = fake_pkg / "consent_modal.py"
+    fake_module.write_text("# stub")
+    assets = tmp_path / "installer" / "assets"
+    assets.mkdir(parents=True)
+    icns = assets / "logo.icns"
+    icns.write_bytes(b"icns")
+    monkeypatch.setattr(consent_modal, "__file__", str(fake_module))
+    # Force the frozen-bundle branch to miss so we exercise the dev fallback.
+    monkeypatch.setattr(consent_modal.sys, "frozen", False, raising=False)
+    assert consent_modal._sayzo_icns_path() == str(icns)
+
+
+def test_sayzo_icns_path_returns_none_when_nothing_on_disk(monkeypatch, tmp_path):
+    """Fresh dev checkout: no .icns anywhere → caller falls back to
+    ``with icon note`` rather than feeding AppleScript a bad path."""
+    _patch_platform_darwin(monkeypatch)
+    fake_pkg = tmp_path / "sayzo_agent"
+    fake_pkg.mkdir()
+    fake_module = fake_pkg / "consent_modal.py"
+    fake_module.write_text("# stub")
+    monkeypatch.setattr(consent_modal, "__file__", str(fake_module))
+    monkeypatch.setattr(consent_modal.sys, "frozen", False, raising=False)
+    assert consent_modal._sayzo_icns_path() is None

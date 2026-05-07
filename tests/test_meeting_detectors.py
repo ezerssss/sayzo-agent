@@ -191,6 +191,29 @@ def test_gmeet_no_match_when_no_browser_window_has_meet():
     assert match_whitelist(SPECS, fg, mic) is None
 
 
+def test_non_browser_foreground_window_title_does_not_leak_into_browser_match():
+    """Regression for 2026-05-07 user report: Discord desktop (a non-browser
+    app) is foreground while chrome holds the mic for an unrelated capture.
+    Discord desktop's window title (``"#channel | Server - Discord"``) used
+    to be unconditionally pulled into the browser-spec title pool by
+    ``_collect_browser_titles``, where it hit ``discord_web``'s lax
+    ``(?i)\\bDiscord\\b`` regex and produced a false match. The matcher
+    must ignore ``window_title`` from a non-browser foreground; only
+    actual browser-owned titles (``browser_window_titles`` /
+    ``browser_tab_title``) participate in browser-spec matching."""
+    fg = ForegroundInfo(
+        process_name="Discord.exe",
+        is_browser=False,
+        window_title="#development | Threadlify - Discord",
+        browser_window_titles=(
+            "Claude - Google Chrome",
+            "Messenger | Facebook - Google Chrome",
+        ),
+    )
+    mic = MicState(holders=[MicHolder("chrome.exe", 10792)])
+    assert match_whitelist(SPECS, fg, mic) is None
+
+
 def test_gmeet_title_prefix_notification_count_still_matches():
     """Chrome prefixes window titles with ``(N) `` when the tab has unread
     notifications. The title regex has to tolerate that."""

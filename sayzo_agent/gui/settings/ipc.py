@@ -154,7 +154,12 @@ class IPCServer:
             self._data_dir.mkdir(parents=True, exist_ok=True)
             _port_file(self._data_dir).write_text(str(self._port), encoding="utf-8")
         except OSError:
-            log.warning("[ipc] failed to write port file", exc_info=True)
+            log.error(
+                "[ipc] failed to write port file at %s — Settings window will "
+                "not be able to reach the agent for live state (hotkey rebind, "
+                "mic snapshots, retry nudges) until this is resolved",
+                _port_file(self._data_dir), exc_info=True,
+            )
 
         log.info("[ipc] listening on %s:%d", _LOOPBACK_HOST, self._port)
 

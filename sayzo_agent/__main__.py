@@ -781,6 +781,23 @@ def test_drill_notification() -> None:
     )
 
 
+def _mac_login_item_active() -> bool:
+    """Will launchd start Sayzo at next login on this Mac?
+
+    Replaces the pre-v2.7.0 ``mac_plist.exists()`` check that sniffed
+    ``~/Library/LaunchAgents/com.sayzo.agent.plist`` directly. With
+    SMAppService.agent the plist lives inside the .app bundle and the
+    registration is in the BTM database, not on disk in the user's home
+    — so the existence check has to go through the SMAppService API.
+    """
+    try:
+        from .gui.setup.launchd import is_registered
+
+        return is_registered()
+    except Exception:
+        return False
+
+
 @cli.command("first-run")
 @click.pass_context
 def first_run(ctx: click.Context) -> None:
@@ -837,16 +854,14 @@ def first_run(ctx: click.Context) -> None:
 
     from .pidfile import is_running
 
-    mac_plist = Path.home() / "Library/LaunchAgents/com.sayzo.agent.plist"
-
     console.print()
     if is_running(cfg.pid_path):
         console.print("  [green]Sayzo is already running.[/]")
-    elif sys.platform == "darwin" and mac_plist.exists():
-        # launchd owns the service on installed macOS; the installer script
-        # runs `launchctl load` immediately after first-run returns. Spawning
-        # our own subprocess here would race it for the pidfile and leak the
-        # detached service's stderr to the installer terminal.
+    elif sys.platform == "darwin" and _mac_login_item_active():
+        # launchd owns the service on installed macOS via SMAppService; it
+        # will start Sayzo at the user's next login. Spawning our own
+        # subprocess here would race it for the pidfile and leak the
+        # detached service's stderr to this terminal.
         console.print("  [green]Sayzo is configured to start automatically.[/]")
     else:
         console.print("  Starting Sayzo...")
@@ -1048,6 +1063,26 @@ def service(force_setup: bool) -> None:
     if sys.platform == "darwin":
         from .macos_bundle_heal import heal_bundle
         heal_bundle()
+
+        # SMAppService migration (v2.7.0+). On a v2.6.x -> v2.7.0 upgrade,
+        # the user has already completed first-run, so the post-setup
+        # call below would never fire. Doing it here on every macOS
+        # service start handles the upgrade migration: the helper deletes
+        # any legacy ``~/Library/LaunchAgents/com.sayzo.agent.plist`` and
+        # registers the bundle plist via SMAppService so the BTM
+        # "running in the background" notification + System Settings
+        # entry are attributed to "Sayzo" instead of the Developer-ID
+        # team identity. Idempotent — register() on an already-registered
+        # agent is a no-op and will NOT re-fire the BTM toast.
+        try:
+            from .gui.setup.launchd import ensure_launchd_registered
+
+            ensure_launchd_registered()
+        except Exception:
+            log.warning(
+                "SMAppService registration at service start failed (non-fatal)",
+                exc_info=True,
+            )
 
     # First-run gate. Detect missing setup signals (auth token, macOS mic
     # permission, permissions onboarding) and open the GUI setup window if any is missing

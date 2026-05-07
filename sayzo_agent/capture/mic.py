@@ -143,6 +143,11 @@ class MicCapture:
             else:
                 reported_latency = float(lat)
         except Exception:
+            log.warning(
+                "mic capture: stream.latency read failed; capture_offset will "
+                "default to 0 (cross-source timing alignment may drift)",
+                exc_info=True,
+            )
             reported_latency = 0.0
 
         self._capture_offset = reported_latency + self.frame_duration

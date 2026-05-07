@@ -719,6 +719,11 @@ class Agent:
             try:
                 emb = self.speaker.embed(pcm_slice)
             except Exception:
+                log.warning(
+                    "[transcript] speaker embed failed for segment %.2f-%.2fs "
+                    "— labelling will fall back to all-zero embedding",
+                    s.start, s.end, exc_info=True,
+                )
                 emb = np.zeros(256, dtype=np.float32)
             sys_embeds.append(emb)
             sys_keep_idx.append(i)
