@@ -157,12 +157,26 @@ class Bridge:
 
     def prompt_mic_permission(self) -> dict[str, Any]:
         """User clicked Grant on the Microphone row. Fires the macOS TCC
-        Microphone dialog on first call (subsequent calls are silent)."""
+        Microphone dialog on first call (subsequent calls are silent).
+
+        Returns ``{"granted": bool|None, "stale_tcc_likely": bool}``. The
+        ``stale_tcc_likely`` flag is True when the helper fingerprinted a
+        TCC entry from a previous Sayzo install with a different signing
+        identity silently denying the request without ever presenting UI
+        (sync read returned NotDetermined, request branch returned False
+        in <500 ms). The frontend swaps the generic "blocked" copy for
+        targeted recovery steps in that case — System Settings shows the
+        toggle ON, which makes the generic message actively misleading.
+        """
         if sys.platform != "darwin":
-            return {"granted": None}
+            return {"granted": None, "stale_tcc_likely": False}
         from sayzo_agent.gui.setup import mac_permissions
 
-        return {"granted": mac_permissions.prompt_microphone()}
+        result = mac_permissions.prompt_microphone()
+        return {
+            "granted": result.granted,
+            "stale_tcc_likely": result.stale_tcc_likely,
+        }
 
     def prompt_audio_capture_permission(self) -> dict[str, Any]:
         """User clicked Grant on the Audio Capture row. Fires the macOS

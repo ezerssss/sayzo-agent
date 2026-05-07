@@ -56,6 +56,19 @@ export type PermissionResult = {
   granted: boolean | null;
 };
 
+// Microphone-specific result. The stale_tcc_likely flag is set by
+// mac_permissions.prompt_microphone when it fingerprints a stale TCC
+// entry — a previous Sayzo install (typically pre-v2.6.0 ad-hoc-signed)
+// recorded a permission entry whose code-requirement no longer matches
+// the current Developer-ID-signed bundle, so the new request silently
+// denies without presenting UI. The Microphone screen shows targeted
+// recovery copy in that case (the System Settings toggle being ON makes
+// the generic "blocked" message misleading).
+export type MicPermissionResult = {
+  granted: boolean | null;
+  stale_tcc_likely: boolean;
+};
+
 export type HotkeyState = {
   binding: string;
   display: string;
@@ -89,7 +102,7 @@ declare global {
     cancel_login(): Promise<{ cancelled: boolean }>;
 
     // Per-permission prompts (one screen each).
-    prompt_mic_permission(): Promise<PermissionResult>;
+    prompt_mic_permission(): Promise<MicPermissionResult>;
     prompt_audio_capture_permission(): Promise<PermissionResult>;
     prompt_notification_permission(): Promise<PermissionResult>;
     check_notification_permission(): Promise<PermissionResult>;

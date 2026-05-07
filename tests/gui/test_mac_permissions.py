@@ -36,6 +36,7 @@ def _fake_avfoundation(
     *,
     status: int,
     request_response: bool | None = None,
+    request_delay_secs: float = 0.0,
 ) -> SimpleNamespace:
     """Build a minimal AVFoundation-shaped module the helper can import.
 
@@ -43,7 +44,10 @@ def _fake_avfoundation(
     will return (0=NotDetermined, 1=Restricted, 2=Denied, 3=Authorized).
     When status==0 (NotDetermined), ``request_response`` controls whether
     the simulated dialog returns ``True`` (allow), ``False`` (deny), or
-    ``None`` (handler never fires — simulates timeout).
+    ``None`` (handler never fires — simulates timeout). ``request_delay_secs``
+    controls how long the simulated dialog takes before firing the
+    completion handler — used to drive the stale-TCC heuristic, which
+    treats sub-500 ms False responses as silent-denies.
     """
     captured: dict = {}
 
@@ -60,14 +64,20 @@ def _fake_avfoundation(
             captured["request_query"] = media_type
             captured["completion"] = completion
             if request_response is not None:
-                # Fire the handler synchronously on a worker thread so the
-                # main thread's event.wait actually unblocks. Real macOS
-                # dispatches on a background queue.
+                # Fire the handler on a worker thread so the caller's
+                # event.wait actually unblocks. Real macOS dispatches on
+                # a private background queue per Apple's docs. Sleep
+                # first so tests of the stale-TCC heuristic can simulate
+                # a "fast silent deny" vs. a slower legitimate click.
                 import threading as _t
-                _t.Thread(
-                    target=lambda: completion(request_response),
-                    daemon=True,
-                ).start()
+                import time as _time
+
+                def _fire():
+                    if request_delay_secs:
+                        _time.sleep(request_delay_secs)
+                    completion(request_response)
+
+                _t.Thread(target=_fire, daemon=True).start()
 
     return SimpleNamespace(
         AVCaptureDevice=_AVCaptureDevice,
@@ -76,32 +86,105 @@ def _fake_avfoundation(
     )
 
 
+def _fake_foundation(
+    *,
+    fire_block: bool = True,
+) -> SimpleNamespace:
+    """Build a minimal Foundation-shaped module exposing NSOperationQueue.
+
+    The helper schedules the AVFoundation request onto
+    ``NSOperationQueue.mainQueue()`` so a frozen pywebview bundle can present
+    the TCC dialog (the framework silently no-ops the dialog when
+    requestAccessForMediaType is invoked off the main thread).
+
+    ``fire_block=True`` runs the scheduled block immediately (simulating a
+    pumping main runloop). ``fire_block=False`` drops it on the floor (the
+    main runloop never pumps), which lets us cover the "dispatched but
+    nothing fired" timeout branch.
+    """
+
+    class _MainQueue:
+        @staticmethod
+        def addOperationWithBlock_(block):
+            if fire_block:
+                # Run on a worker thread to mimic NSOperationQueue's async
+                # semantics — addOperationWithBlock_ returns immediately on
+                # the real API.
+                import threading as _t
+                _t.Thread(target=block, daemon=True).start()
+
+    class _NSOperationQueue:
+        @staticmethod
+        def mainQueue():
+            return _MainQueue
+
+    return SimpleNamespace(NSOperationQueue=_NSOperationQueue)
+
+
+def _patch_av(fake_av, *, fake_foundation_mod=None):
+    """Bundle the patches a prompt_microphone test needs.
+
+    ``fake_av`` is the AVFoundation stand-in. ``fake_foundation_mod`` is
+    the Foundation stand-in (defaults to one whose mainQueue runs blocks
+    synchronously on a worker thread)."""
+    if fake_foundation_mod is None:
+        fake_foundation_mod = _fake_foundation()
+    return [
+        patch("sayzo_agent.gui.setup.mac_permissions.sys.platform", "darwin"),
+        patch.dict(
+            "sys.modules",
+            {
+                "AVFoundation": fake_av,
+                "Foundation": fake_foundation_mod,
+            },
+        ),
+    ]
+
+
 def test_prompt_microphone_returns_true_when_already_authorized():
     """Status == 3 (Authorized): no dialog fired, returns True directly."""
     fake_av = _fake_avfoundation(status=3)
-    with patch(
-        "sayzo_agent.gui.setup.mac_permissions.sys.platform", "darwin"
-    ), patch.dict("sys.modules", {"AVFoundation": fake_av}):
-        assert mac_permissions.prompt_microphone() is True
+    patches = _patch_av(fake_av)
+    _enter_all(patches)
+    try:
+        result = mac_permissions.prompt_microphone()
+        assert result.granted is True
+        assert result.stale_tcc_likely is False
+    finally:
+        _exit_all(patches)
     assert "request_query" not in fake_av._captured
 
 
 def test_prompt_microphone_returns_false_when_previously_denied():
-    """Status == 2 (Denied): no dialog can be re-fired, returns False."""
+    """Status == 2 (Denied): no dialog can be re-fired, returns False.
+
+    A previously-recorded denial is NOT the stale-TCC pattern — the user
+    saw the dialog at some point and chose Don't Allow. stale_tcc_likely
+    must stay False so the GUI shows the standard "blocked" copy, not the
+    "remove from System Settings" recovery flow.
+    """
     fake_av = _fake_avfoundation(status=2)
-    with patch(
-        "sayzo_agent.gui.setup.mac_permissions.sys.platform", "darwin"
-    ), patch.dict("sys.modules", {"AVFoundation": fake_av}):
-        assert mac_permissions.prompt_microphone() is False
+    patches = _patch_av(fake_av)
+    _enter_all(patches)
+    try:
+        result = mac_permissions.prompt_microphone()
+        assert result.granted is False
+        assert result.stale_tcc_likely is False
+    finally:
+        _exit_all(patches)
 
 
 def test_prompt_microphone_returns_false_when_restricted():
     """Status == 1 (Restricted, e.g. MDM/parental controls): returns False."""
     fake_av = _fake_avfoundation(status=1)
-    with patch(
-        "sayzo_agent.gui.setup.mac_permissions.sys.platform", "darwin"
-    ), patch.dict("sys.modules", {"AVFoundation": fake_av}):
-        assert mac_permissions.prompt_microphone() is False
+    patches = _patch_av(fake_av)
+    _enter_all(patches)
+    try:
+        result = mac_permissions.prompt_microphone()
+        assert result.granted is False
+        assert result.stale_tcc_likely is False
+    finally:
+        _exit_all(patches)
 
 
 def test_prompt_microphone_returns_user_decision_when_not_determined():
@@ -112,17 +195,106 @@ def test_prompt_microphone_returns_user_decision_when_not_determined():
     Don't Allow — which made setup mark mic as granted on a denied bundle.
     """
     fake_av = _fake_avfoundation(status=0, request_response=True)
-    with patch(
-        "sayzo_agent.gui.setup.mac_permissions.sys.platform", "darwin"
-    ), patch.dict("sys.modules", {"AVFoundation": fake_av}):
-        assert mac_permissions.prompt_microphone() is True
+    patches = _patch_av(fake_av)
+    _enter_all(patches)
+    try:
+        result = mac_permissions.prompt_microphone()
+        assert result.granted is True
+        assert result.stale_tcc_likely is False
+    finally:
+        _exit_all(patches)
     assert fake_av._captured["request_query"] == "soun"
 
-    fake_av = _fake_avfoundation(status=0, request_response=False)
-    with patch(
-        "sayzo_agent.gui.setup.mac_permissions.sys.platform", "darwin"
-    ), patch.dict("sys.modules", {"AVFoundation": fake_av}):
-        assert mac_permissions.prompt_microphone() is False
+    # A real human deny click takes much longer than the 500 ms threshold,
+    # so a False here represents a legitimate denial and stale_tcc_likely
+    # must stay False. Simulate the elapsed time by having the request
+    # delay before firing the completion handler.
+    fake_av = _fake_avfoundation(
+        status=0, request_response=False, request_delay_secs=0.6
+    )
+    patches = _patch_av(fake_av)
+    _enter_all(patches)
+    try:
+        result = mac_permissions.prompt_microphone()
+        assert result.granted is False
+        assert result.stale_tcc_likely is False
+    finally:
+        _exit_all(patches)
+
+
+def test_prompt_microphone_flags_stale_tcc_on_fast_silent_deny():
+    """The Sheen v2.7.0 case. Status read returns NotDetermined, the
+    request branch fires the completion handler with False in <500 ms
+    (no human can read+click that fast). That's the fingerprint of a
+    stale TCC entry from a prior Sayzo install with a different signing
+    identity silently denying the request without UI. The GUI uses this
+    flag to swap the misleading "open Settings, turn it on" copy for the
+    targeted "remove from System Settings, then retry" recovery flow.
+    """
+    fake_av = _fake_avfoundation(
+        status=0, request_response=False, request_delay_secs=0.0
+    )
+    patches = _patch_av(fake_av)
+    _enter_all(patches)
+    try:
+        result = mac_permissions.prompt_microphone()
+        assert result.granted is False
+        assert result.stale_tcc_likely is True
+    finally:
+        _exit_all(patches)
+
+
+def test_prompt_microphone_does_not_flag_stale_when_user_grants_quickly():
+    """Sub-500 ms approval is implausible for a human but possible in
+    automated UI tests. Either way it's NOT stale-TCC since the result is
+    True. Defensive: stale_tcc_likely must only fire on False results."""
+    fake_av = _fake_avfoundation(
+        status=0, request_response=True, request_delay_secs=0.0
+    )
+    patches = _patch_av(fake_av)
+    _enter_all(patches)
+    try:
+        result = mac_permissions.prompt_microphone()
+        assert result.granted is True
+        assert result.stale_tcc_likely is False
+    finally:
+        _exit_all(patches)
+
+
+def test_prompt_microphone_dispatches_request_to_main_queue():
+    """Regression for v2.7.0 Sheen bug.
+
+    requestAccessForMediaType_completionHandler_ MUST be invoked from a
+    block scheduled on NSOperationQueue.mainQueue(), not from pywebview's
+    JS-RPC worker thread. From the worker thread the AVFoundation
+    framework silently no-ops the dialog and fires the completion handler
+    with `denied` in milliseconds. We verify here that the helper goes
+    through addOperationWithBlock_ for the request — without it, the
+    fix has regressed.
+    """
+    main_queue_calls: list = []
+
+    class _CapturingMainQueue:
+        @staticmethod
+        def addOperationWithBlock_(block):
+            main_queue_calls.append(block)
+            # Run the block on a worker thread so the helper unblocks.
+            import threading as _t
+            _t.Thread(target=block, daemon=True).start()
+
+    capturing = SimpleNamespace(
+        NSOperationQueue=SimpleNamespace(mainQueue=lambda: _CapturingMainQueue)
+    )
+    fake_av = _fake_avfoundation(status=0, request_response=True)
+    patches = _patch_av(fake_av, fake_foundation_mod=capturing)
+    _enter_all(patches)
+    try:
+        assert mac_permissions.prompt_microphone().granted is True
+    finally:
+        _exit_all(patches)
+    # One block scheduled on the main queue: the request itself.
+    assert len(main_queue_calls) == 1
+    assert callable(main_queue_calls[0])
 
 
 def test_prompt_microphone_returns_none_on_dialog_timeout():
@@ -131,23 +303,50 @@ def test_prompt_microphone_returns_none_on_dialog_timeout():
     Return None so the GUI can route to Open-Settings."""
     # request_response=None → handler is never called.
     fake_av = _fake_avfoundation(status=0, request_response=None)
-    # Patch the timeout down so the test runs in milliseconds.
-    with patch(
-        "sayzo_agent.gui.setup.mac_permissions.sys.platform", "darwin"
-    ), patch.dict("sys.modules", {"AVFoundation": fake_av}), patch(
-        "sayzo_agent.gui.setup.mac_permissions._TCC_REQUEST_TIMEOUT_SECS", 0.05
-    ):
-        assert mac_permissions.prompt_microphone() is None
+    patches = _patch_av(fake_av)
+    _enter_all(patches)
+    try:
+        # Patch the timeout down so the test runs in milliseconds.
+        with patch(
+            "sayzo_agent.gui.setup.mac_permissions._TCC_REQUEST_TIMEOUT_SECS",
+            0.05,
+        ):
+            result = mac_permissions.prompt_microphone()
+            assert result.granted is None
+            assert result.stale_tcc_likely is False
+    finally:
+        _exit_all(patches)
+
+
+def test_prompt_microphone_returns_none_when_main_queue_drops_block():
+    """Defensive: if NSOperationQueue.mainQueue silently drops the block
+    (e.g. main runloop isn't pumping for some reason), the completion
+    handler never fires and we should hit the timeout, returning None."""
+    # fire_block=False → addOperationWithBlock_ is a no-op.
+    fake_foundation = _fake_foundation(fire_block=False)
+    fake_av = _fake_avfoundation(status=0, request_response=True)
+    patches = _patch_av(fake_av, fake_foundation_mod=fake_foundation)
+    _enter_all(patches)
+    try:
+        with patch(
+            "sayzo_agent.gui.setup.mac_permissions._TCC_REQUEST_TIMEOUT_SECS",
+            0.05,
+        ):
+            assert mac_permissions.prompt_microphone().granted is None
+    finally:
+        _exit_all(patches)
 
 
 def test_prompt_microphone_returns_none_on_unexpected_status():
     """Defensive: an enum value Apple hasn't documented yet (e.g. 99)
     must not be silently bucketed as granted/denied."""
     fake_av = _fake_avfoundation(status=99)
-    with patch(
-        "sayzo_agent.gui.setup.mac_permissions.sys.platform", "darwin"
-    ), patch.dict("sys.modules", {"AVFoundation": fake_av}):
-        assert mac_permissions.prompt_microphone() is None
+    patches = _patch_av(fake_av)
+    _enter_all(patches)
+    try:
+        assert mac_permissions.prompt_microphone().granted is None
+    finally:
+        _exit_all(patches)
 
 
 def test_prompt_microphone_returns_none_when_avfoundation_unavailable():
@@ -160,12 +359,32 @@ def test_prompt_microphone_returns_none_when_avfoundation_unavailable():
     with patch(
         "sayzo_agent.gui.setup.mac_permissions.sys.platform", "darwin"
     ), patch.dict("sys.modules", {"AVFoundation": failing_module}):
-        assert mac_permissions.prompt_microphone() is None
+        result = mac_permissions.prompt_microphone()
+        assert result.granted is None
+        assert result.stale_tcc_likely is False
+
+
+def test_prompt_microphone_returns_none_when_foundation_unavailable():
+    """Dev machine where pyobjc-framework-Cocoa (Foundation) didn't load:
+    we can't dispatch onto the main queue, so we bail with None rather
+    than fire the request from the worker thread (where the dialog
+    silently no-ops)."""
+    fake_av = _fake_avfoundation(status=0, request_response=True)
+    failing_foundation = SimpleNamespace()  # no NSOperationQueue attribute
+    with patch(
+        "sayzo_agent.gui.setup.mac_permissions.sys.platform", "darwin"
+    ), patch.dict(
+        "sys.modules",
+        {"AVFoundation": fake_av, "Foundation": failing_foundation},
+    ):
+        assert mac_permissions.prompt_microphone().granted is None
 
 
 def test_prompt_microphone_returns_none_on_non_darwin():
     with patch("sayzo_agent.gui.setup.mac_permissions.sys.platform", "win32"):
-        assert mac_permissions.prompt_microphone() is None
+        result = mac_permissions.prompt_microphone()
+        assert result.granted is None
+        assert result.stale_tcc_likely is False
 
 
 # ---------------------------------------------------------------------------

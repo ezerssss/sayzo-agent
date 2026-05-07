@@ -517,7 +517,11 @@ class Bridge:
             return {"granted": None}
 
         if key == "mic":
-            return {"granted": mac_permissions.prompt_microphone()}
+            mic_result = mac_permissions.prompt_microphone()
+            return {
+                "granted": mic_result.granted,
+                "stale_tcc_likely": mic_result.stale_tcc_likely,
+            }
         if key == "audio_capture":
             return {"granted": mac_permissions.prompt_audio_capture()}
         if key == "notifications":

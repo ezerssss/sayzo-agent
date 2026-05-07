@@ -59,6 +59,13 @@ export type PermissionRow = {
 
 export type PermissionResult = {
   granted: boolean | null;
+  // Only set for the "mic" key today. True when the helper fingerprinted
+  // a stale TCC entry from a previous Sayzo install with a different
+  // signing identity silently denying the request without UI. The Setup
+  // window's Microphone screen surfaces targeted recovery copy when this
+  // is true; the Settings PermissionsPane currently just falls back to
+  // the deep-link.
+  stale_tcc_likely?: boolean;
 };
 
 export type PermissionOpenResult = {

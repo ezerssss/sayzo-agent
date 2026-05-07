@@ -2,10 +2,12 @@
 
 Each ``prompt_*`` function is user-initiated: it fires the underlying OS
 API on demand so the TCC dialog appears *after* the in-app explanation,
-not during service startup. All functions return ``bool | None`` (True=
-granted, False=denied, None=inconclusive) and never raise — failures are
-logged and flattened to ``None`` so the GUI can surface a neutral message
-instead of crashing the bridge.
+not during service startup. Most return ``bool | None`` (True=granted,
+False=denied, None=inconclusive) and never raise — failures are logged
+and flattened to ``None`` so the GUI can surface a neutral message
+instead of crashing the bridge. ``prompt_microphone`` returns a richer
+:class:`MicPromptResult` so the GUI can distinguish a true denial from
+a stale-TCC silent-deny.
 """
 from __future__ import annotations
 
@@ -13,7 +15,8 @@ import logging
 import subprocess
 import sys
 import threading
-from typing import Optional
+import time
+from typing import NamedTuple, Optional
 
 log = logging.getLogger(__name__)
 
@@ -46,6 +49,28 @@ _AV_AUTH_NOT_DETERMINED = 0
 _AV_AUTH_RESTRICTED = 1
 _AV_AUTH_DENIED = 2
 _AV_AUTH_AUTHORIZED = 3
+
+# A "denied" answer that arrives faster than this is almost certainly the
+# stale-TCC silent-deny pattern (TCC has an entry whose code-requirement
+# doesn't match the current bundle, so the request fires the completion
+# handler with `False` immediately without presenting UI). A real human
+# read-and-click takes much longer than 500 ms, even on a snap decision.
+_STALE_TCC_THRESHOLD_SECS = 0.5
+
+
+class MicPromptResult(NamedTuple):
+    """Outcome of :func:`prompt_microphone`.
+
+    ``granted`` is the bool/None tri-state every other ``prompt_*`` helper
+    returns. ``stale_tcc_likely`` is True when the heuristic fingerprints a
+    stale TCC entry — the GUI uses that flag to swap the generic "blocked"
+    message for the targeted "remove from System Settings, then retry"
+    recovery steps. False on every other outcome (including legitimate
+    denials, timeouts, and granted).
+    """
+
+    granted: Optional[bool]
+    stale_tcc_likely: bool
 
 # x-apple.systempreferences URIs for the three Privacy & Security sub-panes
 # we care about. There's no public Audio Capture sub-pane URI, so the tap
@@ -135,9 +160,9 @@ def _get_notifier():
     return _NOTIFIER
 
 
-def prompt_microphone() -> Optional[bool]:
+def prompt_microphone() -> MicPromptResult:
     """Read or trigger the macOS Microphone TCC decision and return the
-    actual outcome.
+    actual outcome plus a stale-TCC hint.
 
     Uses ``AVCaptureDevice``'s public TCC API:
 
@@ -157,13 +182,21 @@ def prompt_microphone() -> Optional[bool]:
     of raising. That bug is what made the v2.6.0 macOS hotkey path record
     audio_dur > 0 with mic_total = 0.
 
-    Returns:
-        True   — authorized
-        False  — denied / restricted / declined in the dialog
-        None   — AVFoundation unavailable or dialog timeout
+    The ``stale_tcc_likely`` field of the result is True when the request
+    branch returned False in under
+    :data:`_STALE_TCC_THRESHOLD_SECS` — that's the fingerprint of a TCC
+    entry from a previous Sayzo install with a different signing identity
+    silently denying the request without presenting the dialog. The GUI
+    surfaces a targeted recovery message for this case.
+
+    Returns a :class:`MicPromptResult`:
+        granted=True   — authorized
+        granted=False  — denied / restricted / declined in the dialog
+        granted=None   — AVFoundation unavailable or dialog timeout
+        stale_tcc_likely=True only when the silent-deny pattern fires.
     """
     if sys.platform != "darwin":
-        return None
+        return MicPromptResult(granted=None, stale_tcc_likely=False)
 
     try:
         # AVFoundation framework binding from pyobjc-framework-AVFoundation.
@@ -179,7 +212,7 @@ def prompt_microphone() -> Optional[bool]:
             "[mac_permissions] AVFoundation import failed — cannot read mic TCC",
             exc_info=True,
         )
-        return None
+        return MicPromptResult(granted=None, stale_tcc_likely=False)
 
     try:
         status = AVCaptureDevice.authorizationStatusForMediaType_(
@@ -190,49 +223,87 @@ def prompt_microphone() -> Optional[bool]:
             "[mac_permissions] authorizationStatusForMediaType_ raised",
             exc_info=True,
         )
-        return None
+        return MicPromptResult(granted=None, stale_tcc_likely=False)
+
+    log.info(
+        "[mac_permissions] microphone TCC: status=%r media_type=%r thread=%s",
+        status,
+        AVMediaTypeAudio,
+        threading.current_thread().name,
+    )
 
     if status == _AV_AUTH_AUTHORIZED:
         log.info("[mac_permissions] microphone TCC: already authorized")
-        return True
+        return MicPromptResult(granted=True, stale_tcc_likely=False)
     if status == _AV_AUTH_DENIED:
         log.info("[mac_permissions] microphone TCC: previously denied")
-        return False
+        return MicPromptResult(granted=False, stale_tcc_likely=False)
     if status == _AV_AUTH_RESTRICTED:
         log.info("[mac_permissions] microphone TCC: restricted (MDM/parental)")
-        return False
+        return MicPromptResult(granted=False, stale_tcc_likely=False)
     if status != _AV_AUTH_NOT_DETERMINED:
         log.warning(
             "[mac_permissions] microphone TCC: unexpected status=%r", status
         )
-        return None
+        return MicPromptResult(granted=None, stale_tcc_likely=False)
 
-    # NotDetermined → fire the dialog and block on the user's response. The
-    # bridge call runs on pywebview's worker thread, so blocking here is
-    # exactly what we want — the React screen sits in "Requesting…" state
-    # until the user has actually clicked.
-    log.info("[mac_permissions] microphone TCC: requesting (firing dialog)")
+    # NotDetermined → fire the dialog from the MAIN thread. AVFoundation's
+    # requestAccessForMediaType_completionHandler_ doesn't reliably present
+    # its dialog when invoked from a non-main thread inside a frozen
+    # pywebview bundle — instead the framework silently no-ops the dialog
+    # and fires the completion handler with `denied` in milliseconds. This
+    # is exactly what we hit in v2.7.0: the "requesting" log was followed
+    # by "user response → False" with a 6 ms gap on a user who had never
+    # seen a dialog. Apple's docs say the call is thread-safe, but in
+    # practice the dialog presentation needs to be scheduled onto the main
+    # NSRunLoop. NSOperationQueue.mainQueue() is the cleanest cross-version
+    # way to do that — pywebview's WebView keeps the main runloop pumping,
+    # so the block runs as soon as the runloop is idle.
+    try:
+        from Foundation import NSOperationQueue  # type: ignore[import-not-found]
+    except Exception:
+        log.warning(
+            "[mac_permissions] Foundation import failed — cannot dispatch TCC request",
+            exc_info=True,
+        )
+        return MicPromptResult(granted=None, stale_tcc_likely=False)
+
+    log.info(
+        "[mac_permissions] microphone TCC: requesting (dispatching to main queue)"
+    )
     event = threading.Event()
     granted_holder: list[Optional[bool]] = [None]
 
     def completion(granted) -> None:
         # Always set the event, even if the bool coercion blows up. The
-        # main thread must not sit on Event.wait() forever.
+        # caller must not sit on Event.wait() forever.
         try:
             granted_holder[0] = bool(granted)
         finally:
             event.set()
 
+    def fire_request() -> None:
+        # Runs on the main thread via NSOperationQueue.mainQueue.
+        try:
+            AVCaptureDevice.requestAccessForMediaType_completionHandler_(
+                AVMediaTypeAudio, completion
+            )
+        except Exception:
+            log.warning(
+                "[mac_permissions] requestAccessForMediaType raised on main",
+                exc_info=True,
+            )
+            event.set()  # unblock the caller — outcome stays None
+
+    request_started = time.monotonic()
     try:
-        AVCaptureDevice.requestAccessForMediaType_completionHandler_(
-            AVMediaTypeAudio, completion
-        )
+        NSOperationQueue.mainQueue().addOperationWithBlock_(fire_request)
     except Exception:
         log.warning(
-            "[mac_permissions] requestAccessForMediaType_completionHandler_ raised",
+            "[mac_permissions] addOperationWithBlock_ failed — cannot fire dialog",
             exc_info=True,
         )
-        return None
+        return MicPromptResult(granted=None, stale_tcc_likely=False)
 
     if not event.wait(timeout=_TCC_REQUEST_TIMEOUT_SECS):
         log.warning(
@@ -240,11 +311,26 @@ def prompt_microphone() -> Optional[bool]:
             "(no callback fired — likely no dialog actually presented)",
             _TCC_REQUEST_TIMEOUT_SECS,
         )
-        return None
+        return MicPromptResult(granted=None, stale_tcc_likely=False)
 
+    elapsed = time.monotonic() - request_started
     result = granted_holder[0]
-    log.info("[mac_permissions] microphone TCC: user response → %s", result)
-    return result
+    # Stale-TCC fingerprint: an entry created by a previous Sayzo install
+    # with a different signing identity (e.g. v2.5.x ad-hoc → v2.6.0+
+    # Developer-ID) silently denies the request without presenting UI.
+    # The completion fires with False in milliseconds. A real human can't
+    # read the dialog and click Don't Allow that fast, so a sub-500ms
+    # False from the request branch is a high-confidence stale-TCC signal.
+    stale_tcc_likely = (
+        result is False and elapsed < _STALE_TCC_THRESHOLD_SECS
+    )
+    log.info(
+        "[mac_permissions] microphone TCC: user response → %s (elapsed=%.3fs, stale_tcc_likely=%s)",
+        result,
+        elapsed,
+        stale_tcc_likely,
+    )
+    return MicPromptResult(granted=result, stale_tcc_likely=stale_tcc_likely)
 
 
 def prompt_audio_capture() -> Optional[bool]:
