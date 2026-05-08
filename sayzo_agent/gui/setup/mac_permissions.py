@@ -50,15 +50,18 @@ _AV_AUTH_RESTRICTED = 1
 _AV_AUTH_DENIED = 2
 _AV_AUTH_AUTHORIZED = 3
 
-# A "denied" answer that arrives faster than this is almost certainly a
-# silent-deny pattern: either a stale TCC entry whose code-requirement
-# doesn't match the current bundle (the system fires the completion
-# handler with False immediately without presenting UI), or — on a Sayzo-
-# specific note — a missing `NSMicrophoneUsageDescription` /
-# `NSAudioCaptureUsageDescription` key in the bundle's Info.plist (which
-# AVFoundation rejects at the pre-flight check, before any TCC dialog).
-# A real human read-and-click takes much longer than 500 ms, even on a
-# snap decision.
+# Used by `prompt_audio_capture` (Swift `audio-tap` exit-77 path) to
+# distinguish a real human "Don't Allow" click from a silent-deny.
+# The mic path no longer uses this constant — v2.7.3 reverted the mic
+# trigger to CoreAudio HAL which doesn't have a sub-second-False
+# fingerprint to worry about (it polls AVCaptureDevice.authorizationStatus
+# directly), but the audio-capture path still relies on it. A real
+# human read-and-click takes much longer than 500 ms even on a snap
+# decision; a False arriving faster is the system rejecting the request
+# at a pre-flight check (e.g. PyInstaller bootloader attribution
+# failure, missing usage description, stale-CR orphan entry). See
+# project_macos_silent_tcc_deny.md memory for the full v2.7.3 root
+# cause analysis.
 _STALE_TCC_THRESHOLD_SECS = 0.5
 
 # Bundle identifier our TCC entries are keyed under. Mirrors the
@@ -89,16 +92,25 @@ class TccPromptResult(NamedTuple):
     """Outcome of :func:`prompt_microphone` and :func:`prompt_audio_capture`.
 
     ``granted`` is the bool/None tri-state every other ``prompt_*`` helper
-    returns. ``stale_tcc_likely`` is True when the heuristic fingerprints a
-    stale TCC entry — the GUI uses that flag to swap the generic "blocked"
-    message for the targeted "remove from System Settings, then retry"
-    recovery steps. False on every other outcome (including legitimate
-    denials, timeouts, and granted).
+    returns. ``stale_tcc_likely`` is True when the heuristic fingerprints
+    a "dialog never appeared" condition — the GUI uses that flag to swap
+    the generic "blocked" message for targeted recovery copy.
 
-    Both Microphone (AVFoundation) and Audio Capture (CoreAudio Process
-    Taps via the Swift audio-tap helper) can hit the same root cause: a
-    TCC entry from a pre-v2.6.0 ad-hoc-signed Sayzo install whose code
-    requirement no longer matches the current Developer-ID-signed bundle.
+    The two prompt paths fingerprint differently:
+      - **prompt_microphone** (CoreAudio HAL via sounddevice + AVFoundation
+        status polling): flags ``stale_tcc_likely`` when status never flips
+        from NotDetermined within the polling timeout — the fingerprint of
+        no dialog actually appearing on screen.
+      - **prompt_audio_capture** (Swift `audio-tap` helper, Process Taps
+        API): flags ``stale_tcc_likely`` when the binary exits 77 in
+        under :data:`_STALE_TCC_THRESHOLD_SECS` — same intuition, since
+        no human can read a dialog and click that fast.
+
+    Common underlying causes (see project_macos_silent_tcc_deny.md memory):
+    `LSBackgroundOnly=True` silently injected by PyInstaller, AVFoundation
+    bootloader-attribution failure, missing/orphan TCC entries, or a
+    missing usage-description key in Info.plist. The diagnostic logged at
+    the start of each prompt distinguishes which one.
     """
 
     granted: Optional[bool]
@@ -203,16 +215,23 @@ def _log_bundle_info_plist_once() -> None:
     bundle/build problem (usage-description key missing) or a stale-TCC
     problem (key present, request still silently denied).
 
-    Apple's documented behavior: when a bundle calls
-    ``AVCaptureDevice.requestAccessForMediaType:`` for an audio media type
-    without ``NSMicrophoneUsageDescription`` in its Info.plist, the system
-    rejects the request at the pre-flight check and fires the completion
-    handler with False immediately, without showing a dialog. That symptom
-    is indistinguishable at runtime from a stale-CR silent-deny — except
-    that the missing-key case will (a) never let the bundle appear in
-    System Settings → Privacy & Security → Microphone (no entry can be
-    created), and (b) be visible in this log line. See
-    https://developer.apple.com/documentation/BundleResources/Information-Property-List/NSMicrophoneUsageDescription
+    Surfaces three categories of "TCC dialog never appears":
+
+    1. **`LSBackgroundOnly=True`** — PyInstaller's
+       `building/osx.py` defaults this to True whenever the EXE block
+       has `console=True` (we need that for CLI commands). macOS treats
+       LSBackgroundOnly apps as agent apps that don't show UI — TCC
+       refuses to render the dialog. v2.7.3 added an explicit override
+       to `sayzo-agent.spec`'s `info_plist` setting it to False; this
+       log line lets us verify the override actually landed in the
+       built bundle.
+    2. **Missing usage descriptions** —
+       https://developer.apple.com/documentation/BundleResources/Information-Property-List/NSMicrophoneUsageDescription
+       AVFoundation rejects at pre-flight, dialog never appears.
+    3. **Null `CFBundleDisplayName`** — Apple Forum 30364: "the system
+       will never know what app is asking for a permission." PyInstaller
+       defaults this to the appname so it's almost always present, but
+       we log it to be sure.
     """
     if sys.platform != "darwin":
         return
@@ -253,13 +272,25 @@ def _log_bundle_info_plist_once() -> None:
         s = str(val)
         return f"present ({len(s)} chars: {s[:60]!r})"
 
+    # LSBackgroundOnly is the key field — PyInstaller's BUNDLE() default
+    # sets it to True whenever console=True on the EXE block (which we
+    # need for CLI commands), and a True value tells macOS the app is
+    # an "agent app" that won't show UI — including TCC dialogs.
+    # v2.7.3 added an explicit override to spec.info_plist setting this
+    # to False; this diagnostic line lets us verify the override actually
+    # landed in the shipped Info.plist (sometimes a stale build cache
+    # silently keeps a previous value).
     log.info(
         "[mac_permissions] bundle Info.plist diagnostic: "
-        "path=%s bundle_id=%r executable=%r LSUIElement=%r",
+        "path=%s bundle_id=%r executable=%r LSUIElement=%r LSBackgroundOnly=%r "
+        "CFBundleDisplayName=%r CFBundleName=%r",
         bundle_path,
         info.get("CFBundleIdentifier"),
         info.get("CFBundleExecutable"),
         info.get("LSUIElement"),
+        info.get("LSBackgroundOnly"),
+        info.get("CFBundleDisplayName"),
+        info.get("CFBundleName"),
     )
     log.info(
         "[mac_permissions] usage descriptions: "
@@ -564,36 +595,40 @@ def prompt_microphone() -> TccPromptResult:
     """Read or trigger the macOS Microphone TCC decision and return the
     actual outcome plus a stale-TCC hint.
 
-    Uses ``AVCaptureDevice``'s public TCC API:
+    **Dialog trigger uses CoreAudio HAL via ``sounddevice.InputStream``,
+    not AVFoundation.** This is the historically-working path —
+    pre-v2.7.0 builds successfully showed the TCC dialog and recorded
+    real audio for users who clicked Allow (per direct user reports).
+    v2.7.0 swapped to ``AVCaptureDevice.requestAccessForMediaType:``
+    which silent-denies in <10 ms on Sequoia 15.x for the same bundle
+    config — Apple's TCC subsystem refuses to present its dialog when
+    the request is attributed through PyInstaller's bootloader chain
+    (forum 701094: "TCC works hard to find the responsible code…
+    [if] the newly created process is not detached completely from
+    the calling process, the dialog doesn't show"). HAL's TCC
+    presentation path operates on the running PID directly and isn't
+    subject to the same attribution failure.
 
-    - ``authorizationStatusForMediaType:`` is a sync read of the recorded
-      TCC state — never prompts. If the user has already decided we
-      short-circuit and return without firing a dialog.
-    - ``requestAccessForMediaType:completionHandler:`` only fires the
-      dialog when the recorded status is NotDetermined. The completion
-      handler runs on a background queue when the user clicks; we block
-      this thread on a ``threading.Event`` so the bridge call only returns
-      *after* the user has actually decided.
-
-    Replaces the old "open sounddevice, sleep 0.1s, return True" path,
-    which cheerfully returned ``granted=True`` while the dialog was still
-    on screen — and silently returned ``True`` on a denied bundle because
-    sounddevice opens a "permission denied" stream and reads zeros instead
-    of raising. That bug is what made the v2.6.0 macOS hotkey path record
-    audio_dur > 0 with mic_total = 0.
-
-    The ``stale_tcc_likely`` field of the result is True when the request
-    branch returned False in under
-    :data:`_STALE_TCC_THRESHOLD_SECS` — that's the fingerprint of a TCC
-    entry from a previous Sayzo install with a different signing identity
-    silently denying the request without presenting the dialog. The GUI
-    surfaces a targeted recovery message for this case.
+    The pre-v2.7.0 ``sd.InputStream``-based code had a real bug — it
+    returned ``True`` whether the user clicked Allow or Don't Allow —
+    because it never re-read TCC state after the dialog closed. We
+    fix that here by polling
+    ``AVCaptureDevice.authorizationStatusForMediaType:`` (a pure read,
+    never prompts) every 300 ms while the stream is open. The status
+    flips synchronously when the user clicks, so we observe the real
+    outcome and only return after the user has actually decided.
 
     Returns a :class:`TccPromptResult`:
-        granted=True   — authorized
-        granted=False  — denied / restricted / declined in the dialog
-        granted=None   — AVFoundation unavailable or dialog timeout
-        stale_tcc_likely=True only when the silent-deny pattern fires.
+        granted=True   — authorized (status flipped to Authorized)
+        granted=False  — denied / restricted (status flipped to Denied
+                         or pre-existing Denied)
+        granted=None   — sounddevice unavailable, HAL stream open
+                         failed, or polling timed out (no status flip
+                         within the timeout — likely no dialog
+                         appeared, fingerprint of the same bundle-
+                         attribution issue at the HAL level)
+        stale_tcc_likely=True when polling timed out without a click —
+                         fingerprint that the dialog never presented.
     """
     if sys.platform != "darwin":
         return TccPromptResult(granted=None, stale_tcc_likely=False)
@@ -655,90 +690,116 @@ def prompt_microphone() -> TccPromptResult:
         )
         return TccPromptResult(granted=None, stale_tcc_likely=False)
 
-    # NotDetermined → fire the dialog from the MAIN thread. AVFoundation's
-    # requestAccessForMediaType_completionHandler_ doesn't reliably present
-    # its dialog when invoked from a non-main thread inside a frozen
-    # pywebview bundle — instead the framework silently no-ops the dialog
-    # and fires the completion handler with `denied` in milliseconds. This
-    # is exactly what we hit in v2.7.0: the "requesting" log was followed
-    # by "user response → False" with a 6 ms gap on a user who had never
-    # seen a dialog. Apple's docs say the call is thread-safe, but in
-    # practice the dialog presentation needs to be scheduled onto the main
-    # NSRunLoop. NSOperationQueue.mainQueue() is the cleanest cross-version
-    # way to do that — pywebview's WebView keeps the main runloop pumping,
-    # so the block runs as soon as the runloop is idle.
+    # NotDetermined → trigger the dialog via CoreAudio HAL by opening
+    # an InputStream, then poll AVCaptureDevice.authorizationStatus
+    # until it flips. See the function docstring for why HAL beats
+    # AVCaptureDevice.requestAccess on Sequoia.
     try:
-        from Foundation import NSOperationQueue  # type: ignore[import-not-found]
+        import sounddevice as sd  # type: ignore[import-not-found]
     except Exception:
         log.warning(
-            "[mac_permissions] Foundation import failed — cannot dispatch TCC request",
+            "[mac_permissions] sounddevice import failed — cannot trigger HAL dialog",
             exc_info=True,
         )
         return TccPromptResult(granted=None, stale_tcc_likely=False)
 
+    # Preemptive tccutil reset — clears any orphan TCC entry left over
+    # from a previous install with a different signing identity. status
+    # already read NotDetermined above, so no Authorized grant exists
+    # to nuke. tccutil reset is a no-op when no entry exists.
     log.info(
-        "[mac_permissions] microphone TCC: requesting (dispatching to main queue)"
+        "[mac_permissions] microphone TCC: preemptive tccutil reset before HAL trigger"
     )
-    event = threading.Event()
-    granted_holder: list[Optional[bool]] = [None]
+    _tccutil_reset_service(_TCC_SERVICE_MICROPHONE)
 
-    def completion(granted) -> None:
-        # Always set the event, even if the bool coercion blows up. The
-        # caller must not sit on Event.wait() forever.
+    log.info(
+        "[mac_permissions] microphone TCC: opening HAL input stream to trigger dialog"
+    )
+    request_started = time.monotonic()
+    stream = None
+    try:
         try:
-            granted_holder[0] = bool(granted)
-        finally:
-            event.set()
-
-    def fire_request() -> None:
-        # Runs on the main thread via NSOperationQueue.mainQueue.
-        try:
-            AVCaptureDevice.requestAccessForMediaType_completionHandler_(
-                AVMediaTypeAudio, completion
+            stream = sd.InputStream(
+                samplerate=16000,
+                channels=1,
+                blocksize=160,
+                dtype="float32",
             )
+            stream.start()
         except Exception:
+            # PortAudioError on a denied bundle (rare path — status
+            # would have read Denied above already) or a device-
+            # configuration error. Either way we can't trigger the
+            # dialog through this path.
             log.warning(
-                "[mac_permissions] requestAccessForMediaType raised on main",
+                "[mac_permissions] HAL stream open failed — cannot trigger dialog",
                 exc_info=True,
             )
-            event.set()  # unblock the caller — outcome stays None
+            return TccPromptResult(granted=None, stale_tcc_likely=False)
 
-    request_started = time.monotonic()
-    try:
-        NSOperationQueue.mainQueue().addOperationWithBlock_(fire_request)
-    except Exception:
-        log.warning(
-            "[mac_permissions] addOperationWithBlock_ failed — cannot fire dialog",
-            exc_info=True,
+        # Poll status until it flips. The HAL dialog blocks the user's
+        # click in the system UI; the click flips TCC state, which our
+        # next authorizationStatusForMediaType_ read picks up. 300 ms
+        # cadence balances responsiveness (the user sees the next
+        # screen quickly after clicking) against pyobjc bridge load.
+        deadline = time.monotonic() + _TCC_REQUEST_TIMEOUT_SECS
+        poll_interval_secs = 0.3
+        final_status: int = _AV_AUTH_NOT_DETERMINED
+        while time.monotonic() < deadline:
+            time.sleep(poll_interval_secs)
+            try:
+                final_status = AVCaptureDevice.authorizationStatusForMediaType_(
+                    AVMediaTypeAudio
+                )
+            except Exception:
+                log.debug(
+                    "[mac_permissions] status poll raised", exc_info=True
+                )
+                continue
+            if final_status != _AV_AUTH_NOT_DETERMINED:
+                break
+
+        elapsed = time.monotonic() - request_started
+    finally:
+        if stream is not None:
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                log.debug(
+                    "[mac_permissions] HAL stream teardown raised",
+                    exc_info=True,
+                )
+
+    if final_status == _AV_AUTH_AUTHORIZED:
+        log.info(
+            "[mac_permissions] microphone TCC: HAL dialog → Authorized (elapsed=%.3fs)",
+            elapsed,
         )
-        return TccPromptResult(granted=None, stale_tcc_likely=False)
-
-    if not event.wait(timeout=_TCC_REQUEST_TIMEOUT_SECS):
-        log.warning(
-            "[mac_permissions] microphone TCC: dialog timed out after %.0fs "
-            "(no callback fired — likely no dialog actually presented)",
-            _TCC_REQUEST_TIMEOUT_SECS,
+        return TccPromptResult(granted=True, stale_tcc_likely=False)
+    if final_status == _AV_AUTH_DENIED:
+        log.info(
+            "[mac_permissions] microphone TCC: HAL dialog → Denied (elapsed=%.3fs)",
+            elapsed,
         )
-        return TccPromptResult(granted=None, stale_tcc_likely=False)
+        return TccPromptResult(granted=False, stale_tcc_likely=False)
+    if final_status == _AV_AUTH_RESTRICTED:
+        log.info(
+            "[mac_permissions] microphone TCC: HAL dialog → Restricted (elapsed=%.3fs)",
+            elapsed,
+        )
+        return TccPromptResult(granted=False, stale_tcc_likely=False)
 
-    elapsed = time.monotonic() - request_started
-    result = granted_holder[0]
-    # Stale-TCC fingerprint: an entry created by a previous Sayzo install
-    # with a different signing identity (e.g. v2.5.x ad-hoc → v2.6.0+
-    # Developer-ID) silently denies the request without presenting UI.
-    # The completion fires with False in milliseconds. A real human can't
-    # read the dialog and click Don't Allow that fast, so a sub-500ms
-    # False from the request branch is a high-confidence stale-TCC signal.
-    stale_tcc_likely = (
-        result is False and elapsed < _STALE_TCC_THRESHOLD_SECS
-    )
-    log.info(
-        "[mac_permissions] microphone TCC: user response → %s (elapsed=%.3fs, stale_tcc_likely=%s)",
-        result,
+    # Status never flipped — most likely the HAL dialog never appeared
+    # either, which on Sequoia points back to the bundle-attribution /
+    # Info.plist issue. Surface as None with stale_tcc_likely=True so
+    # the recovery UI fires.
+    log.warning(
+        "[mac_permissions] microphone TCC: HAL polling timed out after %.1fs "
+        "(status still NotDetermined — dialog likely never presented)",
         elapsed,
-        stale_tcc_likely,
     )
-    return TccPromptResult(granted=result, stale_tcc_likely=stale_tcc_likely)
+    return TccPromptResult(granted=None, stale_tcc_likely=True)
 
 
 def prompt_audio_capture() -> TccPromptResult:

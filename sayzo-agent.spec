@@ -348,6 +348,25 @@ if sys.platform == "darwin":
         info_plist={
             "CFBundleShortVersionString": _sayzo_version,
             "LSUIElement": True,  # hide from Dock (tray-only background app)
+            # PyInstaller's BUNDLE() defaults `LSBackgroundOnly=True`
+            # whenever the EXE block has `console=True` (see PyInstaller
+            # building/osx.py: "Setting EXE console=True implies
+            # LSBackgroundOnly=True"). We need console=True so CLI
+            # commands (`sayzo-agent run`, `sayzo-agent first-run`, etc.)
+            # work from a Terminal, but `LSBackgroundOnly=True` makes
+            # macOS classify the bundle as an agent app that won't show
+            # UI — and the TCC subsystem then refuses to present its
+            # permission dialog. Symptom: every Mac user reports the
+            # mic-permission dialog never appears and
+            # `AVCaptureDevice.requestAccess` silent-denies in <10 ms.
+            # This explicit override forces LSBackgroundOnly=False so
+            # the merged Info.plist matches a real LSUIElement (menu-
+            # bar) app — which CAN show TCC dialogs. CFBundleDisplayName
+            # is also explicit (Apple Forum 30364: "if it is null, the
+            # system will never know what app is asking for permission").
+            "LSBackgroundOnly": False,
+            "CFBundleDisplayName": "Sayzo",
+            "CFBundleName": "Sayzo",
             # Usage descriptions are the copy the OS shows in its TCC
             # dialogs. They MUST match Sayzo's armed-only invariant: mic /
             # audio-capture / automation are only used during a capture the
