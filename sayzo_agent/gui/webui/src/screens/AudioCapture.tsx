@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { CheckCircle2, XCircle } from "lucide-react";
+import { CheckCircle2, ClipboardCheck, FolderOpen, XCircle } from "lucide-react";
 import { Button } from "../components/ui/Button";
 import { Layout } from "../components/Layout";
 import { bridge } from "../lib/bridge";
@@ -10,14 +10,22 @@ interface Props {
   onCancel: () => void;
 }
 
-// "stale_tcc" splits off from "denied" so we can show targeted recovery
-// copy. The generic "blocked, open settings, turn it on" message is
-// actively misleading in the stale-TCC case because System Settings shows
-// the toggle ON — the user has nothing left to flip. Same root cause as
-// the Microphone screen: a TCC entry from a pre-v2.6.0 ad-hoc-signed
-// audio-tap binary whose CR no longer matches the current Developer-ID-
-// signed binary.
-type State = "idle" | "pending" | "granted" | "denied" | "stale_tcc";
+// Same root cause as the Microphone screen: macOS silent-denies when an
+// orphan TCC entry from a pre-v2.6.0 ad-hoc-signed Sayzo install has a
+// code requirement that no longer matches the current Developer-ID-
+// signed binary, OR when NSAudioCaptureUsageDescription is missing from
+// Info.plist. In the orphan case the entry is hidden from System
+// Settings → Privacy & Security → Audio Capture, so any "remove from
+// the list" copy is a dead end. Bundle-level recovery via
+// `tccutil reset AudioCapture com.sayzo.agent` + relaunch is the only
+// path that works without Terminal.
+type State =
+  | "idle"
+  | "pending"
+  | "granted"
+  | "denied"
+  | "stale_tcc"
+  | "resetting";
 
 export function AudioCapture({ step, onNext, onCancel }: Props) {
   const [state, setState] = useState<State>("idle");
@@ -41,6 +49,19 @@ export function AudioCapture({ step, onNext, onCancel }: Props) {
     }
   }
 
+  async function handleResetAndRestart() {
+    setState("resetting");
+    try {
+      // Bridge hard-exits after tccutil + relaunch fire; this promise
+      // never resolves on the happy path. A rejection means Python
+      // failed before relaunch, so we recover back to the recovery UI
+      // instead of leaving "resetting" stuck on screen.
+      await bridge.resetAudioCapturePermissionAndRestart();
+    } catch {
+      setState("stale_tcc");
+    }
+  }
+
   return (
     <Layout
       step={step}
@@ -61,15 +82,11 @@ export function AudioCapture({ step, onNext, onCancel }: Props) {
               Open Settings
             </Button>
           ) : state === "stale_tcc" ? (
-            <>
-              <Button
-                variant="secondary"
-                onClick={() => bridge.openAudioCaptureSettings()}
-              >
-                Open Settings
-              </Button>
-              <Button onClick={handleAllow}>Try Again</Button>
-            </>
+            <Button onClick={handleResetAndRestart}>
+              Reset &amp; Restart Sayzo
+            </Button>
+          ) : state === "resetting" ? (
+            <Button disabled>Restarting…</Button>
           ) : (
             <Button onClick={handleAllow} disabled={state === "pending"}>
               {state === "pending" ? "Requesting…" : "Allow"}
@@ -95,22 +112,91 @@ export function AudioCapture({ step, onNext, onCancel }: Props) {
         </div>
       )}
       {state === "stale_tcc" && (
-        <div className="flex items-start gap-2 text-sm text-amber-800">
-          <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
-          <div className="space-y-2">
-            <p className="font-medium">
-              macOS still has a system-audio entry from a previous Sayzo
-              install — that's why you don't see a dialog.
-            </p>
-            <p>
-              Open System Settings → Privacy &amp; Security → Audio Capture,
-              click <span className="font-mono">Sayzo</span> in the list,
-              then click the <span className="font-mono">−</span> button at
-              the bottom to remove it. Come back here and click Try Again.
-            </p>
+        <>
+          <div className="flex items-start gap-2 text-sm text-amber-800">
+            <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
+            <div className="space-y-2">
+              <p className="font-medium">
+                macOS didn't show the permission dialog.
+              </p>
+              <p>
+                This usually means a leftover entry from a previous Sayzo
+                install is silently blocking us — and macOS hides it from
+                System Settings, so there's nothing visible for you to toggle.
+                Click <span className="font-medium">Reset &amp; Restart Sayzo</span>{" "}
+                and we'll clear it for you. The system audio dialog should
+                appear right after Sayzo relaunches.
+              </p>
+            </div>
           </div>
+          <StuckHelp />
+        </>
+      )}
+      {state === "resetting" && (
+        <div className="flex items-center gap-2 text-sm font-medium text-ink">
+          <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-accent" />
+          Clearing the leftover permission and restarting Sayzo…
         </div>
       )}
     </Layout>
+  );
+}
+
+// Mirrors the StuckHelp on Microphone.tsx (kept duplicated rather than
+// shared from a common module — both screens are tiny, the helper is a
+// dozen lines, and bridging through a shared component would force an
+// extra import path for ~20 lines of saved code).
+function StuckHelp() {
+  const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">(
+    "idle",
+  );
+
+  async function handleCopy() {
+    try {
+      const { copied } = await bridge.copyTccDiagnosticToClipboard();
+      setCopyState(copied ? "copied" : "failed");
+    } catch {
+      setCopyState("failed");
+    }
+    window.setTimeout(() => setCopyState("idle"), 2500);
+  }
+
+  return (
+    <div className="mt-4 rounded-md border border-ink-border/60 bg-ink-muted/5 p-3">
+      <p className="text-xs font-medium text-ink">
+        Still stuck after Reset &amp; Restart?
+      </p>
+      <p className="mt-1 text-xs leading-relaxed text-ink-muted">
+        Copy a diagnostic snapshot (bundle info, code-signing details, recent
+        log lines) and send it to{" "}
+        <span className="font-mono">support@sayzo.app</span>. The log folder
+        button opens <span className="font-mono">agent.log</span> directly so
+        you can attach it.
+      </p>
+      <div className="mt-2 flex flex-wrap gap-2">
+        <button
+          type="button"
+          onClick={handleCopy}
+          className="inline-flex items-center gap-1.5 rounded-md border border-ink-border bg-white px-2.5 py-1 text-xs font-medium text-ink hover:bg-ink-muted/10"
+        >
+          <ClipboardCheck className="h-3.5 w-3.5" />
+          {copyState === "copied"
+            ? "Copied!"
+            : copyState === "failed"
+              ? "Copy failed — try again"
+              : "Copy diagnostic info"}
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            void bridge.openLogFolder();
+          }}
+          className="inline-flex items-center gap-1.5 rounded-md border border-ink-border bg-white px-2.5 py-1 text-xs font-medium text-ink hover:bg-ink-muted/10"
+        >
+          <FolderOpen className="h-3.5 w-3.5" />
+          Open log folder
+        </button>
+      </div>
+    </div>
   );
 }

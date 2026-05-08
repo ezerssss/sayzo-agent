@@ -264,6 +264,143 @@ class Bridge:
             return {"sent": bool(sent)}
         return {"sent": False}
 
+    def reset_mic_permission_and_restart(self) -> None:
+        """Programmatic recovery for the macOS "silent-deny" mic state.
+
+        Runs ``tccutil reset Microphone com.sayzo.agent`` to clear any
+        orphan TCC entry (from a previous Sayzo install with a different
+        signing identity, or from an earlier silent-deny that recorded
+        a Denied entry into the database), then immediately relaunches
+        the app and hard-exits this process. Apple's documented behavior
+        is that an already-running process must be quit and restarted
+        after a TCC reset before subsequent ``requestAccess`` calls
+        will surface a fresh dialog — AVFoundation caches the
+        NotDetermined→Denied transition per process.
+
+        Why this exists at all: the previous "open System Settings and
+        remove Sayzo" recovery copy was wrong for the most common case.
+        An orphan CR-mismatched entry is FILTERED OUT of System Settings
+        (the user opens the Microphone pane and Sayzo isn't there),
+        leaving them with no actionable button to click. Bundle-level
+        recovery via tccutil is the only path that works without
+        Terminal.
+
+        No-op on non-darwin.
+        """
+        if sys.platform != "darwin":
+            return
+        from sayzo_agent.gui.setup import mac_permissions
+
+        mac_permissions._tccutil_reset_service(
+            mac_permissions._TCC_SERVICE_MICROPHONE
+        )
+        # Relaunch will hard-exit. Window closing logic is unnecessary
+        # because mac_permissions.relaunch_app calls os._exit(0).
+        self._login.cancel()
+        if self._window is not None:
+            try:
+                self._window.destroy()
+            except Exception:
+                log.debug(
+                    "failed to destroy setup window before mic-reset relaunch",
+                    exc_info=True,
+                )
+        mac_permissions.relaunch_app()
+
+    def reset_audio_capture_permission_and_restart(self) -> None:
+        """Same recovery flow as :meth:`reset_mic_permission_and_restart`,
+        for the Audio Capture (Process Taps) TCC service. Resets the
+        ``AudioCapture`` service for ``com.sayzo.agent`` and relaunches.
+        ``AudioCapture`` is the private TCC service name used by
+        ``AudioHardwareCreateProcessTap`` (macOS 14.4+, see Apple's
+        ``insidegui/AudioCap`` reference)."""
+        if sys.platform != "darwin":
+            return
+        from sayzo_agent.gui.setup import mac_permissions
+
+        mac_permissions._tccutil_reset_service(
+            mac_permissions._TCC_SERVICE_AUDIO_CAPTURE
+        )
+        self._login.cancel()
+        if self._window is not None:
+            try:
+                self._window.destroy()
+            except Exception:
+                log.debug(
+                    "failed to destroy setup window before audio-reset relaunch",
+                    exc_info=True,
+                )
+        mac_permissions.relaunch_app()
+
+    def get_tcc_diagnostic_text(self) -> dict[str, Any]:
+        """Return a plain-text diagnostic summary the user can paste into
+        a support thread when "Reset & Restart Sayzo" hasn't fixed the
+        silent-deny.
+
+        Includes bundle Info.plist key presence (the smoking gun for the
+        AVFoundation pre-flight rejection failure mode), ``codesign -dvv``
+        output (the smoking gun for the orphan-CR failure mode), and the
+        last 50 ``[mac_permissions]`` / ``[mac_heal]`` lines from
+        agent.log. macOS-specific — Windows / Linux callers get a short
+        placeholder so the same UI works without a special case.
+        """
+        if sys.platform == "darwin":
+            from sayzo_agent.gui.setup import mac_permissions
+
+            return {
+                "text": mac_permissions.gather_tcc_diagnostic_text(self._cfg)
+            }
+        return {
+            "text": (
+                f"Platform: {sys.platform} — TCC diagnostic is macOS-specific.\n"
+            )
+        }
+
+    def copy_tcc_diagnostic_to_clipboard(self) -> dict[str, Any]:
+        """Pipe the TCC diagnostic text into ``pbcopy`` so the user can
+        paste it into a support thread with one keystroke. Returns
+        ``{copied: bool}`` so the React button can flash a confirmation."""
+        if sys.platform != "darwin":
+            return {"copied": False}
+        from sayzo_agent.gui.setup import mac_permissions
+
+        return {
+            "copied": mac_permissions.copy_diagnostic_to_clipboard(self._cfg)
+        }
+
+    def open_log_folder(self) -> dict[str, Any]:
+        """Open the agent's log directory in Finder / Explorer so a
+        stuck user can grab ``agent.log`` and email it to support
+        without hunting through ``~/Library/Application Support`` or
+        ``%APPDATA%``. Returns ``{opened: bool}`` for UI feedback.
+
+        Cross-platform: ``open`` on macOS, ``explorer`` on Windows.
+        """
+        log_dir = self._cfg.logs_dir
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            log.debug("log_dir mkdir failed", exc_info=True)
+        try:
+            import subprocess as _sp
+
+            if sys.platform == "darwin":
+                _sp.Popen(
+                    ["open", str(log_dir)],
+                    stdout=_sp.DEVNULL,
+                    stderr=_sp.DEVNULL,
+                )
+            elif sys.platform == "win32":
+                # `explorer <path>` returns rc=1 on success — quirk of
+                # explorer.exe — so we don't check the return code.
+                _sp.Popen(["explorer", str(log_dir)])
+            else:
+                return {"opened": False}
+            return {"opened": True}
+        except Exception:
+            log.warning("open_log_folder failed", exc_info=True)
+            return {"opened": False}
+
     def open_mic_settings(self) -> None:
         if sys.platform == "darwin":
             from sayzo_agent.gui.setup import mac_permissions

@@ -119,6 +119,20 @@ declare global {
     open_notification_settings(): Promise<null>;
     open_accessibility_settings(): Promise<AccessibilityOpenResult>;
 
+    // macOS-only stale-TCC recovery: clears the orphan entry via
+    // `tccutil reset` and relaunches Sayzo. Hard-exits the current
+    // setup window — no return value is meaningful.
+    reset_mic_permission_and_restart(): Promise<null>;
+    reset_audio_capture_permission_and_restart(): Promise<null>;
+
+    // Stuck-user escalation: pull a copy-pasteable diagnostic dump
+    // (Info.plist key presence, codesign output, recent log lines)
+    // and surface the agent.log folder. Used by the recovery screen's
+    // "If Reset & Restart didn't help…" subsection.
+    get_tcc_diagnostic_text(): Promise<{ text: string }>;
+    copy_tcc_diagnostic_to_clipboard(): Promise<{ copied: boolean }>;
+    open_log_folder(): Promise<{ opened: boolean }>;
+
     // Accessibility verification (polled by setup window after deep-link).
     check_accessibility_trusted(): Promise<AccessibilityTrustedResult>;
 
@@ -246,6 +260,26 @@ export const bridge = {
   async openAudioCaptureSettings() {
     await whenReady();
     return window.pywebview.api.open_audio_capture_settings();
+  },
+  async resetMicPermissionAndRestart() {
+    await whenReady();
+    return window.pywebview.api.reset_mic_permission_and_restart();
+  },
+  async resetAudioCapturePermissionAndRestart() {
+    await whenReady();
+    return window.pywebview.api.reset_audio_capture_permission_and_restart();
+  },
+  async getTccDiagnosticText() {
+    await whenReady();
+    return window.pywebview.api.get_tcc_diagnostic_text();
+  },
+  async copyTccDiagnosticToClipboard() {
+    await whenReady();
+    return window.pywebview.api.copy_tcc_diagnostic_to_clipboard();
+  },
+  async openLogFolder() {
+    await whenReady();
+    return window.pywebview.api.open_log_folder();
   },
   async openNotificationSettings() {
     await whenReady();

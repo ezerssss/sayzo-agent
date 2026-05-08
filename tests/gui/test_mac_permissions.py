@@ -779,3 +779,526 @@ def test_open_swallows_oserror():
     ):
         # Should not raise.
         mac_permissions.open_mic_settings()
+
+
+# ---------------------------------------------------------------------------
+# _tccutil_reset_service + relaunch_app + Info.plist diagnostic
+#
+# These power the "Reset & Restart Sayzo" recovery flow. The flow is the
+# only path that resolves a stale-TCC silent-deny without sending the user
+# to Terminal: macOS hides CR-mismatched orphan entries from
+# Privacy & Security, so any "remove from the list" instruction is a dead
+# end. tccutil clears the entry; relaunch is required because AVFoundation
+# caches the per-process NotDetermined→Denied transition (Apple-confirmed
+# behavior — see _tccutil_reset_service docstring for the source).
+# ---------------------------------------------------------------------------
+
+
+def test_tccutil_reset_service_runs_correct_command_and_returns_true_on_rc0():
+    completed = subprocess.CompletedProcess(
+        args=["tccutil", "reset", "Microphone", "com.sayzo.agent"],
+        returncode=0,
+        stdout="",
+        stderr="",
+    )
+    with patch(
+        "sayzo_agent.gui.setup.mac_permissions.sys.platform", "darwin"
+    ), patch(
+        "sayzo_agent.gui.setup.mac_permissions.subprocess.run",
+        return_value=completed,
+    ) as run:
+        ok = mac_permissions._tccutil_reset_service("Microphone")
+    assert ok is True
+    args = run.call_args.args[0]
+    assert args == ["tccutil", "reset", "Microphone", "com.sayzo.agent"]
+    # Must run with capture_output so stdout/stderr can be logged on
+    # failure without leaking to the user's terminal.
+    assert run.call_args.kwargs["capture_output"] is True
+    # text=True so stdout/stderr arrive as strings for log formatting.
+    assert run.call_args.kwargs["text"] is True
+
+
+def test_tccutil_reset_service_returns_false_on_nonzero_rc():
+    """A non-zero exit means tccutil rejected the service name or bundle
+    id. We want a False return so the recovery flow can decide whether to
+    still attempt the relaunch (it does — AVFoundation re-reading from a
+    fresh process is useful even when the explicit reset didn't fire)."""
+    completed = subprocess.CompletedProcess(
+        args=["tccutil", "reset", "Microphone", "com.sayzo.agent"],
+        returncode=1,
+        stdout="",
+        stderr="tccutil: Failed to reset Microphone\n",
+    )
+    with patch(
+        "sayzo_agent.gui.setup.mac_permissions.sys.platform", "darwin"
+    ), patch(
+        "sayzo_agent.gui.setup.mac_permissions.subprocess.run",
+        return_value=completed,
+    ):
+        assert mac_permissions._tccutil_reset_service("Microphone") is False
+
+
+def test_tccutil_reset_service_returns_false_on_oserror():
+    """tccutil missing from PATH (managed Mac with stripped CLI tools)
+    must return False without raising — the recovery flow falls through
+    to relaunch_app, which is still useful on its own."""
+    with patch(
+        "sayzo_agent.gui.setup.mac_permissions.sys.platform", "darwin"
+    ), patch(
+        "sayzo_agent.gui.setup.mac_permissions.subprocess.run",
+        side_effect=FileNotFoundError("no tccutil"),
+    ):
+        assert mac_permissions._tccutil_reset_service("Microphone") is False
+
+
+def test_tccutil_reset_service_is_noop_on_non_darwin():
+    with patch(
+        "sayzo_agent.gui.setup.mac_permissions.sys.platform", "win32"
+    ), patch(
+        "sayzo_agent.gui.setup.mac_permissions.subprocess.run"
+    ) as run:
+        assert mac_permissions._tccutil_reset_service("Microphone") is False
+    assert run.called is False
+
+
+def test_tccutil_reset_service_uses_audio_capture_service_name():
+    """Apple's `man tccutil` does not document AudioCapture explicitly —
+    the service name comes from the canonical `insidegui/AudioCap` sample.
+    Lock the wire string so a future rename in the constants block can't
+    silently regress the audio-tap recovery path."""
+    completed = subprocess.CompletedProcess(
+        args=[], returncode=0, stdout="", stderr=""
+    )
+    with patch(
+        "sayzo_agent.gui.setup.mac_permissions.sys.platform", "darwin"
+    ), patch(
+        "sayzo_agent.gui.setup.mac_permissions.subprocess.run",
+        return_value=completed,
+    ) as run:
+        mac_permissions._tccutil_reset_service(
+            mac_permissions._TCC_SERVICE_AUDIO_CAPTURE
+        )
+    assert run.call_args.args[0][2] == "AudioCapture"
+
+
+def test_relaunch_app_spawns_open_n_against_bundle_then_exits():
+    """relaunch_app must (a) Popen `open -n /path/to/Sayzo.app` so a fresh
+    instance is detached from this process, and (b) os._exit(0) so the
+    current process dies before kernel-locked single-instance arbitration
+    runs against the new launch."""
+    fake_exe = "/Applications/Sayzo.app/Contents/MacOS/sayzo-agent"
+
+    class _FakePath:
+        def __init__(self, p, suffix=None):
+            self._p = p
+            self.suffix = suffix or ""
+
+        def resolve(self):
+            return self
+
+        @property
+        def parents(self):
+            return [
+                _FakePath(
+                    "/Applications/Sayzo.app/Contents/MacOS",
+                ),
+                _FakePath("/Applications/Sayzo.app/Contents"),
+                _FakePath("/Applications/Sayzo.app", suffix=".app"),
+                _FakePath("/Applications"),
+            ]
+
+        def exists(self):
+            return True
+
+        def __str__(self):
+            return self._p
+
+    with patch(
+        "sayzo_agent.gui.setup.mac_permissions.sys.platform", "darwin"
+    ), patch(
+        "sayzo_agent.gui.setup.mac_permissions.sys.executable", fake_exe
+    ), patch(
+        "pathlib.Path",
+        lambda p: _FakePath(p) if isinstance(p, str) else p,
+    ), patch(
+        "sayzo_agent.gui.setup.mac_permissions.subprocess.Popen"
+    ) as popen, patch("os._exit") as exit_call:
+        mac_permissions.relaunch_app()
+
+    # `open -n <bundle>` to launch a new detached instance.
+    args = popen.call_args.args[0]
+    assert args[0] == "open"
+    assert args[1] == "-n"
+    assert args[2] == "/Applications/Sayzo.app"
+    assert popen.call_args.kwargs.get("start_new_session") is True
+    # Must hard-exit with code 0; non-zero would taint kernel exit
+    # bookkeeping and noisy crash reports for what is a normal handoff.
+    exit_call.assert_called_once_with(0)
+
+
+def test_relaunch_app_still_exits_when_no_app_bundle_above_executable():
+    """Source-run dev builds (non-frozen) won't have an .app bundle above
+    sys.executable. We must still hard-exit so the user isn't left with
+    a wedged window — they re-launch manually via the dev script."""
+    fake_exe = "/usr/bin/python3"
+
+    class _FakePath:
+        def __init__(self, p, suffix=""):
+            self._p = p
+            self.suffix = suffix
+
+        def resolve(self):
+            return self
+
+        @property
+        def parents(self):
+            return [_FakePath("/usr/bin"), _FakePath("/usr")]
+
+        def exists(self):
+            return False
+
+        def __str__(self):
+            return self._p
+
+    with patch(
+        "sayzo_agent.gui.setup.mac_permissions.sys.platform", "darwin"
+    ), patch(
+        "sayzo_agent.gui.setup.mac_permissions.sys.executable", fake_exe
+    ), patch(
+        "pathlib.Path",
+        lambda p: _FakePath(p) if isinstance(p, str) else p,
+    ), patch(
+        "sayzo_agent.gui.setup.mac_permissions.subprocess.Popen"
+    ) as popen, patch("os._exit") as exit_call:
+        mac_permissions.relaunch_app()
+    assert popen.called is False
+    exit_call.assert_called_once_with(0)
+
+
+def test_relaunch_app_is_noop_on_non_darwin():
+    """Windows/Linux: don't try to `open -n`. The function exists for the
+    cross-platform call sites in bridge.py; we want a clean no-op."""
+    with patch(
+        "sayzo_agent.gui.setup.mac_permissions.sys.platform", "win32"
+    ), patch(
+        "sayzo_agent.gui.setup.mac_permissions.subprocess.Popen"
+    ) as popen, patch("os._exit") as exit_call:
+        mac_permissions.relaunch_app()
+    assert popen.called is False
+    assert exit_call.called is False
+
+
+def test_log_bundle_info_plist_logs_usage_descriptions(caplog):
+    """The diagnostic must surface presence/absence of the three TCC
+    usage-description keys. If any of them are MISSING after a build,
+    the support thread tells us which one — without this log line a
+    silent-deny bug looks identical to a stale-CR bug."""
+    info = {
+        "CFBundleIdentifier": "com.sayzo.agent",
+        "CFBundleExecutable": "sayzo-agent",
+        "LSUIElement": True,
+        "NSMicrophoneUsageDescription": "Sayzo opens the microphone…",
+        "NSAudioCaptureUsageDescription": "So Sayzo can hear the other…",
+        # NSAppleEventsUsageDescription deliberately omitted to verify
+        # the helper reports MISSING for absent keys.
+    }
+    fake_bundle = MagicMock()
+    fake_bundle.infoDictionary.return_value = info
+    fake_bundle.bundlePath.return_value = "/Applications/Sayzo.app"
+    fake_nsbundle = MagicMock()
+    fake_nsbundle.mainBundle.return_value = fake_bundle
+    fake_foundation = SimpleNamespace(NSBundle=fake_nsbundle)
+
+    # Reset the one-shot guard so the test sees a fresh log.
+    mac_permissions._log_bundle_info_plist_once._done = False  # type: ignore[attr-defined]
+
+    import logging as _logging
+    caplog.set_level(_logging.INFO, logger="sayzo_agent.gui.setup.mac_permissions")
+    with patch(
+        "sayzo_agent.gui.setup.mac_permissions.sys.platform", "darwin"
+    ), patch.dict("sys.modules", {"Foundation": fake_foundation}):
+        mac_permissions._log_bundle_info_plist_once()
+
+    text = " ".join(r.message for r in caplog.records)
+    assert "com.sayzo.agent" in text
+    assert "NSMicrophoneUsageDescription=present" in text
+    assert "NSAudioCaptureUsageDescription=present" in text
+    # The omitted key surfaces explicitly so a future regression where a
+    # build drops a key is loud, not silent.
+    assert "NSAppleEventsUsageDescription=MISSING" in text
+
+
+def test_log_bundle_info_plist_runs_only_once_per_process():
+    """The helper is meant to be cheap to call from prompt_microphone /
+    prompt_audio_capture without re-logging the same payload on every
+    user click. Lock the one-shot semantics so a future refactor doesn't
+    accidentally turn it into a per-call log line."""
+    info = {"CFBundleIdentifier": "com.sayzo.agent"}
+    fake_bundle = MagicMock()
+    fake_bundle.infoDictionary.return_value = info
+    fake_bundle.bundlePath.return_value = "/Applications/Sayzo.app"
+    fake_nsbundle = MagicMock()
+    fake_nsbundle.mainBundle.return_value = fake_bundle
+    fake_foundation = SimpleNamespace(NSBundle=fake_nsbundle)
+    # Pretend it's never run in this process.
+    mac_permissions._log_bundle_info_plist_once._done = False  # type: ignore[attr-defined]
+
+    with patch(
+        "sayzo_agent.gui.setup.mac_permissions.sys.platform", "darwin"
+    ), patch.dict("sys.modules", {"Foundation": fake_foundation}):
+        mac_permissions._log_bundle_info_plist_once()
+        mac_permissions._log_bundle_info_plist_once()
+        mac_permissions._log_bundle_info_plist_once()
+
+    # mainBundle() called exactly once across three calls — the second
+    # and third are short-circuited by the `_done` guard.
+    assert fake_nsbundle.mainBundle.call_count == 1
+
+
+def test_log_bundle_info_plist_is_noop_on_non_darwin():
+    """The diagnostic is macOS-only. On Windows/Linux it must short-circuit
+    before importing Foundation (which doesn't exist there)."""
+    mac_permissions._log_bundle_info_plist_once._done = False  # type: ignore[attr-defined]
+    fake_nsbundle = MagicMock()
+    with patch(
+        "sayzo_agent.gui.setup.mac_permissions.sys.platform", "win32"
+    ), patch.dict(
+        "sys.modules", {"Foundation": SimpleNamespace(NSBundle=fake_nsbundle)}
+    ):
+        mac_permissions._log_bundle_info_plist_once()
+    assert fake_nsbundle.mainBundle.called is False
+
+
+# ---------------------------------------------------------------------------
+# gather_tcc_diagnostic_text + copy_diagnostic_to_clipboard
+#
+# The "Copy diagnostic info" button on the stale_tcc recovery screen runs
+# this end-to-end. Tests guard the structure (so a future regression
+# can't silently drop a section a support engineer is reading) plus the
+# pbcopy contract.
+# ---------------------------------------------------------------------------
+
+
+def _fake_cfg(tmp_path):
+    """Minimal cfg-shaped object exposing the only attribute the
+    diagnostic touches: ``logs_dir`` (Path)."""
+    return SimpleNamespace(logs_dir=tmp_path)
+
+
+def test_gather_tcc_diagnostic_text_includes_all_sections(tmp_path):
+    """Every block a support engineer triages from must be present:
+    version line, bundle introspection (incl. each usage-description
+    key with present/MISSING marker), codesign output, recent log lines.
+    A future refactor that drops one of those sections leaves us blind
+    on a ticket — lock the structure here.
+    """
+    info = {
+        "CFBundleIdentifier": "com.sayzo.agent",
+        "CFBundleExecutable": "sayzo-agent",
+        "LSUIElement": True,
+        "NSMicrophoneUsageDescription": "Sayzo opens the microphone…",
+        "NSAudioCaptureUsageDescription": "So Sayzo can hear the other…",
+        # NSAppleEventsUsageDescription deliberately missing — must show
+        # MISSING so a real-bundle key drop is loud.
+    }
+    fake_bundle = MagicMock()
+    fake_bundle.infoDictionary.return_value = info
+    fake_bundle.bundlePath.return_value = "/Applications/Sayzo.app"
+    fake_nsbundle = MagicMock()
+    fake_nsbundle.mainBundle.return_value = fake_bundle
+    fake_foundation = SimpleNamespace(NSBundle=fake_nsbundle)
+
+    log_path = tmp_path / "agent.log"
+    log_path.write_text(
+        "\n".join(
+            [
+                "2026-05-09 12:00:00 INFO  sayzo_agent.gui.setup.mac_permissions  [mac_permissions] microphone TCC: status=0 media_type='soun' thread=Thread-1",
+                "2026-05-09 12:00:00 INFO  sayzo_agent.gui.setup.mac_permissions  [mac_permissions] microphone TCC: user response → False (elapsed=0.004s, stale_tcc_likely=True)",
+                "2026-05-09 12:00:00 INFO  some.other.logger  unrelated noise — should be filtered out",
+                "2026-05-09 12:00:01 INFO  sayzo_agent.macos_bundle_heal  [mac_heal] codesign audio-tap already valid",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    cs_completed = subprocess.CompletedProcess(
+        args=[],
+        returncode=0,
+        stdout="Executable=/Applications/Sayzo.app/Contents/MacOS/sayzo-agent\n",
+        stderr=(
+            "Identifier=com.sayzo.agent\n"
+            "TeamIdentifier=UYT2A4UX79\n"
+            "Authority=Developer ID Application: Sheen Santos Capadngan\n"
+        ),
+    )
+
+    with patch(
+        "sayzo_agent.gui.setup.mac_permissions.sys.platform", "darwin"
+    ), patch.dict(
+        "sys.modules", {"Foundation": fake_foundation}
+    ), patch(
+        "sayzo_agent.gui.setup.mac_permissions.subprocess.run",
+        return_value=cs_completed,
+    ):
+        text = mac_permissions.gather_tcc_diagnostic_text(_fake_cfg(tmp_path))
+
+    # Header + version line.
+    assert text.splitlines()[0].startswith("Sayzo TCC diagnostic — ")
+    # Bundle section with present + MISSING markers — both signals matter.
+    assert "/Applications/Sayzo.app" in text
+    assert "NSMicrophoneUsageDescription: present" in text
+    assert "NSAudioCaptureUsageDescription: present" in text
+    assert "NSAppleEventsUsageDescription: *** MISSING ***" in text
+    # codesign block
+    assert "codesign -dvv:" in text
+    assert "TeamIdentifier=UYT2A4UX79" in text
+    assert "Authority=Developer ID Application" in text
+    # Filtered log tail — only [mac_permissions]/[mac_heal] lines
+    assert "microphone TCC: status=0" in text
+    assert "[mac_heal] codesign audio-tap already valid" in text
+    assert "unrelated noise" not in text
+
+
+def test_gather_tcc_diagnostic_text_handles_missing_log_file(tmp_path):
+    """Fresh-install path: cfg.logs_dir/agent.log doesn't exist yet.
+    The diagnostic must still produce a well-formed report with a
+    placeholder for the log section instead of raising."""
+    info = {"CFBundleIdentifier": "com.sayzo.agent"}
+    fake_bundle = MagicMock()
+    fake_bundle.infoDictionary.return_value = info
+    fake_bundle.bundlePath.return_value = "/Applications/Sayzo.app"
+    fake_nsbundle = MagicMock()
+    fake_nsbundle.mainBundle.return_value = fake_bundle
+    fake_foundation = SimpleNamespace(NSBundle=fake_nsbundle)
+
+    cs_completed = subprocess.CompletedProcess(
+        args=[], returncode=0, stdout="", stderr=""
+    )
+    with patch(
+        "sayzo_agent.gui.setup.mac_permissions.sys.platform", "darwin"
+    ), patch.dict(
+        "sys.modules", {"Foundation": fake_foundation}
+    ), patch(
+        "sayzo_agent.gui.setup.mac_permissions.subprocess.run",
+        return_value=cs_completed,
+    ):
+        text = mac_permissions.gather_tcc_diagnostic_text(_fake_cfg(tmp_path))
+    assert "log file not present" in text
+
+
+def test_gather_tcc_diagnostic_text_swallows_codesign_failures(tmp_path):
+    """codesign missing from PATH (managed Mac with stripped CLI tools)
+    must not blow up the diagnostic — we still want the bundle info +
+    log lines for triage. Surface the call-failed marker so support can
+    see what was tried."""
+    info = {"CFBundleIdentifier": "com.sayzo.agent"}
+    fake_bundle = MagicMock()
+    fake_bundle.infoDictionary.return_value = info
+    fake_bundle.bundlePath.return_value = "/Applications/Sayzo.app"
+    fake_nsbundle = MagicMock()
+    fake_nsbundle.mainBundle.return_value = fake_bundle
+    fake_foundation = SimpleNamespace(NSBundle=fake_nsbundle)
+
+    with patch(
+        "sayzo_agent.gui.setup.mac_permissions.sys.platform", "darwin"
+    ), patch.dict(
+        "sys.modules", {"Foundation": fake_foundation}
+    ), patch(
+        "sayzo_agent.gui.setup.mac_permissions.subprocess.run",
+        side_effect=FileNotFoundError("no codesign"),
+    ):
+        text = mac_permissions.gather_tcc_diagnostic_text(_fake_cfg(tmp_path))
+    assert "codesign call failed" in text
+
+
+def test_copy_diagnostic_to_clipboard_pipes_text_to_pbcopy(tmp_path):
+    """The recovery flow's one-click escalation: pbcopy receives the full
+    diagnostic text on stdin. We don't assert the exact text (that's
+    gather_tcc_diagnostic_text's contract) — just that pbcopy got a
+    non-trivial chunk of stdin and we returned True on rc=0."""
+    fake_bundle = MagicMock()
+    fake_bundle.infoDictionary.return_value = {
+        "CFBundleIdentifier": "com.sayzo.agent"
+    }
+    fake_bundle.bundlePath.return_value = "/Applications/Sayzo.app"
+    fake_nsbundle = MagicMock()
+    fake_nsbundle.mainBundle.return_value = fake_bundle
+    fake_foundation = SimpleNamespace(NSBundle=fake_nsbundle)
+
+    captured: dict = {}
+
+    def fake_run(args, **kwargs):
+        # The diagnostic calls subprocess.run twice: once for codesign,
+        # once for pbcopy. Capture the pbcopy call's stdin so we can
+        # verify the diagnostic text was actually piped.
+        if args and args[0] == "pbcopy":
+            captured["pbcopy_input"] = kwargs.get("input")
+            return subprocess.CompletedProcess(
+                args=args, returncode=0, stdout="", stderr=""
+            )
+        return subprocess.CompletedProcess(
+            args=args, returncode=0, stdout="", stderr=""
+        )
+
+    with patch(
+        "sayzo_agent.gui.setup.mac_permissions.sys.platform", "darwin"
+    ), patch.dict(
+        "sys.modules", {"Foundation": fake_foundation}
+    ), patch(
+        "sayzo_agent.gui.setup.mac_permissions.subprocess.run",
+        side_effect=fake_run,
+    ):
+        ok = mac_permissions.copy_diagnostic_to_clipboard(_fake_cfg(tmp_path))
+    assert ok is True
+    assert captured.get("pbcopy_input"), "pbcopy received empty stdin"
+    assert "Sayzo TCC diagnostic" in captured["pbcopy_input"]
+
+
+def test_copy_diagnostic_to_clipboard_returns_false_on_pbcopy_failure(tmp_path):
+    """Hardened-runtime / sandboxed scenarios where pbcopy refuses to
+    accept stdin: we must return False so the React button can flash
+    "Copy failed — try again" instead of a misleading "Copied!"."""
+    fake_bundle = MagicMock()
+    fake_bundle.infoDictionary.return_value = {
+        "CFBundleIdentifier": "com.sayzo.agent"
+    }
+    fake_bundle.bundlePath.return_value = "/Applications/Sayzo.app"
+    fake_nsbundle = MagicMock()
+    fake_nsbundle.mainBundle.return_value = fake_bundle
+    fake_foundation = SimpleNamespace(NSBundle=fake_nsbundle)
+
+    def fake_run(args, **kwargs):
+        if args and args[0] == "pbcopy":
+            return subprocess.CompletedProcess(
+                args=args, returncode=1, stdout="", stderr="pbcopy: failed\n"
+            )
+        return subprocess.CompletedProcess(
+            args=args, returncode=0, stdout="", stderr=""
+        )
+
+    with patch(
+        "sayzo_agent.gui.setup.mac_permissions.sys.platform", "darwin"
+    ), patch.dict(
+        "sys.modules", {"Foundation": fake_foundation}
+    ), patch(
+        "sayzo_agent.gui.setup.mac_permissions.subprocess.run",
+        side_effect=fake_run,
+    ):
+        assert (
+            mac_permissions.copy_diagnostic_to_clipboard(_fake_cfg(tmp_path))
+            is False
+        )
+
+
+def test_copy_diagnostic_to_clipboard_is_noop_on_non_darwin(tmp_path):
+    with patch(
+        "sayzo_agent.gui.setup.mac_permissions.sys.platform", "win32"
+    ), patch(
+        "sayzo_agent.gui.setup.mac_permissions.subprocess.run"
+    ) as run:
+        assert (
+            mac_permissions.copy_diagnostic_to_clipboard(_fake_cfg(tmp_path))
+            is False
+        )
+    assert run.called is False

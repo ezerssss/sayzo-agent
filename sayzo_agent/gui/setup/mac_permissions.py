@@ -50,12 +50,39 @@ _AV_AUTH_RESTRICTED = 1
 _AV_AUTH_DENIED = 2
 _AV_AUTH_AUTHORIZED = 3
 
-# A "denied" answer that arrives faster than this is almost certainly the
-# stale-TCC silent-deny pattern (TCC has an entry whose code-requirement
-# doesn't match the current bundle, so the request fires the completion
-# handler with `False` immediately without presenting UI). A real human
-# read-and-click takes much longer than 500 ms, even on a snap decision.
+# A "denied" answer that arrives faster than this is almost certainly a
+# silent-deny pattern: either a stale TCC entry whose code-requirement
+# doesn't match the current bundle (the system fires the completion
+# handler with False immediately without presenting UI), or — on a Sayzo-
+# specific note — a missing `NSMicrophoneUsageDescription` /
+# `NSAudioCaptureUsageDescription` key in the bundle's Info.plist (which
+# AVFoundation rejects at the pre-flight check, before any TCC dialog).
+# A real human read-and-click takes much longer than 500 ms, even on a
+# snap decision.
 _STALE_TCC_THRESHOLD_SECS = 0.5
+
+# Bundle identifier our TCC entries are keyed under. Mirrors the
+# `bundle_identifier` in sayzo-agent.spec's BUNDLE() call. Hard-coded
+# (not read from sys.executable's bundle) because we want `tccutil reset`
+# and Info.plist diagnostics to operate on the value we INTEND, not what
+# the running bundle happens to advertise — if the bundle ID ever drifts
+# in a build, we want the discrepancy to be loud, not silent.
+_BUNDLE_ID = "com.sayzo.agent"
+
+# `tccutil` service identifiers. "Microphone" matches the documented
+# service in `man tccutil`. "AudioCapture" is the private TCC service
+# string `kTCCServiceAudioCapture` used by `AudioHardwareCreateProcessTap`
+# (macOS 14.4+). Apple's `man tccutil` does not document AudioCapture
+# explicitly — service name sourced from the canonical `insidegui/AudioCap`
+# sample which calls the private `TCCAccessRequest` API directly. See
+# https://github.com/insidegui/AudioCap.
+_TCC_SERVICE_MICROPHONE = "Microphone"
+_TCC_SERVICE_AUDIO_CAPTURE = "AudioCapture"
+
+# Subprocess timeout for `tccutil` and similar helpers. tccutil is fast —
+# 5 s is comfortably above any real-world execution time and below any
+# UI patience threshold.
+_SUBPROCESS_TIMEOUT_SECS = 5.0
 
 
 class TccPromptResult(NamedTuple):
@@ -170,6 +197,369 @@ def _get_notifier():
     return _NOTIFIER
 
 
+def _log_bundle_info_plist_once() -> None:
+    """One-shot diagnostic: log the bundle's actual Info.plist values so we
+    can tell — from a user's agent.log — whether the TCC failure is a
+    bundle/build problem (usage-description key missing) or a stale-TCC
+    problem (key present, request still silently denied).
+
+    Apple's documented behavior: when a bundle calls
+    ``AVCaptureDevice.requestAccessForMediaType:`` for an audio media type
+    without ``NSMicrophoneUsageDescription`` in its Info.plist, the system
+    rejects the request at the pre-flight check and fires the completion
+    handler with False immediately, without showing a dialog. That symptom
+    is indistinguishable at runtime from a stale-CR silent-deny — except
+    that the missing-key case will (a) never let the bundle appear in
+    System Settings → Privacy & Security → Microphone (no entry can be
+    created), and (b) be visible in this log line. See
+    https://developer.apple.com/documentation/BundleResources/Information-Property-List/NSMicrophoneUsageDescription
+    """
+    if sys.platform != "darwin":
+        return
+    if getattr(_log_bundle_info_plist_once, "_done", False):
+        return
+    _log_bundle_info_plist_once._done = True  # type: ignore[attr-defined]
+
+    try:
+        from Foundation import NSBundle  # type: ignore[import-not-found]
+    except Exception:
+        log.warning(
+            "[mac_permissions] Foundation.NSBundle import failed — "
+            "cannot diagnose bundle Info.plist",
+            exc_info=True,
+        )
+        return
+
+    try:
+        main_bundle = NSBundle.mainBundle()
+        info = main_bundle.infoDictionary() or {}
+        bundle_path = main_bundle.bundlePath()
+    except Exception:
+        log.warning(
+            "[mac_permissions] NSBundle.mainBundle().infoDictionary() raised",
+            exc_info=True,
+        )
+        return
+
+    # Truthy presence + first 60 chars of each usage description so a user
+    # uploading agent.log to us doesn't accidentally leak surrounding text,
+    # but we can confirm the key actually has a non-empty string value
+    # (PyInstaller writes our spec dict via plistlib — a typo or empty
+    # value would surface here).
+    def _summarize(key: str) -> str:
+        val = info.get(key)
+        if val is None:
+            return "MISSING"
+        s = str(val)
+        return f"present ({len(s)} chars: {s[:60]!r})"
+
+    log.info(
+        "[mac_permissions] bundle Info.plist diagnostic: "
+        "path=%s bundle_id=%r executable=%r LSUIElement=%r",
+        bundle_path,
+        info.get("CFBundleIdentifier"),
+        info.get("CFBundleExecutable"),
+        info.get("LSUIElement"),
+    )
+    log.info(
+        "[mac_permissions] usage descriptions: "
+        "NSMicrophoneUsageDescription=%s NSAudioCaptureUsageDescription=%s "
+        "NSAppleEventsUsageDescription=%s",
+        _summarize("NSMicrophoneUsageDescription"),
+        _summarize("NSAudioCaptureUsageDescription"),
+        _summarize("NSAppleEventsUsageDescription"),
+    )
+
+
+def _tccutil_reset_service(service: str) -> bool:
+    """Run ``tccutil reset <service> com.sayzo.agent`` for the current
+    user's TCC database.
+
+    Returns True on rc=0, False otherwise. Best-effort — never raises.
+
+    ``tccutil`` does NOT require sudo for the current user's TCC database;
+    it can clear any entry for our own bundle. The reset is idempotent:
+    if no entry exists for the bundle/service, ``tccutil`` exits 0 anyway.
+    Apple's documented behavior is that an already-running process must
+    be relaunched after a reset before subsequent ``requestAccess`` calls
+    will surface a fresh dialog — AVFoundation caches the
+    NotDetermined→Denied transition per process. Callers should pair this
+    with a relaunch.
+
+    See https://developer.apple.com/forums/thread/679303 and
+    https://discussions.apple.com/thread/254893066.
+    """
+    if sys.platform != "darwin":
+        return False
+    try:
+        result = subprocess.run(
+            ["tccutil", "reset", service, _BUNDLE_ID],
+            capture_output=True,
+            timeout=_SUBPROCESS_TIMEOUT_SECS,
+            text=True,
+        )
+    except Exception:
+        log.warning(
+            "[mac_permissions] tccutil reset %s raised", service, exc_info=True
+        )
+        return False
+    if result.returncode == 0:
+        log.info(
+            "[mac_permissions] tccutil reset %s %s ok (stdout=%r)",
+            service,
+            _BUNDLE_ID,
+            result.stdout.strip(),
+        )
+        return True
+    log.warning(
+        "[mac_permissions] tccutil reset %s %s failed: rc=%d stderr=%r",
+        service,
+        _BUNDLE_ID,
+        result.returncode,
+        result.stderr.strip(),
+    )
+    return False
+
+
+def _collect_bundle_info() -> dict:
+    """Read the running bundle's Info.plist via NSBundle.mainBundle.
+
+    Shared by :func:`_log_bundle_info_plist_once` (one-shot startup
+    diagnostic) and :func:`gather_tcc_diagnostic_text` (user-triggered
+    Copy Diagnostic Info button). Returns an empty dict on non-darwin
+    or any introspection failure — callers fall back to placeholder
+    output rather than raising into the UI.
+    """
+    if sys.platform != "darwin":
+        return {}
+    try:
+        from Foundation import NSBundle  # type: ignore[import-not-found]
+        main_bundle = NSBundle.mainBundle()
+        info = main_bundle.infoDictionary() or {}
+        return {
+            "bundle_path": str(main_bundle.bundlePath()),
+            "bundle_id": str(info.get("CFBundleIdentifier") or ""),
+            "executable": str(info.get("CFBundleExecutable") or ""),
+            "ls_ui_element": bool(info.get("LSUIElement") or False),
+            "NSMicrophoneUsageDescription": str(
+                info.get("NSMicrophoneUsageDescription") or ""
+            ),
+            "NSAudioCaptureUsageDescription": str(
+                info.get("NSAudioCaptureUsageDescription") or ""
+            ),
+            "NSAppleEventsUsageDescription": str(
+                info.get("NSAppleEventsUsageDescription") or ""
+            ),
+        }
+    except Exception:
+        log.debug("[mac_permissions] _collect_bundle_info raised", exc_info=True)
+        return {}
+
+
+def gather_tcc_diagnostic_text(cfg) -> str:
+    """Build a plain-text diagnostic summary the user can paste into a
+    support thread when "Reset & Restart Sayzo" hasn't fixed the silent-
+    deny.
+
+    Sections:
+        - Sayzo version + macOS version
+        - Bundle path, identifier, executable, LSUIElement
+        - Presence + length of NSMicrophoneUsageDescription /
+          NSAudioCaptureUsageDescription / NSAppleEventsUsageDescription
+          (the value itself is NOT included — just length — so users don't
+          accidentally paste irrelevant copy back to us)
+        - ``codesign -dvv`` output for the bundle (designated requirement,
+          authority, team identifier — tells us whether a CR mismatch
+          really is the cause)
+        - Last 50 lines of ``agent.log`` filtered to ``[mac_permissions]``
+          / ``[mac_heal]`` markers (the TCC story)
+
+    Plain text intentionally — Slack and email render it cleanly, no
+    Markdown surprises. Returns a string ready for clipboard paste; the
+    function never raises.
+    """
+    import datetime as _dt
+    import platform as _platform
+
+    lines: list[str] = []
+    # `utcnow()` is deprecated for removal — use the timezone-aware
+    # equivalent so the report's leading line keeps working on future
+    # Pythons without warnings.
+    now = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    lines.append(f"Sayzo TCC diagnostic — {now}")
+
+    try:
+        from importlib.metadata import version as _pkg_version
+
+        lines.append(f"Sayzo version: {_pkg_version('sayzo-agent')}")
+    except Exception:
+        lines.append("Sayzo version: unknown")
+
+    lines.append(f"Platform: {sys.platform}")
+    if sys.platform == "darwin":
+        try:
+            mv = _platform.mac_ver()
+            lines.append(f"macOS version: {mv[0]} ({mv[2]})")
+        except Exception:
+            lines.append("macOS version: unknown")
+
+    info = _collect_bundle_info()
+    lines.append("")
+    if info:
+        lines.append(f"Bundle path: {info.get('bundle_path')}")
+        lines.append(f"  CFBundleIdentifier: {info.get('bundle_id')!r}")
+        lines.append(f"  CFBundleExecutable: {info.get('executable')!r}")
+        lines.append(f"  LSUIElement: {info.get('ls_ui_element')}")
+        for key in (
+            "NSMicrophoneUsageDescription",
+            "NSAudioCaptureUsageDescription",
+            "NSAppleEventsUsageDescription",
+        ):
+            v = info.get(key) or ""
+            if v:
+                lines.append(f"  {key}: present ({len(v)} chars)")
+            else:
+                # MISSING is the smoking gun for AVFoundation pre-flight
+                # silent-deny — flag it loudly.
+                lines.append(f"  {key}: *** MISSING ***")
+    else:
+        lines.append("Bundle: <unable to introspect via NSBundle>")
+
+    # codesign output goes to stderr by convention (a long-standing Apple
+    # quirk). We merge stdout + stderr so the user gets one block to
+    # paste regardless of which stream the lines arrive on.
+    bundle_path = info.get("bundle_path")
+    lines.append("")
+    if sys.platform == "darwin" and bundle_path:
+        lines.append("codesign -dvv:")
+        try:
+            cs = subprocess.run(
+                ["codesign", "-dvv", "--", bundle_path],
+                capture_output=True,
+                text=True,
+                timeout=_SUBPROCESS_TIMEOUT_SECS,
+            )
+            cs_text = (cs.stdout + cs.stderr).strip()
+            for line in cs_text.splitlines():
+                lines.append(f"  {line}")
+            if cs.returncode != 0:
+                lines.append(f"  (rc={cs.returncode})")
+        except Exception as e:
+            lines.append(f"  (codesign call failed: {e!r})")
+    else:
+        lines.append("codesign: skipped (non-darwin or no bundle path)")
+
+    log_path = cfg.logs_dir / "agent.log"
+    lines.append("")
+    lines.append(f"Last 50 [mac_permissions]/[mac_heal] log lines from {log_path}:")
+    try:
+        if log_path.exists():
+            text = log_path.read_text(encoding="utf-8", errors="replace")
+            wanted = [
+                ln for ln in text.splitlines()
+                if "[mac_permissions]" in ln or "[mac_heal]" in ln
+            ]
+            if not wanted:
+                lines.append("  (no [mac_permissions]/[mac_heal] lines yet)")
+            else:
+                for ln in wanted[-50:]:
+                    lines.append(f"  {ln}")
+        else:
+            lines.append(f"  (log file not present at {log_path})")
+    except Exception as e:
+        lines.append(f"  (read failed: {e!r})")
+
+    return "\n".join(lines) + "\n"
+
+
+def copy_diagnostic_to_clipboard(cfg) -> bool:
+    """Pipe the TCC diagnostic text into ``pbcopy`` so the user can
+    paste it into a support thread with one keystroke.
+
+    Returns True on rc=0, False otherwise. macOS-only (Windows uses
+    ``clip``, but the recovery UI surfaces this button only on the
+    macOS stale-TCC path so we keep the helper darwin-scoped).
+    """
+    if sys.platform != "darwin":
+        return False
+    text = gather_tcc_diagnostic_text(cfg)
+    try:
+        proc = subprocess.run(
+            ["pbcopy"],
+            input=text,
+            text=True,
+            capture_output=True,
+            timeout=_SUBPROCESS_TIMEOUT_SECS,
+        )
+    except Exception:
+        log.warning(
+            "[mac_permissions] pbcopy raised", exc_info=True
+        )
+        return False
+    if proc.returncode == 0:
+        log.info(
+            "[mac_permissions] copied %d-char TCC diagnostic to clipboard",
+            len(text),
+        )
+        return True
+    log.warning(
+        "[mac_permissions] pbcopy failed: rc=%d stderr=%r",
+        proc.returncode,
+        proc.stderr.strip(),
+    )
+    return False
+
+
+def relaunch_app() -> None:
+    """Relaunch the Sayzo .app bundle and hard-exit this process.
+
+    Used as the second half of a "Reset Permission" recovery flow:
+    ``tccutil reset`` clears the orphan TCC entry, then the running
+    process must die so AVFoundation re-reads from a fresh database on
+    the next launch (Apple caches the NotDetermined→Denied transition
+    per process; see `_tccutil_reset_service` docstring for the source).
+
+    Safe to call from any code path: hard-exits unconditionally on macOS,
+    no-op on other platforms. The relaunch uses ``open -n`` (new
+    instance, detached session) so the new process is fully independent
+    of this one — kernel-level pidfile locking in
+    :mod:`sayzo_agent.pidfile` ensures the new instance only proceeds
+    once we're gone.
+    """
+    if sys.platform != "darwin":
+        return
+    try:
+        from pathlib import Path
+
+        exe = Path(sys.executable).resolve()
+        app_bundle = next(
+            (p for p in exe.parents if p.suffix == ".app"), None
+        )
+        if app_bundle is None or not app_bundle.exists():
+            log.warning(
+                "[mac_permissions] relaunch_app: no .app bundle above %s — "
+                "exiting without relaunch",
+                exe,
+            )
+        else:
+            subprocess.Popen(
+                ["open", "-n", str(app_bundle)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            log.warning(
+                "[mac_permissions] relaunch_app: relaunching %s", app_bundle
+            )
+    except Exception:
+        log.warning(
+            "[mac_permissions] relaunch_app: spawn failed",
+            exc_info=True,
+        )
+    import os
+    os._exit(0)
+
+
 def prompt_microphone() -> TccPromptResult:
     """Read or trigger the macOS Microphone TCC decision and return the
     actual outcome plus a stale-TCC hint.
@@ -207,6 +597,14 @@ def prompt_microphone() -> TccPromptResult:
     """
     if sys.platform != "darwin":
         return TccPromptResult(granted=None, stale_tcc_likely=False)
+
+    # First call into prompt_microphone in this process is also the most
+    # useful place to dump the bundle's actual Info.plist values. If
+    # `NSMicrophoneUsageDescription` is missing, the request below will
+    # silent-deny in milliseconds — the diagnostic line tells us
+    # (and the user, on a support thread) which root cause we're
+    # looking at instead of having to guess from the False alone.
+    _log_bundle_info_plist_once()
 
     try:
         # AVFoundation framework binding from pyobjc-framework-AVFoundation.
@@ -382,6 +780,13 @@ def prompt_audio_capture() -> TccPromptResult:
     """
     if sys.platform != "darwin":
         return TccPromptResult(granted=None, stale_tcc_likely=False)
+
+    # Same diagnostic call as prompt_microphone — if
+    # NSAudioCaptureUsageDescription is missing, audio-tap will exit 77
+    # in milliseconds and the heuristic will flag stale_tcc_likely
+    # incorrectly. The Info.plist log line tells us which root cause it is.
+    _log_bundle_info_plist_once()
+
     try:
         from sayzo_agent.capture.system_mac import _find_audio_tap
 
