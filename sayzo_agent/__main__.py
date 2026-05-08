@@ -53,6 +53,68 @@ def _setup_file_logging(logs_dir) -> None:
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
+def _install_excepthooks() -> None:
+    """Route unhandled exceptions to the file log before the default handler runs.
+
+    Without this, Python's default ``sys.excepthook`` writes the
+    traceback to stderr — which is ``/dev/null`` for our windowed
+    background exe (no console attached). The user sees a generic
+    OS-level "unhandled exception" dialog with no detail, and we get
+    no traceback in ``agent.log`` to debug from. Installing a hook
+    that calls ``log.critical(..., exc_info=...)`` first ensures
+    every crash is captured in the rotating log, so postmortem
+    debugging is always possible.
+
+    Hooks installed:
+      * ``sys.excepthook`` — main thread synchronous exceptions
+      * ``threading.excepthook`` (Python 3.8+) — worker-thread exceptions
+
+    asyncio's per-loop ``set_exception_handler`` is set inside
+    ``app.py`` where the loop is constructed; this function only
+    handles the cross-thread synchronous paths.
+
+    Idempotent: callers can invoke this from each CLI subcommand's
+    setup without checking — re-installing the same hook is a no-op.
+    """
+    log = logging.getLogger("excepthook")
+
+    default_sys_excepthook = sys.excepthook
+
+    def _sys_hook(exc_type, exc_value, exc_tb):
+        # Don't drown the log on Ctrl+C; it's user intent, not a bug.
+        if issubclass(exc_type, KeyboardInterrupt):
+            default_sys_excepthook(exc_type, exc_value, exc_tb)
+            return
+        try:
+            log.critical(
+                "unhandled exception", exc_info=(exc_type, exc_value, exc_tb),
+            )
+        except Exception:
+            pass  # never let the hook itself raise
+        default_sys_excepthook(exc_type, exc_value, exc_tb)
+
+    sys.excepthook = _sys_hook
+
+    if hasattr(threading, "excepthook"):
+        default_thread_excepthook = threading.excepthook
+
+        def _thread_hook(args) -> None:
+            if issubclass(args.exc_type, SystemExit):
+                default_thread_excepthook(args)
+                return
+            try:
+                log.critical(
+                    "unhandled exception in thread %s",
+                    args.thread.name if args.thread else "<unknown>",
+                    exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+                )
+            except Exception:
+                pass
+            default_thread_excepthook(args)
+
+        threading.excepthook = _thread_hook
+
+
 async def _do_login(
     cfg,
     no_browser: bool = False,
@@ -112,8 +174,10 @@ def cli(ctx: click.Context) -> None:
     # ran the bundled exe with no args). LSUIElement=True hides the Dock
     # icon, so without this dispatch click would silently print --help to
     # a non-existent stdout and exit, leaving the user staring at nothing.
-    # Defaulting to `service` runs the setup-gate + tray; its pidfile check
-    # cleanly no-ops when launchd already has the service alive.
+    # Defaulting to `service` runs the setup-gate + tray; its kernel-lock
+    # check cleanly no-ops when launchd already has the service alive (the
+    # primary holds the lock; the secondary's `try_acquire_pidfile` returns
+    # False and the secondary asks the primary to open Settings via IPC).
     if ctx.invoked_subcommand is None:
         ctx.invoke(service)
 
@@ -944,15 +1008,18 @@ def run() -> None:
     """Run the listening agent (foreground, verbose terminal output)."""
     cfg = load_config()
     _setup_logging(cfg.log_level, cfg.debug)
+    _install_excepthooks()
+    from .comtypes_setup import configure_comtypes_cache
+    configure_comtypes_cache(cfg.data_dir / "comtypes_cache")
     log = logging.getLogger("run")
 
-    # Single-instance enforcement, same atomic gate as ``service``. Without
-    # this, a developer iterating in two terminals (or the dev ``run`` while
-    # an installed ``service`` is also active) ends up with two primaries
-    # both holding the audio devices — the failure mode the user explicitly
-    # called out. ``run`` doesn't host an IPC server, so a second invocation
-    # silently exits without trying to surface Settings (the only signal the
-    # user gets is the log line below).
+    # Single-instance enforcement, same kernel-lock gate as ``service``.
+    # Without this, a developer iterating in two terminals (or the dev
+    # ``run`` while an installed ``service`` is also active) ends up with
+    # two primaries both holding the audio devices — the failure mode
+    # the user explicitly called out. ``run`` doesn't host an IPC server,
+    # so a second invocation silently exits without trying to surface
+    # Settings (the only signal the user gets is the log line below).
     from .pidfile import try_acquire_pidfile, remove_pid
 
     if not try_acquire_pidfile(cfg.pid_path):
@@ -1022,17 +1089,25 @@ def service(force_setup: bool) -> None:
     """Run the agent as a background service (no terminal output, file logging)."""
     cfg = load_config()
     _setup_file_logging(cfg.logs_dir)
+    _install_excepthooks()
+    # Redirect comtypes runtime cache off %TEMP% before any pycaw /
+    # uiautomation import. CI pre-bakes the common typelibs into the
+    # frozen bundle (see scripts/prebake_comtypes.py); this is defense
+    # in depth for unforeseen typelibs.
+    from .comtypes_setup import configure_comtypes_cache
+    configure_comtypes_cache(cfg.data_dir / "comtypes_cache")
     log = logging.getLogger("service")
 
     from .pidfile import try_acquire_pidfile, remove_pid
 
-    # Atomic single-instance gate. ``try_acquire_pidfile`` uses
-    # ``O_CREAT | O_EXCL`` so two near-simultaneous launches race at the
-    # OS level — exactly one becomes the primary. The loser asks the
-    # winner to surface Settings via IPC, then exits. ``call_quiet``
-    # swallows IPCNotConnected (winner's IPC server may not be up yet
-    # in the rare just-started case), so a mid-startup primary degrades
-    # to the prior silent-exit behavior.
+    # Kernel-level single-instance gate. ``try_acquire_pidfile`` uses
+    # a Windows named mutex / Unix flock — both auto-release on process
+    # death (clean exit, kill, BSOD, reboot), so a stale .pid file from
+    # a previous session is harmless. The loser asks the winner to
+    # surface Settings via IPC, then exits. ``call_quiet`` swallows
+    # IPCNotConnected (winner's IPC server may not be up yet in the
+    # rare just-started case), so a mid-startup primary degrades to
+    # the prior silent-exit behavior.
     if not try_acquire_pidfile(cfg.pid_path):
         try:
             from .gui.settings.ipc import IPCClient, Methods

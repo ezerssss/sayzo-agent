@@ -39,6 +39,20 @@ jobs:
           pip install -e .
           pip install pyinstaller
 
+      - name: Pre-bake comtypes type-library stubs
+        # Materialize comtypes.gen.UIAutomationClient + stdole as static .py
+        # files inside the venv's comtypes/gen/ directory BEFORE PyInstaller
+        # runs. PyInstaller's collect_submodules("comtypes") in
+        # sayzo-agent.spec then bundles them as already-generated modules,
+        # so the frozen runtime never tries to regenerate into %TEMP% (the
+        # cache dir comtypes falls back to when the install dir is read-only,
+        # which is exactly the case under C:\Program Files\Sayzo\). %TEMP%
+        # is volatile (Storage Sense, AV, profile reset) and any failure
+        # during regen surfaced to the user as a generic "unhandled
+        # exception" dialog.
+        shell: pwsh
+        run: python scripts\prebake_comtypes.py
+
       - name: Build with PyInstaller
         run: pyinstaller sayzo-agent.spec
 

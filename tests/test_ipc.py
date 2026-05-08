@@ -61,10 +61,10 @@ def test_open_settings_round_trip(tmp_path: Path) -> None:
 def test_open_settings_not_connected_returns_none(tmp_path: Path) -> None:
     """call_quiet swallows IPCNotConnected when no agent is running.
 
-    This is the path the second-launched ``sayzo-agent`` takes when the
-    primary's pidfile is stale (process died but file remained): we
-    must not propagate the connection error — just exit silently as
-    today.
+    This is the path a secondary ``sayzo-agent`` takes when nothing
+    actually holds the kernel lock — e.g. the previous primary died
+    and the IPC server is gone but a stale ``ipc.port`` file remains.
+    We must not propagate the connection error — just exit silently.
     """
     # No server started, no port file written — IPCClient.read_port
     # raises IPCNotConnected, which call_quiet must swallow.

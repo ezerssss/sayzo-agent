@@ -1,20 +1,49 @@
-"""Tests for the atomic pidfile single-instance gate.
+"""Tests for the kernel-locked single-instance gate.
 
-Focus: ``try_acquire_pidfile`` must be a true mutex. Two near-simultaneous
-calls must result in exactly one returning True and the other False.
-That's the property the user reported regressing in v2.1.17 ("there
-shouldnt be more than one instance bruh") — the legacy ``is_running``
-+ ``write_pid`` two-step had a TOCTOU window.
+Focus: ``try_acquire_pidfile`` is a real OS-level mutex.
+
+The v2.7.0 and earlier ``.pid`` file approach failed in three modes
+across two version bumps:
+
+    v2.1.18 — TOCTOU between is_running and write_pid → two primaries
+    v2.1.19 — cross-privilege os.kill PermissionError → two primaries
+    v2.7.0  — post-reboot PID recycling → zero primaries (the user
+              report that triggered the v2.7.1 rewrite to kernel locks)
+
+The kernel-locked rewrite eliminates *all* of these failure modes
+because the kernel owns the lock state and auto-releases on process
+death — clean exit, kill, BSOD, reboot.
+
+These tests exercise the real CreateMutexW / flock primitives via
+in-process thread contention; the kernel treats threads in one process
+as independent contenders on a named mutex / flock, which gives us
+real cross-process semantics without subprocess management.
 """
 from __future__ import annotations
 
 import os
 import threading
+import time
 from pathlib import Path
 
 import pytest
 
 from sayzo_agent import pidfile
+
+
+@pytest.fixture(autouse=True)
+def _release_after_test(tmp_path: Path):
+    """Release any locks held against this tmp_path on test teardown.
+
+    Each test uses a unique tmp_path so cross-test contamination is
+    impossible at the kernel level (Windows mutex names are derived
+    from the path; flock fds are per-test). But within a test, leftover
+    held handles in ``_held_locks`` would accumulate. Yield, then
+    sweep.
+    """
+    yield
+    for lock_path in list(tmp_path.rglob("*.pid")):
+        pidfile.remove_pid(lock_path)
 
 
 def test_acquire_on_empty_dir_succeeds(tmp_path: Path) -> None:
@@ -24,57 +53,31 @@ def test_acquire_on_empty_dir_succeeds(tmp_path: Path) -> None:
     assert pid_path.read_text().strip() == str(os.getpid())
 
 
-def test_acquire_when_alive_pid_already_holds_fails(tmp_path: Path) -> None:
+def test_acquire_overwrites_stale_pidfile_from_previous_boot(tmp_path: Path) -> None:
+    """The post-reboot bug: a .pid file from a previous boot session
+    survives on disk pointing at a recycled PID. Under the v2.7.0
+    pidfile-as-liveness scheme, ``psutil.pid_exists`` would falsely
+    report the recycled PID alive and lock every Sayzo launch out.
+    Under the kernel-lock scheme, the stale file is harmless — no one
+    holds the kernel mutex / flock, so we acquire and overwrite the
+    file with our PID.
+    """
     pid_path = tmp_path / "agent.pid"
-    # Write our own PID — definitely alive (we are us). Second acquire
-    # must lose because the holder is alive.
-    pid_path.write_text(str(os.getpid()))
-    assert pidfile.try_acquire_pidfile(pid_path) is False
+    pid_path.write_text("13492")  # the user's bug report PID
 
-
-def test_acquire_replaces_stale_pidfile(tmp_path: Path) -> None:
-    """A pidfile pointing at a long-dead PID is treated as stale."""
-    pid_path = tmp_path / "agent.pid"
-    # PID 999999 is well above any plausible live process (Linux default
-    # max is 32768, Windows allocates lower numbers in practice). Both
-    # ``os.kill(999999, 0)`` paths raise OSError, so is_running cleans
-    # the pidfile and the retry succeeds.
-    pid_path.write_text("999999")
     assert pidfile.try_acquire_pidfile(pid_path) is True
     assert pid_path.read_text().strip() == str(os.getpid())
 
 
 def test_acquire_handles_corrupt_pidfile(tmp_path: Path) -> None:
-    """A pidfile with non-numeric content is also treated as stale."""
+    """A garbled .pid file (truncated write, hex content, etc.) is
+    overwritten on the next acquire — the kernel-lock layer doesn't
+    care about file contents at all, only whether the lock is held.
+    """
     pid_path = tmp_path / "agent.pid"
     pid_path.write_text("not-a-pid\n")
     assert pidfile.try_acquire_pidfile(pid_path) is True
-
-
-def test_concurrent_acquires_have_exactly_one_winner(tmp_path: Path) -> None:
-    """The whole point of O_EXCL: a parallel race has one winner."""
-    pid_path = tmp_path / "agent.pid"
-    results: list[bool] = []
-    barrier = threading.Barrier(8)
-
-    def attempt() -> None:
-        # All threads block on the barrier so they all hit O_EXCL at
-        # essentially the same instant.
-        barrier.wait()
-        results.append(pidfile.try_acquire_pidfile(pid_path))
-
-    threads = [threading.Thread(target=attempt) for _ in range(8)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-
-    # All threads share the same PID (they're in the same Python
-    # process), so the loser branch's "is alive?" check sees a
-    # live PID and refuses. Exactly one O_EXCL winner; everyone
-    # else returns False.
-    assert results.count(True) == 1
-    assert results.count(False) == 7
+    assert pid_path.read_text().strip() == str(os.getpid())
 
 
 def test_remove_pid_is_idempotent(tmp_path: Path) -> None:
@@ -86,48 +89,164 @@ def test_remove_pid_is_idempotent(tmp_path: Path) -> None:
     assert not pid_path.exists()
 
 
-def test_is_running_treats_cross_privilege_as_alive(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Simulate the post-install-elevated vs. user-clicked scenario.
+def test_acquire_release_acquire_round_trip(tmp_path: Path) -> None:
+    """Once a process releases, the next acquire must succeed.
 
-    When the post-install Sayzo agent runs elevated and a later
-    user-clicked Sayzo (medium integrity) tries ``os.kill(elevated_pid,
-    0)``, Windows refuses with ERROR_ACCESS_DENIED → ``PermissionError``.
-    The old logic treated that as "process gone" and removed the pidfile,
-    letting two instances coexist. ``is_running`` must report True for a
-    PID that ``psutil.pid_exists`` confirms is alive — even if our own
-    ``os.kill`` probe would have failed.
+    Verifies the kernel actually drops the lock on ``remove_pid``;
+    forgetting ``CloseHandle`` on Windows or ``LOCK_UN`` + ``close`` on
+    Unix would silently leak the lock to the next call.
     """
     pid_path = tmp_path / "agent.pid"
-    pid_path.write_text("12345")  # arbitrary "elevated" PID
-
-    import psutil
-    monkeypatch.setattr(psutil, "pid_exists", lambda pid: pid == 12345)
-
-    # Pretend os.kill would fail with PermissionError if it were tried.
-    # The is_running fast-path uses psutil first, so the os.kill mock is
-    # belt-and-braces: even if the psutil branch were skipped, the
-    # PermissionError-as-alive branch should catch it.
-    def _fake_kill(pid: int, sig: int) -> None:
-        raise PermissionError("Access is denied")
-
-    monkeypatch.setattr(pidfile.os, "kill", _fake_kill)
-
-    assert pidfile.is_running(pid_path) is True
-    # Pidfile must NOT be removed.
-    assert pid_path.exists()
+    assert pidfile.try_acquire_pidfile(pid_path) is True
+    pidfile.remove_pid(pid_path)
+    assert pidfile.try_acquire_pidfile(pid_path) is True
 
 
-def test_acquire_loses_to_cross_privilege_primary(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """End-to-end: try_acquire_pidfile must lose to a cross-privilege primary."""
+def test_concurrent_acquires_have_exactly_one_winner(tmp_path: Path) -> None:
+    """Real OS-level contention: same path, many threads, exactly one
+    becomes primary.
+
+    Each thread calls into ``try_acquire_pidfile`` simultaneously. The
+    Windows kernel mutex (named by path-hash) and POSIX flock both
+    treat threads in the same process as independent contenders, so
+    this exercises real cross-process semantics.
+    """
     pid_path = tmp_path / "agent.pid"
-    pid_path.write_text("12345")
+    results: list[bool] = []
+    barrier = threading.Barrier(8)
+    lock = threading.Lock()
 
-    import psutil
-    monkeypatch.setattr(psutil, "pid_exists", lambda pid: pid == 12345)
+    def attempt() -> None:
+        barrier.wait()
+        won = pidfile.try_acquire_pidfile(pid_path)
+        with lock:
+            results.append(won)
 
-    assert pidfile.try_acquire_pidfile(pid_path) is False
-    assert pid_path.read_text().strip() == "12345"  # primary's PID intact
+    threads = [threading.Thread(target=attempt) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert results.count(True) == 1
+    assert results.count(False) == 7
+
+
+def test_is_running_returns_false_when_no_holder(tmp_path: Path) -> None:
+    pid_path = tmp_path / "agent.pid"
+    assert pidfile.is_running(pid_path) is False
+
+
+def test_is_running_returns_false_for_stale_pidfile_no_holder(tmp_path: Path) -> None:
+    """Stale .pid file from a previous session, no live holder — the
+    post-reboot scenario in isolation. ``is_running`` must report False
+    so callers (e.g. the first-run setup flow's "is Sayzo already
+    running?" branch) take the launch path instead of the no-op path.
+    """
+    pid_path = tmp_path / "agent.pid"
+    pid_path.write_text("13492")
+    assert pidfile.is_running(pid_path) is False
+
+
+def test_is_running_returns_true_while_held(tmp_path: Path) -> None:
+    """Hold the lock in a worker thread and verify the main thread
+    sees ``is_running == True``. The worker holds until released, so
+    the main-thread probe sees the kernel lock as occupied.
+    """
+    pid_path = tmp_path / "agent.pid"
+    acquired = threading.Event()
+    release = threading.Event()
+
+    def hold() -> None:
+        assert pidfile.try_acquire_pidfile(pid_path) is True
+        acquired.set()
+        release.wait(timeout=10)
+        pidfile.remove_pid(pid_path)
+
+    worker = threading.Thread(target=hold)
+    worker.start()
+    try:
+        acquired.wait(timeout=5)
+        assert pidfile.is_running(pid_path) is True
+    finally:
+        release.set()
+        worker.join(timeout=5)
+
+    # After release, the lock is gone and is_running flips back.
+    assert pidfile.is_running(pid_path) is False
+
+
+def test_acquire_blocks_while_other_holds_then_succeeds_after_release(
+    tmp_path: Path,
+) -> None:
+    """The full single-instance dance: while A holds, B can't acquire.
+    Once A releases, B can.
+    """
+    pid_path = tmp_path / "agent.pid"
+    a_acquired = threading.Event()
+    a_release = threading.Event()
+    b_results: list[bool] = []
+
+    def hold_a() -> None:
+        assert pidfile.try_acquire_pidfile(pid_path) is True
+        a_acquired.set()
+        a_release.wait(timeout=10)
+        pidfile.remove_pid(pid_path)
+
+    a = threading.Thread(target=hold_a)
+    a.start()
+    a_acquired.wait(timeout=5)
+
+    # B tries while A still holds — must lose.
+    b_results.append(pidfile.try_acquire_pidfile(pid_path))
+
+    # Release A; B retries — must win.
+    a_release.set()
+    a.join(timeout=5)
+
+    b_results.append(pidfile.try_acquire_pidfile(pid_path))
+    pidfile.remove_pid(pid_path)
+
+    assert b_results == [False, True]
+
+
+def test_distinct_paths_have_independent_locks(tmp_path: Path) -> None:
+    """Two different pidfile paths must not contend.
+
+    Production has both ``agent.pid`` (the listening service) and
+    ``settings.pid`` (the Settings GUI subprocess). Both delegate to
+    the same primitive, so they must have isolated locks — otherwise
+    opening Settings while the agent runs would (incorrectly) report
+    "already running."
+    """
+    pid_a = tmp_path / "agent.pid"
+    pid_b = tmp_path / "settings.pid"
+    assert pidfile.try_acquire_pidfile(pid_a) is True
+    assert pidfile.try_acquire_pidfile(pid_b) is True
+    pidfile.remove_pid(pid_a)
+    pidfile.remove_pid(pid_b)
+
+
+def test_pidfile_content_is_overwritten_on_each_acquire(tmp_path: Path) -> None:
+    """Even if the .pid file was left with wrong content, the next
+    successful acquire writes our current PID. This is what makes the
+    file a reliable "current primary's PID" sticky note for IPC
+    routing and diagnostics.
+    """
+    pid_path = tmp_path / "agent.pid"
+    pid_path.write_text("999999")
+    pidfile.try_acquire_pidfile(pid_path)
+    assert pid_path.read_text().strip() == str(os.getpid())
+    pidfile.remove_pid(pid_path)
+
+
+def test_write_pid_is_unlocked_back_compat(tmp_path: Path) -> None:
+    """``write_pid`` is the bare informational write — no kernel lock,
+    no idempotence checks. Kept for back-compat callers who enforce
+    single-instance some other way.
+    """
+    pid_path = tmp_path / "agent.pid"
+    pidfile.write_pid(pid_path)
+    assert pid_path.read_text().strip() == str(os.getpid())
+    # Still no kernel lock held — another acquirer can come in fresh.
+    assert pidfile.is_running(pid_path) is False

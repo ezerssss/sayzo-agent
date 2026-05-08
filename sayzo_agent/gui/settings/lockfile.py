@@ -1,10 +1,19 @@
 """Cross-process single-instance lock for the Settings subprocess.
 
-The legacy in-process tkinter Settings used a ``threading.Event`` to prevent
-double-clicks on the tray menu from spawning two windows. That guard does
-not generalise to a subprocess model — two ``sayzo-agent settings`` processes
-can race independently. This module owns the cross-process equivalent: a
-PID file at ``data_dir/settings.pid`` plus a stale-detection check.
+Two ``sayzo-agent settings`` invocations can race independently — the
+tray's "Open Settings" click while a window is already open, or a user
+double-clicking the tray menu. This module owns the cross-process
+single-instance guard for that subprocess.
+
+Uses the same kernel-lock primitive as the agent service
+(``sayzo_agent.pidfile``) so the Settings GUI inherits the same
+robustness properties: kernel auto-releases on process death (clean
+exit, kill, BSOD, reboot), no stale userspace state possible.
+
+The pidfile at ``data_dir/settings.pid`` is informational — it stores
+the PID of the active Settings window so callers can read it for
+diagnostics. The actual lock is held in the kernel (named mutex on
+Windows, ``fcntl.flock`` on Unix); the .pid file is just a sticky note.
 
 Usage::
 
@@ -16,49 +25,24 @@ Usage::
 from __future__ import annotations
 
 import logging
-import os
 from pathlib import Path
 from typing import Optional
+
+from sayzo_agent import pidfile
 
 log = logging.getLogger(__name__)
 
 _LOCK_FILENAME = "settings.pid"
 
 
-def _is_pid_alive(pid: int) -> bool:
-    """Best-effort liveness check, robust to cross-privilege contexts.
-
-    On Windows, ``os.kill(pid, 0)`` raises ``PermissionError`` when the
-    target lives at a higher integrity level (e.g. an elevated Settings
-    spawned by NSIS finish-page vs. a user-launched Settings). Treating
-    that as "dead" lets a second instance come up alongside the first.
-    ``psutil.pid_exists`` queries the OS without ``PROCESS_ALL_ACCESS``,
-    so it returns True correctly across the elevation boundary.
-    """
-    if pid <= 0:
-        return False
-    try:
-        import psutil  # type: ignore[import-not-found]
-
-        return bool(psutil.pid_exists(pid))
-    except Exception:
-        pass
-    try:
-        os.kill(pid, 0)
-        return True
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-
-
 class SettingsLock:
-    """Context manager for the Settings single-instance PID file.
+    """Context manager for the Settings single-instance lock.
 
-    On enter, attempts to write our PID to ``data_dir/settings.pid``. If the
-    file already exists with a live PID, ``acquired`` is False and the caller
-    should bail. If the file exists but the PID is stale (process gone), we
-    overwrite it and proceed. On exit, removes the file iff we own it.
+    On enter, attempts to acquire the kernel lock. If another Settings
+    process holds it, ``acquired`` is False and the caller should bail.
+    On exit, releases the kernel lock and removes the .pid file iff we
+    own it. The kernel auto-releases on abnormal termination, so a
+    crashed Settings process never blocks the next launch.
     """
 
     def __init__(self, data_dir: Path) -> None:
@@ -74,75 +58,32 @@ class SettingsLock:
         return self._path
 
     def existing_pid(self) -> Optional[int]:
-        """Read the PID currently in the lockfile, or None."""
+        """Read the PID currently in the .pid file, or None.
+
+        Informational: the lock itself is in the kernel, but callers
+        sometimes want the active primary's PID (e.g. for log output
+        or to send a focus-window IPC message).
+        """
         try:
             return int(self._path.read_text(encoding="utf-8").strip())
         except (FileNotFoundError, ValueError, OSError):
             return None
 
     def __enter__(self) -> "SettingsLock":
-        try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            log.warning("[settings.lock] data_dir not writable: %s", self._path.parent)
-            self._acquired = False
-            return self
-
-        # Atomic create-or-fail with O_EXCL to close the TOCTOU window
-        # between "no live lockfile" and "we wrote ours". Two concurrent
-        # Settings subprocess spawns now race at the OS level — exactly
-        # one wins.
-        payload = str(os.getpid()).encode("utf-8")
-        for _attempt in range(2):
-            try:
-                fd = os.open(
-                    self._path,
-                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+        self._acquired = pidfile.try_acquire_pidfile(self._path)
+        if not self._acquired:
+            prior = self.existing_pid()
+            if prior is not None:
+                log.info(
+                    "[settings.lock] another Settings window is open (pid=%d)",
+                    prior,
                 )
-            except FileExistsError:
-                prior = self.existing_pid()
-                if prior is not None and prior != os.getpid() and _is_pid_alive(prior):
-                    log.info(
-                        "[settings.lock] another Settings window is open (pid=%d)",
-                        prior,
-                    )
-                    self._acquired = False
-                    return self
-                # Stale — remove and retry the exclusive create exactly once.
-                try:
-                    self._path.unlink(missing_ok=True)
-                except OSError:
-                    log.warning(
-                        "[settings.lock] failed to clear stale lock", exc_info=True
-                    )
-                    self._acquired = False
-                    return self
-                continue
-            except OSError:
-                log.warning(
-                    "[settings.lock] failed to create %s", self._path, exc_info=True
-                )
-                self._acquired = False
-                return self
-
-            try:
-                os.write(fd, payload)
-            finally:
-                os.close(fd)
-            self._acquired = True
-            return self
-
-        # Lost the race even after the stale-clear retry.
-        self._acquired = False
+            else:
+                log.info("[settings.lock] another Settings window holds the lock")
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
         if not self._acquired:
             return
-        try:
-            current = self.existing_pid()
-            if current == os.getpid():
-                self._path.unlink(missing_ok=True)
-        except OSError:
-            log.debug("[settings.lock] cleanup failed", exc_info=True)
+        pidfile.remove_pid(self._path)
         self._acquired = False
