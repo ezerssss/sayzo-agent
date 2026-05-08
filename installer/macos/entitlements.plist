@@ -3,7 +3,50 @@
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+    <!--
+      Microphone access. Required for both setup-time TCC dialog
+      presentation AND runtime audio capture (mic.start in
+      ArmController). Without this entitlement on a hardened-runtime
+      bundle, macOS silently denies mic access at the OS level — TCC
+      dialog never appears AND any audio stream we open returns silence
+      (the v2.6.0 "audio_dur > 0 with mic_total = 0" bug). This was the
+      file that existed unused in the repo until v2.7.4 wired it into
+      the codesign step.
+    -->
     <key>com.apple.security.device.audio-input</key>
     <true/>
+
+    <!--
+      PyInstaller embeds Python's interpreter and many C extensions
+      (numpy, scipy, sounddevice, faster-whisper, etc.) inside the .app
+      bundle. They're signed ad-hoc by PyInstaller and re-signed by our
+      `codesign --deep` step under the same Developer ID. But hardened
+      runtime's library validation can still reject them in some
+      configurations because the embedded Python loads frameworks from
+      paths the OS doesn't expect for a Developer-ID app. Disabling
+      library validation lets pyobjc, sounddevice's PortAudio backend,
+      and the Swift helpers (audio-tap, audio-detect) load cleanly.
+    -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+
+    <!--
+      Several C extensions bundled by PyInstaller mark code pages
+      writable+executable at runtime (CFFI's ctypes trampolines, some
+      llvmlite/numba shims when present). Hardened runtime blocks
+      W+X memory by default. Allowing it is the standard recipe for
+      PyInstaller-bundled Python apps under hardened runtime —
+      otherwise the bundle crashes on first import of certain modules.
+    -->
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+
+    <!--
+      Notarization requires Hardened Runtime (--options runtime in our
+      codesign step) which by default disables debugger attachment.
+      Don't add `com.apple.security.cs.debugger` here — we ship to
+      end-users; debugger attachment to a notarized release should
+      stay disabled.
+    -->
 </dict>
 </plist>

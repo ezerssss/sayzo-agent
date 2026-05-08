@@ -10,15 +10,13 @@ interface Props {
   onCancel: () => void;
 }
 
-// Same root cause as the Microphone screen: macOS silent-denies when an
-// orphan TCC entry from a pre-v2.6.0 ad-hoc-signed Sayzo install has a
-// code requirement that no longer matches the current Developer-ID-
-// signed binary, OR when NSAudioCaptureUsageDescription is missing from
-// Info.plist. In the orphan case the entry is hidden from System
-// Settings → Privacy & Security → Audio Capture, so any "remove from
-// the list" copy is a dead end. Bundle-level recovery via
-// `tccutil reset AudioCapture com.sayzo.agent` + relaunch is the only
-// path that works without Terminal.
+// Same shape as the Microphone screen's stale_tcc state. v2.7.4
+// established that the most common reason the system audio dialog
+// doesn't appear is a missing Hardened-Runtime entitlement at codesign
+// time. Other possible causes — orphan TCC entry, missing usage
+// description — are rarer post-v2.7.4. Recovery actions are the same
+// either way: Reset & Restart (clears any orphan entry as a safety
+// belt) plus Copy diagnostic / Open log folder for support.
 type State =
   | "idle"
   | "pending"

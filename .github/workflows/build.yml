@@ -199,7 +199,24 @@ jobs:
         env:
           APPLE_DEVELOPER_ID: ${{ secrets.APPLE_DEVELOPER_ID }}
         run: |
+          # `--entitlements installer/macos/entitlements.plist` is the
+          # critical piece restored in v2.7.4. The file existed in the
+          # repo since v2.6.0 with com.apple.security.device.audio-input
+          # but was never wired into the codesign step. Without it, our
+          # Hardened-Runtime bundle has no audio-input entitlement, so
+          # macOS silently denies mic access — no TCC dialog, no capture
+          # data flow. That's the regression Jhoanna and other users hit
+          # after the v2.6.0 notarization switch (pre-v2.6.0 unsigned
+          # builds had no Hardened Runtime → no entitlement requirement
+          # → dialogs and capture worked end-to-end).
+          #
+          # The plist also includes disable-library-validation and
+          # allow-unsigned-executable-memory — standard Hardened-Runtime
+          # entitlements for PyInstaller-bundled Python apps so the
+          # embedded interpreter, C extensions, and Swift helpers
+          # (audio-tap, audio-detect) load cleanly.
           codesign --deep --force --options runtime \
+            --entitlements installer/macos/entitlements.plist \
             --sign "$APPLE_DEVELOPER_ID" \
             "dist/Sayzo.app"
 

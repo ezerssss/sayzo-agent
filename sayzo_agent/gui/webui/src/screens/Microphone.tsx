@@ -10,16 +10,18 @@ interface Props {
   onCancel: () => void;
 }
 
-// "stale_tcc" splits off from "denied" so we can show targeted recovery
-// copy. macOS silent-denies requestAccess (returns False in milliseconds
-// without ever showing the dialog) when EITHER the bundle's Info.plist
-// is missing NSMicrophoneUsageDescription OR a previous install left an
-// orphan TCC entry whose code-requirement no longer matches the current
-// signing identity. In the orphan case the entry is FILTERED OUT of
-// System Settings → Privacy & Security → Microphone — the user opens
-// the pane and Sayzo isn't there at all, so any "remove from the list"
-// instruction is a dead end. Bundle-level recovery via `tccutil reset`
-// + relaunch is the only path that works without Terminal.
+// "stale_tcc" splits off from "denied" when the OS suppresses the TCC
+// dialog entirely (no banner appears, no entry shows up in System
+// Settings → Microphone). v2.7.4 established the most common cause is
+// a missing Hardened-Runtime entitlement at codesign time
+// (`com.apple.security.device.audio-input`); a less common cause is a
+// genuine orphan TCC entry from a previous Sayzo install with a
+// different code requirement. Both produce the same symptom — dialog
+// never appears, stream returns silence — and the recovery actions
+// available to the user (Reset & Restart, Copy diagnostic, Open log
+// folder) are the same either way. The flag name is kept for
+// back-compat with the Python bridge contract; "dialog blocked" is
+// the more accurate read.
 type State =
   | "idle"
   | "pending"

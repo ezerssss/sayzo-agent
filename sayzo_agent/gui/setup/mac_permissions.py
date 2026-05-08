@@ -50,18 +50,27 @@ _AV_AUTH_RESTRICTED = 1
 _AV_AUTH_DENIED = 2
 _AV_AUTH_AUTHORIZED = 3
 
-# Used by `prompt_audio_capture` (Swift `audio-tap` exit-77 path) to
-# distinguish a real human "Don't Allow" click from a silent-deny.
-# The mic path no longer uses this constant — v2.7.3 reverted the mic
-# trigger to CoreAudio HAL which doesn't have a sub-second-False
-# fingerprint to worry about (it polls AVCaptureDevice.authorizationStatus
-# directly), but the audio-capture path still relies on it. A real
-# human read-and-click takes much longer than 500 ms even on a snap
-# decision; a False arriving faster is the system rejecting the request
-# at a pre-flight check (e.g. PyInstaller bootloader attribution
-# failure, missing usage description, stale-CR orphan entry). See
-# project_macos_silent_tcc_deny.md memory for the full v2.7.3 root
-# cause analysis.
+# Threshold for the "dialog never appeared" fingerprint used by
+# `prompt_audio_capture`. A False arriving from the audio-tap binary
+# in <500 ms is the system pre-rejecting the request without ever
+# presenting UI. Possible causes (most likely first as of v2.7.4):
+#
+#   1. Missing Hardened-Runtime entitlement
+#      (`com.apple.security.cs.disable-library-validation` or the
+#      service-specific `com.apple.security.device.audio-input`). This
+#      is what bit us across v2.6.0 → v2.7.3; fixed by wiring
+#      `installer/macos/entitlements.plist` into the codesign step.
+#   2. Missing usage description in Info.plist
+#      (NSAudioCaptureUsageDescription).
+#   3. Genuine orphan TCC entry whose code requirement no longer
+#      matches the current bundle (rare, fixable with `tccutil reset
+#      AudioCapture com.sayzo.agent`).
+#
+# Naming: `stale_tcc_likely` is the wire-format flag name — kept for
+# back-compat with the bridge JSON contract, even though as of v2.7.4
+# "dialog blocked / never appeared" is more accurate. See
+# project_macos_silent_tcc_deny.md memory for the full history of
+# wrong theories shipped under this name (v2.7.1 → v2.7.3).
 _STALE_TCC_THRESHOLD_SECS = 0.5
 
 # Bundle identifier our TCC entries are keyed under. Mirrors the
@@ -106,11 +115,18 @@ class TccPromptResult(NamedTuple):
         under :data:`_STALE_TCC_THRESHOLD_SECS` — same intuition, since
         no human can read a dialog and click that fast.
 
-    Common underlying causes (see project_macos_silent_tcc_deny.md memory):
-    `LSBackgroundOnly=True` silently injected by PyInstaller, AVFoundation
-    bootloader-attribution failure, missing/orphan TCC entries, or a
-    missing usage-description key in Info.plist. The diagnostic logged at
-    the start of each prompt distinguishes which one.
+    Naming history (kept for back-compat with the bridge JSON contract):
+    ``stale_tcc_likely`` was originally added in v2.7.1 under the theory
+    that orphan TCC entries from pre-v2.6.0 ad-hoc-signed installs were
+    silent-denying. v2.7.4 established the actual root cause was a
+    missing Hardened-Runtime entitlement chain at the codesign step
+    (``installer/macos/entitlements.plist`` wasn't wired into CI's
+    ``codesign --entitlements``). The fingerprint detection itself is
+    still accurate — both an orphan-CR entry AND a missing entitlement
+    cause the same "dialog never appears" symptom — but the field is
+    better understood as "the dialog was blocked by something at the OS
+    level." See ``project_macos_silent_tcc_deny.md`` memory for the
+    full timeline.
     """
 
     granted: Optional[bool]
@@ -307,6 +323,15 @@ def _tccutil_reset_service(service: str) -> bool:
     user's TCC database.
 
     Returns True on rc=0, False otherwise. Best-effort — never raises.
+
+    Originally added in v2.7.1 under the (wrong) theory that the macOS
+    silent-deny was caused by orphan TCC entries from pre-v2.6.0 ad-hoc-
+    signed installs. v2.7.4 established the actual root cause was a
+    missing Hardened-Runtime entitlement, which ``tccutil reset`` doesn't
+    fix. The helper is kept anyway because it's still useful as a manual
+    escape hatch — Jhoanna's machine had 4 stale entries that the reset
+    cleaned up — and because the preemptive call before the HAL trigger
+    in :func:`prompt_microphone` is harmless when no entries exist.
 
     ``tccutil`` does NOT require sudo for the current user's TCC database;
     it can clear any entry for our own bundle. The reset is idempotent:
