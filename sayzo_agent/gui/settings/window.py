@@ -28,6 +28,7 @@ import webview
 
 from sayzo_agent.config import Config
 from sayzo_agent.gui.common.assets import icon_path, webui_index_path
+from sayzo_agent.gui.common.pywebview_patches import apply as _apply_pywebview_patches
 from sayzo_agent.gui.settings.bridge import Bridge
 
 log = logging.getLogger(__name__)
@@ -85,6 +86,8 @@ class SettingsWindow:
         log.info(
             "[settings] opening window at %s (idle=%s)", url, self._idle,
         )
+
+        _apply_pywebview_patches()
 
         window = webview.create_window(
             title=WINDOW_TITLE,
