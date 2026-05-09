@@ -1,4 +1,4 @@
-"""macOS NSAppleEventManager hook for surfacing Settings on user re-launch.
+"""macOS NSApplicationDelegate hook for surfacing Settings on user re-launch.
 
 Sayzo's macOS bundle is ``LSUIElement=True``, which means clicking the .app
 in the Dock / Finder / Spotlight while the agent is already running does
@@ -6,27 +6,51 @@ in the Dock / Finder / Spotlight while the agent is already running does
 ``kAEReopenApplication`` Apple Event to the existing app. Without a handler
 the event is silently dropped, and the user sees no response.
 
-This module installs an ``NSAppleEventManager`` handler that runs the
-caller-supplied ``callback`` whenever a reopen event arrives. The agent
-wires that callback to ``loop.call_soon_threadsafe(state.settings_event.set)``
-so the existing tray-Settings code path takes over from there.
+Why we use NSApplicationDelegate (not NSAppleEventManager directly)
+-------------------------------------------------------------------
 
-The handler operates at the AppleEvent layer, NOT the NSApplicationDelegate
-layer — pystray's NSStatusItem usage is unaffected.
+The earlier implementation registered an ``NSAppleEventManager`` event
+handler for ``kAEReopenApplication`` via
+``setEventHandler:andSelector:forEventClass:andEventID:``. That looked
+correct in isolation but lost a race against AppKit:
 
-PyObjC notes:
+1. We registered our handler.
+2. ``tray.run_main()`` called ``NSApp.run()``.
+3. ``NSApp.run()`` invoked ``[NSApp finishLaunching]``, which **registers
+   NSApplication's own default handler** for ``kAEReopenApplication`` —
+   replacing ours. (``setEventHandler`` is replace-not-chain.)
+4. NSApp's default handler forwards to
+   ``[NSApp.delegate applicationShouldHandleReopen:hasVisibleWindows:]``.
+   pystray never sets ``NSApp.delegate``, so the event silently no-ops.
 
-* ``setEventHandler_andSelector_forEventClass_andEventID_`` does NOT retain
-  the handler, so we keep a module-level strong reference. If the only ref
-  is local to ``install_reopen_handler``, GC eventually collects it and the
-  events stop firing — a footgun documented in the PyObjC mailing list.
-* The handler runs on the main (NSApp) thread. Any work that touches
-  asyncio state must marshal back via ``loop.call_soon_threadsafe`` —
-  callers handle that, this module just invokes the callback directly.
-* The Apple Event four-char codes (``'aevt'`` / ``'rapp'``) are converted
-  to their UInt32 representation here rather than imported from
-  ``Carbon``, since the Carbon module is deprecated and not consistently
-  available across PyObjC versions.
+Diagnosed from a Sequoia 15.5 user log (2026-05-10): the
+``[mac_reopen] installed kAEReopenApplication handler`` line appears at
+boot and is followed seconds later by ``tray icon starting``, then
+nothing — Spotlight clicks while the agent runs produce zero log
+output downstream. Confirmed the handler was being shadowed by
+``finishLaunching``.
+
+The canonical Apple-recommended path is to set an ``NSApplicationDelegate``
+that implements ``applicationShouldHandleReopen:hasVisibleWindows:``.
+NSApp's ``finishLaunching`` registers itself as the AppleEvent handler
+specifically so it can dispatch to the delegate, so a delegate hook is
+ALWAYS called regardless of when the delegate was set. That's the
+contract we want.
+
+Threading and lifecycle notes
+-----------------------------
+
+* ``NSApp.setDelegate_`` does NOT retain the delegate. We hold a
+  module-level strong ref so PyObjC GC doesn't reap it — exact same
+  reason the old NSAppleEventManager path needed it.
+* The delegate's hook runs on the AppKit main thread. Any work that
+  touches asyncio state must marshal back via
+  ``loop.call_soon_threadsafe``. Callers wire that themselves; we just
+  invoke the callback directly. (``threading.Event.set`` happens to
+  be thread-safe, which is what the agent passes in.)
+* Pystray's ``IconDelegate`` is the target of the NSStatusItem button
+  action — it is NOT installed as ``NSApp.delegate``. Setting our
+  delegate does not conflict.
 """
 from __future__ import annotations
 
@@ -36,47 +60,40 @@ from typing import Any, Callable, Optional
 
 log = logging.getLogger(__name__)
 
-# Module-level strong ref to the handler so PyObjC GC doesn't collect it.
-# AppleEvents stop firing if the handler object goes away.
-_handler_singleton: Any = None
-
-
-def _fourcc(code: str) -> int:
-    """Pack a 4-byte ASCII string (e.g. ``'aevt'``) into a UInt32 FourCC."""
-    if len(code) != 4:
-        raise ValueError(f"FourCC must be 4 chars, got {code!r}")
-    return (
-        (ord(code[0]) << 24)
-        | (ord(code[1]) << 16)
-        | (ord(code[2]) << 8)
-        | ord(code[3])
-    )
+# Module-level strong ref to the delegate so PyObjC GC doesn't collect it.
+# NSApp.setDelegate_ is non-retaining; without this, the delegate would be
+# GC'd before the user ever clicks Sayzo, and reopen events would resume
+# being silently dropped.
+_delegate_singleton: Any = None
 
 
 def install_reopen_handler(callback: Callable[[], None]) -> Optional[Any]:
-    """Register an NSAppleEventManager handler for ``kAEReopenApplication``.
+    """Register an ``NSApplicationDelegate`` hook for app-reopen events.
 
-    The handler invokes ``callback()`` (with no arguments) whenever
-    LaunchServices delivers a reopen event — that fires on Dock click,
-    Spotlight launch, ``open -a Sayzo``, and Finder Applications double-click
-    while the app is already running.
+    The hook invokes ``callback()`` (no arguments) whenever LaunchServices
+    delivers a reopen event — fires on Dock click, Spotlight launch,
+    ``open -a Sayzo``, Finder Applications double-click while the app is
+    already running.
 
-    Returns the handler object on success (caller may keep it for parity;
-    a module-level strong ref is held internally so the caller does NOT
-    have to). Returns ``None`` on non-darwin or any registration failure
-    — failures are logged and never propagate, so the agent boot path is
-    unaffected if PyObjC is missing or AppKit raises.
+    Returns the delegate object on success (caller may keep it for
+    parity; a module-level strong ref is held internally so the caller
+    does NOT have to). Returns ``None`` on non-darwin or any
+    registration failure — failures are logged and never propagate, so
+    the agent boot path is unaffected if PyObjC is missing or AppKit
+    raises.
 
-    Idempotent: re-installing replaces the handler. The previous handler
-    object is dropped and may be GC'd.
+    Idempotent: re-installing replaces the previous delegate. The old
+    delegate object is dropped and may be GC'd; AppKit will pick up the
+    new one on the next reopen event.
     """
-    global _handler_singleton
+    global _delegate_singleton
 
     if sys.platform != "darwin":
         return None
 
     try:
-        from Foundation import NSAppleEventManager, NSObject  # type: ignore[import-not-found]
+        from AppKit import NSApplication  # type: ignore[import-not-found]
+        from Foundation import NSObject  # type: ignore[import-not-found]
         import objc  # type: ignore[import-not-found]
     except Exception:
         log.warning(
@@ -85,36 +102,48 @@ def install_reopen_handler(callback: Callable[[], None]) -> Optional[Any]:
         )
         return None
 
-    class _ReopenHandler(NSObject):
+    class _ReopenDelegate(NSObject):
         def initWithCallback_(self, cb):  # type: ignore[no-untyped-def]
-            self = objc.super(_ReopenHandler, self).init()
+            self = objc.super(_ReopenDelegate, self).init()
             if self is None:
                 return None
             self._cb = cb
             return self
 
-        # Selector signature matches "handleReopen:withReplyEvent:". PyObjC
-        # maps trailing colons to Python underscores, so the Python method
-        # name must be ``handleReopen_withReplyEvent_``.
-        def handleReopen_withReplyEvent_(self, event, reply):  # type: ignore[no-untyped-def]
+        # PyObjC selector signature: trailing colons in the Obj-C
+        # selector ``applicationShouldHandleReopen:hasVisibleWindows:``
+        # map to underscores in the Python method name.
+        def applicationShouldHandleReopen_hasVisibleWindows_(  # type: ignore[no-untyped-def]
+            self, app, has_visible_windows
+        ):
             try:
                 self._cb()
             except Exception:
                 log.warning("[mac_reopen] callback raised", exc_info=True)
+            # Returning False prevents NSApp's default reopen behavior
+            # (unminimize windows / bring to front). We have no NSWindows
+            # on the agent process — only the menubar item — so True vs
+            # False is roughly equivalent here, but False is the honest
+            # answer ("we handled it ourselves") and matches what an
+            # LSUIElement app should report.
+            return False
 
     try:
-        handler = _ReopenHandler.alloc().initWithCallback_(callback)
-        manager = NSAppleEventManager.sharedAppleEventManager()
-        manager.setEventHandler_andSelector_forEventClass_andEventID_(
-            handler,
-            b"handleReopen:withReplyEvent:",
-            _fourcc("aevt"),  # kCoreEventClass
-            _fourcc("rapp"),  # kAEReopenApplication
-        )
+        delegate = _ReopenDelegate.alloc().initWithCallback_(callback)
+        # Touching ``sharedApplication`` here is intentional: it
+        # initializes NSApp if no caller has done so yet, so
+        # ``setDelegate_`` always has a valid ``NSApp`` instance to bind
+        # to. pystray will hit the same ``sharedApplication`` later and
+        # get back the singleton — no double-init.
+        app = NSApplication.sharedApplication()
+        app.setDelegate_(delegate)
     except Exception:
-        log.warning("[mac_reopen] failed to install reopen handler", exc_info=True)
+        log.warning("[mac_reopen] failed to install delegate", exc_info=True)
         return None
 
-    _handler_singleton = handler
-    log.info("[mac_reopen] installed kAEReopenApplication handler")
-    return handler
+    _delegate_singleton = delegate
+    log.info(
+        "[mac_reopen] installed NSApplicationDelegate "
+        "applicationShouldHandleReopen:hasVisibleWindows:"
+    )
+    return delegate

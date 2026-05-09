@@ -137,6 +137,15 @@ class TrayState:
     # Tray-thread → asyncio-loop signal: user clicked the "Finish setup at
     # sayzo.app →" item, agent should open the cached onboarding_url.
     finish_setup_event: threading.Event = field(default_factory=threading.Event)
+    # Bootstrap flag — opt-in (default False so existing tests / CLI
+    # paths that don't go through the slow boot remain unchanged). When
+    # the live ``service()`` boot path constructs TrayState, it sets
+    # this True before painting the tray, then calls ``mark_ready()``
+    # once heavy imports + Agent construction finish on the asyncio
+    # worker. While True, the tray tooltip + arm-toggle label render
+    # "Starting…" so the user sees immediate visual feedback instead of
+    # staring at a tray icon whose menu would silently no-op.
+    _starting: bool = False
 
     def set_status(self, status: Status, error_message: str = "") -> None:
         with self._lock:
@@ -170,6 +179,23 @@ class TrayState:
     def get_eod_drill_label(self) -> str | None:
         with self._lock:
             return self._eod_drill_label
+
+    def is_starting(self) -> bool:
+        with self._lock:
+            return self._starting
+
+    def mark_starting(self) -> None:
+        """Set the bootstrap flag — tooltip + arm-toggle render
+        ``"Starting…"`` until ``mark_ready()`` is called. Intended to be
+        called by ``service()`` at tray construction, before the heavy
+        ``.app`` / ``.notify`` import chain runs."""
+        with self._lock:
+            self._starting = True
+
+    def mark_ready(self) -> None:
+        """Clear the bootstrap flag once the live agent is wired up."""
+        with self._lock:
+            self._starting = False
 
     def set_cached_account(self, cached: CachedAccountStatus | None) -> bool:
         """Update the cached account snapshot. Returns ``True`` iff the
@@ -399,6 +425,13 @@ class TrayIcon:
 
     def _tooltip_for(self, status: Status, error_msg: str) -> str:
         hotkey = self.state.get_hotkey_display()
+        # Boot-time precedence: while heavy imports + Agent construction
+        # are still running, neither the armed-state nor account-blocked
+        # tooltip is meaningful — the user just opened Sayzo and needs to
+        # know we're alive. Cleared by the asyncio bootstrap calling
+        # ``state.mark_ready()`` after Agent is constructed.
+        if self.state.is_starting():
+            return "Sayzo — starting…"
         if status == Status.ERROR and error_msg:
             return f"Sayzo — {error_msg}"
         # Account-blocked supersedes everything except an active arming —
@@ -448,6 +481,14 @@ class TrayIcon:
         # ---- dynamic text callbacks (re-evaluated each menu open) ---------
 
         def arm_label(item) -> str:
+            # Bootstrap: tray paints before Agent exists. Setting
+            # ``arm_toggle_event`` while starting=True would queue an arm
+            # against a controller that isn't ready yet — confusing
+            # "click did nothing" UX. The bridge does eventually drain
+            # the event when ready, but the label above the click is the
+            # honest story for the user.
+            if self.state.is_starting():
+                return "Starting Sayzo…"
             status_now, _ = self.state.get_status()
             hotkey = self.state.get_hotkey_display()
             if status_now == Status.ARMED:

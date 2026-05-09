@@ -1250,15 +1250,13 @@ def service(force_setup: bool) -> None:
         upload_client = AuthenticatedUploadClient(auth_client, cfg.captures_dir)
         log.warning("uploads enabled → %s", cfg.auth.effective_server_url)
 
-    from .app import Agent
-    from .notify import APP_AUMID, NoopNotifier, make_notifier
-
-    # Seed the tray with the user's actual hotkey at construction. The
-    # TrayState dataclass field has a default of "Ctrl+Alt+S" for tests,
-    # but the live agent must reflect whatever's in user_settings.json so
-    # the menu/tooltip don't briefly flash the default before
-    # _sync_arm_state_to_tray runs.
+    # Hoist tray construction above the heavy ``.app`` / ``.notify`` import
+    # chain so the menubar icon paints in ~1 s instead of 8–10 s on cold
+    # boot. ``mark_starting()`` is what gates the arm-toggle menu item
+    # against the not-yet-constructed ArmController — without it, a click
+    # during boot would queue an arm against ``None``.
     tray_state = TrayState(hotkey_display=humanize_binding(cfg.arm.hotkey))
+    tray_state.mark_starting()
     tray = TrayIcon(tray_state, cfg.captures_dir)
 
     # User-click launch (no primary was running, parent process looks like
@@ -1275,78 +1273,115 @@ def service(force_setup: bool) -> None:
         )
         tray_state.settings_event.set()
 
-    notifier = make_notifier(app_name=APP_AUMID) if cfg.notifications_enabled else NoopNotifier()
+    # Heavy-import bootstrap. Defers ``from .app import Agent``, ``from
+    # .notify import …``, the Agent constructor, and the daily-drill
+    # scheduler — all together 4–10 s on the first cold path due to
+    # numpy / scipy / silero / faster-whisper / av / desktop-notifier
+    # loading lazily — until AFTER the tray icon has painted.
+    #
+    # Dispatcher routes this:
+    #   - macOS:   spawned on a worker thread BEFORE ``tray.run_main()``
+    #              so the main thread is free to host ``NSApp.run()``,
+    #              which is what actually paints the menubar item.
+    #   - Windows: called synchronously AFTER ``tray.start()`` has
+    #              handed icon paint to a daemon thread.
+    #
+    # ``agent`` is assigned via ``nonlocal`` so ``_main`` (defined
+    # below) resolves it at call time. Python's lexical scoping
+    # tolerates the forward reference: ``agent`` doesn't need to
+    # exist when ``_main`` is parsed, only when it executes — and
+    # by then ``_build_pipeline_state()`` has run.
+    #
+    # ``mark_ready()`` flips the tray's ``_starting`` flag once Agent
+    # is wired up, so the tooltip + arm-toggle stop saying "Starting…"
+    # and start dispatching real arm/disarm events.
+    agent = None
 
-    # Daily-drill scheduler — per-workday notification opening that day's
-    # 60-second drill in the user's default browser. Constructed only when
-    # both master notifications + the daily-drill sub-toggle are on. The
-    # scheduler does its own auth gating (TokenStore.has_tokens) on every
-    # tick, so it's safe to construct pre-login.
-    daily_drill = None
-    if cfg.notifications_enabled and cfg.notifications.daily_drill_enabled:
-        try:
-            from .daily_drill import DailyDrillScheduler
+    def _build_pipeline_state() -> None:
+        nonlocal agent
+        from .app import Agent
+        from .notify import APP_AUMID, NoopNotifier, make_notifier
 
-            def _auth_client_factory():
-                if not store.has_tokens() or not cfg.auth.effective_server_url:
-                    return None
-                return auth_client
-
-            def _is_mic_active_fn() -> bool:
-                # Cheap platform query reusing the arm subsystem's primitives.
-                # Wrapped here because agent.arm doesn't exist at scheduler
-                # construction time — this lambda runs per tick.
-                try:
-                    if sys.platform == "win32":
-                        from .arm.platform_win import get_mic_holders
-                        return bool(get_mic_holders())
-                    if sys.platform == "darwin":
-                        from .arm.platform_mac import is_mic_active
-                        return bool(is_mic_active())
-                except Exception:
-                    log.debug(
-                        "[daily_drill] is_mic_active probe raised", exc_info=True
-                    )
-                return False
-
-            daily_drill = DailyDrillScheduler(
-                cfg=cfg.notifications,
-                master_notifications_enabled=cfg.notifications_enabled,
-                stats_path=cfg.notification_stats_path,
-                notifier=notifier,
-                token_store=store,
-                auth_client_factory=_auth_client_factory,
-                arm_state_fn=lambda: agent.arm.state,
-                is_mic_active_fn=_is_mic_active_fn,
-                tray_state=tray_state,
-            )
-        except Exception:
-            log.warning(
-                "daily-drill scheduler construction failed (non-fatal)",
-                exc_info=True,
-            )
-
-    agent = Agent(
-        cfg,
-        upload_client=upload_client,
-        notifier=notifier,
-        auth_client=auth_client,
-        daily_drill_scheduler=daily_drill,
-    )
-
-    from .account import decide_arm_gate, read_cache as _read_account_cache
-
-    def _account_gate_fn():
-        try:
-            cached = _read_account_cache(cfg)
-        except Exception:
-            log.warning("[arm] account cache read raised; allowing", exc_info=True)
-            cached = None
-        return decide_arm_gate(
-            cached, enabled=cfg.auth.account_check_enabled
+        notifier = (
+            make_notifier(app_name=APP_AUMID)
+            if cfg.notifications_enabled else NoopNotifier()
         )
 
-    agent.arm.account_gate_fn = _account_gate_fn
+        # Daily-drill scheduler — per-workday notification opening that day's
+        # 60-second drill in the user's default browser. Constructed only when
+        # both master notifications + the daily-drill sub-toggle are on. The
+        # scheduler does its own auth gating (TokenStore.has_tokens) on every
+        # tick, so it's safe to construct pre-login.
+        daily_drill = None
+        if cfg.notifications_enabled and cfg.notifications.daily_drill_enabled:
+            try:
+                from .daily_drill import DailyDrillScheduler
+
+                def _auth_client_factory():
+                    if not store.has_tokens() or not cfg.auth.effective_server_url:
+                        return None
+                    return auth_client
+
+                def _is_mic_active_fn() -> bool:
+                    # Cheap platform query reusing the arm subsystem's primitives.
+                    # Wrapped here because agent.arm doesn't exist at scheduler
+                    # construction time — this lambda runs per tick.
+                    try:
+                        if sys.platform == "win32":
+                            from .arm.platform_win import get_mic_holders
+                            return bool(get_mic_holders())
+                        if sys.platform == "darwin":
+                            from .arm.platform_mac import is_mic_active
+                            return bool(is_mic_active())
+                    except Exception:
+                        log.debug(
+                            "[daily_drill] is_mic_active probe raised", exc_info=True
+                        )
+                    return False
+
+                daily_drill = DailyDrillScheduler(
+                    cfg=cfg.notifications,
+                    master_notifications_enabled=cfg.notifications_enabled,
+                    stats_path=cfg.notification_stats_path,
+                    notifier=notifier,
+                    token_store=store,
+                    auth_client_factory=_auth_client_factory,
+                    arm_state_fn=lambda: agent.arm.state,
+                    is_mic_active_fn=_is_mic_active_fn,
+                    tray_state=tray_state,
+                )
+            except Exception:
+                log.warning(
+                    "daily-drill scheduler construction failed (non-fatal)",
+                    exc_info=True,
+                )
+
+        agent = Agent(
+            cfg,
+            upload_client=upload_client,
+            notifier=notifier,
+            auth_client=auth_client,
+            daily_drill_scheduler=daily_drill,
+        )
+
+        from .account import decide_arm_gate, read_cache as _read_account_cache
+
+        def _account_gate_fn():
+            try:
+                cached = _read_account_cache(cfg)
+            except Exception:
+                log.warning("[arm] account cache read raised; allowing", exc_info=True)
+                cached = None
+            return decide_arm_gate(
+                cached, enabled=cfg.auth.account_check_enabled
+            )
+
+        agent.arm.account_gate_fn = _account_gate_fn
+
+        # Tray is now backed by a real ArmController. Stop showing the
+        # bootstrap "Starting…" copy and let menu clicks dispatch.
+        tray_state.mark_ready()
+        tray.update()
 
     async def _main() -> None:
         loop = asyncio.get_running_loop()
@@ -1892,13 +1927,33 @@ def service(force_setup: bool) -> None:
 
     try:
         if sys.platform == "darwin":
-            # macOS: pystray uses AppKit, which requires NSStatusItem to be
-            # instantiated on the main thread. Run asyncio on a worker thread
-            # and hand the main thread to pystray.
+            # macOS dispatch: heavy bootstrap on a worker thread, NSApp on
+            # the main thread.
+            #
+            # 1. Spawn worker that runs ``_build_pipeline_state()`` then
+            #    ``asyncio.run(_main())``. Heavy imports + Agent +
+            #    notify backend init all happen here — off the main
+            #    thread so the tray icon paint at step 3 isn't blocked
+            #    by 4–10 s of cold imports.
+            # 2. Install the NSApplicationDelegate hook for app-reopen
+            #    events (Dock click / Spotlight launch / ``open -a Sayzo``
+            #    while running). LSUIElement=True bundles don't spawn a
+            #    second process for those — LaunchServices delivers a
+            #    ``kAEReopenApplication`` Apple Event to the existing
+            #    process, which the delegate picks up. (Windows handles
+            #    the equivalent via the IPC ``OPEN_SETTINGS`` path; the
+            #    fresh process there hits the kernel mutex and nudges
+            #    the primary.)
+            # 3. ``tray.run_main()`` — calls ``NSApp.run()`` which does
+            #    ``[NSApp finishLaunching]`` (where AppKit registers its
+            #    own kAEReopenApplication handler — the
+            #    NSApplicationDelegate path survives that), then drives
+            #    the runloop until tray quit.
             asyncio_exc: list[BaseException] = []
 
             def _asyncio_runner() -> None:
                 try:
+                    _build_pipeline_state()
                     asyncio.run(_main())
                 except BaseException as e:
                     asyncio_exc.append(e)
@@ -1908,15 +1963,6 @@ def service(force_setup: bool) -> None:
             worker = threading.Thread(target=_asyncio_runner, name="asyncio", daemon=False)
             worker.start()
 
-            # Install the kAEReopenApplication handler before pystray hands
-            # the main thread to NSApp.run(). Without this, clicking the
-            # Sayzo Dock icon / Spotlight launching the .app while we're
-            # already running silently does nothing — LSUIElement=True apps
-            # don't get a second process spawned, so there's no "second
-            # launch IPC" path on macOS the way there is on Windows.
-            # ``tray_state.settings_event`` is a threading.Event, safe to
-            # set from the AppKit main thread; ``_tray_bridge`` picks it
-            # up on its next 0.5 s tick from the asyncio worker.
             try:
                 from .gui.common.mac_reopen import install_reopen_handler
 
@@ -1946,7 +1992,11 @@ def service(force_setup: bool) -> None:
                 # handler, so nothing will revive us. SIGKILL the process
                 # group first to take down direct children (audio-tap, etc.),
                 # then os._exit as a safety net in case killpg raised.
-                agent.stop()
+                # ``agent`` is None if the worker crashed before Agent
+                # construction finished (heavy imports failing land in
+                # ``asyncio_exc``).
+                if agent is not None:
+                    agent.stop()
                 worker.join(timeout=5)
                 log.warning("tray quit — killing process group and exiting")
                 remove_pid(cfg.pid_path)
@@ -1968,7 +2018,19 @@ def service(force_setup: bool) -> None:
             if asyncio_exc and not isinstance(asyncio_exc[0], KeyboardInterrupt):
                 raise asyncio_exc[0]
         else:
+            # Windows / Linux dispatch:
+            # 1. ``tray.start()`` paints the system-tray icon on a daemon
+            #    thread immediately — that's the user's "Sayzo is alive"
+            #    signal, must happen before the heavy import chain.
+            # 2. ``_build_pipeline_state()`` runs the heavy imports +
+            #    Agent construction synchronously on the main thread.
+            #    By the time it returns, the tray icon is already up
+            #    and the user perceives launch as ~instant even though
+            #    asyncio hasn't started yet.
+            # 3. ``asyncio.run(_main())`` blocks the main thread until
+            #    shutdown (Ctrl+C / tray Quit / SIGTERM).
             tray.start()
+            _build_pipeline_state()
             asyncio.run(_main())
     except KeyboardInterrupt:
         pass

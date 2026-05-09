@@ -214,6 +214,36 @@ def ensure_launchd_registered(*, load_immediately: bool = False) -> bool:
         )
         return False
 
+    # Skip the re-register when we're already Enabled. Calling
+    # ``SMAppService.register()`` on an already-Enabled agent succeeds
+    # (returns ok=True), but it ALSO re-loads the plist into launchd —
+    # and since the running process was launched directly by
+    # LaunchServices (Spotlight / Finder / Dock click), launchd has no
+    # supervision record of us. The re-load makes launchd think
+    # ``RunAtLoad=true`` should fire, which spawns a DUPLICATE
+    # sayzo-agent process. The duplicate hits the kernel mutex,
+    # IPC-nudges OPEN_SETTINGS (lost when our IPC server isn't up
+    # yet), and exits — visible in the log as
+    # ``service already running — asked primary to open Settings,
+    # exiting`` ~2 s after every re-launch. Wasted spawn cost on the
+    # user's hot path.
+    #
+    # Discovered 2026-05-10 from a Sequoia 15.5 user log.
+    #
+    # ``is_registered()`` only returns True for ``Enabled`` status —
+    # ``NotRegistered`` and ``RequiresApproval`` (user manually
+    # disabled in System Settings → Login Items) both fall through to
+    # the register call below, which is the right behavior:
+    # ``NotRegistered`` is the first-install path that genuinely needs
+    # registration; ``RequiresApproval`` register() returns ok=False
+    # and we surface the ``status=2`` warning that prompts the user.
+    if is_registered():
+        log.debug(
+            "[launchd] SMAppService already Enabled — skipping re-register "
+            "(would otherwise spawn a duplicate sayzo-agent via launchd RunAtLoad)"
+        )
+        return True
+
     # Migration: drop the legacy free-standing plist, if any. Logged at
     # INFO when something was actually removed so triage can confirm
     # upgrades took effect.
