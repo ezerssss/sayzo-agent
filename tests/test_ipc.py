@@ -131,3 +131,35 @@ def test_test_drill_notification_round_trip(tmp_path: Path) -> None:
     result = asyncio.run(_run())
     assert result == {"ok": True}
     assert len(invocations) == 1
+
+
+def test_quit_agent_constant_value() -> None:
+    # Pin the wire constant — a typo on either side becomes silent at runtime.
+    assert Methods.QUIT_AGENT == "quit_agent"
+
+
+def test_quit_agent_round_trip(tmp_path: Path) -> None:
+    triggered: list[None] = []
+
+    async def _run() -> dict:
+        server = IPCServer(tmp_path)
+
+        def _handler() -> dict:
+            triggered.append(None)
+            return {"ok": True}
+
+        server.register(Methods.QUIT_AGENT, _handler)
+        await server.start()
+        try:
+            client = IPCClient(tmp_path)
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
+                None, client.call, Methods.QUIT_AGENT
+            )
+        finally:
+            await server.stop()
+        return result
+
+    result = asyncio.run(_run())
+    assert result == {"ok": True}
+    assert len(triggered) == 1

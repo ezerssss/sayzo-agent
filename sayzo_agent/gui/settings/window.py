@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlencode
@@ -73,6 +74,9 @@ class SettingsWindow:
         # is flipped by ``_handle_quit_command`` so the second on_closing
         # invocation lets pywebview destroy normally.
         self._quitting = False
+        # Both filled by the ``loaded`` event. See ``_wait_for_bridge_ready``.
+        self._loaded_event = threading.Event()
+        self._loaded_at: float = 0.0
 
     def run_blocking(self) -> None:
         index = webui_index_path()
@@ -146,16 +150,14 @@ class SettingsWindow:
 
         window.events.closing += on_closing
 
-        # macOS: the window is currently hidden (idle pre-warm). pywebview
-        # has already bumped NSApp to Regular activation policy as part of
-        # bringing up the Cocoa run loop, so a Dock icon for this
-        # subprocess is sitting next to the agent's. Hide it. We hook
-        # ``loaded`` instead of running this inline because pywebview
-        # finalises its activation policy as part of window creation,
-        # which happens after our constructor returns; setting before
-        # that gets overwritten.
-        if sys.platform == "darwin":
-            def _hide_dock_after_load() -> None:
+        # macOS: pywebview bumps NSApp to Regular activation policy during
+        # window creation, so by ``loaded`` a Dock entry is showing next to
+        # the agent's. Drop it back while we're still in idle pre-warm.
+        def on_loaded() -> None:
+            log.info("[settings] WebView2 loaded")
+            self._loaded_at = time.monotonic()
+            self._loaded_event.set()
+            if sys.platform == "darwin":
                 try:
                     from sayzo_agent.gui.common.mac_dock import set_dock_visible
 
@@ -165,7 +167,7 @@ class SettingsWindow:
                         "[settings] dock-hide after load failed", exc_info=True
                     )
 
-            window.events.loaded += _hide_dock_after_load
+        window.events.loaded += on_loaded
 
         # Stdin reader runs in a daemon thread so webview.start() can own
         # the main thread. Commands queue inside the pipe before the GUI is
@@ -184,9 +186,8 @@ class SettingsWindow:
         """Read newline-delimited commands from stdin and drive the window.
 
         Recognised commands: ``show``, ``hide``, ``quit``. EOF (parent
-        agent died or closed our stdin pipe) is treated as ``quit`` —
-        without this fallback, an agent crash would leave an orphan
-        Settings process resident with no way for the user to dismiss it.
+        agent died or closed our stdin pipe) is treated as ``quit`` so
+        we don't orphan the subprocess.
         """
         try:
             for line in sys.stdin:
@@ -194,8 +195,10 @@ class SettingsWindow:
                 if not cmd:
                     continue
                 if cmd == "show":
+                    self._wait_for_bridge_ready("show")
                     self._dispatch_show(window)
                 elif cmd == "hide":
+                    self._wait_for_bridge_ready("hide")
                     self._dispatch_hide(window)
                 elif cmd == "quit":
                     self._dispatch_quit(window)
@@ -204,9 +207,30 @@ class SettingsWindow:
                     log.warning("[settings] unknown stdin command: %r", cmd)
         except Exception:
             log.warning("[settings] stdin reader crashed", exc_info=True)
-        # EOF: parent agent vanished. Tear down so we don't orphan.
         log.info("[settings] stdin closed — quitting")
         self._dispatch_quit(window)
+
+    # Empirical delay between ``loaded`` firing and when WebView2's JS
+    # bridge is reliably callable. Below this, ``show()`` lands while the
+    # bridge is still wiring up and subsequent JS→Python calls wedge
+    # silently (Windows: "Hang type: Unknown" in Reliability Monitor).
+    # Repro: ``scripts/repro_settings_race.py`` — loaded fires ~2.2 s after
+    # spawn, show() at +0.1 s wedges, show() at +5 s does not. 3 s is the
+    # observed settle plus ~1 s headroom. ``quit`` deliberately skips this
+    # so a never-loading subprocess can still be torn down.
+    _BRIDGE_SETTLE_SECS = 3.0
+
+    def _wait_for_bridge_ready(self, op: str) -> None:
+        # 30 s overall cap so a stuck load can't permanently freeze show/hide.
+        if not self._loaded_event.wait(timeout=30.0):
+            log.warning(
+                "[settings] %s: loaded event not set after 30 s; dispatching anyway", op
+            )
+            return
+        remaining = max(0.0, self._BRIDGE_SETTLE_SECS - (time.monotonic() - self._loaded_at))
+        log.info("[settings] %s: settle %.2fs", op, remaining)
+        if remaining:
+            time.sleep(remaining)
 
     @staticmethod
     def _dispatch_show(window: "webview.Window") -> None:

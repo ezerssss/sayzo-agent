@@ -378,6 +378,22 @@ class Bridge:
         self._ipc.call_quiet(Methods.INVALIDATE_TOKEN_CACHE)
         return {"signed_out": True}
 
+    def quit_agent(self) -> dict[str, Any]:
+        """Tell the agent to fully shut down — same path as tray Quit.
+
+        Returns ``ok=False`` when the agent isn't reachable so the UI
+        can fall back to ``window.close``.
+        """
+        try:
+            self._ipc.call(Methods.QUIT_AGENT)
+        except IPCNotConnected:
+            log.info("[settings.bridge] quit_agent: agent not reachable")
+            return {"ok": False}
+        except IPCError as e:
+            log.warning("[settings.bridge] quit_agent IPC error: %s", e)
+            return {"ok": False}
+        return {"ok": True}
+
     # ------------------------------------------------------------------
     # JS-callable methods — About
     # ------------------------------------------------------------------

@@ -72,8 +72,7 @@ UninstallIcon "..\..\installer\assets\logo.ico"
 !define MUI_FINISHPAGE_RUN "$INSTDIR\${SERVICE_EXE}"
 ; --force-setup forces the GUI on every install for a visual confirmation,
 ; including upgrade re-installs. App.tsx::initialScreen short-circuits to
-; Done + auto-dismisses when detect_setup says is_complete=true. Don't drop
-; this flag without also removing that short-circuit.
+; Done when detect_setup says is_complete=true; the user clicks Got it.
 !define MUI_FINISHPAGE_RUN_PARAMETERS "service --force-setup"
 !define MUI_FINISHPAGE_RUN_TEXT "Launch Sayzo"
 !insertmacro MUI_PAGE_FINISH
@@ -125,6 +124,13 @@ Section "Install"
         Sleep 3000
         Delete "$INSTDIR\${PRODUCT_EXE}"
         Delete "$INSTDIR\${SERVICE_EXE}"
+
+    ; Wipe _internal/ before extracting. NSIS File /r writes new files but
+    ; does NOT remove files absent from the source dir; without this, stale
+    ; dist-info dirs from prior installs coexist and importlib.metadata
+    ; picks whichever the FS iterates first (NTFS = oldest), so About
+    ; reports the old version after upgrade.
+    RMDir /r "$INSTDIR\_internal"
 
     ; Copy the entire PyInstaller bundle directory.
     ; The NSIS script must be invoked from the repo root where dist/sayzo-agent/ exists.

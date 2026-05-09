@@ -35,39 +35,51 @@ def _reset_notifier_singleton():
 def _fake_avfoundation(
     *,
     status: int,
-    flip_to: int | None = None,
-    flip_after_secs: float = 0.0,
+    completion_grants: bool | None = None,
+    completion_delay_secs: float = 0.0,
+    raise_on_request: Exception | None = None,
 ) -> SimpleNamespace:
     """Build a minimal AVFoundation-shaped module the helper can import.
 
-    The v2.7.3 microphone path uses CoreAudio HAL (sounddevice) to trigger
-    the TCC dialog and polls ``AVCaptureDevice.authorizationStatusForMediaType_``
-    for the user's response. So this fake only needs to fake the status
-    read — ``status`` is the initial value, and ``flip_to`` (optionally
-    after ``flip_after_secs`` of polling) simulates the user clicking
-    Allow / Don't Allow in the HAL dialog. ``flip_to=None`` means the
-    user never clicks (timeout path).
-
-    Status values: 0=NotDetermined, 1=Restricted, 2=Denied, 3=Authorized.
+    Args:
+        status: initial value returned by ``authorizationStatusForMediaType_``.
+            0=NotDetermined, 1=Restricted, 2=Denied, 3=Authorized.
+        completion_grants: True/False fires the completion with that
+            decision; None simulates the dialog never appearing.
+        completion_delay_secs: dialog-think-time before the completion
+            fires; 0 means "instant".
+        raise_on_request: if set, ``requestAccessForMediaType_completionHandler_``
+            raises this instead of dispatching.
     """
+    import threading as _threading
     import time as _time
 
-    state: dict = {"status": status, "flip_at": None}
-
-    if flip_to is not None and status == 0:
-        state["flip_at"] = _time.monotonic() + flip_after_secs
-
-    captured: dict = {"status_queries": 0}
+    state: dict = {"status": status}
+    captured: dict = {"status_queries": 0, "request_calls": 0, "last_handler": None}
 
     class _AVCaptureDevice:
         @staticmethod
         def authorizationStatusForMediaType_(media_type):
             captured["status_queries"] += 1
             captured["last_query"] = media_type
-            if state["flip_at"] is not None and _time.monotonic() >= state["flip_at"]:
-                state["status"] = flip_to
-                state["flip_at"] = None
             return state["status"]
+
+        @staticmethod
+        def requestAccessForMediaType_completionHandler_(media_type, handler):
+            captured["request_calls"] += 1
+            captured["last_handler"] = handler
+            if raise_on_request is not None:
+                raise raise_on_request
+            if completion_grants is None:
+                return
+
+            def _fire():
+                if completion_delay_secs > 0:
+                    _time.sleep(completion_delay_secs)
+                handler(completion_grants)
+
+            # Mirror real AVFoundation's background-queue dispatch.
+            _threading.Thread(target=_fire, daemon=True).start()
 
     return SimpleNamespace(
         AVCaptureDevice=_AVCaptureDevice,
@@ -76,93 +88,32 @@ def _fake_avfoundation(
     )
 
 
-def _fake_sounddevice(*, raise_on_open: bool = False) -> SimpleNamespace:
-    """Fake the sounddevice module the HAL trigger path imports.
-
-    The helper only calls ``sd.InputStream(...).start()`` to trigger
-    the TCC dialog and ``stop()/close()`` on teardown. We don't need
-    to simulate audio — just record that the methods were called so
-    tests can assert the trigger fired.
-    """
-
-    state: dict = {
-        "stream_started": False,
-        "stream_stopped": False,
-        "stream_closed": False,
-    }
-
-    class _Stream:
-        def __init__(self, **kwargs):
-            self._kwargs = kwargs
-
-        def start(self):
-            if raise_on_open:
-                raise RuntimeError("PortAudio: device unavailable")
-            state["stream_started"] = True
-
-        def stop(self):
-            state["stream_stopped"] = True
-
-        def close(self):
-            state["stream_closed"] = True
-
-    return SimpleNamespace(InputStream=_Stream, _state=state)
-
-
-def _patch_av(fake_av, *, fake_sd=None, poll_timeout_secs: float | None = None):
-    """Bundle the patches a prompt_microphone test needs.
-
-    The v2.7.3 implementation uses sounddevice (CoreAudio HAL) for the
-    dialog trigger and polls AVCaptureDevice for status, so tests need
-    both modules faked. ``fake_sd`` defaults to a working stub; pass an
-    ``raise_on_open=True`` variant to cover the HAL-failure path.
-    ``poll_timeout_secs`` shrinks the polling deadline to keep tests
-    fast — defaults to 0.5 s when None.
-    """
-    if fake_sd is None:
-        fake_sd = _fake_sounddevice()
-    p = [
+def _patch_av(fake_av, *, request_timeout_secs: float = 0.5):
+    """Bundle the patches a prompt_microphone test needs."""
+    return [
         patch("sayzo_agent.gui.setup.mac_permissions.sys.platform", "darwin"),
-        patch.dict(
-            "sys.modules",
-            {
-                "AVFoundation": fake_av,
-                "sounddevice": fake_sd,
-            },
-        ),
-        # Skip the actual tccutil reset call — tests don't need to
-        # exercise that subprocess. (Its own behavior is tested
-        # separately in the _tccutil_reset_service block.)
+        patch.dict("sys.modules", {"AVFoundation": fake_av}),
         patch(
             "sayzo_agent.gui.setup.mac_permissions._tccutil_reset_service",
             return_value=True,
         ),
-        # Squelch the bundle Info.plist diagnostic — its NSBundle
-        # import isn't mocked here and would log a warning on every
-        # mic test.
         patch(
             "sayzo_agent.gui.setup.mac_permissions._log_bundle_info_plist_once",
             return_value=None,
         ),
-    ]
-    if poll_timeout_secs is None:
-        poll_timeout_secs = 0.5
-    p.append(
         patch(
             "sayzo_agent.gui.setup.mac_permissions._TCC_REQUEST_TIMEOUT_SECS",
-            poll_timeout_secs,
-        )
-    )
-    return p
+            request_timeout_secs,
+        ),
+    ]
 
 
 def test_prompt_microphone_returns_true_when_already_authorized():
     """Status == 3 (Authorized): no dialog fired, returns True directly.
-    Critical: must not even open the HAL stream, since that would risk
+    Critical: must not even call requestAccess, since that would risk
     replaying a permission flow on an already-granted bundle."""
     fake_av = _fake_avfoundation(status=3)
-    fake_sd = _fake_sounddevice()
-    patches = _patch_av(fake_av, fake_sd=fake_sd)
+    patches = _patch_av(fake_av)
     _enter_all(patches)
     try:
         result = mac_permissions.prompt_microphone()
@@ -170,16 +121,15 @@ def test_prompt_microphone_returns_true_when_already_authorized():
         assert result.stale_tcc_likely is False
     finally:
         _exit_all(patches)
-    # No HAL stream opened on the early-return path.
-    assert fake_sd._state["stream_started"] is False
+    # requestAccess MUST NOT have been called on the early-return path.
+    assert fake_av._captured["request_calls"] == 0
 
 
 def test_prompt_microphone_returns_false_when_previously_denied():
     """Status == 2 (Denied): no dialog re-fires, returns False without
-    opening the HAL stream."""
+    calling requestAccess."""
     fake_av = _fake_avfoundation(status=2)
-    fake_sd = _fake_sounddevice()
-    patches = _patch_av(fake_av, fake_sd=fake_sd)
+    patches = _patch_av(fake_av)
     _enter_all(patches)
     try:
         result = mac_permissions.prompt_microphone()
@@ -187,7 +137,7 @@ def test_prompt_microphone_returns_false_when_previously_denied():
         assert result.stale_tcc_likely is False
     finally:
         _exit_all(patches)
-    assert fake_sd._state["stream_started"] is False
+    assert fake_av._captured["request_calls"] == 0
 
 
 def test_prompt_microphone_returns_false_when_restricted():
@@ -203,15 +153,12 @@ def test_prompt_microphone_returns_false_when_restricted():
         _exit_all(patches)
 
 
-def test_prompt_microphone_returns_true_when_user_grants_via_hal_dialog():
-    """v2.7.3 happy path: status starts NotDetermined, HAL dialog fires
-    when sd.InputStream opens, user clicks Allow, status flips to
-    Authorized, polling picks it up. Critical regression target — this
-    is what was broken across v2.7.0–v2.7.2 when the dialog was triggered
-    via AVCaptureDevice.requestAccessForMediaType_ instead of HAL."""
-    fake_av = _fake_avfoundation(status=0, flip_to=3, flip_after_secs=0.05)
-    fake_sd = _fake_sounddevice()
-    patches = _patch_av(fake_av, fake_sd=fake_sd, poll_timeout_secs=2.0)
+def test_prompt_microphone_returns_true_when_completion_grants():
+    """Happy path: NotDetermined → requestAccess → completion fires True."""
+    fake_av = _fake_avfoundation(
+        status=0, completion_grants=True, completion_delay_secs=0.05
+    )
+    patches = _patch_av(fake_av, request_timeout_secs=2.0)
     _enter_all(patches)
     try:
         result = mac_permissions.prompt_microphone()
@@ -219,21 +166,16 @@ def test_prompt_microphone_returns_true_when_user_grants_via_hal_dialog():
         assert result.stale_tcc_likely is False
     finally:
         _exit_all(patches)
-    # HAL stream MUST have been opened — that's what triggers the dialog.
-    assert fake_sd._state["stream_started"] is True
-    # And torn down cleanly so we don't leak an audio session.
-    assert fake_sd._state["stream_stopped"] is True
-    assert fake_sd._state["stream_closed"] is True
+    # requestAccess MUST have been called — that's what triggers the dialog.
+    assert fake_av._captured["request_calls"] == 1
 
 
-def test_prompt_microphone_returns_false_when_user_denies_via_hal_dialog():
-    """User clicks Don't Allow → status flips NotDetermined → Denied.
-    Helper must observe the flip via polling and return granted=False
-    with stale_tcc_likely=False (this was a real user click, not a
-    silent-deny)."""
-    fake_av = _fake_avfoundation(status=0, flip_to=2, flip_after_secs=0.05)
-    fake_sd = _fake_sounddevice()
-    patches = _patch_av(fake_av, fake_sd=fake_sd, poll_timeout_secs=2.0)
+def test_prompt_microphone_returns_false_when_completion_denies():
+    """User clicks Don't Allow → completion fires False, no stale-TCC flag."""
+    fake_av = _fake_avfoundation(
+        status=0, completion_grants=False, completion_delay_secs=0.05
+    )
+    patches = _patch_av(fake_av, request_timeout_secs=2.0)
     _enter_all(patches)
     try:
         result = mac_permissions.prompt_microphone()
@@ -241,21 +183,13 @@ def test_prompt_microphone_returns_false_when_user_denies_via_hal_dialog():
         assert result.stale_tcc_likely is False
     finally:
         _exit_all(patches)
-    assert fake_sd._state["stream_started"] is True
-    assert fake_sd._state["stream_closed"] is True
+    assert fake_av._captured["request_calls"] == 1
 
 
-def test_prompt_microphone_flags_stale_tcc_when_polling_times_out():
-    """Status NotDetermined, HAL stream opens but status never flips —
-    the fingerprint of "dialog never appeared" (the bundle-attribution
-    problem at the HAL level, mirroring the same failure mode the
-    AVFoundation path had on Sequoia). granted=None plus
-    stale_tcc_likely=True so the recovery UI fires.
-    """
-    # No flip_to — status stays NotDetermined for the whole poll window.
-    fake_av = _fake_avfoundation(status=0)
-    fake_sd = _fake_sounddevice()
-    patches = _patch_av(fake_av, fake_sd=fake_sd, poll_timeout_secs=0.3)
+def test_prompt_microphone_flags_stale_tcc_when_completion_never_fires():
+    """Completion never fires within timeout → granted=None, stale_tcc_likely=True."""
+    fake_av = _fake_avfoundation(status=0, completion_grants=None)
+    patches = _patch_av(fake_av, request_timeout_secs=0.3)
     _enter_all(patches)
     try:
         result = mac_permissions.prompt_microphone()
@@ -263,18 +197,16 @@ def test_prompt_microphone_flags_stale_tcc_when_polling_times_out():
         assert result.stale_tcc_likely is True
     finally:
         _exit_all(patches)
-    # Stream still got opened — important for users to SEE that we tried.
-    assert fake_sd._state["stream_started"] is True
+    # requestAccess WAS called — important for users to SEE that we tried.
+    assert fake_av._captured["request_calls"] == 1
 
 
-def test_prompt_microphone_returns_none_when_hal_stream_open_fails():
-    """sounddevice raises during start() (e.g. PortAudio device gone) —
-    we can't trigger the dialog through HAL. Surface as None without
-    flagging stale_tcc, since this is a HAL availability issue not a
-    bundle/TCC issue."""
-    fake_av = _fake_avfoundation(status=0)
-    fake_sd = _fake_sounddevice(raise_on_open=True)
-    patches = _patch_av(fake_av, fake_sd=fake_sd, poll_timeout_secs=0.5)
+def test_prompt_microphone_returns_none_when_request_access_raises():
+    """AVFoundation raises (e.g. PyObjC bridge error) → None without stale-TCC flag."""
+    fake_av = _fake_avfoundation(
+        status=0, raise_on_request=RuntimeError("AV bridge failure")
+    )
+    patches = _patch_av(fake_av, request_timeout_secs=0.5)
     _enter_all(patches)
     try:
         result = mac_permissions.prompt_microphone()
@@ -306,27 +238,6 @@ def test_prompt_microphone_returns_none_when_avfoundation_unavailable():
         result = mac_permissions.prompt_microphone()
         assert result.granted is None
         assert result.stale_tcc_likely is False
-
-
-def test_prompt_microphone_returns_none_when_sounddevice_unavailable():
-    """Dev machine without sounddevice (or its C deps): we can't trigger
-    the HAL dialog. Return None without raising."""
-    fake_av = _fake_avfoundation(status=0)
-    failing_sd = SimpleNamespace()  # no InputStream attribute
-    with patch(
-        "sayzo_agent.gui.setup.mac_permissions.sys.platform", "darwin"
-    ), patch.dict(
-        "sys.modules",
-        {"AVFoundation": fake_av, "sounddevice": failing_sd},
-    ), patch(
-        "sayzo_agent.gui.setup.mac_permissions._tccutil_reset_service",
-        return_value=True,
-    ), patch(
-        "sayzo_agent.gui.setup.mac_permissions._log_bundle_info_plist_once",
-        return_value=None,
-    ):
-        result = mac_permissions.prompt_microphone()
-        assert result.granted is None
 
 
 def test_prompt_microphone_returns_none_on_non_darwin():

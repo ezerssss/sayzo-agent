@@ -279,6 +279,16 @@ def _mac_unload_launchd_agent() -> None:
         log.exception("launchctl bootout failed")
 
 
+def request_full_shutdown(state: "TrayState") -> None:
+    """Ask the agent to fully exit — the same shape the tray Quit menu uses.
+
+    macOS unloads launchd first; the eventual SIGKILL→process-group exit
+    is non-zero, which would otherwise trip ``KeepAlive`` and revive us.
+    """
+    _mac_unload_launchd_agent()
+    state.quit_event.set()
+
+
 class TrayIcon:
     """Manages the system tray icon lifecycle on a background thread."""
 
@@ -425,8 +435,7 @@ class TrayIcon:
             open_folder(self.captures_dir)
 
         def on_quit(icon, item):
-            _mac_unload_launchd_agent()
-            self.state.quit_event.set()
+            request_full_shutdown(self.state)
             icon.stop()
 
         def on_open_update(icon, item):

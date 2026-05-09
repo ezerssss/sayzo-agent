@@ -6,19 +6,17 @@ import { bridge } from "../lib/bridge";
 
 interface Props {
   hotkeyDisplay: string;
-  // True when App.tsx short-circuited here because setup was already
-  // complete (post-install confirmation flash, not the walked-through path).
-  autoDismiss?: boolean;
 }
-
-const AUTO_DISMISS_MS = 1500;
 
 // Last screen before the setup window closes. Copy has to match the
 // armed-only invariant: Sayzo does NOT listen continuously. The mic stays
 // closed until the user presses the hotkey OR accepts a meeting-detect
 // consent prompt. Anything that sounds like "always listening in the
 // background" is a bug — it's the whole point of the rewrite.
-export function Done({ hotkeyDisplay, autoDismiss = false }: Props) {
+//
+// Do NOT auto-dismiss this screen — JS-initiated closes hang the macOS
+// runloop. See ``Bridge.quit_app`` for the NSEvent quirk.
+export function Done({ hotkeyDisplay }: Props) {
   const [finishing, setFinishing] = useState(false);
 
   async function handleFinish() {
@@ -43,15 +41,6 @@ export function Done({ hotkeyDisplay, autoDismiss = false }: Props) {
     return () => window.removeEventListener("keydown", onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [finishing]);
-
-  useEffect(() => {
-    if (!autoDismiss) return;
-    const handle = window.setTimeout(() => {
-      void handleFinish();
-    }, AUTO_DISMISS_MS);
-    return () => window.clearTimeout(handle);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autoDismiss]);
 
   return (
     <Layout

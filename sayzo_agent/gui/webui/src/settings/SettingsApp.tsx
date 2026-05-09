@@ -7,6 +7,7 @@ import { CapturesPane } from "./CapturesPane";
 import { MeetingAppsPane } from "./MeetingAppsPane";
 import { NotificationsPane } from "./NotificationsPane";
 import { PermissionsPane } from "./PermissionsPane";
+import { QuitSayzoButton } from "./QuitSayzoButton";
 import { ShortcutPane } from "./ShortcutPane";
 import logoUrl from "../assets/logo.png";
 
@@ -171,9 +172,8 @@ function Sidebar({ active, onSelect, inProgressCount }: SidebarProps) {
           />
         ))}
       </ul>
-      <div className="mt-auto px-4 pb-6 pt-8 text-xs leading-snug text-ink-muted">
-        Sayzo keeps running when you close this window — open it again
-        any time from the menu bar.
+      <div className="mt-auto border-t border-ink-border px-4 py-4">
+        <QuitSayzoButton />
       </div>
     </nav>
   );

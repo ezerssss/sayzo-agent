@@ -595,7 +595,11 @@ class Bridge:
             )
 
     def finish(self) -> None:
-        """User clicked the success/done button. Setup is considered complete."""
+        """User clicked the success/done button. Setup is complete.
+
+        Must be invoked from a real user click — see ``quit_app`` for
+        the macOS NSEvent quirk that breaks JS-initiated closes.
+        """
         self._result = SetupResult.COMPLETED
         if self._window is not None:
             try:

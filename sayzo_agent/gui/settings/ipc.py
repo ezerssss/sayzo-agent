@@ -79,6 +79,8 @@ class Methods:
     # CLI and the tray Debug submenu. Bypasses the timing gates so the
     # user can verify the round-trip without waiting for the model to pick.
     TEST_DRILL_NOTIFICATION = "test_drill_notification"
+    # Settings UI's "Quit Sayzo" button — same path as tray Quit menu.
+    QUIT_AGENT = "quit_agent"
 
 
 class IPCError(Exception):

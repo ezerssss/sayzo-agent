@@ -1082,8 +1082,7 @@ def run() -> None:
     is_flag=True,
     hidden=True,
     help="Always open the first-run GUI even if setup looks complete. "
-    "Passed by every install path so the user gets a visual post-install "
-    "confirmation (already-set-up runs auto-dismiss).",
+    "Passed by every install path for visual post-install confirmation.",
 )
 def service(force_setup: bool) -> None:
     """Run the agent as a background service (no terminal output, file logging)."""
@@ -1160,11 +1159,9 @@ def service(force_setup: bool) -> None:
             )
 
     # First-run gate. Open the GUI setup window when setup signals are
-    # missing, when --force-setup is passed (every install path does, so the
-    # post-install launch always confirms visually — already-set-up runs
-    # short-circuit to Done and auto-dismiss in the webview), or on the
-    # first .app launch on macOS. Blocks the main thread; cancel exits
-    # cleanly without starting the tray + agent.
+    # missing, when --force-setup is passed (every install path does), or
+    # on the first .app launch on macOS. Blocks the main thread; cancel
+    # exits cleanly without starting the tray + agent.
     from .gui.setup.detect import detect_setup
     from .gui.setup.marker import is_first_launch, mark_setup_seen
 
@@ -1241,7 +1238,7 @@ def service(force_setup: bool) -> None:
         cfg = load_config()
 
     from .auth.store import TokenStore
-    from .gui.tray import TrayIcon, TrayState, Status
+    from .gui.tray import TrayIcon, TrayState, Status, request_full_shutdown
 
     from .auth.client import make_auth_client
     auth_client = make_auth_client(cfg)
@@ -1467,6 +1464,13 @@ def service(force_setup: bool) -> None:
             tray_state.settings_event.set()
             return {"ok": True}
 
+        def _ipc_quit_agent() -> dict:
+            # Same shape as the tray Quit menu — see tray.request_full_shutdown
+            # for why macOS must unload launchd before quit_event fires.
+            log.info("[ipc] quit_agent received from Settings")
+            request_full_shutdown(tray_state)
+            return {"ok": True}
+
         def _ipc_reload_notification_config() -> dict:
             try:
                 fresh = load_config()
@@ -1516,6 +1520,7 @@ def service(force_setup: bool) -> None:
         )
         ipc_server.register(Methods.NUDGE_UPLOAD_RETRY, _ipc_nudge_upload_retry)
         ipc_server.register(Methods.OPEN_SETTINGS, _ipc_open_settings)
+        ipc_server.register(Methods.QUIT_AGENT, _ipc_quit_agent)
         ipc_server.register(
             Methods.RELOAD_NOTIFICATION_CONFIG, _ipc_reload_notification_config
         )

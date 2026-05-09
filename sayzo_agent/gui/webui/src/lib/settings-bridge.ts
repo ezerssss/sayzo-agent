@@ -227,6 +227,9 @@ declare global {
     account_status(): Promise<AccountStatus>;
     sign_out(): Promise<{ signed_out: boolean }>;
 
+    // App lifecycle.
+    quit_agent(): Promise<{ ok: boolean }>;
+
     // About.
     check_for_update(): Promise<{ checking: boolean }>;
 
@@ -316,6 +319,11 @@ export const settingsBridge = {
   async signOut() {
     await whenReady();
     return window.pywebview.api.sign_out();
+  },
+
+  async quitAgent() {
+    await whenReady();
+    return window.pywebview.api.quit_agent();
   },
 
   async checkForUpdate() {

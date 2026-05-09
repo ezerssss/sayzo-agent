@@ -49,8 +49,7 @@ Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
 
 # NSIS silent install (/S) skips the finish page, so MUI_FINISHPAGE_RUN
 # doesn't fire — we have to launch the service ourselves. --force-setup
-# matches the GUI-install path; already-set-up runs auto-dismiss in the
-# webview.
+# matches the GUI-install path.
 $servicePath = Join-Path $env:ProgramFiles "Sayzo\sayzo-agent-service.exe"
 if (Test-Path $servicePath) {
     Write-Host "  Opening setup window..." -ForegroundColor Cyan
