@@ -75,6 +75,9 @@ function initialScreen(
   if (isAccountBlocked(status.account_state)) {
     return "finish-signup";
   }
+  // Upgrade re-install over a complete setup: skip the walkthrough
+  // (Done.tsx auto-dismisses after a brief confirmation flash).
+  if (status.is_complete) return "done";
   // One-shot resume after Restart-Sayzo from the Accessibility screen.
   // The backend writes a marker before exit and clears it on this read,
   // so we only honor it when the target screen is actually in this
@@ -86,9 +89,6 @@ function initialScreen(
   ) {
     return "accessibility";
   }
-  // Already-complete flow won't reach here (detect_setup + .setup-seen gates
-  // the window entirely), but guard anyway: jump to the first post-welcome
-  // screen so the user can still walk through permissions.
   return sequence[1] ?? "done";
 }
 
@@ -291,7 +291,14 @@ export function App() {
         />
       );
     case "done":
-      return <Done hotkeyDisplay={hotkeyDisplay} />;
+      // status.is_complete is captured at mount, so this is true only on
+      // the short-circuit path — not when the user walks through to Done.
+      return (
+        <Done
+          hotkeyDisplay={hotkeyDisplay}
+          autoDismiss={status.is_complete}
+        />
+      );
   }
 }
 

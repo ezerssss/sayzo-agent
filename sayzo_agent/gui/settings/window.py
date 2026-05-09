@@ -28,6 +28,7 @@ import webview
 
 from sayzo_agent.config import Config
 from sayzo_agent.gui.common.assets import icon_path, webui_index_path
+from sayzo_agent.gui.common.safe_quit import safe_quit_window
 from sayzo_agent.gui.settings.bridge import Bridge
 
 log = logging.getLogger(__name__)
@@ -245,7 +246,6 @@ class SettingsWindow:
 
     def _dispatch_quit(self, window: "webview.Window") -> None:
         self._quitting = True
-        try:
-            window.destroy()
-        except Exception:
-            log.warning("[settings] destroy failed", exc_info=True)
+        # safe_quit_window bypasses window.destroy() — see its docstring
+        # for the WinForms FormClosed-recursion rationale.
+        safe_quit_window(window)

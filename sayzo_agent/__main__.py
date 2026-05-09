@@ -1082,8 +1082,8 @@ def run() -> None:
     is_flag=True,
     hidden=True,
     help="Always open the first-run GUI even if setup looks complete. "
-    "Used by the NSIS finish-page-launch on Windows so users get visual "
-    "confirmation right after install.",
+    "Passed by every install path so the user gets a visual post-install "
+    "confirmation (already-set-up runs auto-dismiss).",
 )
 def service(force_setup: bool) -> None:
     """Run the agent as a background service (no terminal output, file logging)."""
@@ -1159,12 +1159,12 @@ def service(force_setup: bool) -> None:
                 exc_info=True,
             )
 
-    # First-run gate. Detect missing setup signals (auth token, macOS mic
-    # permission, permissions onboarding) and open the GUI setup window if any is missing
-    # — or if the caller forced it via --force-setup (NSIS finish-page), or
-    # if this is the very first .app launch on macOS (no marker file). The
-    # window blocks the main thread until the user completes setup or
-    # cancels. On cancel, exit cleanly without starting the tray + agent.
+    # First-run gate. Open the GUI setup window when setup signals are
+    # missing, when --force-setup is passed (every install path does, so the
+    # post-install launch always confirms visually — already-set-up runs
+    # short-circuit to Done and auto-dismiss in the webview), or on the
+    # first .app launch on macOS. Blocks the main thread; cancel exits
+    # cleanly without starting the tray + agent.
     from .gui.setup.detect import detect_setup
     from .gui.setup.marker import is_first_launch, mark_setup_seen
 

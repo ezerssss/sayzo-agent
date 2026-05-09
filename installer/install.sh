@@ -71,6 +71,8 @@ echo "  Installed to ${APP_PATH}"
 # codesign / notarytool / stapler steps), so spctl accepts it and `open`
 # launches the .app cleanly. The earlier "spawn the inner Mach-O directly
 # to bypass spctl" hack is gone with notarization.
+# --force-setup matches the Windows NSIS finish-page launch; already-set-up
+# runs auto-dismiss in the webview.
 echo ""
 echo "  Opening Sayzo..."
 open "$APP_PATH" --args service --force-setup || {

@@ -65,15 +65,15 @@ UninstallIcon "..\..\installer\assets\logo.ico"
 
 ; Finish page with a "Launch Sayzo" checkbox that runs the windowless
 ; service exe (console=False per sayzo-agent.spec). The service detects
-; missing setup signals and opens its own first-run GUI if needed - that's
-; the whole point of the GUI installer path. See ~/.claude/plans/i-created-a-memory-quizzical-cosmos.md.
+; missing setup signals and opens its own first-run GUI if needed.
 ; The MUI_FINISHPAGE_RUN_* defines must come BEFORE MUI_PAGE_FINISH.
 !define MUI_FINISHPAGE_TITLE "Sayzo is ready."
 !define MUI_FINISHPAGE_TEXT "We'll open a short setup window to get Sayzo ready. Nothing records until you say so."
 !define MUI_FINISHPAGE_RUN "$INSTDIR\${SERVICE_EXE}"
-; --force-setup makes the service open the GUI regardless of detect_setup's
-; verdict - users get visual confirmation right after install even if they
-; had prior-install state from a previous CLI run.
+; --force-setup forces the GUI on every install for a visual confirmation,
+; including upgrade re-installs. App.tsx::initialScreen short-circuits to
+; Done + auto-dismisses when detect_setup says is_complete=true. Don't drop
+; this flag without also removing that short-circuit.
 !define MUI_FINISHPAGE_RUN_PARAMETERS "service --force-setup"
 !define MUI_FINISHPAGE_RUN_TEXT "Launch Sayzo"
 !insertmacro MUI_PAGE_FINISH
@@ -94,10 +94,37 @@ Section "Install"
     ; ERROR_SHARING_VIOLATION on sayzo-agent.exe / sayzo-agent-service.exe mid
     ; File /r and the install aborts with files half-replaced. Idempotent -
     ; both commands exit non-zero on "task/process not found" and we ignore
-    ; the return. The Task Scheduler task itself is re-created below with /F.
+    ; the return. /T also kills child processes (e.g. the Settings pywebview
+    ; subprocess holding its own DLL handles). The Task Scheduler task itself
+    ; is re-created below with /F.
     nsExec::ExecToLog 'schtasks /End /TN "Sayzo"'
-    nsExec::ExecToLog 'taskkill /IM sayzo-agent-service.exe /F'
-    nsExec::ExecToLog 'taskkill /IM sayzo-agent.exe /F'
+    nsExec::ExecToLog 'taskkill /IM sayzo-agent-service.exe /F /T'
+    nsExec::ExecToLog 'taskkill /IM sayzo-agent.exe /F /T'
+
+    ; Wait for Windows to fully release the killed processes' file handles
+    ; before File /r tries to overwrite them. taskkill /F returns immediately
+    ; but the kernel still needs time to tear down DLL imports and close the
+    ; main exe handle - typically 100-500 ms but observed up to 1.5 s on
+    ; busy systems. Without this gap, File /r races the cleanup: most files
+    ; replace fine, but sayzo-agent.exe (locked the longest, since it's the
+    ; loader for python3xx.dll plus every loaded .pyd) silently doesn't get
+    ; overwritten, and the user ends up with a registry/uninstaller that
+    ; says vN+1 while the running exe still reports vN.
+    ;
+    ; Then explicitly Delete the exes as a probe: if a handle is still open
+    ; past the first sleep, Delete sets the error flag, and we retry with
+    ; a longer sleep before falling through to File /r. This makes the
+    ; partial-replace failure mode self-recovering instead of silently
+    ; corrupting the install.
+    Sleep 2000
+    ClearErrors
+    Delete "$INSTDIR\${PRODUCT_EXE}"
+    Delete "$INSTDIR\${SERVICE_EXE}"
+    IfErrors 0 +4
+        DetailPrint "Sayzo executables still locked - waiting 3 more seconds..."
+        Sleep 3000
+        Delete "$INSTDIR\${PRODUCT_EXE}"
+        Delete "$INSTDIR\${SERVICE_EXE}"
 
     ; Copy the entire PyInstaller bundle directory.
     ; The NSIS script must be invoked from the repo root where dist/sayzo-agent/ exists.
