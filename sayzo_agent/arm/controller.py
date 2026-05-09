@@ -1072,22 +1072,31 @@ class ArmController:
 
     def _resolve_hotkey_target_pids(self) -> tuple[int, ...]:
         """Smart-guess which PIDs to scope capture to for a hotkey-triggered
-        arm. The two platforms diverge because macOS has no per-process
-        mic-holder attribution.
+        arm. We only commit to a scope when we're CONFIDENT the right app
+        is identified — otherwise we bail to endpoint capture so the
+        user's explicit "record now" intent never produces a silent file.
 
-        **Windows** (``mic.holders`` has real PIDs):
-          1. Any whitelisted apps among the mic-holders → PIDs of those
-             holders only (ignores unknowns like Cortana / voice assistants).
-          2. Otherwise, any unknown apps holding the mic → all of their
-             PIDs (catches new meeting apps we haven't whitelisted yet).
-          3. Nothing holding the mic → endpoint-wide fallback.
+        **Windows** (``mic.holders`` from pycaw):
+          1. Any whitelisted apps among the mic-holders → scope to those
+             holders' PIDs only (ignores Cortana / voice assistants /
+             other false-positives).
+          2. Otherwise (mic-holders exist but none are whitelisted) →
+             endpoint scope. Used to scope to all unknown holders; that
+             produced silent captures whenever the wrong app held the
+             mic at hotkey time. Unknown holders are recorded to
+             ``seen_apps`` for one-click promotion in Settings.
+          3. No mic-holders → endpoint scope.
 
-        **macOS** (no per-process mic attribution):
+        **macOS** (foreground app + ``audio-detect`` mic attribution):
           1. Mic active + foreground matches a whitelisted spec → PIDs
              enumerated for that spec via the platform resolver.
-          2. Mic active + foreground is an identifiable app → PIDs for
-             that app (treats foreground as the likely meeting app).
-          3. Mic not active, or foreground unknown → endpoint fallback.
+          2. Mic active + foreground is some other app → endpoint scope.
+             Used to build a synthetic spec for the foreground; that
+             produced silent captures when the foreground at hotkey
+             time wasn't the audio source the user wanted captured (a
+             different app while a Zoom call ran in the background).
+             The foreground bundle id is recorded to ``seen_apps``.
+          3. Mic not active, or foreground unknown → endpoint scope.
         """
         try:
             mic = self._snapshot_mic_state()
@@ -1113,11 +1122,9 @@ class ArmController:
                 whitelisted_proc_names.add(name.lower())
 
         whitelisted_pids: set[int] = set()
-        all_pids: set[int] = set()
         for h in mic.holders:
             if h.pid <= 0:
                 continue
-            all_pids.add(h.pid)
             if h.process_name.lower() in whitelisted_proc_names:
                 whitelisted_pids.add(h.pid)
 
@@ -1127,12 +1134,27 @@ class ArmController:
                 len(whitelisted_pids),
             )
             return tuple(sorted(whitelisted_pids))
-        if all_pids:
-            log.info(
-                "[arm] hotkey smart-guess (win): scoping to %d unknown mic-holder(s)",
-                len(all_pids),
-            )
-            return tuple(sorted(all_pids))
+
+        # Mic-holders exist but none are whitelisted. We used to scope
+        # the loopback to every unknown holder ("catches new meeting
+        # apps"); that bit users when the wrong app happened to hold the
+        # mic at hotkey time — Slack huddle, ChatGPT voice mode, Voice
+        # Recorder, Steam Voice — and produced a silent system track for
+        # what the user actually wanted captured. The hotkey is the
+        # user's explicit "capture now" intent; bailing to endpoint scope
+        # guarantees we capture something. The unknown holders are still
+        # recorded into seen_apps so they bubble up in Settings →
+        # Meeting Apps → "Suggested to add" for one-click promotion.
+        holder_names = sorted({h.process_name for h in mic.holders if h.process_name})
+        log.info(
+            "[arm] hotkey smart-guess (win): %d unknown mic-holder(s) (%s) — "
+            "using endpoint scope to avoid silent capture",
+            len(mic.holders), ", ".join(holder_names) or "?",
+        )
+        try:
+            self._record_unmatched_holders(mic, ForegroundInfo())
+        except Exception:
+            log.debug("[arm] hotkey seen_apps.record failed", exc_info=True)
         return ()
 
     def _resolve_hotkey_target_pids_mac(
@@ -1174,31 +1196,26 @@ class ArmController:
                 # Resolver returned empty — fall through to Pass 2.
                 break
 
-        # Pass 2: foreground is some identifiable app; enumerate its PIDs
-        # even though it isn't whitelisted (user explicitly hotkey'd, so we
-        # believe them about intent).
-        synthetic = DetectorSpec(
-            app_key="__hotkey_fg__",
-            display_name="(foreground)",
-            process_names=[fg.process_name] if fg.process_name else [],
-            bundle_ids=[fg.bundle_id] if fg.bundle_id else [],
-            is_browser=fg.is_browser,
+        # Foreground is some identifiable app but not whitelisted. We
+        # used to build a synthetic spec for it and scope the tap to its
+        # PIDs ("user hotkey'd, we believe them about intent"). That bit
+        # users whose foreground at hotkey time wasn't the audio source
+        # they wanted captured — e.g. Notes / Slack / a different app
+        # while a meeting ran in the background — leaving them with a
+        # silent system track. Bail to endpoint scope so we always
+        # capture something; record the foreground bundle to seen_apps
+        # so it bubbles up in Settings → Meeting Apps → "Suggested to
+        # add" for one-click promotion.
+        log.info(
+            "[arm] hotkey smart-guess (mac): foreground (%s) not whitelisted "
+            "— using endpoint scope to avoid silent capture",
+            fg_bundle or fg_proc or "?",
         )
         try:
-            pids = tuple(self._q_resolve_pids_for_spec(synthetic) or ())
+            self._record_unmatched_holders(mic, fg)
         except Exception:
-            log.debug(
-                "[arm] resolve_pids_for_spec(synthetic foreground) raised",
-                exc_info=True,
-            )
-            pids = ()
-        if pids:
-            log.info(
-                "[arm] hotkey smart-guess (mac): scoping to foreground "
-                "(%d pids, bundle=%s)",
-                len(pids), fg_bundle or fg_proc,
-            )
-        return pids
+            log.debug("[arm] hotkey seen_apps.record failed", exc_info=True)
+        return ()
 
     def _snapshot_mic_state(self) -> MicState:
         holders = self._q_mic_holders() or []

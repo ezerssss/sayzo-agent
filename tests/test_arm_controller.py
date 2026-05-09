@@ -826,9 +826,22 @@ async def test_hotkey_smart_guess_wins_whitelisted_over_unknown(monkeypatch):
     await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
 
 
-async def test_hotkey_smart_guess_wins_all_holders_when_none_whitelisted(monkeypatch):
-    """Windows: no whitelisted apps hold the mic → scope to every
-    mic-holder (catches new meeting apps that aren't in the whitelist)."""
+async def test_hotkey_smart_guess_win_endpoint_when_no_whitelisted_holder(monkeypatch):
+    """Windows: mic-holders exist but none are whitelisted → endpoint
+    scope (NOT scope to the unknowns).
+
+    The earlier behavior scoped the loopback to every unknown mic-holder
+    on the theory that one of them was a new meeting app worth catching.
+    In practice that produced silent captures whenever the wrong app
+    happened to hold the mic at hotkey time — Slack huddle / ChatGPT
+    voice mode / Voice Recorder / Steam Voice — and the actual audio
+    the user wanted captured was on a different app entirely. The
+    hotkey is the user's explicit "capture now" intent and a silent
+    file is the worst possible response to it; endpoint scope is the
+    safe fallback. (Unknown holders are recorded to seen_apps so the
+    user can promote them for next time — covered by the watcher-path
+    seen_apps tests.)
+    """
     monkeypatch.setattr("sayzo_agent.arm.controller.sys.platform", "win32")
     notifier = FakeNotifier()
     notifier.consent_script = ["yes"]
@@ -841,7 +854,9 @@ async def test_hotkey_smart_guess_wins_all_holders_when_none_whitelisted(monkeyp
     )
     await ctrl._on_hotkey_pressed()
     assert ctrl.state == ArmState.ARMED
-    assert sys_cap.last_target_pids == (5555, 6666)
+    # Endpoint scope — empty tuple — is what SystemCapture turns into a
+    # fall-through to endpoint-wide loopback on Windows.
+    assert sys_cap.last_target_pids == ()
 
     await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
 
@@ -927,6 +942,74 @@ async def test_hotkey_smart_guess_mac_endpoint_when_mic_inactive(monkeypatch):
     )
     await ctrl._on_hotkey_pressed()
     assert ctrl.state == ArmState.ARMED
+    assert sys_cap.last_target_pids == ()
+
+    await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
+
+
+async def test_hotkey_smart_guess_mac_endpoint_when_foreground_not_whitelisted(monkeypatch):
+    """macOS: mic active + foreground is some non-whitelisted app →
+    endpoint scope (NOT scope to a synthetic spec for that foreground).
+
+    The earlier behavior built a synthetic ``DetectorSpec`` for the
+    foreground app and scoped the tap to its PIDs on the theory that
+    "the user explicitly hotkey'd, so we believe them about intent."
+    In practice that produced silent captures when the foreground at
+    hotkey time wasn't the audio source the user wanted captured —
+    classic case: the user has Notes / Slack / a browser foreground
+    while a Zoom call runs in the background. The synthetic foreground
+    spec captured Notes, which produces no audio, and the meeting was
+    lost. Endpoint scope guarantees we capture the speaker output
+    regardless of which window is forward.
+    """
+    monkeypatch.setattr("sayzo_agent.arm.controller.sys.platform", "darwin")
+    notifier = FakeNotifier()
+    notifier.consent_script = ["yes"]
+
+    def fake_resolver(spec):
+        # Defensive: if anything still routes through the resolver for
+        # an unwhitelisted foreground, return PIDs so the test would
+        # FAIL (catching a regression where Pass 2 sneaks back in).
+        return (9001, 9002)
+
+    cfg = ArmConfig(
+        hotkey="ctrl+alt+s",
+        poll_interval_secs=0.01,
+        hotkey_confirm_timeout_secs=0.1,
+        consent_toast_timeout_secs=0.1,
+        end_toast_timeout_secs=0.1,
+        checkin_toast_timeout_secs=0.1,
+        meeting_ended_toast_timeout_secs=0.1,
+        whitelist_arm_release_grace_secs=0.03,
+        force_close_after_keep_going_secs=0.05,
+        decline_release_grace_secs=0.05,
+        long_meeting_checkin_marks_secs=[3600.0],
+        detectors=default_detector_specs(),
+    )
+    conv_cfg = ConversationConfig(joint_silence_close_secs=1.0)
+    detector = ConversationDetector(conv_cfg)
+    mic = FakeCapture()
+    sys_cap = FakeCapture()
+    vad_m = FakeVAD()
+    vad_s = FakeVAD()
+
+    ctrl = ArmController(
+        cfg, detector,
+        mic_capture=mic, sys_capture=sys_cap,
+        vad_mic=vad_m, vad_sys=vad_s,
+        notifier=notifier,
+        get_mic_holders=lambda: [],
+        is_mic_active=lambda: True,
+        get_running_processes=lambda: frozenset({"com.apple.notes"}),
+        # Foreground = Apple Notes — definitely not in the whitelist.
+        get_foreground_info=lambda: ForegroundInfo(bundle_id="com.apple.notes"),
+        resolve_pids_for_spec=fake_resolver,
+    )
+
+    await ctrl._on_hotkey_pressed()
+    assert ctrl.state == ArmState.ARMED
+    # Endpoint scope — empty tuple — even though Notes is identifiable
+    # in the foreground and the resolver would happily return PIDs for it.
     assert sys_cap.last_target_pids == ()
 
     await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
