@@ -30,6 +30,7 @@ import webview
 from sayzo_agent.config import Config
 from sayzo_agent.gui.common.assets import icon_path, webui_index_path
 from sayzo_agent.gui.common.safe_quit import safe_quit_window
+from sayzo_agent.gui.common.win_shutdown import install_shutdown_protection
 from sayzo_agent.gui.settings.bridge import Bridge
 
 log = logging.getLogger(__name__)
@@ -104,6 +105,15 @@ class SettingsWindow:
             hidden=self._idle,
         )
         self._bridge._attach_window(window)
+
+        # Windows-only: intercept SystemEvents.SessionEnding so we exit
+        # cleanly via WM_QUIT before pywebview's FormClosed handler runs
+        # against a dying WebView2 child process and surfaces a JIT
+        # dialog that blocks Windows shutdown. See gui/common/win_shutdown.py.
+        def _mark_quitting() -> None:
+            self._quitting = True
+
+        install_shutdown_protection(window, set_quitting=_mark_quitting)
 
         icon_arg: dict = {}
         icon = icon_path()

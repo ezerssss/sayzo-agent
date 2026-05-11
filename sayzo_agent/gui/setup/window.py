@@ -15,6 +15,7 @@ import webview
 
 from sayzo_agent.config import Config
 from sayzo_agent.gui.common.assets import icon_path, webui_index_path
+from sayzo_agent.gui.common.win_shutdown import install_shutdown_protection
 from sayzo_agent.gui.setup.bridge import Bridge, SetupResult
 
 log = logging.getLogger(__name__)
@@ -56,6 +57,13 @@ class SetupWindow:
             text_select=False,
         )
         self._bridge._attach_window(window)
+
+        # Windows-only: intercept SystemEvents.SessionEnding so we exit
+        # cleanly via WM_QUIT before pywebview's FormClosed handler runs
+        # against a dying WebView2 child process and surfaces a JIT
+        # dialog that blocks Windows shutdown. See gui/common/win_shutdown.py.
+        # Setup has no idle-vs-quit distinction, so no set_quitting callback.
+        install_shutdown_protection(window)
 
         # Catch the user-closed-via-X path (the Cancel button is handled by
         # Bridge.quit_app, which hard-exits directly). pywebview's Cocoa
