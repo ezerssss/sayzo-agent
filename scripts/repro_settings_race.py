@@ -23,7 +23,6 @@ import subprocess
 import sys
 import time
 
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
