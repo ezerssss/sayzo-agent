@@ -157,75 +157,13 @@ _ACCESSIBILITY_DEEPLINK = (
     "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
 )
 
-# Lazy DesktopNotifierSync singleton. Repeated construction is expensive and
-# pointless — the backend binding is stateless across calls once built.
-_NOTIFIER = None
-_NOTIFIER_INIT_FAILED = False
-_NOTIFIER_LOCK = threading.Lock()
-
-
-def _get_notifier():
-    global _NOTIFIER, _NOTIFIER_INIT_FAILED
-    if _NOTIFIER is not None or _NOTIFIER_INIT_FAILED:
-        return _NOTIFIER
-    with _NOTIFIER_LOCK:
-        if _NOTIFIER is not None or _NOTIFIER_INIT_FAILED:
-            return _NOTIFIER
-        try:
-            from desktop_notifier import Icon
-            from desktop_notifier.sync import DesktopNotifierSync
-
-            from sayzo_agent.gui.common.assets import notification_icon_path
-
-            # Bump desktop-notifier's own logger so its codesign /
-            # auth-grant lines flow into agent.log alongside our own
-            # ``[mac_permissions]`` lines. Mirrors what notify.py does
-            # for the runtime notifier.
-            try:
-                logging.getLogger("desktop_notifier").setLevel(logging.INFO)
-            except Exception:
-                pass
-
-            # Pass our own logo so the test toast shows the Sayzo icon
-            # instead of desktop-notifier's bundled python.png. Same fix
-            # we apply on Windows; on macOS UNN it shows up next to the
-            # title in the Notification Center.
-            icon_p = notification_icon_path()
-            app_icon = Icon(path=icon_p) if icon_p else None
-            log.info(
-                "[mac_permissions] notifier init: icon=%s exists=%s",
-                icon_p,
-                icon_p.exists() if icon_p else False,
-            )
-            _NOTIFIER = DesktopNotifierSync(app_name="Sayzo", app_icon=app_icon)
-            log.info(
-                "[mac_permissions] DesktopNotifierSync init OK"
-            )
-            # Bundle introspection — mirrors notify.py so users running
-            # diagnose-notifications and users hitting the onboarding
-            # test-toast path get the same identity log either way.
-            try:
-                from desktop_notifier.backends.macos_support import (  # type: ignore[import-not-found]
-                    is_bundle,
-                    is_signed_bundle,
-                )
-
-                log.info(
-                    "[mac_permissions] bundle: is_bundle=%s is_signed=%s",
-                    is_bundle(),
-                    is_signed_bundle(),
-                )
-            except Exception:
-                log.debug(
-                    "[mac_permissions] bundle introspection failed",
-                    exc_info=True,
-                )
-        except Exception:
-            _NOTIFIER_INIT_FAILED = True
-            log.warning(
-                "[mac_permissions] DesktopNotifierSync init failed", exc_info=True
-            )
-    return _NOTIFIER
+# Notification "permission" no longer exists in v2.10+ — the custom HUD
+# (see :mod:`sayzo_agent.gui.hud`) owns the notification surface
+# end-to-end and doesn't go through ``UNUserNotificationCenter``. The
+# functions below survive only because the bridge still exposes them
+# (legacy bindings used by the now-removed Notifications onboarding
+# screen) — they return constants that indicate "already granted" so
+# any straggler caller doesn't block setup.
 
 
 def _log_bundle_info_plist_once() -> None:
@@ -927,109 +865,29 @@ def _terminate(proc: subprocess.Popen) -> None:
 
 
 def prompt_notifications() -> TccPromptResult:
-    """Call ``DesktopNotifierSync.request_authorisation`` — first call on
-    macOS triggers the UNUserNotificationCenter dialog.
+    """No-op stub — notifications are owned by the custom HUD in v2.10+.
 
-    Stale-TCC detection mirrors the mic + audio-capture paths: a UNN
-    entry from a pre-v2.6.0 (ad-hoc-signed) Sayzo install whose code
-    requirement no longer matches the current bundle silently denies
-    without presenting UI. The same sub-500 ms-False fingerprint applies
-    here. Returns a :class:`TccPromptResult`.
+    The Notifications onboarding screen was removed when the HUD shipped
+    (`project_custom_hud_shipped`). The bridge method this function
+    backs survives only as a non-load-bearing legacy binding; returning
+    ``granted=True`` means any caller that hasn't been pruned yet just
+    advances. No OS dialog fires.
     """
     if sys.platform != "darwin":
         return TccPromptResult(granted=None, stale_tcc_likely=False)
-    notifier = _get_notifier()
-    if notifier is None:
-        return TccPromptResult(granted=None, stale_tcc_likely=False)
-    request_started = time.monotonic()
-    try:
-        granted = bool(notifier.request_authorisation())
-    except Exception:
-        log.warning(
-            "[mac_permissions] request_authorisation failed", exc_info=True
-        )
-        return TccPromptResult(granted=None, stale_tcc_likely=False)
-    elapsed = time.monotonic() - request_started
-    stale_tcc_likely = (
-        granted is False and elapsed < _STALE_TCC_THRESHOLD_SECS
-    )
-    log.info(
-        "[mac_permissions] notifications TCC: user response → %s (elapsed=%.3fs, stale_tcc_likely=%s)",
-        granted,
-        elapsed,
-        stale_tcc_likely,
-    )
-    return TccPromptResult(granted=granted, stale_tcc_likely=stale_tcc_likely)
+    return TccPromptResult(granted=True, stale_tcc_likely=False)
 
 
 def is_notification_authorised() -> Optional[bool]:
-    """Non-prompting probe of current notification authorisation. Polled by
-    the Notifications onboarding screen while the user toggles Sayzo on in
-    System Settings, mirroring how Accessibility polls
-    ``is_accessibility_trusted()``. Returns True / False / None (error)."""
+    """No-op stub — see :func:`prompt_notifications`."""
     if sys.platform != "darwin":
         return None
-    notifier = _get_notifier()
-    if notifier is None:
-        return None
-    try:
-        return bool(notifier.has_authorisation())
-    except Exception:
-        log.warning(
-            "[mac_permissions] has_authorisation failed", exc_info=True
-        )
-        return None
+    return True
 
 
 def send_verification_notification() -> bool:
-    """Fire a single test toast so the user can confirm notifications
-    actually appear on their screen. ``request_authorisation`` returning
-    True can lie when the bundle is misconfigured (signed but not notarised,
-    AUMID drift, etc.); an actual toast hitting the screen is ground truth.
-
-    Returns True on best-effort send success, False otherwise. Failures
-    are logged but never propagated.
-    """
-    if sys.platform != "darwin":
-        return False
-    notifier = _get_notifier()
-    if notifier is None:
-        log.warning(
-            "[mac_permissions] verification toast skipped — notifier unavailable"
-        )
-        return False
-    log.info("[mac_permissions] verification toast: send begin")
-    try:
-        # has_authorisation is a quick sync probe; logging the result
-        # alongside the send call lets us correlate "user clicked Test
-        # but no toast" reports against whether UNN even thinks we have
-        # rights at the moment of the send.
-        try:
-            authed = notifier.has_authorisation()
-            log.info(
-                "[mac_permissions] verification toast: has_authorisation=%s",
-                authed,
-            )
-        except Exception:
-            log.debug(
-                "[mac_permissions] verification toast: has_authorisation failed",
-                exc_info=True,
-            )
-
-        identifier = notifier.send(
-            title="Sayzo notifications are on",
-            message="You'll see prompts like this when Sayzo spots a meeting.",
-        )
-        log.info(
-            "[mac_permissions] verification toast: send done id=%s", identifier
-        )
-        return True
-    except Exception:
-        log.warning(
-            "[mac_permissions] send_verification_notification failed",
-            exc_info=True,
-        )
-        return False
+    """No-op stub — see :func:`prompt_notifications`."""
+    return False
 
 
 def _open(deeplink: str) -> None:

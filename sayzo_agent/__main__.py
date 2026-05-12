@@ -799,60 +799,104 @@ def logout() -> None:
 
 @cli.command("diagnose-notifications")
 def diagnose_notifications() -> None:
-    """Run a desktop-notification diagnostic and dump the report.
+    """Run a HUD-notification diagnostic and dump the report.
 
-    Constructs the same ``DesktopNotifier`` the agent uses, captures
-    bundle / codesign state, probes ``has_authorisation``, then sends
-    one fire-and-forget toast and one consent toast. Prints a
-    structured report to stdout AND writes every step into
-    ``~/.sayzo/agent/logs/agent.log`` so the same data is available
-    offline if the user pastes the file later.
+    Spins up a temporary :class:`HudLauncher`, waits for the HUD
+    subprocess to emit ``hud_ready``, then fires one fire-and-forget
+    toast and one consent card. Prints a structured report to stdout
+    AND writes every step into ``~/.sayzo/agent/logs/agent.log`` so the
+    same data is available offline if the user pastes the file later.
 
-    Use this when notifications appear to do nothing on a user's machine
-    despite the OS settings showing Sayzo as authorised — the report
-    + log lines together pinpoint whether the failure is in our wrapper,
-    desktop-notifier, or the OS.
+    Use this when notifications appear to do nothing on a user's
+    machine — the report + log lines pinpoint whether the failure is in
+    the HUD subprocess (never reached ``hud_ready``), the JSON pipe
+    (commands sent but no response), or the React app (rendered but no
+    user interaction round-trip).
     """
     import json as _json
 
     cfg = load_config()
     _setup_file_logging(cfg.logs_dir)
-    # Also mirror to stdout so the user immediately sees the lines, not
-    # just the structured report at the end. The file handler is still
-    # capturing everything for offline review.
     stream_handler = logging.StreamHandler(sys.stderr)
     stream_handler.setFormatter(
         logging.Formatter("%(asctime)s %(levelname)-5s %(name)s  %(message)s")
     )
     logging.getLogger().addHandler(stream_handler)
 
-    from .notify import APP_AUMID, make_notifier
+    from .gui.hud.launcher import HudLauncher
+    from .notify import HudNotifier
 
-    click.echo("=== Sayzo notification diagnostic ===\n")
-    click.echo("Constructing notifier...")
-    notifier = make_notifier(app_name=APP_AUMID)
-    # Give the background loop a moment to finish init + initial auth
-    # probe before we start firing test toasts. The wait inside __init__
-    # gates on loop creation, not on the auth probe completing.
-    time.sleep(2.0)
+    async def _run_diag() -> dict:
+        launcher = HudLauncher()
+        await launcher.start()
+        ready = await launcher.wait_for_ready(timeout_secs=20.0)
+        report: dict = {
+            "platform": sys.platform,
+            "frozen": getattr(sys, "frozen", False),
+            "hud_ready": ready,
+            "diagnostic": launcher.diagnose(),
+            "test_toast": None,
+            "consent_round_trip": None,
+        }
+        if not ready:
+            await launcher.quit()
+            return report
 
-    click.echo("Running diagnose() — watch your screen for two test toasts...\n")
-    report = notifier.diagnose()
+        notifier = HudNotifier(launcher)
+        try:
+            notifier.notify(
+                "Sayzo notification test",
+                "If you can read this, the HUD is wired correctly.",
+            )
+            report["test_toast"] = {"ok": True}
+        except Exception as exc:
+            report["test_toast"] = {"ok": False, "error": repr(exc)}
+
+        # Give the toast a moment to render before stacking the card.
+        await asyncio.sleep(1.0)
+
+        # ask_consent is sync — run on the executor so we don't block
+        # the loop and starve the stdout reader resolving the response.
+        loop = asyncio.get_running_loop()
+        try:
+            answer = await loop.run_in_executor(
+                None,
+                lambda: notifier.ask_consent(
+                    "Sayzo consent test",
+                    "If you see Yes/No buttons, consent prompts work. "
+                    "Click either — this is just a round-trip check.",
+                    "Yes",
+                    "No",
+                    8.0,
+                    "timeout",
+                ),
+            )
+            report["consent_round_trip"] = {"ok": True, "result": answer}
+        except Exception as exc:
+            report["consent_round_trip"] = {"ok": False, "error": repr(exc)}
+
+        await launcher.quit()
+        return report
+
+    click.echo("=== Sayzo HUD diagnostic ===\n")
+    click.echo("Spawning HUD subprocess and exercising the round-trip...\n")
+    report = asyncio.run(_run_diag())
 
     click.echo("\n=== Report ===")
     click.echo(_json.dumps(report, indent=2, default=str))
     click.echo("\nFull trace written to: " + str(cfg.logs_dir / "agent.log"))
     click.echo(
-        "\nNo toast on screen? Check:\n"
-        "  • macOS: System Settings → Notifications → Sayzo → Banner Style "
-        "is set (NOT 'None'); Focus mode is off; toggle Allow off+on.\n"
-        "  • Windows: Settings → System → Notifications → Sayzo is on; "
-        "Focus assist is off.\n"
-        "  • In agent.log, look for `[notify] backend init failed`. On "
-        "macOS, a shipped release should log `is_signed=True`; "
-        "`is_signed=False` on a release build means TCC has a stale "
-        "entry from a prior unsigned/ad-hoc build — toggle Sayzo off "
-        "and on in System Settings → Notifications to refresh it.\n"
+        "\nNo HUD on screen? Check:\n"
+        "  • Look for `[hud] spawning subprocess` and `[hud] subprocess "
+        "emitted hud_ready` in agent.log — these are the two key "
+        "lifecycle lines.\n"
+        "  • A missing `hud_ready` means the React app didn't mount — "
+        "verify the webui bundle exists at "
+        "`sayzo_agent/gui/webui/dist/index.html` (run `npm run build` "
+        "from `sayzo_agent/gui/webui/` if not).\n"
+        "  • A `[hud] giving up after N respawns` line means the "
+        "subprocess crashed repeatedly — the underlying error is in "
+        "the lines just before, usually a webview backend init failure.\n"
     )
 
 
@@ -1105,9 +1149,15 @@ def run() -> None:
         log.info("Uploads enabled → %s", cfg.auth.effective_server_url)
 
     from .app import Agent
-    from .notify import APP_AUMID, NoopNotifier, make_notifier
+    from .gui.hud.launcher import HudLauncher
+    from .notify import HudNotifier, NoopNotifier
 
-    notifier = make_notifier(app_name=APP_AUMID) if cfg.notifications_enabled else NoopNotifier()
+    hud_launcher: HudLauncher | None = (
+        HudLauncher() if cfg.notifications_enabled else None
+    )
+    notifier = (
+        HudNotifier(hud_launcher) if hud_launcher is not None else NoopNotifier()
+    )
     agent = Agent(cfg, upload_client=upload_client, notifier=notifier, auth_client=auth_client)
 
     async def _main() -> None:
@@ -1124,7 +1174,14 @@ def run() -> None:
             # Windows: signal handlers via add_signal_handler are unsupported
             pass
 
-        await agent.run()
+        if hud_launcher is not None:
+            await hud_launcher.start()
+
+        try:
+            await agent.run()
+        finally:
+            if hud_launcher is not None:
+                await hud_launcher.quit()
 
     try:
         asyncio.run(_main())
@@ -1399,7 +1456,7 @@ def service(force_setup: bool, from_autostart: bool, open_settings: bool) -> Non
     # Heavy-import bootstrap. Defers ``from .app import Agent``, ``from
     # .notify import …``, the Agent constructor, and the daily-drill
     # scheduler — all together 4–10 s on the first cold path due to
-    # numpy / scipy / silero / faster-whisper / av / desktop-notifier
+    # numpy / scipy / silero / faster-whisper / av / pywebview
     # loading lazily — until AFTER the tray icon has painted.
     #
     # Dispatcher routes this:
@@ -1420,14 +1477,23 @@ def service(force_setup: bool, from_autostart: bool, open_settings: bool) -> Non
     # and start dispatching real arm/disarm events.
     agent = None
 
-    def _build_pipeline_state() -> None:
-        nonlocal agent
-        from .app import Agent
-        from .notify import APP_AUMID, NoopNotifier, make_notifier
+    # HudLauncher manages the HUD subprocess lifetime. Constructed inside
+    # _build_pipeline_state (sync) so it's available before _main runs, but
+    # .start() is called inside _main where the asyncio loop is live.
+    hud_launcher: "HudLauncher | None" = None
 
+    def _build_pipeline_state() -> None:
+        nonlocal agent, hud_launcher
+        from .app import Agent
+        from .gui.hud.launcher import HudLauncher
+        from .notify import HudNotifier, NoopNotifier
+
+        hud_launcher = (
+            HudLauncher() if cfg.notifications_enabled else None
+        )
         notifier = (
-            make_notifier(app_name=APP_AUMID)
-            if cfg.notifications_enabled else NoopNotifier()
+            HudNotifier(hud_launcher)
+            if hud_launcher is not None else NoopNotifier()
         )
 
         # Share the notifier + pre-quit hook with the tray so both the
@@ -1867,6 +1933,14 @@ def service(force_setup: bool, from_autostart: bool, open_settings: bool) -> Non
         settings_launcher = _SettingsLauncher()
         await settings_launcher.start()
 
+        # HUD subprocess: spawn now so it's warm by the time the user
+        # first arms (whitelist or hotkey). The launcher itself was
+        # constructed in _build_pipeline_state so the notifier could
+        # bind to it; .start() spawns the actual subprocess and brings
+        # up the stdout reader.
+        if hud_launcher is not None:
+            await hud_launcher.start()
+
         def _sync_arm_state_to_tray() -> None:
             """Push ArmController.state → TrayState immediately.
 
@@ -2118,6 +2192,8 @@ def service(force_setup: bool, from_autostart: bool, open_settings: bool) -> Non
             # don't leave an orphan pywebview process if SIGKILL fires
             # later in the macOS force-exit path).
             await settings_launcher.quit()
+            if hud_launcher is not None:
+                await hud_launcher.quit()
             await ipc_server.stop()
 
     try:
@@ -2287,6 +2363,51 @@ def settings(pane: str | None, idle: bool) -> None:
             SettingsWindow(cfg, pane=pane, idle=idle).run_blocking()
         except Exception:
             log.exception("settings window crashed")
+
+
+@cli.command()
+@click.option(
+    "--idle",
+    is_flag=True,
+    default=False,
+    help=(
+        "Subprocess mode (default for agent-spawned HUDs). The window "
+        "opens immediately but its React app stays in the `hidden` "
+        "state until the agent writes a show_pill / show_toast / etc. "
+        "command over stdin."
+    ),
+)
+@click.option(
+    "--demo",
+    is_flag=True,
+    default=False,
+    help=(
+        "Render the in-HUD demo control strip so a developer can click "
+        "through each event type. Used by scripts/preview_hud.py."
+    ),
+)
+def hud(idle: bool, demo: bool) -> None:
+    """Open the HUD overlay window in a dedicated pywebview process.
+
+    Spawned by the agent at boot via :class:`HudLauncher`. Exits 0 when
+    the window closes or the parent's stdin EOFs.
+    """
+    # idle is accepted purely for symmetry with the settings subprocess —
+    # the HUD has no separate eager/idle mode (it's always "ready and
+    # waiting for commands"), so the flag's only effect is to make the
+    # invocation legible in `ps`.
+    _ = idle
+
+    cfg = load_config()
+    _setup_logging("INFO", debug=cfg.debug)
+    log = logging.getLogger("hud")
+
+    from .gui.hud.window import HudWindow
+
+    try:
+        HudWindow(cfg, demo=demo).run_blocking()
+    except Exception:
+        log.exception("HUD window crashed")
 
 
 if __name__ == "__main__":

@@ -23,9 +23,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SOURCE = REPO_ROOT / "installer" / "assets"
 TARGET = REPO_ROOT / "sayzo_agent" / "gui" / "webui" / "src" / "assets"
 
-# Files that the React bundle imports. Add new entries here as the UI
-# grows — anything not listed is left alone in the target dir.
-SYNCED = ["logo.png"]
+# `logo.svg` is the HUD's preferred source — renders crisp at every size
+# the HUD displays it (16–48 px). `logo.png` (1024×1024 master) is kept
+# for Settings + Setup windows that import it today, plus any consumer
+# that can't handle SVG.
+SYNCED = ["logo.png", "logo.svg"]
 
 
 def main() -> int:

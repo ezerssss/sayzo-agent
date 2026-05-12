@@ -170,6 +170,13 @@ class Agent:
         self._captures_discarded: int = 0
         self._echo_segments_dropped: int = 0
         self._echo_secs_dropped: float = 0.0
+        # Per-source RMS amplitudes. Updated in `_consume` from each
+        # captured frame, drained at ~15 Hz by `_audio_level_emitter`
+        # and pushed to the HUD pill's waveform. Plain floats — Python
+        # GIL makes the load/store atomic enough for telemetry-grade
+        # smoothness; we don't lock.
+        self._latest_mic_level: float = 0.0
+        self._latest_sys_level: float = 0.0
         # Settings → Captures pane reads this via IPC. Keys are the proc_id
         # (also reused as the eventual on-disk record id), values describe
         # what's currently being processed for the user-facing list.
@@ -233,6 +240,51 @@ class Agent:
             self.detector.on_frame(source, frame, capture_mono_ts, now)
             for seg in vad.feed(frame):
                 self.detector.on_segment(seg, now)
+            # Per-frame RMS for the HUD waveform. `np.mean(frame * frame,
+            # dtype=np.float32)` runs the squaring in int16 then accumulates
+            # into float32 — avoids the full int16→float32 copy that
+            # `frame.astype(np.float32) ** 2` allocates on every call.
+            if frame.size:
+                try:
+                    rms = float(np.sqrt(np.mean(frame * frame, dtype=np.float32))) / 32768.0
+                except Exception:
+                    rms = 0.0
+                if source == "mic":
+                    self._latest_mic_level = rms
+                else:
+                    self._latest_sys_level = rms
+
+    async def _audio_level_emitter(self) -> None:
+        """Push per-source RMS amplitude to the HUD waveform at ~15 Hz.
+
+        Gated by ``armed_event`` — when the agent is disarmed, no audio
+        is flowing and there's nothing to report. Change-detected so a
+        long silent stretch doesn't burn 15 pipe writes/sec on
+        identical-to-three-decimals levels; the React side renders
+        nothing new in that case anyway.
+        """
+        launcher = getattr(self.notifier, "launcher", None)
+        if launcher is None:
+            return
+        prev_mic: float = -1.0
+        prev_sys: float = -1.0
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(self.arm.armed_event.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            if self._stop.is_set():
+                break
+            mic = self._latest_mic_level
+            sys_lvl = self._latest_sys_level
+            if abs(mic - prev_mic) >= 0.005 or abs(sys_lvl - prev_sys) >= 0.005:
+                try:
+                    launcher.set_audio_levels(mic, sys_lvl)
+                except Exception:
+                    log.debug("[hud] set_audio_levels failed", exc_info=True)
+                prev_mic = mic
+                prev_sys = sys_lvl
+            await asyncio.sleep(1.0 / 15.0)
 
     async def _ticker(self) -> None:
         while not self._stop.is_set():
@@ -805,6 +857,7 @@ class Agent:
             asyncio.create_task(self._consume("mic", self.mic.queue, self.vad_mic)),
             asyncio.create_task(self._consume("system", self.sys.queue, self.vad_sys)),
             asyncio.create_task(self._ticker()),
+            asyncio.create_task(self._audio_level_emitter()),
         ]
         log.info(
             "[agent] running. Shortcut: %s. Ctrl+C to stop.",

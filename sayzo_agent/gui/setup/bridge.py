@@ -198,71 +198,11 @@ class Bridge:
             "stale_tcc_likely": result.stale_tcc_likely,
         }
 
-    def prompt_notification_permission(self) -> dict[str, Any]:
-        """User clicked Allow on the Notifications row. On macOS, fires the
-        UNUserNotificationCenter dialog on first call. On Windows, just
-        returns current toast-authorization status (non-prompting).
-
-        macOS payload includes ``stale_tcc_likely`` so the Notifications
-        screen can show the same recovery flow when a pre-v2.6.0 UNN
-        entry silent-denies the request. Windows always returns
-        ``stale_tcc_likely=False`` since the failure mode doesn't apply
-        there.
-        """
-        if sys.platform == "darwin":
-            from sayzo_agent.gui.setup import mac_permissions
-
-            result = mac_permissions.prompt_notifications()
-            return {
-                "granted": result.granted,
-                "stale_tcc_likely": result.stale_tcc_likely,
-            }
-        if sys.platform == "win32":
-            from sayzo_agent.gui.setup import win_permissions
-
-            return {
-                "granted": win_permissions.has_notification_permission(),
-                "stale_tcc_likely": False,
-            }
-        return {"granted": None, "stale_tcc_likely": False}
-
-    def check_notification_permission(self) -> dict[str, Any]:
-        """Non-prompting current-state probe. Polled by the Notifications
-        screen while it's deep-linked the user into System Settings, so the
-        UI flips to "granted" automatically when the user toggles us on
-        without us re-firing the OS dialog (which only fires once per app
-        anyway, but the no-prompt variant is cleaner and matches the
-        Accessibility polling pattern)."""
-        if sys.platform == "darwin":
-            from sayzo_agent.gui.setup import mac_permissions
-
-            return {"granted": mac_permissions.is_notification_authorised()}
-        if sys.platform == "win32":
-            from sayzo_agent.gui.setup import win_permissions
-
-            return {"granted": win_permissions.has_notification_permission()}
-        return {"granted": None}
-
-    def send_test_notification(self) -> dict[str, Any]:
-        """Fire a one-off verification toast right after permission flips
-        granted. End-to-end check: a return of `request_authorisation()`
-        True can lie if the bundle is misconfigured; an actual toast
-        appearing on the user's screen is ground truth.
-
-        Best-effort — failures are swallowed and reported as `{"sent": False}`
-        so the UI can choose whether to show a softer error.
-        """
-        if sys.platform == "darwin":
-            from sayzo_agent.gui.setup import mac_permissions
-
-            sent = mac_permissions.send_verification_notification()
-            return {"sent": bool(sent)}
-        if sys.platform == "win32":
-            from sayzo_agent.gui.setup import win_permissions
-
-            sent = win_permissions.send_verification_notification()
-            return {"sent": bool(sent)}
-        return {"sent": False}
+    # Notification-permission bridge methods were removed in v2.10 along
+    # with the Notifications onboarding screen — the custom HUD overlay
+    # (`project_custom_hud_shipped`) doesn't depend on OS notification
+    # permission. The corresponding TypeScript declarations were dropped
+    # from `lib/bridge.ts`.
 
     def reset_mic_permission_and_restart(self) -> None:
         """Programmatic recovery for the macOS "silent-deny" mic state.

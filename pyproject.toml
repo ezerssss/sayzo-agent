@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sayzo-agent"
-version = "2.9.0"
+version = "2.10.0"
 description = "Armed-only capture agent for Sayzo — records meetings on user consent (hotkey or whitelisted meeting app) and feeds them to downstream English-coaching analysis."
 requires-python = ">=3.10"
 dependencies = [
@@ -32,7 +32,11 @@ dependencies = [
     "rich>=13.7",
     "pystray>=0.19",
     "Pillow>=10.0",
-    "desktop-notifier>=6.2",
+    # Native notifications were retired in v2.10 in favor of the custom
+    # HUD overlay (sayzo_agent/gui/hud/). The old `desktop-notifier`
+    # dep, the `MacUnsignedNotifier` fallback, and the
+    # `osascript display dialog` consent path are all gone — see
+    # `project_custom_hud_shipped` in the auto-memory.
     "pywebview>=5.3,<6",
     # Armed-only capture model (v1.0+).
     # Global hotkey listener + process / window queries.

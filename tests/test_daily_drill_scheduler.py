@@ -277,15 +277,14 @@ async def test_skips_when_no_tokens(stats_path, monkeypatch) -> None:
     assert notifier.actionable_calls == []
 
 
-@pytest.mark.asyncio
-async def test_skips_when_os_notifications_disabled(stats_path, monkeypatch) -> None:
-    _patch_fetch(monkeypatch, _ok_response())
-    fn = FakeNotifier(has_authorisation=False)
-    sched, _, _ = _make_scheduler(stats_path=stats_path, fake_notifier=fn)
-    res = await sched._evaluate_and_maybe_fire(ignore_gates=False)
-    assert res.status == "skipped_os_disabled"
-    # And the prompt-shown latch is set so we don't re-prompt.
-    assert sched._stats.os_disabled_prompt_shown is True
+# Pre-v2.10 the scheduler skipped daily-drill firing and surfaced a
+# one-time tray warning when has_authorisation_sync() returned False
+# (OS notifications disabled at the system level). With the v2.10 HUD
+# rewrite, has_authorisation_sync() never returns False — the HUD owns
+# its own UI surface and is "authorised" whenever the subprocess is
+# alive. The corresponding "test_skips_when_os_notifications_disabled"
+# test has been removed because the code path it exercised no longer
+# exists; see project_custom_hud_shipped.md for the migration notes.
 
 
 @pytest.mark.asyncio

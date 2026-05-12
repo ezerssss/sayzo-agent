@@ -94,7 +94,6 @@ class _PendingFire:
 # Tray label string used for the EOD fallback. Centralised so the unit
 # tests can assert on it without re-spelling the copy.
 _EOD_LABEL = "Today's drill — 60s"
-_OS_DISABLED_LABEL = "⚠ Enable notifications to get drills"
 
 
 class DailyDrillScheduler:
@@ -260,9 +259,14 @@ class DailyDrillScheduler:
         # Reset the warn-once latch when the user signs in.
         self._auth_warned = False
 
-        if self._has_auth_cached is False and not ignore_gates:
-            self._maybe_show_os_disabled_warning()
-            return FireResult(status="skipped_os_disabled")
+        # Pre-v2.10 this branch surfaced a one-time tray warning when
+        # the OS had silently denied notification permissions (the
+        # `[notify] auth probe: has_authorisation=False` regression).
+        # With v2.10+ the HUD owns its own UI — `has_authorisation_sync`
+        # returns True whenever the launcher is alive — so this branch
+        # is unreachable and has been removed. The `skipped_os_disabled`
+        # status name is retained in `_FIRE_STATUSES` for backward
+        # compat with on-disk stats from older versions.
 
         if not ignore_gates:
             # Weekend cold-start gate
@@ -527,24 +531,6 @@ class DailyDrillScheduler:
         tray Debug submenu. Always re-runs the API fetch + dispatch path.
         """
         return await self._evaluate_and_maybe_fire(ignore_gates=ignore_gates)
-
-    # ------------------------------------------------------------------
-    # OS-disabled UX
-    # ------------------------------------------------------------------
-
-    def _maybe_show_os_disabled_warning(self) -> None:
-        if self._stats.os_disabled_prompt_shown:
-            return
-        if self._tray_state is not None:
-            try:
-                self._tray_state.set_eod_drill_label(_OS_DISABLED_LABEL)
-            except Exception:
-                log.debug("[daily_drill] tray label set failed", exc_info=True)
-        self._stats.os_disabled_prompt_shown = True
-        self._save_stats()
-        log.warning(
-            "[daily_drill] OS notifications disabled — surfaced one-time prompt"
-        )
 
     # ------------------------------------------------------------------
     # Internals

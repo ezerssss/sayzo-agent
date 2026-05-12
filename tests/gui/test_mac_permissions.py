@@ -496,92 +496,37 @@ def test_prompt_audio_capture_returns_none_on_non_darwin():
 
 
 # ---------------------------------------------------------------------------
-# prompt_notifications
+# prompt_notifications — HUD-era stubs (no OS dialog fires)
 # ---------------------------------------------------------------------------
 
 
-def _patch_notifier(authorise_return: bool | Exception):
-    """Return a context manager that patches DesktopNotifierSync in sys.modules
-    with a backend whose request_authorisation returns ``authorise_return`` (or
-    raises it, if it's an Exception)."""
-    fake = MagicMock()
-    if isinstance(authorise_return, Exception):
-        fake.request_authorisation.side_effect = authorise_return
-    else:
-        fake.request_authorisation.return_value = authorise_return
-    module = SimpleNamespace(DesktopNotifierSync=MagicMock(return_value=fake))
-    return patch.dict("sys.modules", {"desktop_notifier.sync": module}), fake
-
-
-def test_prompt_notifications_returns_true_when_granted():
-    sys_modules_patch, _ = _patch_notifier(True)
-    with patch("sayzo_agent.gui.setup.mac_permissions.sys.platform", "darwin"), sys_modules_patch:
+def test_prompt_notifications_returns_granted_on_darwin():
+    """v2.10+: HUD owns the notification surface, so the OS dialog is
+    skipped and the helper just reports "granted" so legacy callers
+    don't block setup."""
+    with patch("sayzo_agent.gui.setup.mac_permissions.sys.platform", "darwin"):
         result = mac_permissions.prompt_notifications()
-        assert result.granted is True
-        assert result.stale_tcc_likely is False
-
-
-def test_prompt_notifications_returns_false_when_denied_slowly():
-    """Real human-click denial: stale_tcc_likely stays False because the
-    elapsed time exceeds the 500 ms threshold."""
-    fake = MagicMock()
-
-    def _slow_deny():
-        import time as _t
-        _t.sleep(0.6)
-        return False
-
-    fake.request_authorisation.side_effect = _slow_deny
-    module = SimpleNamespace(DesktopNotifierSync=MagicMock(return_value=fake))
-    with patch(
-        "sayzo_agent.gui.setup.mac_permissions.sys.platform", "darwin"
-    ), patch.dict("sys.modules", {"desktop_notifier.sync": module}):
-        result = mac_permissions.prompt_notifications()
-        assert result.granted is False
-        assert result.stale_tcc_likely is False
-
-
-def test_prompt_notifications_flags_stale_tcc_on_fast_silent_deny():
-    """Stale UNN entry from a previous Sayzo install with a different
-    signing identity silently denies without UI. request_authorisation
-    returns False instantly. The helper flags stale_tcc_likely so the
-    bridge payload exposes it (the React Notifications screen still falls
-    back to the existing waiting-state polling, since the System Settings
-    Notifications toggle DOES re-record under the new CR — but the flag
-    is plumbed through for diagnostics + future refinement)."""
-    sys_modules_patch, _ = _patch_notifier(False)
-    with patch("sayzo_agent.gui.setup.mac_permissions.sys.platform", "darwin"), sys_modules_patch:
-        result = mac_permissions.prompt_notifications()
-        assert result.granted is False
-        assert result.stale_tcc_likely is True
-
-
-def test_prompt_notifications_returns_none_on_backend_error():
-    sys_modules_patch, _ = _patch_notifier(RuntimeError("boom"))
-    with patch("sayzo_agent.gui.setup.mac_permissions.sys.platform", "darwin"), sys_modules_patch:
-        result = mac_permissions.prompt_notifications()
-        assert result.granted is None
-        assert result.stale_tcc_likely is False
+    assert result.granted is True
+    assert result.stale_tcc_likely is False
 
 
 def test_prompt_notifications_returns_none_on_non_darwin():
     with patch("sayzo_agent.gui.setup.mac_permissions.sys.platform", "win32"):
         result = mac_permissions.prompt_notifications()
-        assert result.granted is None
-        assert result.stale_tcc_likely is False
+    assert result.granted is None
+    assert result.stale_tcc_likely is False
 
 
-def test_prompt_notifications_returns_none_when_init_fails():
-    """If DesktopNotifierSync construction throws, the helper must swallow
-    and return None (never raise back into the bridge)."""
-    failing_ctor = MagicMock(side_effect=RuntimeError("no backend"))
-    module = SimpleNamespace(DesktopNotifierSync=failing_ctor)
-    with patch(
-        "sayzo_agent.gui.setup.mac_permissions.sys.platform", "darwin"
-    ), patch.dict("sys.modules", {"desktop_notifier.sync": module}):
-        result = mac_permissions.prompt_notifications()
-        assert result.granted is None
-        assert result.stale_tcc_likely is False
+def test_is_notification_authorised_returns_true_on_darwin():
+    with patch("sayzo_agent.gui.setup.mac_permissions.sys.platform", "darwin"):
+        assert mac_permissions.is_notification_authorised() is True
+
+
+def test_send_verification_notification_is_a_noop():
+    """v2.10+: no test toast fires because there's nothing to verify —
+    the HUD's own diagnostics CLI (`sayzo-agent diagnose-notifications`)
+    is the real check."""
+    assert mac_permissions.send_verification_notification() is False
 
 
 # ---------------------------------------------------------------------------

@@ -106,12 +106,11 @@ declare global {
     start_login(): Promise<{ started: boolean }>;
     cancel_login(): Promise<{ cancelled: boolean }>;
 
-    // Per-permission prompts (one screen each).
+    // Per-permission prompts (one screen each). v2.10+: the Notifications
+    // permission flow is gone (custom HUD owns the surface), so only
+    // the mic + audio-capture prompts remain.
     prompt_mic_permission(): Promise<TccPermissionResult>;
     prompt_audio_capture_permission(): Promise<TccPermissionResult>;
-    prompt_notification_permission(): Promise<TccPermissionResult>;
-    check_notification_permission(): Promise<PermissionResult>;
-    send_test_notification(): Promise<{ sent: boolean }>;
 
     // Settings deep-links.
     open_mic_settings(): Promise<null>;
@@ -241,18 +240,8 @@ export const bridge = {
     await whenReady();
     return window.pywebview.api.prompt_audio_capture_permission();
   },
-  async promptNotificationPermission() {
-    await whenReady();
-    return window.pywebview.api.prompt_notification_permission();
-  },
-  async checkNotificationPermission() {
-    await whenReady();
-    return window.pywebview.api.check_notification_permission();
-  },
-  async sendTestNotification() {
-    await whenReady();
-    return window.pywebview.api.send_test_notification();
-  },
+  // promptNotificationPermission / checkNotificationPermission /
+  // sendTestNotification removed in v2.10 — see `project_custom_hud_shipped`.
   async openMicSettings() {
     await whenReady();
     return window.pywebview.api.open_mic_settings();

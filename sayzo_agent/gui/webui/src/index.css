@@ -2,6 +2,72 @@
 @tailwind components;
 @tailwind utilities;
 
+/* HUD drag regions — used by the frameless HUD overlay window (see
+   gui/hud/window.py + src/HudApp.tsx). `-webkit-app-region: drag` is a
+   Chromium / WebKit feature that hooks click-and-drag on an element to
+   move the host OS window. Works in WebView2 (Windows) and WKWebView
+   (macOS). `no-drag` opts a child element back out so buttons keep
+   their normal click behaviour. */
+.hud-drag {
+  -webkit-app-region: drag;
+  app-region: drag;
+  cursor: move;
+}
+.hud-no-drag {
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+  cursor: default;
+}
+
+/* Three-dot grip affordance at the top of every draggable HUD element.
+   Visual signal that the surface is grabbable (Granola pattern). The
+   container is `pointer-events: none` because the click-handling /
+   drag-region semantics live on the parent `.hud-drag` element; the
+   dots are pure visual UI. */
+.hud-grip {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 3px;
+  padding-top: 4px;
+  padding-bottom: 2px;
+  opacity: 0.45;
+  transition: opacity 150ms ease;
+  pointer-events: none;
+}
+.hud-drag:hover .hud-grip {
+  opacity: 0.8;
+}
+.hud-grip > span {
+  width: 3px;
+  height: 3px;
+  border-radius: 9999px;
+  background-color: #6b7280; /* matches ink-muted */
+}
+
+/* Soft, slow pulse for the Sayzo logo on the pill — replaces
+   Tailwind's harsh `animate-ping` which reads as alarm. */
+@keyframes sayzo-soft-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.65; }
+}
+.animate-sayzo-pulse {
+  animation: sayzo-soft-pulse 2.4s ease-in-out infinite;
+}
+
+/* Crisper down-scaling for the small inline Sayzo logo. The HUD imports
+   `logo-sm.png` (128×128, pre-rasterized via scripts/sync_brand_assets.py
+   from the 1024×1024 master) so the per-pixel downscale ratio inside the
+   browser is small. These CSS hints push WebView2 / WKWebView toward
+   the highest-quality scaler and a GPU-composited layer, which
+   eliminates the visible aliasing that 1024 → 24px produced. */
+.hud-logo-img {
+  image-rendering: -webkit-optimize-contrast;
+  image-rendering: high-quality;
+  -webkit-backface-visibility: hidden;
+  transform: translateZ(0);
+}
+
 @layer base {
   html,
   body,

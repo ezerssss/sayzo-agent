@@ -37,7 +37,7 @@ from ..account import AccountGateDecision
 from ..config import ArmConfig, DetectorSpec
 from ..conversation import ConversationDetector, SessionState
 from ..models import SessionCloseReason
-from ..notify import ConsentResult, DesktopNotifier, Notifier
+from ..notify import ConsentResult, Notifier
 from . import detectors as _d
 from . import seen_apps as _seen_apps
 from .detectors import ForegroundInfo, MicState
@@ -204,6 +204,14 @@ class ArmController:
         self.vad_mic = vad_mic
         self.vad_sys = vad_sys
         self.notifier = notifier
+        # The HUD launcher (if any) — used to drive the persistent
+        # capture pill (show / hide / collapse) on arm/disarm. Pulled
+        # off the notifier so we don't need a separate constructor
+        # argument. ``None`` for tests / NoopNotifier paths — every
+        # pill-related call becomes a no-op.
+        self._hud_launcher = getattr(notifier, "launcher", None)
+        if self._hud_launcher is not None:
+            self._hud_launcher.set_pill_stop_callback(self._on_pill_stop_clicked)
         self._data_dir = data_dir
 
         # Per-session dedup for seen-apps writes. Keyed by lower-cased
@@ -469,6 +477,26 @@ class ArmController:
         ):
             await self._disarm_internal(SessionCloseReason.HOTKEY_END)
 
+    def _on_pill_stop_clicked(self) -> None:
+        """User clicked the HUD pill's stop button — disarm immediately.
+
+        Called from :class:`HudLauncher`'s stdout reader, which runs on
+        the agent's asyncio loop. The pill stop button is an explicit
+        UI action, no confirmation is shown — going through the
+        confirm-toast path on top of the click would feel double-tappy.
+        """
+        if self.state != ArmState.ARMED:
+            return
+        loop = self._loop
+        if loop is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._disarm_internal(SessionCloseReason.HOTKEY_END), loop,
+            )
+        except Exception:
+            log.warning("[arm] pill_stop schedule failed", exc_info=True)
+
     async def _race_confirm_with_double_tap(
         self, title: str, body: str, yes_label: str, no_label: str,
     ) -> bool:
@@ -619,6 +647,18 @@ class ArmController:
             )
             return
 
+        # Show the persistent HUD pill — live timer + arm-reason label
+        # + stop button. Mirrors the agent's arm state so the user
+        # always knows it's running. The pill stays visible until
+        # _disarm_internal hides it.
+        if self._hud_launcher is not None:
+            self._hud_launcher.show_pill(
+                reason=reason.source,
+                reason_label=(reason.display_name or reason.source.capitalize()),
+                start_ts=time.time(),
+                hotkey=self.current_hotkey,
+            )
+
         # Post-arm guidance toast AFTER streams confirmed open, so we
         # don't tell the user we're capturing while the mic driver is
         # still coming up (and they might start speaking into a silent
@@ -690,6 +730,12 @@ class ArmController:
         self.armed_event.clear()
         log.info("[arm] DISARMED (reason=%s)", close_reason.value)
         self._fire_state_change()
+
+        # Hide the HUD pill the moment the state flip lands — same
+        # ordering rationale as the tray-callback fire (UI should
+        # reflect the user's decision before stream tear-down latency).
+        if self._hud_launcher is not None:
+            self._hud_launcher.hide_pill()
 
         try:
             await self.mic.stop()

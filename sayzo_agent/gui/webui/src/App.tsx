@@ -6,7 +6,6 @@ import { FinishSignup } from "./screens/FinishSignup";
 import { Microphone } from "./screens/Microphone";
 import { AudioCapture } from "./screens/AudioCapture";
 import { Accessibility } from "./screens/Accessibility";
-import { Notifications } from "./screens/Notifications";
 import { Shortcut } from "./screens/Shortcut";
 import { Done } from "./screens/Done";
 import { Alert } from "./components/ui/Alert";
@@ -15,13 +14,17 @@ import { Alert } from "./components/ui/Alert";
 // skippable if the user is already signed in. Everything after is a
 // straight walk to the Done screen.
 //
-// macOS (7): welcome → microphone → audio-capture → accessibility →
-//            notifications → shortcut → done
+// v2.10 removed the "notifications" screen on both platforms — the
+// custom HUD overlay owns the notification surface end-to-end and
+// doesn't depend on the OS notification permission.
+//
+// macOS (6): welcome → microphone → audio-capture → accessibility →
+//            shortcut → done
 //   (Accessibility doubles as the gate for the global hotkey AND the
 //   AX-based web meeting detector — there's no separate Automation
 //   screen, since reading browser tab URLs would force the scary
 //   "Sayzo wants to control your browser" TCC dialog.)
-// Windows (4): welcome → notifications → shortcut → done
+// Windows (3): welcome → shortcut → done
 //
 // "finish-signup" is an out-of-sequence screen inserted between welcome
 // and the first permission screen whenever the server reports the
@@ -34,7 +37,6 @@ type Screen =
   | "microphone"
   | "audio-capture"
   | "accessibility"
-  | "notifications"
   | "shortcut"
   | "done";
 
@@ -55,12 +57,11 @@ function sequenceFor(platform: string): Screen[] {
       "microphone",
       "audio-capture",
       "accessibility",
-      "notifications",
       "shortcut",
       "done",
     ];
   }
-  return ["welcome", "notifications", "shortcut", "done"];
+  return ["welcome", "shortcut", "done"];
 }
 
 function initialScreen(
@@ -256,15 +257,6 @@ export function App() {
       return (
         <Accessibility
           step={step!}
-          onNext={advance}
-          onCancel={handleCancel}
-        />
-      );
-    case "notifications":
-      return (
-        <Notifications
-          step={step!}
-          platform={config.platform}
           onNext={advance}
           onCancel={handleCancel}
         />

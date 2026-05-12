@@ -129,9 +129,49 @@ function installCapturesPreviewBridge(): void {
   }
 }
 
+function installHudPreviewBridge(): void {
+  // The HUD has no Python methods it needs to call during preview except
+  // `hud_event` (used to ship card / actionable responses back to the
+  // launcher). In mock mode we just log those — there's no parent process
+  // to receive them.
+  console.info("[mock-bridge] HUD preview");
+  const overrides: Record<string, (...args: unknown[]) => Promise<unknown>> = {
+    hud_event: async (payload: unknown) => {
+      console.info("[mock-bridge] hud_event", payload);
+      return null;
+    },
+  };
+  const stubApi = makeStubApi(overrides);
+  (window as unknown as Record<string, unknown>).pywebview = { api: stubApi };
+
+  // Force the HUD route (and any specific preview hint) into the hash if
+  // not already there. Lets `npm run dev:hud` open the browser straight
+  // onto the HUD without having to type the fragment by hand.
+  const hash = window.location.hash.replace(/^#/, "");
+  const params = new URLSearchParams(hash);
+  if (params.get("route") !== "hud") {
+    params.set("route", "hud");
+  }
+  // Enable the demo control strip by default in dev mock mode so the
+  // user can click through each event type. Production startup never
+  // hits this branch.
+  if (!params.has("demo")) {
+    params.set("demo", "1");
+  }
+  window.location.hash = params.toString();
+}
+
 if (MOCK_ON && typeof window !== "undefined") {
-  if (readPreviewScreen() === "finish-signup") {
+  const preview = readPreviewScreen();
+  if (preview === "finish-signup") {
     installFinishSignupPreviewBridge();
+  } else if (preview && preview.startsWith("hud-")) {
+    installHudPreviewBridge();
+  } else if (
+    new URLSearchParams(window.location.hash.replace(/^#/, "")).get("route") ===
+    "hud"
+  ) {
+    installHudPreviewBridge();
   } else {
     installCapturesPreviewBridge();
   }

@@ -1,0 +1,415 @@
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { Sparkles } from "lucide-react";
+import { hudBridge, HudCommand } from "./lib/hud-bridge";
+import { HudShell } from "./hud/HudShell";
+import { StatePill } from "./hud/StatePill";
+import { DotIndicator } from "./hud/DotIndicator";
+import { ConsentCard } from "./hud/ConsentCard";
+import { InfoToast } from "./hud/InfoToast";
+import { ActionableToast } from "./hud/ActionableToast";
+import { HudCard } from "./hud/HudCard";
+
+// Top-right HUD root. Owns the state machine: pill visibility / collapsed,
+// queued consent cards (FIFO, one at a time), stacked toasts, the
+// daily-drill actionable. Subscribes to incoming commands from Python
+// via window.hudBridge.dispatch; emits responses via hudBridge.sendEvent.
+
+interface PillState {
+  reason: string;
+  reasonLabel: string;
+  startTs: number;
+  hotkey: string;
+  collapsed: boolean;
+}
+
+interface CardState {
+  request_id: string;
+  title: string;
+  body: string;
+  yes_label: string;
+  no_label: string;
+  timeout_secs: number;
+}
+
+interface ToastState {
+  id: string;
+  title: string;
+  body: string;
+  ttl_secs: number;
+}
+
+interface ActionableState {
+  request_id: string;
+  title: string;
+  body: string;
+  button_label: string;
+  expire_after_secs: number;
+}
+
+const MAX_VISIBLE_TOASTS = 3;
+
+function previewLabelFor(kind: string): string {
+  switch (kind) {
+    case "hud-pill":
+      return "show pill";
+    case "hud-dot":
+      return "collapse to dot";
+    case "hud-card":
+      return "fire consent card";
+    case "hud-toast":
+      return "fire info toast";
+    case "hud-actionable":
+      return "fire actionable";
+    default:
+      return kind;
+  }
+}
+
+export function HudApp() {
+  const [pill, setPill] = useState<PillState | null>(null);
+  const [cards, setCards] = useState<CardState[]>([]);
+  const [toasts, setToasts] = useState<ToastState[]>([]);
+  const [actionable, setActionable] = useState<ActionableState | null>(null);
+  const [demoMode, setDemoMode] = useState(false);
+  // Combined mic + system audio level (max of the two). `undefined`
+  // means no real audio is streaming and the Waveform self-animates;
+  // a defined value flips it into "react to real audio" mode.
+  const [audioLevel, setAudioLevel] = useState<number | undefined>(undefined);
+
+  // Force a re-render path for demo mode if the hash hints at it.
+  useEffect(() => {
+    const hash = window.location.hash.replace(/^#/, "");
+    const params = new URLSearchParams(hash);
+    if (params.get("demo") === "1") {
+      setDemoMode(true);
+    }
+  }, []);
+
+  // Subscribe to incoming commands from Python. The bridge buffers any
+  // commands that arrive before the first subscriber attaches (e.g. cold
+  // boot races where the launcher writes before React mounts), and
+  // flushes them on subscribe.
+  useEffect(() => {
+    const unsub = hudBridge.subscribe((cmd: HudCommand) => {
+      switch (cmd.cmd) {
+        case "show_pill":
+          setPill({
+            reason: cmd.reason,
+            reasonLabel: cmd.reason_label,
+            startTs: cmd.start_ts,
+            hotkey: cmd.hotkey,
+            collapsed: false,
+          });
+          break;
+        case "hide_pill":
+          setPill(null);
+          break;
+        case "set_pill_collapsed":
+          setPill((p) => (p ? { ...p, collapsed: cmd.collapsed } : p));
+          break;
+        case "set_audio_levels":
+          // Display the louder of mic/system. The waveform is a single
+          // bar group — splitting into two columns could come later
+          // but adds visual noise on the compact pill.
+          setAudioLevel(Math.max(0, Math.min(1, Math.max(cmd.mic, cmd.system))));
+          break;
+        case "show_card":
+          setCards((cs) => [
+            ...cs,
+            {
+              request_id: cmd.request_id,
+              title: cmd.title,
+              body: cmd.body,
+              yes_label: cmd.yes_label,
+              no_label: cmd.no_label,
+              timeout_secs: cmd.timeout_secs,
+            },
+          ]);
+          break;
+        case "show_toast":
+          setToasts((ts) => {
+            const next = [...ts, {
+              id: cmd.id,
+              title: cmd.title,
+              body: cmd.body,
+              ttl_secs: cmd.ttl_secs,
+            }];
+            // Evict oldest if we go over the visible cap.
+            return next.slice(-MAX_VISIBLE_TOASTS);
+          });
+          break;
+        case "show_actionable":
+          setActionable({
+            request_id: cmd.request_id,
+            title: cmd.title,
+            body: cmd.body,
+            button_label: cmd.button_label,
+            expire_after_secs: cmd.expire_after_secs,
+          });
+          break;
+        case "hide_all":
+          setPill(null);
+          setCards([]);
+          setToasts([]);
+          setActionable(null);
+          break;
+        case "demo_mode":
+          setDemoMode(cmd.on);
+          break;
+      }
+    });
+
+    // Signal readiness — the launcher's stdout reader unblocks any
+    // buffered show_* commands when it sees this. Wrapped in a single
+    // microtask so the subscriber above is registered before any
+    // dispatch round-trip happens through evaluate_js.
+    queueMicrotask(() => hudBridge.markReadyOnce());
+
+    return unsub;
+  }, []);
+
+  const handleCardAnswer = useCallback(
+    (request_id: string, answer: "yes" | "no" | "timeout") => {
+      setCards((cs) => cs.filter((c) => c.request_id !== request_id));
+      void hudBridge.sendEvent({
+        event: "card_response",
+        request_id,
+        answer,
+      });
+    },
+    [],
+  );
+
+  const handleToastExpire = useCallback((id: string) => {
+    setToasts((ts) => ts.filter((t) => t.id !== id));
+  }, []);
+
+  const handleActionable = useCallback(
+    (request_id: string, outcome: "pressed" | "expired") => {
+      setActionable(null);
+      void hudBridge.sendEvent({
+        event: "actionable_response",
+        request_id,
+        outcome,
+      });
+    },
+    [],
+  );
+
+  const handlePillStop = useCallback(() => {
+    // Optimistic local hide — matches what production does anyway:
+    // ArmController._on_pill_stop_clicked triggers _disarm_internal,
+    // which calls launcher.hide_pill() to clear the pill. The agent's
+    // own hide_pill round-trip lands shortly after; it's idempotent
+    // (the pill is already gone). Without this optimistic clear the
+    // demo preview (which has no launcher reading stdout) would leave
+    // the pill on screen after stop, which is misleading.
+    setPill(null);
+    void hudBridge.sendEvent({ event: "pill_stop_clicked" });
+  }, []);
+
+  const handlePillCollapse = useCallback(() => {
+    setPill((p) => (p ? { ...p, collapsed: true } : p));
+    void hudBridge.sendEvent({ event: "pill_collapsed" });
+  }, []);
+
+  const handlePillExpand = useCallback(() => {
+    setPill((p) => (p ? { ...p, collapsed: false } : p));
+    void hudBridge.sendEvent({ event: "pill_expanded" });
+  }, []);
+
+  // Only the FIFO head card is visible. Queued cards wait their turn.
+  const activeCard = cards[0] ?? null;
+
+  // Demo controls — dispatch synthetic commands into the bridge so the
+  // exact same code path the production launcher uses also drives the
+  // preview. No mock state, no parallel renderers.
+  const demoActions = useMemo(
+    () => [
+      {
+        key: "hud-pill",
+        run: () =>
+          hudBridge.dispatch({
+            cmd: "show_pill",
+            reason: "hotkey",
+            reason_label: "Hotkey",
+            start_ts: Date.now() / 1000,
+            hotkey: "Ctrl+Alt+S",
+          }),
+      },
+      {
+        key: "hud-pill-zoom",
+        run: () =>
+          hudBridge.dispatch({
+            cmd: "show_pill",
+            reason: "whitelist",
+            reason_label: "Zoom",
+            start_ts: Date.now() / 1000 - 752,
+            hotkey: "Ctrl+Alt+S",
+          }),
+      },
+      {
+        key: "hud-dot",
+        run: () =>
+          hudBridge.dispatch({ cmd: "set_pill_collapsed", collapsed: true }),
+      },
+      {
+        key: "hud-card",
+        run: () =>
+          hudBridge.dispatch({
+            cmd: "show_card",
+            request_id: `demo-${Date.now()}`,
+            title: "Sayzo is ready to coach you",
+            body: "Looks like you're in Zoom. Want us to capture this call for personalized speaking drills?",
+            yes_label: "Start coaching",
+            no_label: "Not now",
+            timeout_secs: 15,
+          }),
+      },
+      {
+        key: "hud-card-end",
+        run: () =>
+          hudBridge.dispatch({
+            cmd: "show_card",
+            request_id: `demo-${Date.now()}`,
+            title: "Was that the end of your meeting?",
+            body: "It's been quiet for a bit. Wrap up and save, or keep going?",
+            yes_label: "Wrap up",
+            no_label: "Keep going",
+            timeout_secs: 12,
+          }),
+      },
+      {
+        key: "hud-toast",
+        run: () =>
+          hudBridge.dispatch({
+            cmd: "show_toast",
+            id: `toast-${Date.now()}`,
+            title: "Conversation saved",
+            body: "Discussion about Q4 targets · 2m 34s",
+            ttl_secs: 4,
+          }),
+      },
+      {
+        key: "hud-actionable",
+        run: () =>
+          hudBridge.dispatch({
+            cmd: "show_actionable",
+            request_id: `actionable-${Date.now()}`,
+            title: "Daily speaking drill",
+            body: "Two minutes today — practice the filler-word habit you've been working on.",
+            button_label: "Open drill",
+            expire_after_secs: 30,
+          }),
+      },
+      {
+        key: "hud-hide",
+        run: () => hudBridge.dispatch({ cmd: "hide_all" }),
+      },
+    ],
+    [],
+  );
+
+  // Auto-fire one preview command if the URL hints at a specific scenario.
+  // Lets `npm run dev:hud-card` open straight to the consent card view
+  // without manual interaction.
+  useEffect(() => {
+    const hash = window.location.hash.replace(/^#/, "");
+    const params = new URLSearchParams(hash);
+    const preview = params.get("preview");
+    if (!preview) return;
+    const match = demoActions.find((a) => a.key === preview);
+    if (!match) return;
+    // For card / actionable previews, also show the pill underneath so
+    // the layered look matches production.
+    if (preview === "hud-card" || preview === "hud-card-end" || preview === "hud-actionable") {
+      hudBridge.dispatch({
+        cmd: "show_pill",
+        reason: "hotkey",
+        reason_label: "Hotkey",
+        start_ts: Date.now() / 1000 - 35,
+        hotkey: "Ctrl+Alt+S",
+      });
+    }
+    const id = setTimeout(() => match.run(), 100);
+    return () => clearTimeout(id);
+  }, [demoActions]);
+
+  return (
+    <HudShell>
+      {/* Base layer: pill or dot, shown only while armed. */}
+      {pill && !pill.collapsed && (
+        <StatePill
+          audioLevel={audioLevel}
+          onStop={handlePillStop}
+          onCollapse={handlePillCollapse}
+        />
+      )}
+      {pill && pill.collapsed && (
+        <DotIndicator onExpand={handlePillExpand} />
+      )}
+
+      {/* Toasts: stacked, oldest at top, newest at bottom. */}
+      {toasts.map((t) => (
+        <InfoToast
+          key={t.id}
+          title={t.title}
+          body={t.body}
+          ttlSecs={t.ttl_secs}
+          onExpire={() => handleToastExpire(t.id)}
+        />
+      ))}
+
+      {/* FIFO consent card. Only the head is rendered. */}
+      {activeCard && (
+        <ConsentCard
+          key={activeCard.request_id}
+          title={activeCard.title}
+          body={activeCard.body}
+          yesLabel={activeCard.yes_label}
+          noLabel={activeCard.no_label}
+          timeoutSecs={activeCard.timeout_secs}
+          onAnswer={(a) => handleCardAnswer(activeCard.request_id, a)}
+        />
+      )}
+
+      {/* Actionable (daily drill). */}
+      {actionable && (
+        <ActionableToast
+          key={actionable.request_id}
+          title={actionable.title}
+          body={actionable.body}
+          buttonLabel={actionable.button_label}
+          expireAfterSecs={actionable.expire_after_secs}
+          onOutcome={(o) => handleActionable(actionable.request_id, o)}
+        />
+      )}
+
+      {/* Demo control strip. Visible only with #demo=1 or after the
+          launcher sends the demo_mode command. Lets a developer click
+          through each event type against the real frameless window. */}
+      {demoMode && (
+        <div className="mt-auto">
+          <HudCard className="px-2 pb-2 pt-1">
+            <div className="mt-1 flex items-center gap-1.5 px-1 text-[10px] uppercase tracking-wider text-ink-muted">
+              <Sparkles size={11} />
+              Demo controls
+            </div>
+            <div className="mt-1.5 grid grid-cols-2 gap-1.5">
+              {demoActions.map((a) => (
+                <button
+                  key={a.key}
+                  type="button"
+                  onClick={a.run}
+                  className="hud-no-drag rounded-md bg-gray-50 px-2 py-1.5 text-left text-[11px] font-medium text-ink-muted transition hover:bg-gray-100 hover:text-ink"
+                >
+                  {previewLabelFor(a.key) || a.key}
+                </button>
+              ))}
+            </div>
+          </HudCard>
+        </div>
+      )}
+    </HudShell>
+  );
+}

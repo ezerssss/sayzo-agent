@@ -149,8 +149,8 @@ class TrayState:
     _starting: bool = False
 
     # Shared notifier reference set by ``_build_pipeline_state`` once the
-    # desktop-notifier backend is constructed. Read by anything that needs
-    # to surface a toast outside the asyncio loop's normal flow — e.g. the
+    # HUD launcher has been constructed. Read by anything that needs to
+    # surface a toast outside the asyncio loop's normal flow — e.g. the
     # pre-quit hook below.
     notifier: Any = None
 
