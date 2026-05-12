@@ -135,6 +135,7 @@ async def test_check_returns_update_when_newer(monkeypatch: pytest.MonkeyPatch) 
         version="0.1.1",
         url="https://sayzo.app/releases/windows/sayzo-setup.exe",
         notes="Quiet the STT hallucination on idle.",
+        sha256="deadbeef",
     )
 
 
@@ -182,5 +183,21 @@ async def test_check_handles_malformed_version_field(
     monkeypatch.setattr(sys, "platform", "win32")
     bad = {**_GOOD_MANIFEST, "version": "not-a-version"}
     async with httpx.AsyncClient(transport=_transport(200, bad)) as client:
+        info = await check("0.1.0", client=client, url="https://example.com/latest.json")
+    assert info is None
+
+
+async def test_check_refuses_manifest_without_sha256(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A manifest missing sha256 (tampered, or pre-Phase-B CI artifact) must
+    # not advertise an update — Phase B's stager refuses to download anything
+    # without an integrity check, so propagating None here is safer.
+    monkeypatch.setattr(sys, "platform", "win32")
+    no_hash = {
+        **_GOOD_MANIFEST,
+        "windows": {"url": "https://sayzo.app/releases/windows/sayzo-setup.exe"},
+    }
+    async with httpx.AsyncClient(transport=_transport(200, no_hash)) as client:
         info = await check("0.1.0", client=client, url="https://example.com/latest.json")
     assert info is None

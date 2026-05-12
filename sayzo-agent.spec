@@ -420,3 +420,19 @@ if sys.platform == "darwin":
     _dst_plist = _launch_agents_dir / "com.sayzo.agent.plist"
     _dst_plist.write_bytes(_src_plist.read_bytes())
     print(f"sayzo-agent.spec: bundled LaunchAgent plist at {_dst_plist}")
+
+    # Auto-update apply helper (Phase B). Lives at Contents/Resources/ so the
+    # Python wrapper in sayzo_agent/update_apply_mac.py can locate it via
+    # sys.executable -> ../Resources/apply_update.sh. PyInstaller's `datas`
+    # mechanism copies files but doesn't preserve the executable bit on every
+    # filesystem; the post-build write + chmod pattern guarantees +x survives
+    # the path from a git-checked-out source file to the signed .app. Must
+    # happen BEFORE codesign — Apple's signature covers every byte under
+    # Contents/.
+    _resources_dir = _bundle_path / "Contents" / "Resources"
+    _resources_dir.mkdir(parents=True, exist_ok=True)
+    _src_apply = Path("installer/macos/apply_update.sh")
+    _dst_apply = _resources_dir / "apply_update.sh"
+    _dst_apply.write_bytes(_src_apply.read_bytes())
+    _dst_apply.chmod(0o755)
+    print(f"sayzo-agent.spec: bundled apply_update.sh at {_dst_apply}")

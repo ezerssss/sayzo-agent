@@ -29,6 +29,7 @@ class UpdateInfo:
     version: str
     url: str
     notes: str
+    sha256: str
 
 
 def platform_key() -> Optional[str]:
@@ -122,5 +123,17 @@ async def check(
     if not isinstance(dl_url, str) or not dl_url:
         return None
 
+    # sha256 is required for Phase B auto-install. CI's latest.json generator
+    # always emits it (see .github/workflows/build.yml). A manifest without
+    # sha256 is either tampered or a pre-Phase-B CI artifact — refuse to
+    # advertise it as an update rather than downloading something we can't
+    # integrity-check.
+    sha256 = platform_entry.get("sha256")
+    if not isinstance(sha256, str) or not sha256:
+        log.warning(
+            "[update] manifest %s entry missing sha256 — refusing update", pkey
+        )
+        return None
+
     notes = data.get("notes") if isinstance(data.get("notes"), str) else ""
-    return UpdateInfo(version=advertised, url=dl_url, notes=notes)
+    return UpdateInfo(version=advertised, url=dl_url, notes=notes, sha256=sha256)

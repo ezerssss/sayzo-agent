@@ -1125,6 +1125,38 @@ def service(force_setup: bool) -> None:
     from . import __version__
     log.warning("sayzo-agent service starting v%s (pid=%d)", __version__, os.getpid())
 
+    # Auto-update boot-time apply. Handles the "user rebooted before
+    # quitting" case: launchd / Task Scheduler boots the OLD agent that
+    # was on disk before the swap, we detect a newer staged version, and
+    # hand off to the installer / swap helper before any heavy work
+    # starts. ``apply_staged_if_newer`` only returns when there's nothing
+    # to apply (or spawn raised) — on success the helper calls
+    # ``os._exit`` inside and we never reach the rest of ``service()``.
+    # The kernel pidfile lock released by os._exit lets the new agent
+    # acquire it cleanly when it relaunches.
+    from .update_apply import apply_staged_if_newer
+    apply_staged_if_newer(cfg.data_dir, __version__, where="boot")
+
+    # Post-upgrade detection. ``last_seen_version.txt`` is the
+    # source-of-truth for "what we ran last time"; if it's strictly older
+    # than ``__version__`` we just successfully applied an auto-update —
+    # clear the now-obsolete stage and queue the "Sayzo updated" toast for
+    # after the notifier is constructed downstream (see _build_pipeline_state).
+    from .last_version import read_last_seen, write_last_seen
+    from .update import is_newer as _update_is_newer
+    from .update_stage import clear_staged
+
+    _prior_version = read_last_seen(cfg.data_dir)
+    _pending_upgrade_toast: typing.Optional[tuple[str, str]] = None
+    if _prior_version is not None and _update_is_newer(_prior_version, __version__):
+        log.warning(
+            "[update] post-upgrade detected: prior=v%s now=v%s",
+            _prior_version, __version__,
+        )
+        _pending_upgrade_toast = (_prior_version, __version__)
+        clear_staged(cfg.data_dir)
+    write_last_seen(cfg.data_dir, __version__)
+
     # macOS bundle self-heal: strip the com.apple.quarantine xattr and,
     # for unsigned dev builds only, ad-hoc-sign the Swift helpers so
     # they can spawn under Apple Silicon's mandatory-signature loader.
@@ -1306,6 +1338,25 @@ def service(force_setup: bool) -> None:
             make_notifier(app_name=APP_AUMID)
             if cfg.notifications_enabled else NoopNotifier()
         )
+
+        # Fire the post-upgrade toast queued by the boot-time last_version
+        # check above. Best-effort: any notifier failure logs but doesn't
+        # block agent startup. Toast title intentionally omits the prior
+        # version — users don't care what they upgraded FROM, only that
+        # they're now on the latest.
+        if _pending_upgrade_toast is not None and cfg.notifications_enabled:
+            try:
+                _prior_v, _now_v = _pending_upgrade_toast
+                notifier.notify(
+                    "Sayzo updated",
+                    f"Now running v{_now_v}.",
+                )
+                log.info(
+                    "[update] post-upgrade toast fired (v%s -> v%s)",
+                    _prior_v, _now_v,
+                )
+            except Exception:
+                log.warning("[update] post-upgrade toast failed", exc_info=True)
 
         # Daily-drill scheduler — per-workday notification opening that day's
         # 60-second drill in the user's default browser. Constructed only when
@@ -1804,16 +1855,27 @@ def service(force_setup: bool) -> None:
                     tray.update()
                     last_hotkey = cur_hotkey
 
-        # Best-effort update check. Surfaces "Download Sayzo vX.Y.Z" in the
-        # tray menu + fires ONE toast per newly-discovered version when the
-        # public manifest at sayzo.app/releases/latest.json advertises
-        # something newer than our installed __version__. Failures are logged
+        # Phase B auto-update: poll the manifest, background-download the new
+        # release into ``<data_dir>/staged_update/``, verify SHA256. The
+        # actual swap happens at the NEXT agent restart (tray Quit, OS
+        # reboot, or boot-time apply path) — see ``apply_staged_if_newer``
+        # call sites in ``service()`` for the apply half. We deliberately do
+        # NOT fire a "click to download" toast anymore: the new UX is silent
+        # download + after-the-fact "Sayzo updated to vX.Y.Z" toast on next
+        # boot. The tray "Download Sayzo vX.Y.Z" item stays as a visible
+        # signal that an update is staged, but the click-to-browser fallback
+        # is preserved for users who explicitly want it. Failures are logged
         # and swallowed — auto-update must never break capture. The two env
         # overrides exist so the E2E test in the plan's Verification section
         # can trigger a check in seconds instead of hours.
         async def _update_check() -> None:
             from . import __version__
             from .update import check
+            from .update_stage import (
+                clear_staged,
+                download_and_stage,
+                read_staged,
+            )
             from .gui.tray import UpdateOffer
 
             initial_delay = float(
@@ -1827,7 +1889,6 @@ def service(force_setup: bool) -> None:
             except asyncio.CancelledError:
                 return
 
-            notified_versions: set[str] = set()
             while not agent._stop.is_set():
                 try:
                     info = await check(__version__)
@@ -1838,25 +1899,41 @@ def service(force_setup: bool) -> None:
                 if info is None:
                     tray_state.set_update_offer(None)
                 else:
-                    tray_state.set_update_offer(
-                        UpdateOffer(version=info.version, url=info.url)
-                    )
-                    if info.version not in notified_versions:
-                        notified_versions.add(info.version)
-                        body = info.notes or f"v{info.version} is ready to install."
-                        # Dispatch the toast on the heavy-worker executor to
-                        # match the sink's invariant: on Windows, WinRT pins
-                        # its COM apartment to whichever thread first builds
-                        # the backend, so every notify() call must go through
-                        # the same executor. See sink.py:530 + notify.py
-                        # docstring for the full rationale.
-                        try:
-                            await loop.run_in_executor(
-                                agent._executor, notifier.notify,
-                                "Sayzo update available", body,
+                    # Avoid re-downloading the same release on every poll.
+                    # If the stage on disk already matches what the manifest
+                    # advertises, we're done until a newer version ships.
+                    current_stage = read_staged(cfg.data_dir)
+                    if current_stage is not None and current_stage.version == info.version:
+                        log.info(
+                            "[update] v%s already staged at %s",
+                            info.version, current_stage.payload_path,
+                        )
+                        tray_state.set_update_offer(
+                            UpdateOffer(version=info.version, url=info.url)
+                        )
+                    else:
+                        if current_stage is not None:
+                            # Older stage on disk, newer one in manifest.
+                            # Wipe the old before we re-stage so two
+                            # payloads don't coexist mid-download.
+                            log.info(
+                                "[update] replacing stale stage v%s with v%s",
+                                current_stage.version, info.version,
                             )
+                            clear_staged(cfg.data_dir)
+                        try:
+                            staged = await download_and_stage(info, cfg.data_dir)
                         except Exception:
-                            log.warning("[update] toast failed", exc_info=True)
+                            log.warning(
+                                "[update] download_and_stage raised", exc_info=True
+                            )
+                            staged = None
+                        if staged is not None:
+                            tray_state.set_update_offer(
+                                UpdateOffer(
+                                    version=staged.version, url=info.url
+                                )
+                            )
 
                 try:
                     await asyncio.sleep(interval)
@@ -1999,6 +2076,14 @@ def service(force_setup: bool) -> None:
                     agent.stop()
                 worker.join(timeout=5)
                 log.warning("tray quit — killing process group and exiting")
+
+                # Apply-at-quit (Phase B). If a staged update is ready, the
+                # swap helper takes over here (Popen with start_new_session
+                # so it survives the killpg below). On success the helper
+                # calls os._exit and we never reach remove_pid / killpg.
+                # On no-op / spawn failure, fall through to normal shutdown.
+                apply_staged_if_newer(cfg.data_dir, __version__, where="quit")
+
                 remove_pid(cfg.pid_path)
                 # Best-effort: pkill any remaining direct children that may
                 # have escaped the process group (WebKit XPC helpers).
@@ -2036,6 +2121,12 @@ def service(force_setup: bool) -> None:
         pass
     finally:
         tray.stop()
+        # Apply-at-quit (Phase B). If a staged update is ready, the silent
+        # installer takes over here. On success it spawns detached with /S
+        # and we never reach remove_pid (the installer's taskkill /F kills
+        # us mid-finally; the kernel mutex releases automatically). On
+        # no-op / spawn failure, fall through to normal shutdown.
+        apply_staged_if_newer(cfg.data_dir, __version__, where="quit")
         remove_pid(cfg.pid_path)
         log.warning("sayzo-agent service stopped")
 
