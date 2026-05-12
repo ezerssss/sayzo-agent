@@ -361,3 +361,62 @@ def _async_returning(value: Any):
     async def _coro(*args: Any, **kwargs: Any) -> Any:
         return value
     return _coro
+
+
+# ---------------------------------------------------------------------------
+# Recording pane: get/set_recording_setting
+# ---------------------------------------------------------------------------
+
+
+def test_get_recording_settings_reflects_endpoint_default(cfg: Config) -> None:
+    """Fresh config (post-v2.9.0 default flip): per_app_capture should be False
+    because system_scope defaults to 'endpoint'."""
+    b = Bridge(cfg)
+    assert b.get_recording_settings() == {"per_app_capture": False}
+
+
+def test_get_recording_settings_reflects_arm_app_override(cfg: Config) -> None:
+    """User has opted into per-app capture (Beta toggle on)."""
+    cfg.capture.system_scope = "arm_app"  # type: ignore[assignment]
+    b = Bridge(cfg)
+    assert b.get_recording_settings() == {"per_app_capture": True}
+
+
+def test_set_recording_setting_enables_per_app(cfg: Config) -> None:
+    """Toggle on: cfg mutates, user_settings.json gets the new scope,
+    requires_restart=True is returned."""
+    from sayzo_agent import settings_store as ss
+
+    b = Bridge(cfg)
+    result = b.set_recording_setting("per_app_capture", True)
+
+    assert result == {"saved": True, "requires_restart": True}
+    assert cfg.capture.system_scope == "arm_app"
+    persisted = ss.load(cfg.data_dir)
+    assert persisted == {"capture": {"system_scope": "arm_app"}}
+
+
+def test_set_recording_setting_disables_per_app(cfg: Config) -> None:
+    """Toggle off: persists 'endpoint' explicitly so the user's choice
+    survives even if the default flips again later."""
+    from sayzo_agent import settings_store as ss
+
+    cfg.capture.system_scope = "arm_app"  # type: ignore[assignment]
+    b = Bridge(cfg)
+    result = b.set_recording_setting("per_app_capture", False)
+
+    assert result == {"saved": True, "requires_restart": True}
+    assert cfg.capture.system_scope == "endpoint"
+    persisted = ss.load(cfg.data_dir)
+    assert persisted == {"capture": {"system_scope": "endpoint"}}
+
+
+def test_set_recording_setting_rejects_unknown_key(cfg: Config) -> None:
+    """Defensive: future-self adds a new key in TS without wiring Python.
+    We don't want a silent no-op + saved=True; we want a clear error."""
+    b = Bridge(cfg)
+    result = b.set_recording_setting("bogus", True)
+    assert result["saved"] is False
+    assert "unknown recording key" in result["error"]
+    # cfg untouched.
+    assert cfg.capture.system_scope == "endpoint"

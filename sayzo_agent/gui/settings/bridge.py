@@ -553,6 +553,60 @@ class Bridge:
         return {"saved": True}
 
     # ------------------------------------------------------------------
+    # JS-callable methods — Recording
+    # ------------------------------------------------------------------
+
+    def get_recording_settings(self) -> dict[str, bool]:
+        """Read recording-pane toggle state from the live ``Config`` overlay.
+
+        ``per_app_capture`` is the inverse-mapped view of
+        ``cfg.capture.system_scope``: True ⇒ ``arm_app`` (per-app capture
+        enabled), False ⇒ ``endpoint`` (whole-system capture). The Settings
+        pane phrases it as opt-in to per-app to match the beta framing.
+        """
+        return {
+            "per_app_capture": self._cfg.capture.system_scope == "arm_app",
+        }
+
+    def set_recording_setting(self, key: str, value: bool) -> dict[str, Any]:
+        """Persist a single recording-pane toggle.
+
+        Returns ``requires_restart=True`` because the capture pipeline is
+        constructed once at agent startup (``app.py`` builds ``SystemCapture``
+        with the config-time ``system_scope``) and isn't reconstructed
+        between arms. The Settings UI surfaces this to the user. Live
+        reload would require restructuring the Agent lifecycle and is out
+        of scope for the beta rollout.
+        """
+        if key != "per_app_capture":
+            return {"saved": False, "error": f"unknown recording key: {key}"}
+
+        coerced = bool(value)
+        new_scope = "arm_app" if coerced else "endpoint"
+
+        try:
+            self._cfg.capture.system_scope = new_scope  # type: ignore[assignment]
+        except Exception:
+            log.debug(
+                "[settings.bridge] cfg.capture.system_scope mutation failed",
+                exc_info=True,
+            )
+
+        try:
+            settings_store.save(
+                self._cfg.data_dir,
+                {"capture": {"system_scope": new_scope}},
+            )
+        except Exception:
+            log.warning(
+                "[settings.bridge] persist recording setting %s failed",
+                key, exc_info=True,
+            )
+            return {"saved": False, "error": "couldn't write user_settings.json"}
+
+        return {"saved": True, "requires_restart": True}
+
+    # ------------------------------------------------------------------
     # JS-callable methods — Permissions
     # ------------------------------------------------------------------
 

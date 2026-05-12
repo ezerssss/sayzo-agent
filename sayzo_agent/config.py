@@ -22,20 +22,27 @@ class CaptureConfig(BaseSettings):
     mic_device: str | None = None  # None = default input
     sys_device: str | None = None  # None = default loopback
 
-    # v1.7.0: per-app system-audio scoping. When the agent arms for a
-    # specific app (whitelist consent, or hotkey smart-guess identified
-    # a mic-holder), the system-audio capture scopes to just that app's
-    # PIDs via WASAPI process loopback on Windows / CoreAudio process tap
-    # include-list on macOS. Prevents Spotify / YouTube bleeding into a
-    # Zoom capture.
+    # System-audio scoping mode. Picks between capturing only the meeting
+    # app's audio vs. all system audio output.
     #
-    # - ``arm_app`` (default): scope to the armed app's PIDs when known,
-    #   fall back to endpoint-wide loopback otherwise (older OS builds,
-    #   activation failures, hotkey with no mic-holder).
-    # - ``endpoint``: always use endpoint-wide loopback, like pre-v1.7.0.
-    #   Safety valve for users on unusual configurations where per-app
-    #   capture misbehaves — ``SAYZO_CAPTURE__SYSTEM_SCOPE=endpoint``.
-    system_scope: Literal["arm_app", "endpoint"] = "arm_app"
+    # - ``endpoint`` (default since v2.9.0): whole-system loopback —
+    #   WASAPI loopback against the default render endpoint on Windows /
+    #   global CoreAudio Process Tap on macOS. Matches what Granola /
+    #   Krisp / most AI meeting note-takers do. Works reliably across
+    #   Chrome versions, OS minor versions, and EDR-managed Macs. Cost:
+    #   if you have Spotify or background apps playing during a meeting,
+    #   their audio ends up in the capture too.
+    # - ``arm_app`` (BETA, opt-in via Settings → Recording → "Per-app
+    #   audio capture (Beta)" or ``SAYZO_CAPTURE__SYSTEM_SCOPE=arm_app``):
+    #   scope to the armed app's PIDs via WASAPI process loopback / per-
+    #   process Process Tap. Reduces background-app bleed, but per-PID
+    #   attribution is fragile — Chrome's WebRTC renderer PID, audio-
+    #   service helper PIDs spawned post-tap, and some EDR-managed macOS
+    #   configurations all break it silently, producing empty captures
+    #   the user only notices when their drills come back empty. The
+    #   pre-2.9 default; demoted to beta after Sheen's Rippling Mac and
+    #   other field reports made the failure pattern untenable.
+    system_scope: Literal["arm_app", "endpoint"] = "endpoint"
 
     # Opus encoder (see sink.encode_opus_stereo). `application=audio` is
     # libopus's general-purpose mode — it preserves high frequencies, stereo
@@ -748,6 +755,21 @@ def load_config() -> Config:
         if user_notif:
             init_kwargs["notifications"] = {
                 **probe.notifications.model_dump(), **user_notif
+            }
+
+    if isinstance(user.get("capture"), dict):
+        env_capture_keys = {
+            k[len("SAYZO_CAPTURE__"):].lower()
+            for k in os.environ
+            if k.upper().startswith("SAYZO_CAPTURE__")
+        }
+        user_capture = {
+            k: v for k, v in user["capture"].items()
+            if k.lower() not in env_capture_keys
+        }
+        if user_capture:
+            init_kwargs["capture"] = {
+                **probe.capture.model_dump(), **user_capture
             }
 
     cfg = Config(**init_kwargs) if init_kwargs else probe

@@ -75,3 +75,34 @@ def test_env_var_overrides_user_settings(tmp_path: Path, monkeypatch) -> None:
     from sayzo_agent.config import load_config
     cfg = load_config()
     assert cfg.arm.hotkey == "ctrl+shift+e"
+
+
+def test_capture_system_scope_default_is_endpoint(tmp_path: Path, monkeypatch) -> None:
+    """Default system_scope flipped from 'arm_app' to 'endpoint' in v2.9.0.
+
+    Per-app capture is fragile across Chrome / OS / EDR configurations
+    (see Sheen's Rippling-managed Mac that captured sys_total=0s on
+    every meeting while Granola — global tap — worked fine). Endpoint
+    capture is now the default; per-app is opt-in via Settings → Recording.
+    """
+    monkeypatch.setenv("SAYZO_DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("SAYZO_CAPTURE__SYSTEM_SCOPE", raising=False)
+
+    from sayzo_agent.config import load_config
+    cfg = load_config()
+    assert cfg.capture.system_scope == "endpoint"
+
+
+def test_capture_system_scope_user_settings_overrides_default(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Users who opt into per-app via Settings → Recording (or by hand-editing
+    user_settings.json) should keep their choice when the build's default
+    flips."""
+    monkeypatch.setenv("SAYZO_DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("SAYZO_CAPTURE__SYSTEM_SCOPE", raising=False)
+    settings_store.save(tmp_path, {"capture": {"system_scope": "arm_app"}})
+
+    from sayzo_agent.config import load_config
+    cfg = load_config()
+    assert cfg.capture.system_scope == "arm_app"

@@ -51,6 +51,12 @@ export type NotificationFlags = {
 
 export type NotificationKey = keyof NotificationFlags;
 
+export type RecordingSettings = {
+  per_app_capture: boolean;
+};
+
+export type RecordingSettingKey = keyof RecordingSettings;
+
 export type PermissionRow = {
   key: string;
   label: string;
@@ -241,6 +247,13 @@ declare global {
       value: boolean,
     ): Promise<{ saved: boolean; error?: string }>;
 
+    // Recording.
+    get_recording_settings(): Promise<RecordingSettings>;
+    set_recording_setting(
+      key: RecordingSettingKey,
+      value: boolean,
+    ): Promise<{ saved: boolean; requires_restart?: boolean; error?: string }>;
+
     // Permissions.
     get_permissions(): Promise<PermissionRow[]>;
     request_permission(key: string): Promise<PermissionResult>;
@@ -343,6 +356,15 @@ export const settingsBridge = {
   async setNotification(key: NotificationKey, value: boolean) {
     await whenReady();
     return window.pywebview.api.set_notification(key, value);
+  },
+
+  async getRecordingSettings() {
+    await whenReady();
+    return window.pywebview.api.get_recording_settings();
+  },
+  async setRecordingSetting(key: RecordingSettingKey, value: boolean) {
+    await whenReady();
+    return window.pywebview.api.set_recording_setting(key, value);
   },
 
   async getHotkey() {

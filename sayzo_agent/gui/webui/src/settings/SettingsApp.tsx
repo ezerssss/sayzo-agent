@@ -7,6 +7,7 @@ import { CapturesPane } from "./CapturesPane";
 import { MeetingAppsPane } from "./MeetingAppsPane";
 import { NotificationsPane } from "./NotificationsPane";
 import { PermissionsPane } from "./PermissionsPane";
+import { RecordingPane } from "./RecordingPane";
 import { QuitSayzoButton } from "./QuitSayzoButton";
 import { ShortcutPane } from "./ShortcutPane";
 import logoUrl from "../assets/logo.png";
@@ -21,6 +22,7 @@ const PANE_NAMES = [
   "Meeting Apps",
   "Captures",
   "Shortcut",
+  "Recording",
   "Notifications",
   "Permissions",
   "About",
@@ -135,6 +137,7 @@ export function SettingsApp() {
           {active === "Captures" && <CapturesPane />}
           {active === "Permissions" && <PermissionsPane />}
           {active === "Account" && <AccountPane />}
+          {active === "Recording" && <RecordingPane />}
           {active === "Notifications" && <NotificationsPane />}
           {active === "About" && <AboutPane />}
         </div>
