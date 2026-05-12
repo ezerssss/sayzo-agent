@@ -23,6 +23,28 @@ export type SayzoEvent =
       notes?: string;
     }
   | { type: "update_error"; message: string }
+  // Settings — About pane "Install update" flow (Stage 4).
+  // Phases the install worker walks through, in order:
+  //   - downloading: stream-fetch in progress; `percent` 0..99.
+  //   - applying: download done + hash verified, agent quit triggered.
+  //                The Settings window will close shortly as the agent
+  //                tears down to run the installer / swap helper.
+  //   - noop_already_latest: manifest says nothing newer to install.
+  //   - queued_for_restart: stage written but agent not reachable; the
+  //                boot-time apply path will pick it up next launch.
+  //   - error: anything went wrong; `message` is user-safe.
+  | {
+      type: "update_phase";
+      phase:
+        | "downloading"
+        | "applying"
+        | "noop_already_latest"
+        | "queued_for_restart"
+        | "error";
+      version?: string;
+      percent?: number;
+      message?: string;
+    }
   | { type: "status_updated"; status: unknown }; // future-proof
 
 type Listener = (evt: SayzoEvent) => void;

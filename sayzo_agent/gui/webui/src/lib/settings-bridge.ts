@@ -232,6 +232,7 @@ declare global {
 
     // About.
     check_for_update(): Promise<{ checking: boolean }>;
+    install_update_now(): Promise<{ started: boolean }>;
 
     // Notifications.
     get_notifications(): Promise<NotificationFlags>;
@@ -329,6 +330,10 @@ export const settingsBridge = {
   async checkForUpdate() {
     await whenReady();
     return window.pywebview.api.check_for_update();
+  },
+  async installUpdateNow() {
+    await whenReady();
+    return window.pywebview.api.install_update_now();
   },
 
   async getNotifications() {

@@ -36,13 +36,32 @@ Unicode true
 !endif
 !define PRODUCT_EXE "sayzo-agent.exe"
 !define SERVICE_EXE "sayzo-agent-service.exe"
-!define INSTALL_DIR "$PROGRAMFILES64\Sayzo"
+
+; Per-user install (Stage 0 of the auto-update plan). %LOCALAPPDATA%\Programs
+; mirrors Slack, Discord, VS Code, Microsoft Teams, GitHub Desktop etc. - any
+; modern Win app whose updater wants to swap files without an admin prompt.
+; Switching here means:
+;   - RequestExecutionLevel user (no UAC on install / update / uninstall)
+;   - Task Scheduler entry runs at the user's normal privilege level (no
+;     /RL HIGHEST). Sayzo's runtime needs WASAPI loopback + pycaw mic-session
+;     enumeration + pynput global hotkey + UIAutomation browser-tab reads —
+;     none of those require elevation in practice (confirmed in dev runs).
+;   - Uninstall registry entry lives in HKCU (Settings -> Apps shows it for
+;     the current user only — appropriate for a per-user install).
+!define INSTALL_DIR "$LOCALAPPDATA\Programs\Sayzo"
 !define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}"
+
+; Legacy admin install location (pre-v2.8.0). The migration block in .onInit
+; detects this and runs the legacy uninstaller elevated before the per-user
+; install proceeds. After v2.8.0 has rolled to all users this block can be
+; deleted entirely.
+!define LEGACY_INSTALL_DIR "$PROGRAMFILES64\Sayzo"
+!define LEGACY_UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}"
 
 Name "${PRODUCT_NAME} ${PRODUCT_VERSION}"
 OutFile "sayzo-setup.exe"
 InstallDir "${INSTALL_DIR}"
-RequestExecutionLevel admin
+RequestExecutionLevel user
 SetCompressor /SOLID lzma
 Icon "..\..\installer\assets\logo.ico"
 UninstallIcon "..\..\installer\assets\logo.ico"
@@ -82,10 +101,63 @@ UninstallIcon "..\..\installer\assets\logo.ico"
 !insertmacro MUI_LANGUAGE "English"
 
 ; ---------------------------------------------------------------------------
+; Legacy admin-install migration (Stage 0 of the auto-update plan).
+;
+; A user upgrading from v2.7.x has Sayzo installed under Program Files via the
+; admin installer. v2.8.0+ installs to %LOCALAPPDATA% with no admin needed.
+; We detect the legacy install via its HKLM uninstall key and run the OLD
+; uninstall.exe elevated via ShellExecute "runas" -- the user sees ONE UAC
+; prompt total for the migration; every future update is admin-free.
+;
+; Caveats:
+;   - If the legacy agent is still running when the legacy uninstall fires,
+;     locked files (sayzo-agent.exe + loaded DLLs) may remain orphan in
+;     C:\Program Files\Sayzo. They're harmless: the Task Scheduler entry was
+;     deleted, no HKLM/HKCU reference remains, nothing will relaunch them.
+;     The user can manually delete the folder if they care about disk space.
+;   - This block is dead code once every v2.7.x user has migrated. Safe to
+;     remove in a future release.
+; ---------------------------------------------------------------------------
+
+Function MigrateLegacyInstall
+    ; Pre-v2.8.0 installs wrote their uninstall metadata to the HKLM uninstall
+    ; key. v2.8.0+ writes to HKCU, so an HKLM read returning a string here is
+    ; an unambiguous "legacy admin install present" signal.
+    ReadRegStr $0 HKLM "${LEGACY_UNINSTALL_KEY}" "UninstallString"
+    StrCmp $0 "" no_legacy
+
+    ; Strip surrounding quotes from the UninstallString. NSIS's WriteRegStr
+    ; quotes the path for shell-friendliness (so users running it from a
+    ; cmd.exe with spaces in the path work), but ExecShellWait takes the
+    ; path and args as separate args, so the quotes get in the way.
+    StrCpy $1 $0 1
+    StrCmp $1 '"' 0 no_strip
+        StrCpy $0 $0 "" 1
+        StrCpy $0 $0 -1
+    no_strip:
+
+    DetailPrint "Sayzo is moving to a per-user install location."
+    DetailPrint "Approve the next prompt to clean up the previous admin install."
+    DetailPrint "(This is the last UAC prompt you'll see for Sayzo updates.)"
+
+    ; /S = silent. ExecShellWait blocks until the elevated subprocess exits.
+    ; Errors from the legacy uninstaller are non-fatal — even a partial cleanup
+    ; (e.g. some locked files left behind) puts us in a strictly better state
+    ; than before this migration ran. We proceed to the per-user install
+    ; either way; the new install never references the legacy location.
+    ExecShellWait "runas" "$0" "/S" SW_HIDE
+
+    no_legacy:
+FunctionEnd
+
+; ---------------------------------------------------------------------------
 ; Install
 ; ---------------------------------------------------------------------------
 
 Section "Install"
+    Call MigrateLegacyInstall
+
+
     SetOutPath "$INSTDIR"
 
     ; Stop any running agent before overwriting its exes. Without this, a user
@@ -174,12 +246,19 @@ Section "Install"
     WriteRegStr HKCU "Environment" "Path" "$0;$INSTDIR"
     SendMessage ${HWND_BROADCAST} ${WM_WININICHANGE} 0 "STR:Environment" /TIMEOUT=5000
 
-    ; Create Task Scheduler entry: run at login, hidden, restart on failure.
+    ; Create Task Scheduler entry: run at login, restart on failure.
     ; Points at the windowless service exe so no console window pops up.
     ; /SC ONLOGON: trigger at user login
-    ; /RL HIGHEST: run with highest privileges (needed for WASAPI on some systems)
     ; /F: force overwrite if exists
-    nsExec::ExecToLog 'schtasks /Create /TN "Sayzo" /TR "\"$INSTDIR\${SERVICE_EXE}\" service" /SC ONLOGON /RL HIGHEST /F'
+    ;
+    ; v2.8.0+: dropped /RL HIGHEST. The legacy admin install needed it to
+    ; survive UAC virtualization (the service exe lived in Program Files),
+    ; but a per-user install in %LOCALAPPDATA% has full read/write access at
+    ; the user's normal integrity level — WASAPI loopback, pycaw, pynput
+    ; global hotkey, and UIAutomation browser-tab reads all work without
+    ; elevation. Bonus: a user can manage their own task without admin, so
+    ; the silent-installer apply path (auto-update) needs zero UAC prompts.
+    nsExec::ExecToLog 'schtasks /Create /TN "Sayzo" /TR "\"$INSTDIR\${SERVICE_EXE}\" service" /SC ONLOGON /F'
 
     ; Start Menu shortcut - also uses the windowless exe so clicking it doesn't
     ; pop a terminal. The console exe stays available on PATH for CLI use.
@@ -195,14 +274,18 @@ Section "Install"
     ApplicationID::Set "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME}.lnk" "Sayzo"
     Pop $0
 
-    ; Write uninstall information to registry.
-    WriteRegStr HKLM "${UNINSTALL_KEY}" "DisplayName" "${PRODUCT_NAME}"
-    WriteRegStr HKLM "${UNINSTALL_KEY}" "UninstallString" '"$INSTDIR\uninstall.exe"'
-    WriteRegStr HKLM "${UNINSTALL_KEY}" "InstallLocation" "$INSTDIR"
-    WriteRegStr HKLM "${UNINSTALL_KEY}" "Publisher" "${PRODUCT_PUBLISHER}"
-    WriteRegStr HKLM "${UNINSTALL_KEY}" "DisplayVersion" "${PRODUCT_VERSION}"
-    WriteRegDWORD HKLM "${UNINSTALL_KEY}" "NoModify" 1
-    WriteRegDWORD HKLM "${UNINSTALL_KEY}" "NoRepair" 1
+    ; Write uninstall information to registry under HKCU (per-user). The
+    ; "Apps & Features" / "Programs and Features" UI surfaces both HKLM
+    ; and HKCU entries; using HKCU means this entry only appears for the
+    ; user who installed Sayzo (the only user it serves) and no admin
+    ; rights are required to write or delete it.
+    WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayName" "${PRODUCT_NAME}"
+    WriteRegStr HKCU "${UNINSTALL_KEY}" "UninstallString" '"$INSTDIR\uninstall.exe"'
+    WriteRegStr HKCU "${UNINSTALL_KEY}" "InstallLocation" "$INSTDIR"
+    WriteRegStr HKCU "${UNINSTALL_KEY}" "Publisher" "${PRODUCT_PUBLISHER}"
+    WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayVersion" "${PRODUCT_VERSION}"
+    WriteRegDWORD HKCU "${UNINSTALL_KEY}" "NoModify" 1
+    WriteRegDWORD HKCU "${UNINSTALL_KEY}" "NoRepair" 1
 
     ; Write uninstaller.
     WriteUninstaller "$INSTDIR\uninstall.exe"
@@ -230,6 +313,7 @@ Section "Uninstall"
     ; Remove install directory.
     RMDir /r "$INSTDIR"
 
-    ; Remove registry keys.
-    DeleteRegKey HKLM "${UNINSTALL_KEY}"
+    ; Remove registry keys. HKCU mirrors the install-time write (Stage 0
+    ; per-user install).
+    DeleteRegKey HKCU "${UNINSTALL_KEY}"
 SectionEnd

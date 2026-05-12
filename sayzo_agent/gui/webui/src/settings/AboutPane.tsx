@@ -10,13 +10,19 @@ type CheckState =
   | { kind: "checking" }
   | { kind: "latest" }
   | { kind: "available"; version: string; url: string }
-  | { kind: "error" };
+  | { kind: "downloading"; version: string; percent: number }
+  | { kind: "applying"; version: string }
+  | { kind: "queued"; version: string }
+  | { kind: "error"; message?: string };
 
 const CHECK_LABELS: Record<CheckState["kind"], string> = {
   idle: "Check for updates",
   checking: "Checking…",
   latest: "Check again",
   available: "Check again",
+  downloading: "Downloading…",
+  applying: "Installing…",
+  queued: "Check again",
   error: "Try again",
 };
 
@@ -49,7 +55,23 @@ export function AboutPane() {
           setCheck({ kind: "latest" });
         }
       } else if (evt.type === "update_error") {
-        setCheck({ kind: "error" });
+        setCheck({ kind: "error", message: evt.message });
+      } else if (evt.type === "update_phase") {
+        if (evt.phase === "downloading" && evt.version) {
+          setCheck({
+            kind: "downloading",
+            version: evt.version,
+            percent: evt.percent ?? 0,
+          });
+        } else if (evt.phase === "applying" && evt.version) {
+          setCheck({ kind: "applying", version: evt.version });
+        } else if (evt.phase === "queued_for_restart" && evt.version) {
+          setCheck({ kind: "queued", version: evt.version });
+        } else if (evt.phase === "noop_already_latest") {
+          setCheck({ kind: "latest" });
+        } else if (evt.phase === "error") {
+          setCheck({ kind: "error", message: evt.message });
+        }
       }
     });
   }, []);
@@ -60,6 +82,21 @@ export function AboutPane() {
       await settingsBridge.checkForUpdate();
     } catch {
       setCheck({ kind: "error" });
+    }
+  }
+
+  async function handleInstall(version: string) {
+    // Optimistic transition so the button can't be re-clicked while the
+    // worker spins up. The real downloading event arrives within ~100ms
+    // and replaces this state.
+    setCheck({ kind: "downloading", version, percent: 0 });
+    try {
+      await settingsBridge.installUpdateNow();
+    } catch {
+      setCheck({
+        kind: "error",
+        message: "Couldn't start the install. Try again.",
+      });
     }
   }
 
@@ -111,7 +148,11 @@ export function AboutPane() {
           <Button
             variant="secondary"
             onClick={handleCheck}
-            disabled={check.kind === "checking"}
+            disabled={
+              check.kind === "checking" ||
+              check.kind === "downloading" ||
+              check.kind === "applying"
+            }
           >
             {checkLabel}
           </Button>
@@ -132,15 +173,57 @@ export function AboutPane() {
               </div>
               <Button
                 variant="primary"
-                onClick={() => settingsBridge.openUrl(check.url)}
+                onClick={() => handleInstall(check.version)}
               >
-                Download Sayzo {check.version}
+                Install Sayzo {check.version}
               </Button>
+            </div>
+          )}
+          {check.kind === "downloading" && (
+            <div className="space-y-2">
+              <div className="text-ink">
+                Downloading Sayzo {check.version}…
+              </div>
+              {/* Simple inline progress bar — keeps the dependency graph
+                  shallow (no chart lib for a 1-D percent). The width is
+                  clamped 0–100 so a buggy event with percent>100 doesn't
+                  blow out the layout. */}
+              <div className="h-1.5 w-64 overflow-hidden rounded-full bg-ink-border">
+                <div
+                  className="h-full bg-ink transition-all duration-200"
+                  style={{
+                    width: `${Math.max(0, Math.min(100, check.percent))}%`,
+                  }}
+                />
+              </div>
+              <div className="text-xs text-ink-muted">
+                {check.percent}%
+              </div>
+            </div>
+          )}
+          {check.kind === "applying" && (
+            <div className="space-y-1">
+              <div className="text-ink">
+                Installing Sayzo {check.version}…
+              </div>
+              <div className="text-xs text-ink-muted">
+                Sayzo will restart in a moment. This window will close.
+              </div>
+            </div>
+          )}
+          {check.kind === "queued" && (
+            <div className="space-y-1">
+              <div className="text-ink">
+                Version {check.version} is ready to install.
+              </div>
+              <div className="text-xs text-ink-muted">
+                It'll be applied the next time Sayzo starts.
+              </div>
             </div>
           )}
           {check.kind === "error" && (
             <span className="text-ink-muted">
-              Couldn't check right now. Please try again.
+              {check.message || "Couldn't check right now. Please try again."}
             </span>
           )}
         </div>

@@ -32,7 +32,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import httpx
 
@@ -83,12 +83,19 @@ async def download_and_stage(
     *,
     client: Optional[httpx.AsyncClient] = None,
     chunk_size: int = 64 * 1024,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> Optional[StagedUpdate]:
     """Download ``info.url`` to a staging slot and verify SHA256.
 
     Returns a :class:`StagedUpdate` on success, ``None`` on any failure
     (network error, hash mismatch, unsupported platform, disk error). Failures
     never raise — auto-update must not break capture.
+
+    ``progress_callback`` is invoked as ``(bytes_so_far, total_bytes)`` at
+    roughly every 5% mark plus once on completion. ``total_bytes`` is 0 when
+    the server omits Content-Length (rare for sayzo.app releases but possible
+    via mirrors / proxies). The callback is best-effort — any exception in it
+    is swallowed so a buggy UI handler can't kill the download.
 
     The caller is responsible for not re-entering this function while a stage
     is in flight. The update-check task in ``__main__.py`` runs serially, so
@@ -150,6 +157,22 @@ async def download_and_stage(
                                 total_bytes, expected_total,
                             )
                             next_log_threshold += 0.05
+                            if progress_callback is not None:
+                                try:
+                                    progress_callback(total_bytes, expected_total)
+                                except Exception:
+                                    log.debug(
+                                        "[update-stage] progress_callback raised",
+                                        exc_info=True,
+                                    )
+
+            # One final progress tick at 100%, so a UI showing a bar reaches
+            # full before flipping to the "applying" phase.
+            if progress_callback is not None:
+                try:
+                    progress_callback(total_bytes, expected_total or total_bytes)
+                except Exception:
+                    log.debug("[update-stage] final progress_callback raised", exc_info=True)
     except Exception:
         log.warning(
             "[update-stage] download failed for v%s from %s",

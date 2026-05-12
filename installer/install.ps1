@@ -50,12 +50,23 @@ Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
 # NSIS silent install (/S) skips the finish page, so MUI_FINISHPAGE_RUN
 # doesn't fire — we have to launch the service ourselves. --force-setup
 # matches the GUI-install path.
-$servicePath = Join-Path $env:ProgramFiles "Sayzo\sayzo-agent-service.exe"
-if (Test-Path $servicePath) {
+#
+# v2.8.0+: install location moved to %LOCALAPPDATA%\Programs\Sayzo (per-user,
+# no admin required). We keep the legacy $env:ProgramFiles probe as a fallback
+# so this script also works against a transitional state where the old admin
+# install is still present (the v2.8.0 installer's migration block removes it,
+# but if a user runs this script before that ships, we want to do something
+# sensible).
+$localServicePath = Join-Path $env:LOCALAPPDATA "Programs\Sayzo\sayzo-agent-service.exe"
+$legacyServicePath = Join-Path $env:ProgramFiles "Sayzo\sayzo-agent-service.exe"
+if (Test-Path $localServicePath) {
     Write-Host "  Opening setup window..." -ForegroundColor Cyan
-    Start-Process -FilePath $servicePath -ArgumentList "service", "--force-setup"
+    Start-Process -FilePath $localServicePath -ArgumentList "service", "--force-setup"
+} elseif (Test-Path $legacyServicePath) {
+    Write-Host "  Opening setup window..." -ForegroundColor Cyan
+    Start-Process -FilePath $legacyServicePath -ArgumentList "service", "--force-setup"
 } else {
-    Write-Host "  Warning: could not find $servicePath" -ForegroundColor Yellow
+    Write-Host "  Warning: could not find Sayzo at $localServicePath or $legacyServicePath" -ForegroundColor Yellow
     Write-Host "  Launch Sayzo from the Start Menu to complete setup." -ForegroundColor Yellow
 }
 

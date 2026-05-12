@@ -169,6 +169,30 @@ class Bridge:
         except Exception:
             log.warning("[settings.bridge] failed to push event", exc_info=True)
 
+    def _push_update_phase(
+        self,
+        phase: str,
+        *,
+        version: Optional[str] = None,
+        percent: Optional[int] = None,
+        message: Optional[str] = None,
+    ) -> None:
+        """Emit an ``update_phase`` event with optional fields populated.
+
+        Centralises the event shape so the wire contract with
+        ``events.ts``'s ``update_phase`` union lives in one place — a typo
+        in ``phase`` here is the only failure mode, vs. eight separate
+        inline dicts where any ``type``/``phase`` key could drift.
+        """
+        event: dict[str, Any] = {"type": "update_phase", "phase": phase}
+        if version is not None:
+            event["version"] = version
+        if percent is not None:
+            event["percent"] = percent
+        if message is not None:
+            event["message"] = message
+        self._push_event(event)
+
     # ------------------------------------------------------------------
     # JS-callable methods — General
     # ------------------------------------------------------------------
@@ -411,6 +435,29 @@ class Bridge:
             daemon=True,
         ).start()
         return {"checking": True}
+
+    def install_update_now(self) -> dict[str, Any]:
+        """Kick off the full Phase B apply flow on a worker thread.
+
+        If a staged release matching the latest manifest is already on disk
+        (the background poll usually beats the user to it), skips straight
+        to "applying" — call ``QUIT_AGENT`` on the live agent, which routes
+        through ``apply_staged_if_newer`` in the quit path.
+
+        Otherwise: fetches the manifest, downloads the platform installer
+        with SHA256 verify, then triggers the apply.
+
+        Frontend subscribes to ``update_phase`` events with shape
+        ``{phase: "downloading" | "applying" | "noop_already_latest" |
+        "queued_for_restart" | "error", percent?: int, version?: str,
+        message?: str}``.
+        """
+        threading.Thread(
+            target=self._install_update_worker,
+            name="settings-install-update",
+            daemon=True,
+        ).start()
+        return {"started": True}
 
     # ------------------------------------------------------------------
     # JS-callable methods — Shortcut
@@ -944,3 +991,165 @@ class Bridge:
                 "url": info.url,
                 "notes": info.notes,
             })
+
+    def _install_update_worker(self) -> None:
+        """Worker thread for ``install_update_now``.
+
+        Two flows depending on whether the background poll already staged a
+        download for us:
+
+        1. **Already staged for the latest version** -> push "applying" and
+           fire ``QUIT_AGENT`` over IPC. The agent's quit-path picks up the
+           staged update via ``apply_staged_if_newer`` and hands off to the
+           platform installer / swap helper. We never see the new agent come
+           up — this subprocess will be terminated by the apply path along
+           with the agent.
+
+        2. **Not staged (or stale stage)** -> fetch manifest, stream-download
+           the platform installer with hash verify, then proceed to step 1.
+
+        Errors at any step push ``update_phase: error`` and bail. Best-effort
+        — auto-update must not crash the Settings subprocess.
+        """
+        import asyncio
+
+        from sayzo_agent.update import check as _update_check, is_newer
+        from sayzo_agent.update_stage import (
+            clear_staged,
+            download_and_stage,
+            read_staged,
+        )
+
+        try:
+            staged = read_staged(self._cfg.data_dir)
+
+            # Step 1: do we already have what we need on disk? The check
+            # query against the manifest is cheap, but if a freshly-staged
+            # build is sitting there, skip the round-trip and apply.
+            info = None
+            need_download = True
+            if staged is not None and is_newer(__version__, staged.version):
+                # Run a quick manifest check to confirm the stage matches what
+                # the server currently advertises — guards against the case
+                # where a much newer release dropped while a stale stage sat
+                # waiting on disk. If the manifest says we're past staged or
+                # if the manifest is unreachable, we still proceed with what
+                # we have (offline-friendly: an old stage you've already
+                # downloaded is better than nothing).
+                try:
+                    info = asyncio.run(_update_check(__version__))
+                except Exception:
+                    log.debug("[settings.bridge] manifest check failed during install", exc_info=True)
+                    info = None
+                if info is None or info.version == staged.version:
+                    need_download = False
+                else:
+                    # Manifest advertises something newer than what's staged
+                    # — clear the stale stage and let the download path
+                    # re-fetch.
+                    log.info(
+                        "[settings.bridge] staged v%s is older than manifest v%s; re-downloading",
+                        staged.version, info.version,
+                    )
+                    clear_staged(self._cfg.data_dir)
+
+            # Step 2: download path. Need either a fresh manifest fetch (we
+            # didn't take the staged shortcut) or the manifest from the
+            # consistency check above.
+            if need_download:
+                if info is None:
+                    try:
+                        info = asyncio.run(_update_check(__version__))
+                    except Exception as e:
+                        log.warning(
+                            "[settings.bridge] update check failed during install",
+                            exc_info=True,
+                        )
+                        self._push_update_phase("error", message=str(e))
+                        return
+                if info is None:
+                    # Manifest says we're on the latest. Surface this rather
+                    # than silently doing nothing — the user clicked Install.
+                    self._push_update_phase("noop_already_latest")
+                    return
+
+                # Stream the download with a progress callback that emits
+                # one event per ~5% so the UI can render a smooth bar.
+                self._push_update_phase(
+                    "downloading", version=info.version, percent=0,
+                )
+
+                # Dedup adjacent identical percents. update_stage's caller
+                # currently fires at clean 5% increments so duplicates are
+                # rare in practice — this is defense-in-depth so a future
+                # change to the throttle (e.g. per-chunk emit) doesn't
+                # flood the GUI thread with no-op evaluate_js round-trips.
+                last_pct = 0
+
+                def _on_progress(done: int, total: int) -> None:
+                    nonlocal last_pct
+                    if total <= 0:
+                        return
+                    pct = int(min(99, round(done / total * 100)))
+                    if pct == last_pct:
+                        return
+                    last_pct = pct
+                    self._push_update_phase(
+                        "downloading", version=info.version, percent=pct,
+                    )
+
+                try:
+                    staged = asyncio.run(
+                        download_and_stage(
+                            info, self._cfg.data_dir,
+                            progress_callback=_on_progress,
+                        )
+                    )
+                except Exception as e:
+                    log.warning(
+                        "[settings.bridge] download_and_stage raised", exc_info=True
+                    )
+                    self._push_update_phase("error", message=str(e))
+                    return
+
+                if staged is None:
+                    # SHA mismatch / disk error / network failure. The stager
+                    # logs the specific reason — we surface a generic message
+                    # to the UI rather than leaking internals.
+                    self._push_update_phase(
+                        "error",
+                        message="Couldn't download the update. Try again later.",
+                    )
+                    return
+
+            # Step 3: apply. By here ``staged`` is guaranteed non-None.
+            assert staged is not None
+            self._push_update_phase("applying", version=staged.version)
+
+            # Triggering the agent's quit-path is what actually runs the
+            # apply. The agent's finally block calls
+            # ``apply_staged_if_newer`` which detects our staged file and
+            # spawns the installer / swap helper. If the agent isn't
+            # reachable (it crashed, or the user disabled auto-start),
+            # surface "queued_for_restart" — the boot-time apply path will
+            # catch it next time the agent runs.
+            try:
+                self._ipc.call(Methods.QUIT_AGENT)
+            except IPCNotConnected:
+                self._push_update_phase(
+                    "queued_for_restart", version=staged.version,
+                )
+                return
+            except IPCError as e:
+                log.warning(
+                    "[settings.bridge] QUIT_AGENT failed during install: %s", e
+                )
+                self._push_update_phase("error", message=str(e))
+                return
+        except Exception as e:
+            # Catch-all so a buggy code path doesn't crash the Settings
+            # subprocess silently.
+            log.warning(
+                "[settings.bridge] install_update_now worker crashed", exc_info=True
+            )
+            self._push_update_phase("error", message=str(e))

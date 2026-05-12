@@ -10,9 +10,11 @@ picks a destination in this order:
 1. ``<comtypes-install>/gen/``                       — if writable
 2. (frozen exe) ``%TEMP%\\comtypes_cache\\<exe>-<py>`` — fallback
 
-For our PyInstaller-frozen build under ``C:\\Program Files\\Sayzo\\``,
-the install directory is read-only, so the fallback at ``%TEMP%`` is
-what gets used. ``%TEMP%`` is volatile — Storage Sense, antivirus,
+For our PyInstaller-frozen build under
+``%LOCALAPPDATA%\\Programs\\Sayzo\\`` (v2.8.0+; pre-v2.8.0 was
+``C:\\Program Files\\Sayzo\\``), the install directory is theoretically
+writable now, but ``comtypes`` still treats PyInstaller bundle paths as
+immutable, so the fallback at ``%TEMP%`` is what gets used. ``%TEMP%`` is volatile — Storage Sense, antivirus,
 profile resets, and manual "Disk Cleanup" all blow it away. The next
 launch tries to regenerate the stubs, and any failure during regen
 (typelib missing on this Windows version, race with AV, write-perm
