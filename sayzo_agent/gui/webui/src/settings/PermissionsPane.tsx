@@ -22,11 +22,15 @@ export function PermissionsPane() {
 
   async function handleReRequest(key: string) {
     // Try the programmatic prompt first. mic + audio_capture surface a TCC
-    // dialog directly; accessibility + automation return granted=null so we
-    // fall through to the deep-link.
+    // dialog directly when status is NotDetermined; accessibility + automation
+    // return granted=null. If the user previously toggled the permission off
+    // in System Settings, status is Denied and AVFoundation short-circuits
+    // without presenting a dialog (granted=false) — Apple deliberately won't
+    // re-prompt, the user must use System Settings. So we fall through to the
+    // deep-link on anything that isn't an outright grant.
     try {
       const result = await settingsBridge.requestPermission(key);
-      if (result.granted === null) {
+      if (result.granted !== true) {
         await settingsBridge.openPermissionSettings(key);
       }
     } catch {

@@ -275,12 +275,19 @@ func resolveAudioObjectsForPIDs(_ targetPIDs: [pid_t]) -> [AudioObjectID] {
     }
 
     // Step 3: for each object, read its PID and keep matching ones.
+    // Track matched PIDs (with their bundle ids when readable) so we can
+    // emit a precise diagnostic line — the count-only "matched 3/23"
+    // log used to be a dead-end in field triage because we couldn't tell
+    // whether the right renderer was matched, and 3 always-output Chrome
+    // helpers look identical to 3 wrong-helper matches.
     var addrPID = AudioObjectPropertyAddress(
         mSelector: kAudioProcessPropertyPID,
         mScope: kAudioObjectPropertyScopeGlobal,
         mElement: kAudioObjectPropertyElementMain
     )
     var matched: [AudioObjectID] = []
+    var matchedPIDs = Set<pid_t>()
+    var matchedDescriptions: [String] = []
     for obj in objects {
         var pid: pid_t = 0
         var pidSize: UInt32 = UInt32(MemoryLayout<pid_t>.size)
@@ -290,6 +297,9 @@ func resolveAudioObjectsForPIDs(_ targetPIDs: [pid_t]) -> [AudioObjectID] {
         if pidStatus != noErr { continue }
         if wanted.contains(pid) {
             matched.append(obj)
+            matchedPIDs.insert(pid)
+            let bundle = readAudioProcessBundleID(obj) ?? "?"
+            matchedDescriptions.append("pid=\(pid)(\(bundle))")
         }
     }
 
@@ -305,8 +315,49 @@ func resolveAudioObjectsForPIDs(_ targetPIDs: [pid_t]) -> [AudioObjectID] {
                 + "out of \(targetPIDs.count) requested PIDs\n",
             stderr
         )
+        fputs(
+            "audio-tap: matched: \(matchedDescriptions.joined(separator: ", "))\n",
+            stderr
+        )
+        let unmatched = targetPIDs.filter { !matchedPIDs.contains($0) }
+        if !unmatched.isEmpty {
+            // Just PIDs — we don't have AudioObjectIDs for these, so no
+            // bundle-id readout. The caller already knows the requested
+            // PID list; this echo is for grep-ability against the
+            // matched-PIDs line above.
+            let unmatchedStr = unmatched.map { String($0) }.joined(separator: ", ")
+            fputs(
+                "audio-tap: unmatched (\(unmatched.count)): \(unmatchedStr)\n",
+                stderr
+            )
+        }
     }
     return matched
+}
+
+// Read the bundle id of an AudioProcessObject via
+// kAudioProcessPropertyBundleID. Mirrors the same helper in the
+// audio-detect Swift binary — kept duplicated here rather than shared
+// so each helper compiles as a single-file unit (no header / module).
+// Returns nil when the property is unsupported, the process has no
+// bundle id (e.g. command-line tools), or any CoreAudio error.
+func readAudioProcessBundleID(_ obj: AudioObjectID) -> String? {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioProcessPropertyBundleID,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var raw: Unmanaged<CFString>?
+    var size: UInt32 = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+    let status = withUnsafeMutablePointer(to: &raw) { ptr -> OSStatus in
+        ptr.withMemoryRebound(to: UInt8.self, capacity: Int(size)) { _ in
+            AudioObjectGetPropertyData(obj, &addr, 0, nil, &size, ptr)
+        }
+    }
+    if status != noErr { return nil }
+    guard let cf = raw?.takeRetainedValue() else { return nil }
+    let s = cf as String
+    return s.isEmpty ? nil : s
 }
 
 // Read the tap's native audio stream format — the format IO proc will deliver.

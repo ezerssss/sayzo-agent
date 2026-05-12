@@ -146,12 +146,19 @@ def _warn_missing_binary_once() -> None:
     )
 
 
-def _run_binary(binary: Path, timeout_secs: float = 1.5) -> list[AudioProcess]:
+def _run_binary(binary: Path, timeout_secs: float = 1.9) -> list[AudioProcess]:
     """Invoke ``audio-detect --json`` and parse the output.
 
     Returns an empty list on any failure (timeout, non-zero exit,
     malformed JSON). All failure modes are logged at WARNING the first
     time and DEBUG thereafter — we never raise back to the watcher.
+
+    The 1.9 s default sits just under ``ArmConfig.poll_interval_secs``
+    (= 2.0 s) so a slow subprocess never backpressures the watcher into
+    overlapping invocations. EDR-managed Macs (e.g. Rippling) commonly
+    add 200–800 ms of subprocess-spawn latency from on-launch scanning,
+    so 1.5 s — the previous default — was too tight and produced
+    spurious WARNING noise.
     """
     try:
         proc = subprocess.run(

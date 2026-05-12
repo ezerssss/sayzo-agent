@@ -53,6 +53,12 @@ log = logging.getLogger(__name__)
 # Small fast-path window for double-tapping the hotkey to bypass confirmation.
 _DOUBLE_TAP_SECS = 1.0
 
+# Time throttle for the diagnostic "[arm] no whitelist match" log. Layered
+# on top of the existing signature-based dedup so background dictation
+# apps that flicker the mic holders can't generate hundreds of log lines
+# per hour by defeating the signature.
+_NO_MATCH_LOG_THROTTLE_SECS = 30.0
+
 
 class ArmState(str, Enum):
     DISARMED = "disarmed"
@@ -736,6 +742,15 @@ class ArmController:
         # Diagnostic dedup key for the no-match log below — see the
         # call site for what it covers and when it gets reset.
         last_no_match_signature: Optional[tuple] = None
+        # Time-throttle layered on top of the signature dedup. Background
+        # dictation apps (Apple CoreSpeech, Wispr Flow, etc.) flicker the
+        # holder set every few seconds and defeat the signature dedup,
+        # producing hundreds of log lines per hour on otherwise-idle
+        # machines. Even after a new signature appears, we suppress
+        # repeat logs within ``_NO_MATCH_LOG_THROTTLE_SECS`` of the last
+        # one — except for the very first emission per watcher start,
+        # so a tailing log can see we're alive.
+        last_no_match_log_at: float = 0.0
         try:
             last_match_key: Optional[str] = None
             while not self._stop.is_set():
@@ -808,27 +823,34 @@ class ArmController:
                         )
                         if signature != last_no_match_signature:
                             last_no_match_signature = signature
-                            sig_titles = tuple(
-                                sorted({
-                                    fg.browser_tab_title or "",
-                                    fg.window_title or "",
-                                    *fg.browser_window_titles,
-                                } - {""})
+                            throttle_ok = (
+                                last_no_match_log_at == 0.0
+                                or (now_mono - last_no_match_log_at)
+                                >= _NO_MATCH_LOG_THROTTLE_SECS
                             )
-                            log.info(
-                                "[arm] no whitelist match: holders=%s "
-                                "fg.bundle=%s fg.is_browser=%s "
-                                "tab_title=%r win_titles=%r url=%r — "
-                                "active_specs=%d (suppressed=%d)",
-                                list(holder_summary) or "[]",
-                                fg.bundle_id,
-                                fg.is_browser,
-                                fg.browser_tab_title,
-                                list(sig_titles),
-                                fg.browser_tab_url,
-                                len(self.cfg.detectors),
-                                len(suppressed),
-                            )
+                            if throttle_ok:
+                                last_no_match_log_at = now_mono
+                                sig_titles = tuple(
+                                    sorted({
+                                        fg.browser_tab_title or "",
+                                        fg.window_title or "",
+                                        *fg.browser_window_titles,
+                                    } - {""})
+                                )
+                                log.info(
+                                    "[arm] no whitelist match: holders=%s "
+                                    "fg.bundle=%s fg.is_browser=%s "
+                                    "tab_title=%r win_titles=%r url=%r — "
+                                    "active_specs=%d (suppressed=%d)",
+                                    list(holder_summary) or "[]",
+                                    fg.bundle_id,
+                                    fg.is_browser,
+                                    fg.browser_tab_title,
+                                    list(sig_titles),
+                                    fg.browser_tab_url,
+                                    len(self.cfg.detectors),
+                                    len(suppressed),
+                                )
                     elif last_no_match_signature is not None:
                         last_no_match_signature = None
                     self._record_unmatched_holders(mic, fg)
