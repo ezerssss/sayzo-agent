@@ -18,6 +18,7 @@ Usage:
     python scripts/probe_audio.py                       # interactive menu
     python scripts/probe_audio.py --list-only           # just enumerate
     python scripts/probe_audio.py --app chrome          # non-interactive
+    python scripts/probe_audio.py --global              # whole-system tap
     python scripts/probe_audio.py --duration 30         # 30 s capture
     python scripts/probe_audio.py --no-wav              # skip WAV dump
 
@@ -409,22 +410,34 @@ async def _drain_and_score(
 
 
 async def _run_capture(
-    entry: AppEntry,
+    entry: Optional[AppEntry],
     duration_s: float,
     wav_path: Optional[Path],
 ) -> CaptureMetrics:
-    """Construct the production capture class and drive it."""
+    """Construct the production capture class and drive it.
+
+    ``entry`` ``None`` ⇒ global tap (endpoint-wide loopback on Windows,
+    no-PID Process Tap on macOS). This is the same code path Sayzo uses
+    when ``system_scope="endpoint"`` — i.e. when per-app scoping is
+    disabled. Useful for "does ANY system audio reach us?" testing,
+    since global tap bypasses per-process attribution entirely.
+    """
     if sys.platform == "win32":
-        from sayzo_agent.capture.system_win_process import (
-            ProcessLoopbackCapture, is_supported,
-        )
-        if not is_supported():
-            raise RuntimeError(
-                "WASAPI process loopback requires Windows 10 build 19041 "
-                "(version 2004, May 2020) or newer"
+        if entry is not None:
+            from sayzo_agent.capture.system_win_process import (
+                ProcessLoopbackCapture, is_supported,
             )
-        capture = ProcessLoopbackCapture(target_pids=entry.pids)
-        await capture.start()
+            if not is_supported():
+                raise RuntimeError(
+                    "WASAPI process loopback requires Windows 10 build 19041 "
+                    "(version 2004, May 2020) or newer"
+                )
+            capture = ProcessLoopbackCapture(target_pids=entry.pids)
+            await capture.start()
+        else:
+            from sayzo_agent.capture.system_win import SystemCapture
+            capture = SystemCapture(system_scope="endpoint")
+            await capture.start()
         try:
             return await _drain_and_score(capture, duration_s, wav_path)
         finally:
@@ -432,8 +445,10 @@ async def _run_capture(
 
     elif sys.platform == "darwin":
         from sayzo_agent.capture.system_mac import SystemCapture
-        capture = SystemCapture(system_scope="arm_app")
-        await capture.start(target_pids=entry.pids)
+        scope = "arm_app" if entry is not None else "endpoint"
+        capture = SystemCapture(system_scope=scope)
+        pids = entry.pids if entry is not None else ()
+        await capture.start(target_pids=pids)
         try:
             return await _drain_and_score(capture, duration_s, wav_path)
         finally:
@@ -501,6 +516,22 @@ async def _async_main(args: argparse.Namespace) -> int:
               f"{sys.platform!r}", file=sys.stderr)
         return 2
 
+    if args.app and args.global_scope:
+        print("ERROR: --app and --global are mutually exclusive.", file=sys.stderr)
+        return 2
+
+    # --global skips the discovery menu entirely.
+    if args.global_scope:
+        out_dir = Path(args.output_dir).resolve()
+        wav_path = None if args.no_wav else _build_wav_path(out_dir, "global")
+        print(f"\nCapturing GLOBAL system audio (endpoint-wide) for "
+              f"{args.duration:.1f}s …")
+        if wav_path is not None:
+            print(f"  WAV → {wav_path}")
+        metrics = await _run_capture(None, args.duration, wav_path)
+        print(_format_metrics(metrics))
+        return 0
+
     entries = _list_apps()
     _print_menu(entries)
 
@@ -544,6 +575,16 @@ def main() -> int:
         "--app", type=str, default=None,
         help="Non-interactive: pick the app whose name/exe/bundle contains "
              "this substring (case-insensitive). E.g. 'chrome', 'granola'.",
+    )
+    p.add_argument(
+        "--global", dest="global_scope", action="store_true",
+        help="Capture the whole system audio output instead of a single app. "
+             "Bypasses the picker. Uses Sayzo's endpoint-scope code path "
+             "(WASAPI loopback on default speakers / global Process Tap on "
+             "macOS). Useful for 'does ANY audio reach us?' testing — if "
+             "global PASSes but --app FAILs, the bug is in per-process "
+             "scoping; if global also FAILs, the interference is below "
+             "the capture API itself.",
     )
     p.add_argument(
         "--list-only", action="store_true",
