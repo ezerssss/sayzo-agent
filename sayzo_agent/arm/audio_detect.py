@@ -48,7 +48,16 @@ _CACHE_TTL_SECS = 1.8
 
 @dataclass(frozen=True)
 class AudioProcess:
-    """One row from ``audio-detect --json``."""
+    """One row from ``audio-detect --json``.
+
+    ``input_device_names`` carries the CoreAudio human-readable names of
+    every INPUT device the process currently has open (one name per
+    entry — typically 0 or 1). The agent uses the first entry to route
+    ``MicCapture`` to the same device the meeting app picked when a user
+    has a non-default mic. Older Swift binaries omit this field;
+    :func:`_run_binary` defaults it to ``[]`` so the upgrade is forward-
+    compatible.
+    """
 
     pid: int
     responsible_pid: int  # -1 when the SPI didn't resolve
@@ -56,6 +65,7 @@ class AudioProcess:
     input: bool
     output: bool
     running: bool
+    input_device_names: tuple[str, ...] = ()
 
 
 @dataclass
@@ -182,6 +192,19 @@ def _run_binary(binary: Path, timeout_secs: float = 1.5) -> list[AudioProcess]:
         if not isinstance(r, dict):
             continue
         try:
+            raw_devices = r.get("input_device_names") or []
+            if not isinstance(raw_devices, list):
+                # Defensive: an older / malformed binary might emit a
+                # non-list here. Treat as no-data rather than crashing
+                # the whole snapshot.
+                log.debug(
+                    "[arm.audio_detect] non-list input_device_names: %r",
+                    raw_devices,
+                )
+                raw_devices = []
+            devices = tuple(
+                str(d) for d in raw_devices if isinstance(d, str) and d
+            )
             out.append(AudioProcess(
                 pid=int(r.get("pid", -1)),
                 responsible_pid=int(r.get("responsible_pid", -1)),
@@ -189,6 +212,7 @@ def _run_binary(binary: Path, timeout_secs: float = 1.5) -> list[AudioProcess]:
                 input=bool(r.get("input", 0)),
                 output=bool(r.get("output", 0)),
                 running=bool(r.get("running", 0)),
+                input_device_names=devices,
             ))
         except (TypeError, ValueError):
             log.debug("[arm.audio_detect] skip malformed row: %r", r)

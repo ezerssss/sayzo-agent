@@ -2,11 +2,14 @@
 
 The detector inputs come from platform-specific queries (see
 ``platform_win.py`` / ``platform_mac.py``): a list of processes
-currently holding the default microphone as an active capture session,
-plus the frontmost app + active browser tab URL/title. Both platforms
-populate the same :class:`MicState` shape now — Windows from pycaw
-WASAPI session enumeration, macOS from the ``audio-detect`` Swift
-helper (per-process attribution via ``kAudioHardwarePropertyProcessObjectList``
+currently holding ANY active capture session (not just the default
+mic — meeting apps regularly grab a non-default device, e.g. a USB
+headset while the OS default stays on the built-in mic, and we have
+to see those too), plus the frontmost app + active browser tab
+URL/title. Both platforms populate the same :class:`MicState` shape
+now — Windows from pycaw WASAPI session enumeration across every
+active capture endpoint, macOS from the ``audio-detect`` Swift helper
+(per-process attribution via ``kAudioHardwarePropertyProcessObjectList``
 on macOS 14.4+, mapped through the responsibility SPI to user-facing
 apps).
 
@@ -75,8 +78,7 @@ class ForegroundInfo:
 
 @dataclass(frozen=True)
 class MicHolder:
-    """One process currently holding an active capture session on the
-    default microphone.
+    """One process currently holding an active capture session.
 
     - ``process_name`` — Windows: executable name (``zoom.exe``).
       macOS: bundle id of the user-facing app (``us.zoom.xos``); the
@@ -88,23 +90,35 @@ class MicHolder:
     - ``bundle_id`` — macOS only; same value as ``process_name`` on
       Mac, ``None`` on Windows. Carried separately so the matcher can
       check it against ``DetectorSpec.bundle_ids`` without ambiguity.
+    - ``device_name`` — the OS-level capture device the session lives
+      on (e.g. ``"Microphone (USB Headset)"`` on Windows, the CoreAudio
+      device name on macOS). ``None`` when we couldn't read it. The
+      matcher doesn't use this — it's read by the controller to route
+      ``MicCapture`` to the device the meeting app actually picked, so
+      users with a non-default mic don't get recorded from the wrong
+      device. Multiple holders on different devices is supported but
+      rare; the controller's scope resolver picks one.
     """
 
     process_name: str
     pid: int = -1
     bundle_id: Optional[str] = None
+    device_name: Optional[str] = None
 
 
 @dataclass(frozen=True)
 class MicState:
     """Normalized mic-holder snapshot that works on both platforms.
 
-    Windows: ``holders`` comes directly from WASAPI session enumeration
-    via pycaw. macOS (v2.5+): ``holders`` comes from the ``audio-detect``
-    Swift helper, which enumerates ``kAudioHardwarePropertyProcessObjectList``
-    (macOS 14.4+) and maps each capturing process to its user-facing
-    app via Apple's responsibility SPI. Either way the matcher only
-    consults ``holders`` for the desktop match path.
+    Windows: ``holders`` comes from WASAPI session enumeration via
+    pycaw across every active capture endpoint (the default mic is
+    one of them, but a non-default device the user picked in their
+    meeting app is also covered). macOS (v2.5+): ``holders`` comes
+    from the ``audio-detect`` Swift helper, which enumerates
+    ``kAudioHardwarePropertyProcessObjectList`` (macOS 14.4+,
+    device-agnostic) and maps each capturing process to its
+    user-facing app via Apple's responsibility SPI. Either way the
+    matcher only consults ``holders`` for the desktop match path.
 
     ``active`` and ``running_processes`` are still populated on macOS
     for the seen-apps recording path (catching unmatched mic-holders

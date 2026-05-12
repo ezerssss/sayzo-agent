@@ -20,7 +20,8 @@
 // JSON output schema:
 //   [
 //     {"pid": 1234, "responsible_pid": 1200, "bundle_id": "us.zoom.xos",
-//      "input": 1, "output": 0, "running": 1},
+//      "input": 1, "output": 0, "running": 1,
+//      "input_device_names": ["MacBook Pro Microphone"]},
 //     ...
 //   ]
 //
@@ -32,6 +33,14 @@
 // - input / output / running — UInt32 booleans (0 or 1) from the kAudioProcess
 //                              IsRunningInput / IsRunningOutput / IsRunning
 //                              properties
+// - input_device_names — list of human-readable input-device names the
+//                        process currently has open (read via
+//                        kAudioProcessPropertyDevices with input scope +
+//                        kAudioObjectPropertyName per device). Used by the
+//                        controller to route MicCapture to the same device
+//                        the meeting app picked. Empty when the process
+//                        holds no input devices, or when the property read
+//                        failed (the agent falls back to the OS default mic).
 //
 // Compile (matches the audio-tap recipe):
 //   swiftc -O -target arm64-apple-macos14.4 -o audio-detect main.swift \
@@ -176,6 +185,71 @@ func readBool(_ obj: AudioObjectID, _ selector: AudioObjectPropertySelector) -> 
     return status == noErr ? value : nil
 }
 
+// Read kAudioObjectPropertyName on any AudioObject. Used for input-device
+// human-readable names — same string CoreAudio returns to PortAudio /
+// sounddevice for device-name reads, so the matcher can pass it straight
+// into sd.InputStream(device=...).
+func readObjectName(_ obj: AudioObjectID) -> String? {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioObjectPropertyName,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var raw: Unmanaged<CFString>?
+    var size: UInt32 = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+    let status = withUnsafeMutablePointer(to: &raw) { ptr -> OSStatus in
+        ptr.withMemoryRebound(to: UInt8.self, capacity: Int(size)) { _ in
+            AudioObjectGetPropertyData(obj, &addr, 0, nil, &size, ptr)
+        }
+    }
+    if status != noErr { return nil }
+    return raw?.takeRetainedValue() as String?
+}
+
+// Returns the human-readable names of every INPUT device the process is
+// currently using. Implementation mirrors listProcessObjects(): a
+// size-then-read pattern on kAudioProcessPropertyDevices with input
+// scope, then resolves each AudioObjectID via readObjectName.
+//
+// Returns [] when the process holds no input devices (the common case —
+// most audio processes are output-only) or when the property is
+// unsupported. Property-read errors are deliberately silent here:
+// firing one warning per non-input process per poll would drown the
+// real diagnostics. Actual transport failures still surface via the
+// existing stderr-once path in the Python wrapper.
+func readInputDeviceNames(_ obj: AudioObjectID) -> [String] {
+    var addr = AudioObjectPropertyAddress(
+        mSelector: kAudioProcessPropertyDevices,
+        mScope: kAudioObjectPropertyScopeInput,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var size: UInt32 = 0
+    var status = AudioObjectGetPropertyDataSize(obj, &addr, 0, nil, &size)
+    if status != noErr || size == 0 {
+        return []
+    }
+    let count = Int(size) / MemoryLayout<AudioObjectID>.size
+    if count == 0 {
+        return []
+    }
+    var deviceIds = [AudioObjectID](repeating: 0, count: count)
+    status = deviceIds.withUnsafeMutableBufferPointer { buf -> OSStatus in
+        guard let base = buf.baseAddress else { return OSStatus(-1) }
+        return AudioObjectGetPropertyData(obj, &addr, 0, nil, &size, base)
+    }
+    if status != noErr {
+        return []
+    }
+    var names: [String] = []
+    names.reserveCapacity(deviceIds.count)
+    for did in deviceIds {
+        if let name = readObjectName(did) {
+            names.append(name)
+        }
+    }
+    return names
+}
+
 // ---------------------------------------------------------------------------
 // Output formats
 // ---------------------------------------------------------------------------
@@ -187,6 +261,7 @@ struct AudioProcessRow {
     let input: UInt32
     let output: UInt32
     let running: UInt32
+    let inputDeviceNames: [String]
 }
 
 func collectRows() -> ([AudioProcessRow]?, OSStatus) {
@@ -200,6 +275,12 @@ func collectRows() -> ([AudioProcessRow]?, OSStatus) {
         let input = readBool(obj, kAudioProcessPropertyIsRunningInput) ?? 0
         let output = readBool(obj, kAudioProcessPropertyIsRunningOutput) ?? 0
         let running = readBool(obj, kAudioProcessPropertyIsRunning) ?? 0
+        // Only query the input-device list when the process is actually
+        // capturing — readInputDeviceNames is cheap when there are no
+        // input devices (single GetPropertyDataSize that fails), but we
+        // can avoid even that subprocess-CoreAudio round-trip for the
+        // output-only majority of audio processes.
+        let deviceNames = input != 0 ? readInputDeviceNames(obj) : []
         let resp: Int
         if pid > 0, let r = responsiblePid(for: pid_t(pid)) {
             resp = Int(r)
@@ -208,10 +289,24 @@ func collectRows() -> ([AudioProcessRow]?, OSStatus) {
         }
         rows.append(AudioProcessRow(
             pid: pid, responsible: resp, bundle: bundle,
-            input: input, output: output, running: running
+            input: input, output: output, running: running,
+            inputDeviceNames: deviceNames
         ))
     }
     return (rows, noErr)
+}
+
+// JSON-escape a string for embedding in a quoted field. Backslash + quote
+// + control characters are the bare minimum; bundle ids and device names
+// shouldn't contain anything weirder, but the agent must never emit
+// unparseable JSON.
+func escapeJSONString(_ s: String) -> String {
+    return s
+        .replacingOccurrences(of: "\\", with: "\\\\")
+        .replacingOccurrences(of: "\"", with: "\\\"")
+        .replacingOccurrences(of: "\n", with: "\\n")
+        .replacingOccurrences(of: "\r", with: "\\r")
+        .replacingOccurrences(of: "\t", with: "\\t")
 }
 
 func printJSON(_ rows: [AudioProcessRow]) {
@@ -220,18 +315,18 @@ func printJSON(_ rows: [AudioProcessRow]) {
     for r in rows {
         let bundleField: String
         if let b = r.bundle {
-            // JSON-escape: handle backslash, double-quote, control chars.
-            let escaped = b
-                .replacingOccurrences(of: "\\", with: "\\\\")
-                .replacingOccurrences(of: "\"", with: "\\\"")
-            bundleField = "\"\(escaped)\""
+            bundleField = "\"\(escapeJSONString(b))\""
         } else {
             bundleField = "null"
         }
+        let devicesField = "[" + r.inputDeviceNames
+            .map { "\"\(escapeJSONString($0))\"" }
+            .joined(separator: ",") + "]"
         entries.append(
             "{\"pid\":\(r.pid),\"responsible_pid\":\(r.responsible)," +
             "\"bundle_id\":\(bundleField)," +
-            "\"input\":\(r.input),\"output\":\(r.output),\"running\":\(r.running)}"
+            "\"input\":\(r.input),\"output\":\(r.output),\"running\":\(r.running)," +
+            "\"input_device_names\":\(devicesField)}"
         )
     }
     print("[\(entries.joined(separator: ","))]")
@@ -242,14 +337,15 @@ func printHuman(_ rows: [AudioProcessRow]) {
         print("(no audio process objects)")
         return
     }
-    print(String(format: "  %6s  %6s  %3s  %3s  %3s  %s",
-                 "pid", "resp", "in", "out", "run", "bundle"))
+    print(String(format: "  %6s  %6s  %3s  %3s  %3s  %-40s  %s",
+                 "pid", "resp", "in", "out", "run", "bundle", "input devices"))
     for r in rows {
         let pidS = r.pid >= 0 ? String(format: "%6d", r.pid) : "     -"
         let respS = r.responsible >= 0 ? String(format: "%6d", r.responsible) : "     -"
         let bundle = r.bundle ?? "<none>"
-        print(String(format: "  %@  %@  %3d  %3d  %3d  %@",
-                     pidS, respS, r.input, r.output, r.running, bundle))
+        let devices = r.inputDeviceNames.isEmpty ? "-" : r.inputDeviceNames.joined(separator: ", ")
+        print(String(format: "  %@  %@  %3d  %3d  %3d  %-40@  %@",
+                     pidS, respS, r.input, r.output, r.running, bundle, devices))
     }
 }
 

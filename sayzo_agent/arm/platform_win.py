@@ -3,8 +3,14 @@
 Capabilities exposed to the ArmController:
 
 - ``get_mic_holders()`` → list of processes currently holding an active
-  capture session on the default microphone endpoint, via pycaw
-  (``IMMDeviceEnumerator`` → ``IAudioSessionManager2`` → sessions).
+  capture session on ANY active capture endpoint, via pycaw
+  (``IMMDeviceEnumerator.EnumAudioEndpoints`` → per-endpoint
+  ``IAudioSessionManager2`` → sessions). Each holder is tagged with the
+  endpoint's friendly device name so the controller can route
+  ``MicCapture`` to whichever device the meeting app actually picked
+  (a user with built-in mic as the OS default + USB headset selected
+  in Zoom would otherwise be invisible to detection AND recorded from
+  the wrong device).
 - ``get_foreground_info()`` → the frontmost window's owning process name,
   the window title, a heuristic ``is_browser`` flag, and (for browsers)
   the active tab URL read via UI Automation.
@@ -117,15 +123,30 @@ def _mic_holders_on_com_thread() -> list[MicHolder]:
     """The real mic-holder query. Must run on the COM worker thread because
     the comtypes objects returned here (IMMDevice, IAudioSessionManager2,
     session enumerator, individual sessions) are apartment-thread-affine
-    and can only be used on the thread they were created on."""
+    and can only be used on the thread they were created on.
+
+    Enumerates EVERY active capture endpoint (not just the OS default mic
+    via ``GetDefaultAudioEndpoint`` — that was the pre-v2.7.12 behavior
+    and missed any meeting app that picked a non-default device). Each
+    holder is tagged with its endpoint's friendly name so the controller
+    can route the mic capture to the same device the meeting app picked.
+    Per-endpoint failures are logged and skipped rather than collapsing
+    the whole query — one broken endpoint shouldn't blind us to the rest.
+    """
     try:
         from pycaw.pycaw import (
             IAudioSessionControl2,
             IAudioSessionManager2,
             IMMDeviceEnumerator,
         )
-        from pycaw.constants import CLSID_MMDeviceEnumerator
-        from comtypes import CLSCTX_ALL, CoCreateInstance
+        from pycaw.api.mmdeviceapi.depend.structures import PROPERTYKEY
+        from pycaw.constants import (
+            CLSID_MMDeviceEnumerator,
+            DEVICE_STATE,
+            EDataFlow,
+            STGM,
+        )
+        from comtypes import CLSCTX_ALL, CoCreateInstance, GUID
     except Exception:
         log.warning(
             "[arm.win] pycaw/comtypes import failed on COM worker thread — "
@@ -134,9 +155,11 @@ def _mic_holders_on_com_thread() -> list[MicHolder]:
         )
         return []
 
-    # Device role enum values — pycaw doesn't expose these directly.
-    EDATAFLOW_CAPTURE = 1
-    EROLE_CONSOLE = 0
+    # PKEY_Device_FriendlyName = ({a45c254e-df1c-4efd-8020-67d146a850e0}, 14).
+    # pycaw exposes PROPERTYKEY but not the constant — build it here.
+    pkey_friendly_name = PROPERTYKEY()
+    pkey_friendly_name.fmtid = GUID("{a45c254e-df1c-4efd-8020-67d146a850e0}")
+    pkey_friendly_name.pid = 14
 
     import psutil
 
@@ -146,48 +169,102 @@ def _mic_holders_on_com_thread() -> list[MicHolder]:
             IMMDeviceEnumerator,
             CLSCTX_ALL,
         )
-        device = enumerator.GetDefaultAudioEndpoint(EDATAFLOW_CAPTURE, EROLE_CONSOLE)
-        # IMMDevice.Activate returns an IUnknown pointer in comtypes; cast to
-        # the real interface before calling its methods or .GetSessionEnumerator
-        # raises AttributeError.
-        raw = device.Activate(IAudioSessionManager2._iid_, CLSCTX_ALL, None)
-        mgr = raw.QueryInterface(IAudioSessionManager2)
-        session_enum = mgr.GetSessionEnumerator()
-        count = session_enum.GetCount()
+        device_collection = enumerator.EnumAudioEndpoints(
+            EDataFlow.eCapture.value,
+            DEVICE_STATE.ACTIVE.value,
+        )
+        n_devices = device_collection.GetCount()
     except Exception:
         log.warning(
-            "[arm.win] capture-endpoint session enum failed",
+            "[arm.win] capture-endpoint enumeration failed — "
+            "meeting detection skipped this poll",
             exc_info=True,
         )
         return []
 
     holders: list[MicHolder] = []
-    for i in range(count):
+    for d_idx in range(n_devices):
+        device = None
+        device_name: Optional[str] = None
         try:
-            ctrl = session_enum.GetSession(i)
-            ctrl2 = ctrl.QueryInterface(IAudioSessionControl2)
-            # State: 0 Inactive, 1 Active, 2 Expired. We want Active.
-            state = ctrl.GetState()
-            if state != 1:
-                continue
-            pid = ctrl2.GetProcessId()
-            if pid <= 0:
-                continue
-            try:
-                name = psutil.Process(pid).name()
-            except Exception:
-                name = ""
-            if name:
-                holders.append(MicHolder(process_name=name, pid=pid))
+            device = device_collection.Item(d_idx)
         except Exception:
-            log.debug("[arm.win] session %d inspect failed", i, exc_info=True)
+            log.warning(
+                "[arm.win] capture endpoint %d/%d Item() failed — skipping",
+                d_idx, n_devices, exc_info=True,
+            )
             continue
+
+        # Friendly-name read is best-effort. A None ``device_name`` on the
+        # holder doesn't break detection (matcher still fires on
+        # process/bundle), but the controller will fall back to the OS
+        # default mic for capture instead of routing to this endpoint.
+        try:
+            prop_store = device.OpenPropertyStore(STGM.STGM_READ.value)
+            pv = prop_store.GetValue(pkey_friendly_name)
+            value = pv.GetValue()
+            try:
+                pv.clear()
+            except Exception:
+                pass
+            if value:
+                device_name = str(value)
+        except Exception:
+            log.debug(
+                "[arm.win] endpoint %d friendly-name read failed — "
+                "holder will carry no device_name (capture falls back "
+                "to OS default for this holder)",
+                d_idx, exc_info=True,
+            )
+
+        try:
+            raw = device.Activate(
+                IAudioSessionManager2._iid_, CLSCTX_ALL, None,
+            )
+            mgr = raw.QueryInterface(IAudioSessionManager2)
+            session_enum = mgr.GetSessionEnumerator()
+            session_count = session_enum.GetCount()
+        except Exception:
+            log.warning(
+                "[arm.win] session manager activate failed for endpoint %r — "
+                "skipping its sessions (other endpoints continue)",
+                device_name or f"#{d_idx}", exc_info=True,
+            )
+            continue
+
+        for s_idx in range(session_count):
+            try:
+                ctrl = session_enum.GetSession(s_idx)
+                ctrl2 = ctrl.QueryInterface(IAudioSessionControl2)
+                # State: 0 Inactive, 1 Active, 2 Expired. We want Active.
+                state = ctrl.GetState()
+                if state != 1:
+                    continue
+                pid = ctrl2.GetProcessId()
+                if pid <= 0:
+                    continue
+                try:
+                    name = psutil.Process(pid).name()
+                except Exception:
+                    name = ""
+                if name:
+                    holders.append(MicHolder(
+                        process_name=name,
+                        pid=pid,
+                        device_name=device_name,
+                    ))
+            except Exception:
+                log.debug(
+                    "[arm.win] endpoint %r session %d inspect failed",
+                    device_name or f"#{d_idx}", s_idx, exc_info=True,
+                )
+                continue
 
     return holders
 
 
 def get_mic_holders() -> list[MicHolder]:
-    """Enumerate processes with an active capture session on the default mic.
+    """Enumerate processes with an active capture session on any endpoint.
 
     Submits the query to the COM worker thread (see module docstring).
     Returns empty list on any failure — the ArmController tolerates that.
@@ -196,7 +273,11 @@ def get_mic_holders() -> list[MicHolder]:
         fut = _get_com_executor().submit(_mic_holders_on_com_thread)
         # 2 s matches the watcher's poll interval; if a single query takes
         # longer than a full poll, something is badly wrong and we'd rather
-        # skip this round than stack queries.
+        # skip this round than stack queries. Enumerating multiple
+        # endpoints + their session managers raises the per-poll cost
+        # above the old single-default-endpoint path, but on consumer
+        # machines the active capture-endpoint count is small (2–5) and
+        # the bound has held in manual smoke.
         return fut.result(timeout=2.0)
     except Exception:
         log.warning(

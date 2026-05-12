@@ -110,8 +110,28 @@ class MicCapture:
         except RuntimeError:
             pass
 
-    async def start(self) -> None:
+    async def start(self, *, device: str | None = None) -> None:
+        """Open the input stream.
+
+        ``device`` overrides the device picked at construction time. The
+        ArmController passes the OS capture device the matched meeting
+        app is using (so users with a non-default mic don't get recorded
+        from the wrong one); ``None`` keeps the constructor default,
+        which is also ``None`` → sounddevice resolves to the OS default
+        input. The chosen device is recorded by the log line at the
+        bottom of this method so a user reading agent.log can confirm
+        which mic is actually open.
+
+        If sounddevice rejects the device (rare — e.g. the device was
+        unplugged between the matcher seeing it and us trying to open
+        it), we fall back to the OS default and log the failure so the
+        user gets *some* audio rather than a hard failure / silent
+        capture. The fallback is one-shot per ``start()`` call; we
+        don't retry the named device.
+        """
         self._loop = asyncio.get_running_loop()
+        if device is not None:
+            self.device = device
         # Defense-in-depth: drain any frames left over from a previous arm
         # cycle. Belt-and-suspenders against the path where stop() left
         # frames in the queue; without this, the consumer would pull
@@ -121,15 +141,35 @@ class MicCapture:
         # Reset the de-aliasing anchor so the first new frame's stamp is
         # set by wall clock, not max(wall, last_old + frame_duration).
         self._last_emitted_ts = None
-        self._stream = sd.InputStream(
-            samplerate=self.sample_rate,
-            blocksize=self.frame_samples,
-            channels=1,
-            dtype="float32",
-            device=self.device,
-            callback=self._callback,
-        )
-        self._stream.start()
+        try:
+            self._stream = sd.InputStream(
+                samplerate=self.sample_rate,
+                blocksize=self.frame_samples,
+                channels=1,
+                dtype="float32",
+                device=self.device,
+                callback=self._callback,
+            )
+            self._stream.start()
+        except Exception as exc:
+            if self.device is None:
+                # Already on the OS default — nothing to fall back to.
+                raise
+            log.warning(
+                "mic capture: opening device=%r failed (%s); falling back "
+                "to OS default for this session",
+                self.device, exc, exc_info=True,
+            )
+            self.device = None
+            self._stream = sd.InputStream(
+                samplerate=self.sample_rate,
+                blocksize=self.frame_samples,
+                channels=1,
+                dtype="float32",
+                device=None,
+                callback=self._callback,
+            )
+            self._stream.start()
 
         # `Stream.latency` returns either a float (InputStream) or a tuple
         # (Stream with both input+output) depending on the sounddevice

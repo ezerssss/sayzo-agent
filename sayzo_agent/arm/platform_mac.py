@@ -350,6 +350,24 @@ def get_mic_holders() -> list[MicHolder]:
         # work with.
         recovered_bundle = proc.bundle_id or bundle_by_pid.get(proc.pid)
 
+        # Pick the first reported input device name for this process. If
+        # an app has multiple input devices open (vanishingly rare on
+        # macOS — usually a niche pro-audio setup), we'd need richer
+        # routing to follow them all; first-wins keeps the contract
+        # uniform with Windows and logs the case for visibility.
+        device_name: Optional[str]
+        if proc.input_device_names:
+            device_name = proc.input_device_names[0]
+            if len(proc.input_device_names) > 1:
+                log.info(
+                    "[arm.mac] pid=%d holds %d input devices %r — using first "
+                    "for capture routing",
+                    proc.pid, len(proc.input_device_names),
+                    list(proc.input_device_names),
+                )
+        else:
+            device_name = None
+
         owner_pid, owner_bundle = _resolve_owner_with_bundle(
             pid=proc.pid,
             responsible_pid=proc.responsible_pid,
@@ -367,6 +385,7 @@ def get_mic_holders() -> list[MicHolder]:
                 process_name=owner_bundle,
                 pid=pid,
                 bundle_id=owner_bundle,
+                device_name=device_name,
             ))
             continue
 
@@ -383,6 +402,7 @@ def get_mic_holders() -> list[MicHolder]:
             process_name=recovered_bundle,
             pid=proc.pid,
             bundle_id=recovered_bundle,
+            device_name=device_name,
         ))
 
     # One-shot diagnostic when audio_detect saw input-active processes

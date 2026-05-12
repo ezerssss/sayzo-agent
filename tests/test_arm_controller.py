@@ -31,13 +31,22 @@ class FakeCapture:
         self.start_count = 0
         self.stop_count = 0
         self.fail_next_start = False
-        # Latest value passed to start() — lets tests assert that
-        # whitelist / hotkey smart-guess PIDs reach the capture layer.
+        # Latest values passed to start() — lets tests assert that
+        # whitelist / hotkey smart-guess PIDs reach the system capture
+        # layer (last_target_pids) and that the resolved mic device
+        # reaches the mic capture layer (last_device).
         self.last_target_pids: tuple[int, ...] = ()
+        self.last_device: Optional[str] = None
 
-    async def start(self, *, target_pids: tuple[int, ...] = ()) -> None:
+    async def start(
+        self,
+        *,
+        target_pids: tuple[int, ...] = (),
+        device: Optional[str] = None,
+    ) -> None:
         self.start_count += 1
         self.last_target_pids = tuple(target_pids)
+        self.last_device = device
         if self.fail_next_start:
             self.fail_next_start = False
             raise RuntimeError("simulated capture failure")
@@ -419,6 +428,13 @@ async def test_whitelist_arm_uses_resolver_when_match_has_no_pids():
             is_browser=False,
             browser_window_titles=("Meet - abc-defg-hij - Google Chrome",),
         ),
+        # Inject empty browser-title / URL queries so the controller's
+        # _snapshot_foreground enrichment doesn't fall back to the real
+        # platform queries and pick up actual browser tabs from
+        # whoever's running these tests on a workstation. Without this,
+        # the injected browser_window_titles above would be overwritten.
+        get_browser_window_titles=lambda: [],
+        get_browser_window_urls=lambda: [],
         resolve_pids_for_spec=fake_resolver,
     )
 
@@ -436,6 +452,136 @@ async def test_whitelist_arm_uses_resolver_when_match_has_no_pids():
         await ctrl._whitelist_task
     except asyncio.CancelledError:
         pass
+    await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
+
+
+# ---- mic-device routing (v2.7.12) ------------------------------------
+#
+# Verifies the fix for multi-mic users: a meeting app that picked a
+# non-default capture device is detected (via the all-endpoints Windows
+# enumeration + per-process device list from the macOS Swift helper)
+# AND we record from the device the app is actually using, not the OS
+# default. Both halves run through ``MicCapture.start(device=...)``.
+
+
+async def test_whitelist_arm_routes_mic_to_holder_device():
+    """Whitelist match where the matching holder reports a device_name →
+    controller threads it into MicCapture.start. Without this fix, a user
+    on a USB headset would be recorded from their built-in mic (faint,
+    distant audio, not silent — worse than silent because captures look
+    fine until you listen)."""
+    notifier = FakeNotifier()
+    notifier.consent_script = ["yes"]
+    ctrl, _, mic, sys_cap, *_ = _make_controller(
+        notifier=notifier,
+        mic_holders=[
+            MicHolder(
+                process_name="zoom.exe",
+                pid=1234,
+                device_name="Microphone (USB Headset)",
+            ),
+        ],
+    )
+    ctrl._loop = asyncio.get_running_loop()
+    ctrl._whitelist_task = asyncio.create_task(ctrl._run_whitelist_watcher())
+    await asyncio.sleep(0.15)
+    assert ctrl.state == ArmState.ARMED
+    assert ctrl._reason is not None
+    assert ctrl._reason.mic_device == "Microphone (USB Headset)"
+    assert mic.last_device == "Microphone (USB Headset)"
+
+    ctrl._whitelist_task.cancel()
+    try:
+        await ctrl._whitelist_task
+    except asyncio.CancelledError:
+        pass
+    await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
+
+
+async def test_whitelist_arm_default_mic_when_holder_has_no_device():
+    """No regression: a holder with ``device_name=None`` (Windows
+    endpoint that failed friendly-name read, or older macOS Swift
+    binary without device reporting) → mic.start receives ``device=None``
+    → sounddevice resolves to the OS default."""
+    notifier = FakeNotifier()
+    notifier.consent_script = ["yes"]
+    ctrl, _, mic, sys_cap, *_ = _make_controller(
+        notifier=notifier,
+        mic_holders=[MicHolder("zoom.exe", 1234)],  # No device_name.
+    )
+    ctrl._loop = asyncio.get_running_loop()
+    ctrl._whitelist_task = asyncio.create_task(ctrl._run_whitelist_watcher())
+    await asyncio.sleep(0.15)
+    assert ctrl.state == ArmState.ARMED
+    assert ctrl._reason is not None
+    assert ctrl._reason.mic_device is None
+    assert mic.last_device is None
+
+    ctrl._whitelist_task.cancel()
+    try:
+        await ctrl._whitelist_task
+    except asyncio.CancelledError:
+        pass
+    await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
+
+
+async def test_hotkey_smart_guess_win_routes_mic_to_unknown_holder_device(monkeypatch):
+    """Windows hotkey + unknown holder with a device_name: system
+    loopback stays endpoint-wide (today's "avoid silent capture"
+    rationale — the unknown app might not produce any system output)
+    BUT the mic follows the unknown holder's device. The user
+    explicitly hotkey'd; recording from where the mic is actually
+    being used beats recording the OS default pointed at empty air.
+    """
+    monkeypatch.setattr("sayzo_agent.arm.controller.sys.platform", "win32")
+    notifier = FakeNotifier()
+    notifier.consent_script = ["yes"]
+    ctrl, _, mic, sys_cap, *_ = _make_controller(
+        notifier=notifier,
+        mic_holders=[
+            MicHolder(
+                process_name="newmeeting.exe",
+                pid=5555,
+                device_name="USB Microphone",
+            ),
+        ],
+    )
+    await ctrl._on_hotkey_pressed()
+    assert ctrl.state == ArmState.ARMED
+    assert sys_cap.last_target_pids == ()
+    assert mic.last_device == "USB Microphone"
+
+    await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
+
+
+async def test_hotkey_smart_guess_win_routes_mic_to_whitelisted_holder_device(monkeypatch):
+    """Windows hotkey: Zoom on a USB headset (whitelisted) + Cortana on
+    built-in mic. We scope sys-loopback to Zoom AND route the mic to the
+    USB headset (the whitelisted holder's device). Cortana's device must
+    not win even though its holder was also present."""
+    monkeypatch.setattr("sayzo_agent.arm.controller.sys.platform", "win32")
+    notifier = FakeNotifier()
+    notifier.consent_script = ["yes"]
+    ctrl, _, mic, sys_cap, *_ = _make_controller(
+        notifier=notifier,
+        mic_holders=[
+            MicHolder(
+                process_name="zoom.exe",
+                pid=1234,
+                device_name="USB Headset Microphone",
+            ),
+            MicHolder(
+                process_name="cortana.exe",
+                pid=9999,
+                device_name="Internal Microphone Array",
+            ),
+        ],
+    )
+    await ctrl._on_hotkey_pressed()
+    assert ctrl.state == ArmState.ARMED
+    assert sys_cap.last_target_pids == (1234,)
+    assert mic.last_device == "USB Headset Microphone"
+
     await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
 
 
@@ -800,7 +946,7 @@ async def test_meeting_ended_keep_going_resets_on_mic_return():
 
 # ---- hotkey smart-guess (v1.7.0) -----------------------------------
 #
-# Verifies the Windows and macOS branches of `_resolve_hotkey_target_pids`.
+# Verifies the Windows and macOS branches of `_resolve_hotkey_arm_scope`.
 # On Windows we drive with synthetic mic.holders; on macOS we flip
 # sys.platform and drive via foreground + mic.active + an injected resolver.
 

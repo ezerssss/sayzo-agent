@@ -274,9 +274,16 @@ class Agent:
             label = arm_reason.app_key or arm_reason.source
             if arm_reason.target_pids:
                 pids_csv = ",".join(str(p) for p in arm_reason.target_pids)
-                reason_tag = f" ({label} scope=app[{pids_csv}])"
+                scope_part = f"app[{pids_csv}]"
             else:
-                reason_tag = f" ({label} scope=endpoint)"
+                scope_part = "endpoint"
+            mic_part = arm_reason.mic_device or "default"
+            # Truncate the device name so a long PortAudio identifier
+            # ("Microphone (2- Realtek(R) Audio)") doesn't bloat the
+            # heartbeat line.
+            if len(mic_part) > 24:
+                mic_part = mic_part[:23] + "…"
+            reason_tag = f" ({label} scope={scope_part} mic={mic_part})"
         if d.state == SessionState.OPEN and d._buffers is not None:
             elapsed = now - d._session_start_mono
             mic_voiced = d._buffers.mic_total_voiced()
