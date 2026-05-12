@@ -165,6 +165,64 @@ async def _do_login(
         click.echo("Login successful.")
 
 
+def _wait_for_install_lock_release(data_dir, log) -> None:
+    """Block boot until any in-flight NSIS installer's File /r completes.
+
+    The Windows NSIS installer (``installer/windows/sayzo-agent.nsi``)
+    writes ``<data_dir>/install_in_progress.lock`` at the start of
+    Section "Install" and deletes it after the silent-install relaunch
+    (v2.8.2+). If we're a fresh ``service`` process spawned during that
+    window (user clicked Sayzo from the Start Menu while an auto-update
+    was applying), waiting here avoids racing the partial-binary
+    replacement — without this, the import chain could hit ImportError
+    on a half-replaced ``python3xx.dll`` / ``_internal/*.pyd``.
+
+    Staleness: a crashed/cancelled installer leaves the lock orphan.
+    Treat anything older than ``STALE_AGE_SECS`` as dead and proceed —
+    better a possibly-racy boot than a permanently-blocked agent. The
+    NSIS installer overwrites the lock at the start of every new install
+    so the staleness only matters in the crash-recovery edge case.
+    """
+    lock = data_dir / "install_in_progress.lock"
+    if not lock.is_file():
+        return
+
+    STALE_AGE_SECS = 300
+    POLL_INTERVAL_SECS = 2.0
+    MAX_WAIT_SECS = 60
+
+    waited = 0.0
+    while waited < MAX_WAIT_SECS:
+        try:
+            age = time.time() - lock.stat().st_mtime
+        except OSError:
+            return  # vanished mid-poll — installer finished
+        if age > STALE_AGE_SECS:
+            log.warning(
+                "[install-lock] stale (%.0fs old) — deleting and proceeding",
+                age,
+            )
+            try:
+                lock.unlink()
+            except OSError:
+                pass
+            return
+        log.info(
+            "[install-lock] install in progress; waiting (%.0fs elapsed)",
+            waited,
+        )
+        time.sleep(POLL_INTERVAL_SECS)
+        waited += POLL_INTERVAL_SECS
+        if not lock.is_file():
+            log.info("[install-lock] released after %.0fs", waited)
+            return
+
+    log.warning(
+        "[install-lock] still held after %ds — proceeding anyway",
+        MAX_WAIT_SECS,
+    )
+
+
 @click.group(invoke_without_command=True)
 @click.version_option(package_name="sayzo-agent")
 @click.pass_context
@@ -1093,7 +1151,17 @@ def run() -> None:
     "login would auto-pop Settings — explorer.exe (the Run-key host) is "
     "treated as a user shell by looks_user_launched().",
 )
-def service(force_setup: bool, from_autostart: bool) -> None:
+@click.option(
+    "--open-settings",
+    is_flag=True,
+    hidden=True,
+    help="Auto-open the Settings window on boot. Set by the NSIS silent-"
+    "install relaunch path so a user who clicked 'Install update' from "
+    "Settings lands back in Settings on the new version. Bypasses the "
+    "looks_user_launched() heuristic, which doesn't fire when the parent "
+    "process is the installer (Exec'd from NSIS) rather than explorer.exe.",
+)
+def service(force_setup: bool, from_autostart: bool, open_settings: bool) -> None:
     """Run the agent as a background service (no terminal output, file logging)."""
     cfg = load_config()
     _setup_file_logging(cfg.logs_dir)
@@ -1130,6 +1198,15 @@ def service(force_setup: bool, from_autostart: bool) -> None:
                 exc_info=True,
             )
         return
+
+    # Install-progress race guard (v2.8.2). If an NSIS installer is
+    # currently doing File /r on this bundle, racing it with a partial-
+    # binary boot risks ImportError mid-load on python3xx.dll or one of
+    # the _internal/ DLLs. Block here until the installer releases its
+    # lock file. Stale lock (crashed installer) > 5 min is treated as
+    # dead and overwritten. Must run before any heavy import that could
+    # be mid-replace.
+    _wait_for_install_lock_release(cfg.data_dir, log)
 
     from . import __version__
     log.warning("sayzo-agent service starting v%s (pid=%d)", __version__, os.getpid())
@@ -1308,7 +1385,12 @@ def service(force_setup: bool, from_autostart: bool) -> None:
     # it up via its existing settings-event polling — no new wiring.
     from .launch_source import looks_user_launched
 
-    if not should_show_gui and not from_autostart and looks_user_launched():
+    if open_settings:
+        log.warning(
+            "service: --open-settings flag — auto-opening Settings"
+        )
+        tray_state.settings_event.set()
+    elif not should_show_gui and not from_autostart and looks_user_launched():
         log.warning(
             "service: user-click launch detected — auto-opening Settings"
         )
@@ -1347,6 +1429,33 @@ def service(force_setup: bool, from_autostart: bool) -> None:
             make_notifier(app_name=APP_AUMID)
             if cfg.notifications_enabled else NoopNotifier()
         )
+
+        # Share the notifier + pre-quit hook with the tray so both the
+        # IPC QUIT_AGENT path and the tray Quit menu can surface a
+        # "Sayzo is updating…" toast when this quit will trigger a staged
+        # auto-update apply (Phase B, v2.8.2). Without this, the dead
+        # zone between Settings closing and the new agent reappearing is
+        # silent — users can reasonably think Sayzo crashed and try to
+        # reopen it mid File /r.
+        tray_state.notifier = notifier
+
+        def _fire_pre_apply_toast() -> None:
+            try:
+                from .update_stage import read_staged
+                from .update import is_newer
+                staged = read_staged(cfg.data_dir)
+                if (staged is not None
+                        and is_newer(__version__, staged.version)
+                        and cfg.notifications_enabled):
+                    notifier.notify(
+                        "Sayzo is updating",
+                        f"Installing v{staged.version}. "
+                        "Sayzo will reappear shortly.",
+                    )
+            except Exception:
+                log.debug("[update] pre-apply toast failed", exc_info=True)
+
+        tray_state.pre_quit_hook = _fire_pre_apply_toast
 
         # Fire the post-upgrade toast queued by the boot-time last_version
         # check above. Best-effort: any notifier failure logs but doesn't

@@ -46,6 +46,7 @@ import sys
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, Callable
 
 from PIL import Image
 
@@ -146,6 +147,19 @@ class TrayState:
     # "Starting…" so the user sees immediate visual feedback instead of
     # staring at a tray icon whose menu would silently no-op.
     _starting: bool = False
+
+    # Shared notifier reference set by ``_build_pipeline_state`` once the
+    # desktop-notifier backend is constructed. Read by anything that needs
+    # to surface a toast outside the asyncio loop's normal flow — e.g. the
+    # pre-quit hook below.
+    notifier: Any = None
+
+    # Optional callable invoked by :func:`request_full_shutdown` before the
+    # quit event fires. Lets the agent surface a final-state notification
+    # (e.g. "Sayzo is updating…" when a staged auto-update is about to be
+    # applied) from a closure that has cfg / __version__ / notifier in
+    # scope, without forcing tray.py to know about update_stage.
+    pre_quit_hook: Callable[[], None] | None = None
 
     def set_status(self, status: Status, error_message: str = "") -> None:
         with self._lock:
@@ -310,7 +324,18 @@ def request_full_shutdown(state: "TrayState") -> None:
 
     macOS unloads launchd first; the eventual SIGKILL→process-group exit
     is non-zero, which would otherwise trip ``KeepAlive`` and revive us.
+
+    Fires ``state.pre_quit_hook`` (if set) before signalling the quit so
+    the agent has a chance to surface a "Sayzo is updating…" toast when
+    this quit is going to trigger a staged auto-update apply.
     """
+    if state.pre_quit_hook is not None:
+        try:
+            state.pre_quit_hook()
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "pre_quit_hook raised", exc_info=True,
+            )
     _mac_unload_launchd_agent()
     state.quit_event.set()
 

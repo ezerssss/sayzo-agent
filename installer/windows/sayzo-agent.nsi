@@ -157,6 +157,22 @@ FunctionEnd
 Section "Install"
     Call MigrateLegacyInstall
 
+    ; v2.8.2: install-in-progress lock. The agent's boot path
+    ; (``_wait_for_install_lock_release`` in ``__main__.py``) reads this
+    ; file and waits, so a Start-Menu click during the install dead zone
+    ; doesn't race File /r on the bundle. mtime doubles as a staleness
+    ; signal — a crashed installer's orphan lock is treated as dead after
+    ; 5 min and overwritten on the next install.
+    ;
+    ; Only relevant for update installs (where a running agent might
+    ; race). On fresh installs the data dir doesn't exist yet; skip
+    ; silently.
+    IfFileExists "$PROFILE\.sayzo\agent\*.*" install_lock_write install_lock_skip
+    install_lock_write:
+        FileOpen $1 "$PROFILE\.sayzo\agent\install_in_progress.lock" w
+        FileWrite $1 "v${PRODUCT_VERSION}"
+        FileClose $1
+    install_lock_skip:
 
     SetOutPath "$INSTDIR"
 
@@ -233,12 +249,23 @@ Section "Install"
     ; c10.dll depends on msvcp140/vcruntime140 and we strip those from the
     ; PyInstaller bundle (see sayzo-agent.spec) so Windows loads matched
     ; versions from the Redist instead of PyInstaller's mismatched copies.
-    ; /install /quiet /norestart is idempotent - skips fast if up to date.
+    ;
+    ; v2.8.2: skip when already installed. The redist installer self-elevates
+    ; regardless of /quiet /norestart, popping UAC on every run — surprising
+    ; to users mid auto-update who see an unbranded Microsoft prompt with no
+    ; Sayzo context. ``Installed=1`` at this VS 14.0 Runtimes key is
+    ; Microsoft's documented "is the redist present" signal (same key
+    ; vcredist.exe writes on successful install). HKLM is world-readable so
+    ; a user-scope installer can probe it without elevation.
     !if /FileExists "VC_redist.x64.exe"
-        DetailPrint "Installing Visual C++ Redistributable..."
-        File "VC_redist.x64.exe"
-        ExecWait '"$INSTDIR\VC_redist.x64.exe" /install /quiet /norestart'
-        Delete "$INSTDIR\VC_redist.x64.exe"
+        ReadRegDWORD $1 HKLM "SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64" "Installed"
+        IntCmp $1 1 vcredist_skip vcredist_install vcredist_install
+        vcredist_install:
+            DetailPrint "Installing Visual C++ Redistributable..."
+            File "VC_redist.x64.exe"
+            ExecWait '"$INSTDIR\VC_redist.x64.exe" /install /quiet /norestart'
+            Delete "$INSTDIR\VC_redist.x64.exe"
+        vcredist_skip:
     !endif
 
     ; Add install dir to user PATH so `sayzo-agent` works from any terminal.
@@ -298,6 +325,25 @@ Section "Install"
 
     ; Write uninstaller.
     WriteUninstaller "$INSTDIR\uninstall.exe"
+
+    ; Release the install-progress lock so any agent processes that
+    ; queued up during the install (Fix 5) can proceed past their boot
+    ; wait. Order matters: release BEFORE the silent relaunch below so
+    ; the relaunched agent doesn't see its own install lock and wait
+    ; pointlessly for 60 s.
+    Delete "$PROFILE\.sayzo\agent\install_in_progress.lock"
+
+    ; Silent-install fallback (v2.8.2). MUI_FINISHPAGE_RUN only fires in
+    ; interactive mode; on /S (the auto-update apply path via
+    ; update_apply_win.spawn_installer_and_exit) it's skipped and the
+    ; user is left with an empty tray until next login. Explicitly
+    ; relaunch the new agent here. --open-settings tells the agent to
+    ; surface Settings on boot — matches the user's mental model since
+    ; they were just in Settings when they clicked Install.
+    IfSilent silent_relaunch fini_install
+    silent_relaunch:
+        Exec '"$INSTDIR\${SERVICE_EXE}" service --open-settings'
+    fini_install:
 SectionEnd
 
 ; ---------------------------------------------------------------------------
