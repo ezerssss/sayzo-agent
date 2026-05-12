@@ -246,19 +246,28 @@ Section "Install"
     WriteRegStr HKCU "Environment" "Path" "$0;$INSTDIR"
     SendMessage ${HWND_BROADCAST} ${WM_WININICHANGE} 0 "STR:Environment" /TIMEOUT=5000
 
-    ; Create Task Scheduler entry: run at login, restart on failure.
-    ; Points at the windowless service exe so no console window pops up.
-    ; /SC ONLOGON: trigger at user login
-    ; /F: force overwrite if exists
+    ; v2.8.1: register auto-start via the HKCU Run key instead of Task
+    ; Scheduler. Background: in v2.8.0 we used ``schtasks /Create`` and on
+    ; some user accounts (group-policy locked, antivirus-hardened, EDR-
+    ; managed) it failed silently with "Access is denied" even though the
+    ; install was user-scope. The HKCU Run key is the per-user-app standard
+    ; (Slack, Discord, VS Code, GitHub Desktop) — no Task Scheduler service
+    ; involvement, no policy interaction, no race with the legacy migration
+    ; uninstaller's ``schtasks /Delete``.
     ;
-    ; v2.8.0+: dropped /RL HIGHEST. The legacy admin install needed it to
-    ; survive UAC virtualization (the service exe lived in Program Files),
-    ; but a per-user install in %LOCALAPPDATA% has full read/write access at
-    ; the user's normal integrity level — WASAPI loopback, pycaw, pynput
-    ; global hotkey, and UIAutomation browser-tab reads all work without
-    ; elevation. Bonus: a user can manage their own task without admin, so
-    ; the silent-installer apply path (auto-update) needs zero UAC prompts.
-    nsExec::ExecToLog 'schtasks /Create /TN "Sayzo" /TR "\"$INSTDIR\${SERVICE_EXE}\" service" /SC ONLOGON /F'
+    ; The ``--from-autostart`` flag tells the agent to suppress the user-
+    ; click Settings auto-open (``looks_user_launched()`` would otherwise
+    ; trigger because explorer.exe is the parent of every Run-key-launched
+    ; process; without the flag, Settings would pop on every login).
+    ;
+    ; Defensive cleanup: pre-emptively delete any leftover Task Scheduler
+    ; entry from v2.8.0 install attempts OR a legacy ``/RL HIGHEST`` task
+    ; the migration block's elevated uninstaller didn't fully purge. Both
+    ; exit non-zero when the task isn't present — harmless.
+    nsExec::ExecToLog 'schtasks /End /TN "Sayzo"'
+    nsExec::ExecToLog 'schtasks /Delete /TN "Sayzo" /F'
+
+    WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "Sayzo" '"$INSTDIR\${SERVICE_EXE}" service --from-autostart'
 
     ; Start Menu shortcut - also uses the windowless exe so clicking it doesn't
     ; pop a terminal. The console exe stays available on PATH for CLI use.
@@ -296,7 +305,14 @@ SectionEnd
 ; ---------------------------------------------------------------------------
 
 Section "Uninstall"
-    ; Stop the running agent.
+    ; Stop the running agent. v2.8.1+ auto-starts via HKCU Run key (no
+    ; Task Scheduler), so the canonical stop is taskkill. The schtasks
+    ; lines below are defensive cleanup for installs that came through
+    ; v2.8.0 (which attempted to create a task) or a legacy ``/RL HIGHEST``
+    ; entry that survived the migration uninstaller.
+    nsExec::ExecToLog 'taskkill /IM sayzo-agent-service.exe /F /T'
+    nsExec::ExecToLog 'taskkill /IM sayzo-agent.exe /F /T'
+    DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "Sayzo"
     nsExec::ExecToLog 'schtasks /End /TN "Sayzo"'
     nsExec::ExecToLog 'schtasks /Delete /TN "Sayzo" /F'
 

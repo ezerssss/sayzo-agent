@@ -1084,7 +1084,16 @@ def run() -> None:
     help="Always open the first-run GUI even if setup looks complete. "
     "Passed by every install path for visual post-install confirmation.",
 )
-def service(force_setup: bool) -> None:
+@click.option(
+    "--from-autostart",
+    is_flag=True,
+    hidden=True,
+    help="Set by the Windows HKCU Run-key auto-start path so the agent "
+    "suppresses the user-click Settings auto-open. Without this, every "
+    "login would auto-pop Settings — explorer.exe (the Run-key host) is "
+    "treated as a user shell by looks_user_launched().",
+)
+def service(force_setup: bool, from_autostart: bool) -> None:
     """Run the agent as a background service (no terminal output, file logging)."""
     cfg = load_config()
     _setup_file_logging(cfg.logs_dir)
@@ -1299,7 +1308,7 @@ def service(force_setup: bool) -> None:
     # it up via its existing settings-event polling — no new wiring.
     from .launch_source import looks_user_launched
 
-    if not should_show_gui and looks_user_launched():
+    if not should_show_gui and not from_autostart and looks_user_launched():
         log.warning(
             "service: user-click launch detected — auto-opening Settings"
         )
