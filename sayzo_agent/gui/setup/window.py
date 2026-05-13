@@ -15,6 +15,7 @@ import webview
 
 from sayzo_agent.config import Config
 from sayzo_agent.gui.common.assets import icon_path, webui_index_path
+from sayzo_agent.gui.common.pywebview_patches import patch_clear_user_data_none_guard
 from sayzo_agent.gui.common.win_shutdown import install_shutdown_protection
 from sayzo_agent.gui.setup.bridge import Bridge, SetupResult
 
@@ -57,6 +58,10 @@ class SetupWindow:
             text_select=False,
         )
         self._bridge._attach_window(window)
+
+        # Both Windows-only, both must precede webview.start(); see their
+        # module docstrings for the rationale.
+        patch_clear_user_data_none_guard()
 
         # Windows-only: intercept SystemEvents.SessionEnding so we exit
         # cleanly via WM_QUIT before pywebview's FormClosed handler runs

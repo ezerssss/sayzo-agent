@@ -244,12 +244,17 @@ _PYWEBVIEW_TEARDOWN_SIGNATURES = (
     "Form.OnFormClosed",
     "Form.WmClose",
     "BrowserForm",
-    # The two exception signatures we know surface from pywebview's on_close
-    # path during shutdown:
+    # Known exception signatures from pywebview's on_close path during shutdown:
     #   1. v2.7.5 / KeyError('master') — `del BrowserView.instances[uid]`
     #   2. v2.7.11 trigger — Control.Invoke against a dead WebView2 process
+    #   3. v2.14.1 trigger — EdgeChrome.clear_user_data reading BrowserProcessId
+    #      while CoreWebView2 is still None (form closed pre-init). Layer-1
+    #      fix is pywebview_patches.patch_clear_user_data_none_guard; this
+    #      signature is the belt-and-suspenders safety net for the same path.
     "Process with an Id of",
     "KeyError",
+    "BrowserProcessId",
+    "clear_user_data",
 )
 
 
