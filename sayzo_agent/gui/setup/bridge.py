@@ -353,16 +353,6 @@ class Bridge:
 
             mac_permissions.open_audio_capture_settings()
 
-    def open_notification_settings(self) -> None:
-        if sys.platform == "darwin":
-            from sayzo_agent.gui.setup import mac_permissions
-
-            mac_permissions.open_notification_settings()
-        elif sys.platform == "win32":
-            from sayzo_agent.gui.setup import win_permissions
-
-            win_permissions.open_notification_settings()
-
     # ---- Accessibility (macOS — needed for global hotkey + AX-based
     # web meeting detection) -----------------------------------------
 

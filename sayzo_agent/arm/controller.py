@@ -469,7 +469,16 @@ class ArmController:
             )
 
     async def _disarm_with_confirm(self) -> None:
-        """Show the stop-confirmation toast. On Yes / double-tap, disarm."""
+        """Show the stop-confirmation toast. On Yes / double-tap, disarm.
+
+        If the user has turned off ``ArmConfig.confirm_hotkey_stop`` in
+        the Settings pane, skip the toast and disarm immediately —
+        treating the hotkey press as the explicit decision the
+        confirmation would have asked about.
+        """
+        if not self.cfg.confirm_hotkey_stop:
+            await self._disarm_internal(SessionCloseReason.HOTKEY_END)
+            return
         if await self._race_confirm_with_double_tap(
             "Stop recording?",
             "We'll save what we've captured so far.",
@@ -991,6 +1000,8 @@ class ArmController:
     # ---- long-meeting check-in (runs while ARMED) ------------------------
 
     async def _run_checkins(self, session_start_mono: float) -> None:
+        if not self.cfg.checkin_enabled:
+            return
         try:
             for mark in sorted(self.cfg.long_meeting_checkin_marks_secs):
                 # Sleep until this mark elapses.
@@ -1028,6 +1039,8 @@ class ArmController:
 
     async def _run_meeting_ended_watcher(self, reason: ArmReason) -> None:
         assert reason.app_key is not None
+        if not self.cfg.meeting_ended_watcher_enabled:
+            return
         try:
             grace = 0.0
             # ``keep_going_clicked`` switches the watcher into silent
@@ -1079,18 +1092,19 @@ class ArmController:
                             "— wrapping up the session (app=%s)",
                             absence_after_keep_going, reason.app_key,
                         )
-                        name = reason.display_name or "your meeting app"
-                        try:
-                            self.notifier.notify(
-                                "Wrapped up your session",
-                                f"Looks like {name} stayed quiet for a while — "
-                                "Sayzo saved what you had.",
-                            )
-                        except Exception:
-                            log.debug(
-                                "[arm] info toast on force-close failed",
-                                exc_info=True,
-                            )
+                        if self.cfg.notify_session_wrapped:
+                            name = reason.display_name or "your meeting app"
+                            try:
+                                self.notifier.notify(
+                                    "Wrapped up your session",
+                                    f"Looks like {name} stayed quiet for a while — "
+                                    "Sayzo saved what you had.",
+                                )
+                            except Exception:
+                                log.debug(
+                                    "[arm] info toast on force-close failed",
+                                    exc_info=True,
+                                )
                         await self._disarm_internal(
                             SessionCloseReason.WHITELIST_ENDED
                         )

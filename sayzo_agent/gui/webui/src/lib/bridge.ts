@@ -115,7 +115,6 @@ declare global {
     // Settings deep-links.
     open_mic_settings(): Promise<null>;
     open_audio_capture_settings(): Promise<null>;
-    open_notification_settings(): Promise<null>;
     open_accessibility_settings(): Promise<AccessibilityOpenResult>;
 
     // macOS-only stale-TCC recovery: clears the orphan entry via
@@ -269,10 +268,6 @@ export const bridge = {
   async openLogFolder() {
     await whenReady();
     return window.pywebview.api.open_log_folder();
-  },
-  async openNotificationSettings() {
-    await whenReady();
-    return window.pywebview.api.open_notification_settings();
   },
   async openAccessibilitySettings() {
     await whenReady();

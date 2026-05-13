@@ -1277,7 +1277,14 @@ def service(force_setup: bool, from_autostart: bool, open_settings: bool) -> Non
     # ``os._exit`` inside and we never reach the rest of ``service()``.
     # The kernel pidfile lock released by os._exit lets the new agent
     # acquire it cleanly when it relaunches.
-    from .update_apply import apply_staged_if_newer
+    #
+    # Clear any stale quit-apply intent so a crashed prior session can't
+    # silently auto-install on the NEXT plain tray Quit.
+    from .update_apply import (
+        apply_staged_if_newer,
+        clear_quit_apply_intent,
+    )
+    clear_quit_apply_intent(cfg.data_dir)
     apply_staged_if_newer(cfg.data_dir, __version__, where="boot")
 
     # Post-upgrade detection. ``last_seen_version.txt`` is the
@@ -1506,9 +1513,16 @@ def service(force_setup: bool, from_autostart: bool, open_settings: bool) -> Non
         tray_state.notifier = notifier
 
         def _fire_pre_apply_toast() -> None:
+            # Only fires when the user explicitly chose "install now" —
+            # plain tray Quit leaves the flag absent, so we don't promise
+            # a reappearance that won't happen.
             try:
                 from .update_stage import read_staged
                 from .update import is_newer
+                from .update_apply import has_quit_apply_intent
+
+                if not has_quit_apply_intent(cfg.data_dir):
+                    return
                 staged = read_staged(cfg.data_dir)
                 if (staged is not None
                         and is_newer(__version__, staged.version)
@@ -1522,6 +1536,23 @@ def service(force_setup: bool, from_autostart: bool, open_settings: bool) -> Non
                 log.debug("[update] pre-apply toast failed", exc_info=True)
 
         tray_state.pre_quit_hook = _fire_pre_apply_toast
+
+        # Shared by the HUD "Install now" toast (see _update_check) and the
+        # tray "Install Sayzo vX.Y.Z" menu (see gui/tray.py::on_open_update).
+        # Settings → Install update writes the same flag from its own
+        # subprocess via IPC QUIT_AGENT — three surfaces, one mechanism.
+        def _on_install_update_clicked() -> None:
+            try:
+                from .update_apply import set_quit_apply_intent
+                set_quit_apply_intent(cfg.data_dir)
+                request_full_shutdown(tray_state)
+            except Exception:
+                log.warning(
+                    "[update] install-update click handler raised",
+                    exc_info=True,
+                )
+
+        tray_state.on_install_update_clicked = _on_install_update_clicked
 
         # Fire the post-upgrade toast queued by the boot-time last_version
         # check above. Best-effort: any notifier failure logs but doesn't
@@ -2047,19 +2078,14 @@ def service(force_setup: bool, from_autostart: bool, open_settings: bool) -> Non
                     tray.update()
                     last_hotkey = cur_hotkey
 
-        # Phase B auto-update: poll the manifest, background-download the new
-        # release into ``<data_dir>/staged_update/``, verify SHA256. The
-        # actual swap happens at the NEXT agent restart (tray Quit, OS
-        # reboot, or boot-time apply path) — see ``apply_staged_if_newer``
-        # call sites in ``service()`` for the apply half. We deliberately do
-        # NOT fire a "click to download" toast anymore: the new UX is silent
-        # download + after-the-fact "Sayzo updated to vX.Y.Z" toast on next
-        # boot. The tray "Download Sayzo vX.Y.Z" item stays as a visible
-        # signal that an update is staged, but the click-to-browser fallback
-        # is preserved for users who explicitly want it. Failures are logged
-        # and swallowed — auto-update must never break capture. The two env
-        # overrides exist so the E2E test in the plan's Verification section
-        # can trigger a check in seconds instead of hours.
+        # Phase B auto-update: poll the manifest, download + verify SHA256.
+        # The swap is NOT applied here — see update_apply.py for the apply
+        # half. Fires a one-shot "New version available" HUD toast when a
+        # fresh stage lands; the per-version early-return below ensures the
+        # toast only fires once per release. Failures swallowed so a flaky
+        # manifest fetch never breaks capture. Env overrides
+        # SAYZO_UPDATE_CHECK_INITIAL_DELAY_SECS + ..._INTERVAL_SECS exist
+        # for E2E tests.
         async def _update_check() -> None:
             from . import __version__
             from .update import check
@@ -2126,6 +2152,23 @@ def service(force_setup: bool, from_autostart: bool, open_settings: bool) -> Non
                                     version=staged.version, url=info.url
                                 )
                             )
+                            if cfg.notifications_enabled:
+                                try:
+                                    tray_state.notifier.notify_actionable(
+                                        title="New version available",
+                                        body=(
+                                            f"Sayzo v{staged.version} "
+                                            "is ready to install."
+                                        ),
+                                        button_label="Install now",
+                                        on_pressed=tray_state.on_install_update_clicked,
+                                        expire_after_secs=60.0,
+                                    )
+                                except Exception:
+                                    log.warning(
+                                        "[update] install-ready toast raised",
+                                        exc_info=True,
+                                    )
 
                 try:
                     await asyncio.sleep(interval)
@@ -2271,12 +2314,8 @@ def service(force_setup: bool, from_autostart: bool, open_settings: bool) -> Non
                 worker.join(timeout=5)
                 log.warning("tray quit — killing process group and exiting")
 
-                # Apply-at-quit (Phase B). If a staged update is ready, the
-                # swap helper takes over here (Popen with start_new_session
-                # so it survives the killpg below). On success the helper
-                # calls os._exit and we never reach remove_pid / killpg.
-                # On no-op / spawn failure, fall through to normal shutdown.
-                apply_staged_if_newer(cfg.data_dir, __version__, where="quit")
+                from .update_apply import apply_staged_at_quit_if_flagged
+                apply_staged_at_quit_if_flagged(cfg.data_dir, __version__)
 
                 remove_pid(cfg.pid_path)
                 # Best-effort: pkill any remaining direct children that may
@@ -2315,12 +2354,8 @@ def service(force_setup: bool, from_autostart: bool, open_settings: bool) -> Non
         pass
     finally:
         tray.stop()
-        # Apply-at-quit (Phase B). If a staged update is ready, the silent
-        # installer takes over here. On success it spawns detached with /S
-        # and we never reach remove_pid (the installer's taskkill /F kills
-        # us mid-finally; the kernel mutex releases automatically). On
-        # no-op / spawn failure, fall through to normal shutdown.
-        apply_staged_if_newer(cfg.data_dir, __version__, where="quit")
+        from .update_apply import apply_staged_at_quit_if_flagged
+        apply_staged_at_quit_if_flagged(cfg.data_dir, __version__)
         remove_pid(cfg.pid_path)
         log.warning("sayzo-agent service stopped")
 

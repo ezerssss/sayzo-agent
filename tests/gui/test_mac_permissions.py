@@ -496,40 +496,6 @@ def test_prompt_audio_capture_returns_none_on_non_darwin():
 
 
 # ---------------------------------------------------------------------------
-# prompt_notifications — HUD-era stubs (no OS dialog fires)
-# ---------------------------------------------------------------------------
-
-
-def test_prompt_notifications_returns_granted_on_darwin():
-    """v2.10+: HUD owns the notification surface, so the OS dialog is
-    skipped and the helper just reports "granted" so legacy callers
-    don't block setup."""
-    with patch("sayzo_agent.gui.setup.mac_permissions.sys.platform", "darwin"):
-        result = mac_permissions.prompt_notifications()
-    assert result.granted is True
-    assert result.stale_tcc_likely is False
-
-
-def test_prompt_notifications_returns_none_on_non_darwin():
-    with patch("sayzo_agent.gui.setup.mac_permissions.sys.platform", "win32"):
-        result = mac_permissions.prompt_notifications()
-    assert result.granted is None
-    assert result.stale_tcc_likely is False
-
-
-def test_is_notification_authorised_returns_true_on_darwin():
-    with patch("sayzo_agent.gui.setup.mac_permissions.sys.platform", "darwin"):
-        assert mac_permissions.is_notification_authorised() is True
-
-
-def test_send_verification_notification_is_a_noop():
-    """v2.10+: no test toast fires because there's nothing to verify —
-    the HUD's own diagnostics CLI (`sayzo-agent diagnose-notifications`)
-    is the real check."""
-    assert mac_permissions.send_verification_notification() is False
-
-
-# ---------------------------------------------------------------------------
 # open_* helpers
 # ---------------------------------------------------------------------------
 
@@ -554,22 +520,12 @@ def test_open_audio_capture_settings_uses_audio_capture_uri():
     assert "Privacy_AudioCapture" in args[1]
 
 
-def test_open_notification_settings_uses_notifications_uri():
-    with patch(
-        "sayzo_agent.gui.setup.mac_permissions.sys.platform", "darwin"
-    ), patch("sayzo_agent.gui.setup.mac_permissions.subprocess.Popen") as popen:
-        mac_permissions.open_notification_settings()
-    args = popen.call_args.args[0]
-    assert "Notifications-Settings" in args[1]
-
-
 def test_open_helpers_are_noop_on_non_darwin():
     with patch(
         "sayzo_agent.gui.setup.mac_permissions.sys.platform", "win32"
     ), patch("sayzo_agent.gui.setup.mac_permissions.subprocess.Popen") as popen:
         mac_permissions.open_mic_settings()
         mac_permissions.open_audio_capture_settings()
-        mac_permissions.open_notification_settings()
     assert popen.called is False
 
 

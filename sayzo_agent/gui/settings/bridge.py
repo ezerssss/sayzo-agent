@@ -64,8 +64,8 @@ _MAC_PERMISSION_ROWS: tuple[dict[str, str], ...] = (
 )
 
 # Direct deep-links for permissions that can only be toggled in System
-# Settings (Accessibility has no programmatic grant flow). mic /
-# audio_capture / notifications use the deep-links inside ``mac_permissions``.
+# Settings (Accessibility has no programmatic grant flow). mic and
+# audio_capture use the deep-links inside ``mac_permissions``.
 _MAC_PERMISSION_DEEPLINKS: dict[str, str] = {
     "accessibility": (
         "x-apple.systempreferences:com.apple.preference.security"
@@ -93,6 +93,22 @@ _NOTIFICATION_KEYS: dict[str, dict] = {
     "capture_saved": {
         "store_patch": lambda v: {"notify_capture_saved": v},
         "cfg_attr": ("notify_capture_saved",),
+    },
+    "session_wrapped": {
+        "store_patch": lambda v: {"arm": {"notify_session_wrapped": v}},
+        "cfg_attr": ("arm", "notify_session_wrapped"),
+    },
+    "checkin": {
+        "store_patch": lambda v: {"arm": {"checkin_enabled": v}},
+        "cfg_attr": ("arm", "checkin_enabled"),
+    },
+    "meeting_ended_watcher": {
+        "store_patch": lambda v: {"arm": {"meeting_ended_watcher_enabled": v}},
+        "cfg_attr": ("arm", "meeting_ended_watcher_enabled"),
+    },
+    "confirm_hotkey_stop": {
+        "store_patch": lambda v: {"arm": {"confirm_hotkey_stop": v}},
+        "cfg_attr": ("arm", "confirm_hotkey_stop"),
     },
     # Daily-drill scheduler sub-toggle. Persists to user_settings.json
     # under "notifications.daily_drill_enabled"; the live agent is
@@ -502,6 +518,10 @@ class Bridge:
             "welcome": bool(self._cfg.notify_welcome),
             "post_arm": bool(self._cfg.arm.notify_post_arm),
             "capture_saved": bool(self._cfg.notify_capture_saved),
+            "session_wrapped": bool(self._cfg.arm.notify_session_wrapped),
+            "checkin": bool(self._cfg.arm.checkin_enabled),
+            "meeting_ended_watcher": bool(self._cfg.arm.meeting_ended_watcher_enabled),
+            "confirm_hotkey_stop": bool(self._cfg.arm.confirm_hotkey_stop),
             "daily_drill": bool(self._cfg.notifications.daily_drill_enabled),
         }
 
@@ -537,10 +557,14 @@ class Bridge:
             )
             return {"saved": False, "error": "couldn't write user_settings.json"}
 
-        # Nudge the live agent so the change applies without a restart.
-        # Daily-drill toggle hits its own scheduler reload path; the
-        # master / welcome / capture_saved / post_arm toggles read
-        # straight from cfg on each event so they don't need a nudge.
+        # Daily-drill scheduler has a dedicated reload IPC; master flag
+        # routes through the same path so the scheduler picks up the
+        # gate. The other toggles (welcome / capture_saved / arm.*)
+        # are read from ``cfg`` on each event by the running agent;
+        # the settings subprocess holds its own ``cfg`` copy, so those
+        # changes take effect on the next agent process restart. Mid-
+        # session live propagation for the arm flags is preexisting
+        # tech debt (post_arm has the same shape).
         if key in ("daily_drill", "master"):
             try:
                 self._ipc.call_quiet(Methods.RELOAD_NOTIFICATION_CONFIG)
@@ -645,12 +669,6 @@ class Bridge:
                 "granted": result.granted,
                 "stale_tcc_likely": result.stale_tcc_likely,
             }
-        if key == "notifications":
-            result = mac_permissions.prompt_notifications()
-            return {
-                "granted": result.granted,
-                "stale_tcc_likely": result.stale_tcc_likely,
-            }
         return {"granted": None}
 
     def open_permission_settings(self, key: str) -> dict[str, bool]:
@@ -673,8 +691,6 @@ class Bridge:
                 mac_permissions.open_mic_settings()
             elif key == "audio_capture":
                 mac_permissions.open_audio_capture_settings()
-            elif key == "notifications":
-                mac_permissions.open_notification_settings()
             elif key in _MAC_PERMISSION_DEEPLINKS:
                 import subprocess as _sp
                 _sp.Popen(["open", _MAC_PERMISSION_DEEPLINKS[key]])
@@ -1180,14 +1196,15 @@ class Bridge:
             assert staged is not None
             self._push_update_phase("applying", version=staged.version)
 
-            # Triggering the agent's quit-path is what actually runs the
-            # apply. The agent's finally block calls
-            # ``apply_staged_if_newer`` which detects our staged file and
-            # spawns the installer / swap helper. If the agent isn't
-            # reachable (it crashed, or the user disabled auto-start),
-            # surface "queued_for_restart" — the boot-time apply path will
-            # catch it next time the agent runs.
+            # Write the quit-apply intent flag BEFORE QUIT_AGENT so the
+            # agent's quit path applies the stage. Without the flag, a
+            # plain tray Quit no longer auto-installs (see update_apply.py).
+            # If the agent is unreachable, the flag still sits on disk for
+            # the boot-time apply path to catch on next launch — we surface
+            # "queued_for_restart" in that case.
             try:
+                from sayzo_agent.update_apply import set_quit_apply_intent
+                set_quit_apply_intent(self._cfg.data_dir)
                 self._ipc.call(Methods.QUIT_AGENT)
             except IPCNotConnected:
                 self._push_update_phase(

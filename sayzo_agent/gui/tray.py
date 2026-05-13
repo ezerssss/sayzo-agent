@@ -161,6 +161,15 @@ class TrayState:
     # scope, without forcing tray.py to know about update_stage.
     pre_quit_hook: Callable[[], None] | None = None
 
+    # Optional callable invoked when the user clicks the tray's "Install
+    # Sayzo vX.Y.Z" menu item (and reused as the HUD "Install now" toast
+    # button's ``on_pressed``). The closure — assigned by
+    # ``_build_pipeline_state`` in ``__main__.py`` — writes the quit-apply
+    # intent flag and calls :func:`request_full_shutdown` so the quit path
+    # actually applies the staged update. Keeps tray.py free of update_apply
+    # imports.
+    on_install_update_clicked: Callable[[], None] | None = None
+
     def set_status(self, status: Status, error_message: str = "") -> None:
         with self._lock:
             self.status = status
@@ -497,11 +506,9 @@ class TrayIcon:
             icon.stop()
 
         def on_open_update(icon, item):
-            offer = self.state.get_update_offer()
-            if offer is None:
+            if self.state.get_update_offer() is None:
                 return
-            import webbrowser
-            webbrowser.open(offer.url)
+            self.state.on_install_update_clicked()
 
         # ---- dynamic text callbacks (re-evaluated each menu open) ---------
 
@@ -531,7 +538,7 @@ class TrayIcon:
 
         def update_text(item) -> str:
             offer = self.state.get_update_offer()
-            return f"Download Sayzo v{offer.version}" if offer else ""
+            return f"Install Sayzo v{offer.version}" if offer else ""
 
         def update_visible(item) -> bool:
             return self.state.get_update_offer() is not None

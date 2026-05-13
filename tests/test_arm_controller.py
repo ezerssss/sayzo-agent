@@ -12,6 +12,7 @@ Drives the controller with:
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any, Optional
 
 import pytest
@@ -1295,3 +1296,136 @@ async def test_rebind_hotkey_surfaces_error_on_conflict():
     assert err is not None
     assert "already in use" in err
     assert ctrl.cfg.hotkey == "ctrl+alt+s"  # unchanged
+
+
+# ---- notification gating toggles ---------------------------------------
+#
+# The four new ArmConfig toggles (checkin_enabled,
+# meeting_ended_watcher_enabled, confirm_hotkey_stop,
+# notify_session_wrapped) gate user-visible toasts / consents that
+# previously always fired. Each test sets the flag false, drives the
+# matching code path, and asserts the toast / consent didn't fire.
+
+
+async def test_long_meeting_checkin_skipped_when_disabled():
+    """Disabling ``checkin_enabled`` makes ``_run_checkins`` short-circuit
+    with no consent toast even after the configured mark elapses."""
+    notifier = FakeNotifier()
+    # Mark every 0.02 s so we don't have to wait.
+    ctrl, *_, _ = _make_controller(
+        notifier=notifier,
+        cfg_overrides={
+            "checkin_enabled": False,
+            "long_meeting_checkin_marks_secs": [0.02],
+        },
+    )
+    task = asyncio.create_task(ctrl._run_checkins(time.monotonic()))
+    await asyncio.sleep(0.1)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    assert notifier.consent_calls == []
+
+
+async def test_long_meeting_checkin_fires_when_enabled():
+    """Sanity counterpart: enabling the flag (default) still fires."""
+    notifier = FakeNotifier()
+    notifier.consent_script = ["yes"]
+    ctrl, *_, _ = _make_controller(
+        notifier=notifier,
+        cfg_overrides={
+            "checkin_enabled": True,
+            "long_meeting_checkin_marks_secs": [0.02],
+        },
+    )
+    ctrl.state = ArmState.ARMED  # bypass real arm
+    task = asyncio.create_task(ctrl._run_checkins(time.monotonic()))
+    await asyncio.sleep(0.25)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    assert any(c["title"] == "Still in the meeting?" for c in notifier.consent_calls)
+
+
+async def test_meeting_ended_watcher_skipped_when_disabled():
+    """Disabling ``meeting_ended_watcher_enabled`` makes
+    ``_run_meeting_ended_watcher`` short-circuit immediately — no polling,
+    no toast."""
+    notifier = FakeNotifier()
+    ctrl, *_, _ = _make_controller(
+        notifier=notifier,
+        cfg_overrides={"meeting_ended_watcher_enabled": False},
+    )
+    ctrl.state = ArmState.ARMED
+    reason = ArmReason(source="whitelist", app_key="zoom", display_name="Zoom")
+    task = asyncio.create_task(ctrl._run_meeting_ended_watcher(reason))
+    await asyncio.sleep(0.1)
+    # Should have completed (early return) without firing anything.
+    assert task.done()
+    assert notifier.consent_calls == []
+    assert all("Looks like your meeting ended" not in t for t, _ in notifier.fire_and_forget)
+
+
+async def test_hotkey_disarm_skips_confirm_when_disabled():
+    """With ``confirm_hotkey_stop`` off, pressing the hotkey while armed
+    disarms immediately — no consent toast is shown."""
+    notifier = FakeNotifier()
+    # Only the initial arm consent is consumed; no second consent should fire.
+    notifier.consent_script = ["yes"]
+    ctrl, *_, _ = _make_controller(
+        notifier=notifier,
+        cfg_overrides={"confirm_hotkey_stop": False},
+    )
+
+    await ctrl._on_hotkey_pressed()
+    assert ctrl.state == ArmState.ARMED
+
+    await ctrl._on_hotkey_pressed()
+    assert ctrl.state == ArmState.DISARMED
+    # Only the arm consent fired ("Start recording?"); no "Stop recording?".
+    assert all(c["title"] != "Stop recording?" for c in notifier.consent_calls)
+
+
+async def test_session_wrapped_notify_skipped_when_disabled():
+    """With ``notify_session_wrapped`` off, the post-Keep-going force-close
+    branch disarms silently — no "Wrapped up your session" toast. Drives
+    the real ``_run_meeting_ended_watcher`` so the production gate is
+    actually exercised (mirrors ``test_meeting_ended_keep_going_force_closes_after_threshold``)."""
+    notifier = FakeNotifier()
+    # Whitelist yes → arm. Meeting-ended toast → "Keep going" (no).
+    notifier.consent_script = ["yes", "no"]
+    ctrl, _, *_ = _make_controller(
+        notifier=notifier,
+        mic_holders=[MicHolder("zoom.exe", 1234)],
+        cfg_overrides={
+            "poll_interval_secs": 0.01,
+            "whitelist_arm_release_grace_secs": 0.02,
+            "force_close_after_keep_going_secs": 0.06,
+            "meeting_ended_toast_timeout_secs": 0.02,
+            "notify_session_wrapped": False,
+        },
+    )
+    ctrl._loop = asyncio.get_running_loop()
+    ctrl._whitelist_task = asyncio.create_task(ctrl._run_whitelist_watcher())
+    await asyncio.sleep(0.05)
+    assert ctrl.state == ArmState.ARMED
+    ctrl._q_mic_holders = lambda: []
+    await asyncio.sleep(0.35)
+    assert ctrl.state == ArmState.DISARMED
+    # Production gate is exercised: force-close hit, watcher branched
+    # through the notify_session_wrapped check, and the toast was
+    # suppressed.
+    info_calls = [t for t in notifier.fire_and_forget if "Wrapped up" in t[0]]
+    assert info_calls == [], (
+        f"expected no 'Wrapped up' toast when disabled, got {info_calls!r}"
+    )
+
+    ctrl._whitelist_task.cancel()
+    try:
+        await ctrl._whitelist_task
+    except asyncio.CancelledError:
+        pass

@@ -15,8 +15,15 @@ from pathlib import Path
 import pytest
 
 from sayzo_agent.update_stage import StagedUpdate
-from sayzo_agent import update_apply_win
+from sayzo_agent import update_apply, update_apply_win
 from sayzo_agent import update_apply_mac
+from sayzo_agent.update_apply import (
+    QUIT_APPLY_FLAG_NAME,
+    apply_staged_if_newer,
+    clear_quit_apply_intent,
+    has_quit_apply_intent,
+    set_quit_apply_intent,
+)
 
 
 class _ExitSentinel(Exception):
@@ -193,4 +200,75 @@ def test_mac_spawn_raises_when_helper_missing(
     staged = _staged(tmp_path)
     with pytest.raises(RuntimeError, match="apply_update.sh"):
         update_apply_mac.spawn_swap_helper_and_exit(staged)
+    assert rec.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Quit-apply intent flag (v2.12+)
+#
+# These primitives gate the quit-time apply call sites so a plain tray Quit
+# no longer auto-installs a staged update. Settings → Install update, the
+# tray "Install Sayzo vX.Y.Z" menu item, and the HUD "Install now" toast
+# button each write the flag before triggering the quit.
+# ---------------------------------------------------------------------------
+
+
+def test_set_quit_apply_intent_creates_flag(tmp_path: Path) -> None:
+    assert not has_quit_apply_intent(tmp_path)
+    set_quit_apply_intent(tmp_path)
+    assert has_quit_apply_intent(tmp_path)
+    assert (tmp_path / QUIT_APPLY_FLAG_NAME).is_file()
+
+
+def test_set_quit_apply_intent_is_idempotent(tmp_path: Path) -> None:
+    set_quit_apply_intent(tmp_path)
+    set_quit_apply_intent(tmp_path)
+    assert has_quit_apply_intent(tmp_path)
+
+
+def test_set_quit_apply_intent_creates_missing_data_dir(tmp_path: Path) -> None:
+    target = tmp_path / "fresh" / "data"
+    assert not target.exists()
+    set_quit_apply_intent(target)
+    assert has_quit_apply_intent(target)
+
+
+def test_clear_quit_apply_intent_removes_flag(tmp_path: Path) -> None:
+    set_quit_apply_intent(tmp_path)
+    clear_quit_apply_intent(tmp_path)
+    assert not has_quit_apply_intent(tmp_path)
+
+
+def test_clear_quit_apply_intent_is_safe_when_missing(tmp_path: Path) -> None:
+    # Must not raise — boot-time clear runs unconditionally before any
+    # session has had a chance to write the flag.
+    clear_quit_apply_intent(tmp_path)
+    assert not has_quit_apply_intent(tmp_path)
+
+
+def test_apply_staged_if_newer_noop_when_nothing_staged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # No stage on disk → apply is a no-op regardless of platform helper.
+    # Patch sys.platform-specific helpers to record any spawn — none expected.
+    rec = _PopenRecorder()
+    monkeypatch.setattr(subprocess, "Popen", rec)
+    apply_staged_if_newer(tmp_path, "1.0.0", where="quit")
+    assert rec.calls == []
+
+
+def test_apply_staged_if_newer_noop_when_stage_not_newer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Stage exists but matches running version → no platform spawn.
+    monkeypatch.setattr(
+        update_apply, "read_staged",
+        lambda data_dir: StagedUpdate(
+            version="1.0.0", platform="windows", sha256="x", notes="",
+            payload_path=tmp_path / "payload.exe", ready_at="x",
+        ),
+    )
+    rec = _PopenRecorder()
+    monkeypatch.setattr(subprocess, "Popen", rec)
+    apply_staged_if_newer(tmp_path, "1.0.0", where="quit")
     assert rec.calls == []

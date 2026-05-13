@@ -150,21 +150,9 @@ _MIC_DEEPLINK = (
 _AUDIO_CAPTURE_DEEPLINK = (
     "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture"
 )
-_NOTIFICATIONS_DEEPLINK = (
-    "x-apple.systempreferences:com.apple.Notifications-Settings.extension"
-)
 _ACCESSIBILITY_DEEPLINK = (
     "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
 )
-
-# Notification "permission" no longer exists in v2.10+ — the custom HUD
-# (see :mod:`sayzo_agent.gui.hud`) owns the notification surface
-# end-to-end and doesn't go through ``UNUserNotificationCenter``. The
-# functions below survive only because the bridge still exposes them
-# (legacy bindings used by the now-removed Notifications onboarding
-# screen) — they return constants that indicate "already granted" so
-# any straggler caller doesn't block setup.
-
 
 def _log_bundle_info_plist_once() -> None:
     """One-shot diagnostic: log the bundle's actual Info.plist values so we
@@ -864,32 +852,6 @@ def _terminate(proc: subprocess.Popen) -> None:
         log.debug("[mac_permissions] proc.kill raised", exc_info=True)
 
 
-def prompt_notifications() -> TccPromptResult:
-    """No-op stub — notifications are owned by the custom HUD in v2.10+.
-
-    The Notifications onboarding screen was removed when the HUD shipped
-    (`project_custom_hud_shipped`). The bridge method this function
-    backs survives only as a non-load-bearing legacy binding; returning
-    ``granted=True`` means any caller that hasn't been pruned yet just
-    advances. No OS dialog fires.
-    """
-    if sys.platform != "darwin":
-        return TccPromptResult(granted=None, stale_tcc_likely=False)
-    return TccPromptResult(granted=True, stale_tcc_likely=False)
-
-
-def is_notification_authorised() -> Optional[bool]:
-    """No-op stub — see :func:`prompt_notifications`."""
-    if sys.platform != "darwin":
-        return None
-    return True
-
-
-def send_verification_notification() -> bool:
-    """No-op stub — see :func:`prompt_notifications`."""
-    return False
-
-
 def _open(deeplink: str) -> None:
     if sys.platform != "darwin":
         return
@@ -905,10 +867,6 @@ def open_mic_settings() -> None:
 
 def open_audio_capture_settings() -> None:
     _open(_AUDIO_CAPTURE_DEEPLINK)
-
-
-def open_notification_settings() -> None:
-    _open(_NOTIFICATIONS_DEEPLINK)
 
 
 def open_accessibility_settings() -> None:

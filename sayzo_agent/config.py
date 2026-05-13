@@ -488,6 +488,32 @@ class ArmConfig(BaseSettings):
     # toasts are unaffected (they're how the user decides what to capture).
     notify_post_arm: bool = True
 
+    # Sub-toggle for the long-meeting check-in consent ("Still in the
+    # meeting?" at 1h / 2h / 2h30 / 3h / +30 min). When ``False``,
+    # ``_run_checkins`` short-circuits and the agent never asks. Users
+    # in deliberately long calls might prefer this off; the trade-off
+    # is the session keeps capturing indefinitely until the user
+    # disarms via hotkey or the joint-silence path fires.
+    checkin_enabled: bool = True
+
+    # Sub-toggle for the whitelist meeting-ended watcher ("Looks like
+    # your meeting ended"). When ``False``, ``_run_meeting_ended_watcher``
+    # short-circuits — the agent won't auto-suggest wrap-up when the
+    # meeting app stops holding the mic. User must disarm manually.
+    meeting_ended_watcher_enabled: bool = True
+
+    # Sub-toggle for the hotkey-while-armed "Stop recording?" consent.
+    # When ``False``, pressing the hotkey while armed disarms
+    # immediately without asking — no safety net for accidental presses.
+    confirm_hotkey_stop: bool = True
+
+    # Sub-toggle for the "Wrapped up your session" info toast that
+    # fires after the meeting-ended watcher's silent force-close (the
+    # post-"Keep going" path that auto-closes once the arm-app has
+    # been absent past the force-close threshold). Informational only;
+    # the disarm still happens either way.
+    notify_session_wrapped: bool = True
+
 
 class AuthConfig(BaseSettings):
     auth_url: str = "https://sayzo.app/api/auth"
@@ -728,7 +754,11 @@ def load_config() -> Config:
         for k in os.environ
         if k.upper().startswith("SAYZO_") and "__" not in k[len("SAYZO_"):]
     }
-    for key in ("notifications_enabled", "notify_welcome", "notify_capture_saved"):
+    for key in (
+        "notifications_enabled",
+        "notify_welcome",
+        "notify_capture_saved",
+    ):
         if key in user and key not in env_top_keys:
             init_kwargs[key] = user[key]
 
