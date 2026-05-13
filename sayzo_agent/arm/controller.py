@@ -196,6 +196,12 @@ class ArmController:
         # hotkey or the whitelist consent path. ``None`` ⇒ no gating
         # (test default; production wires this from ``__main__``).
         account_gate_fn: Optional[AccountGateFn] = None,
+        # Reads current ``cfg.capture.system_scope`` ("endpoint" or
+        # "arm_app"). Callable, not snapshot — the Settings pane mutates
+        # the live config object, so the next hotkey press needs the
+        # fresh value. Default returns "endpoint" so tests + the
+        # smoke-test harness don't have to pass it explicitly.
+        system_scope_fn: Callable[[], str] = lambda: "endpoint",
     ) -> None:
         self.cfg = cfg
         self.detector = detector
@@ -270,6 +276,7 @@ class ArmController:
 
         # Web-onboarding gate (see _arm_internal + _run_whitelist_watcher).
         self.account_gate_fn: Optional[AccountGateFn] = account_gate_fn
+        self._system_scope_fn = system_scope_fn
         # Per-app_key dedup for the watcher's "skipped because gated" log,
         # so a long meeting in a blocked-account state doesn't spam at the
         # 2 s poll cadence.
@@ -418,7 +425,7 @@ class ArmController:
             if self.state == ArmState.ARMED:
                 await self._disarm_internal(SessionCloseReason.HOTKEY_END)
             else:
-                target_pids, mic_device = self._resolve_hotkey_arm_scope()
+                target_pids, mic_device = self._resolve_hotkey_arm()
                 await self._arm_internal(
                     ArmReason(
                         source="hotkey",
@@ -459,7 +466,7 @@ class ArmController:
             "Sayzo will capture this conversation so we can coach you on it.",
             "Yes, start", "Cancel",
         ):
-            target_pids, mic_device = self._resolve_hotkey_arm_scope()
+            target_pids, mic_device = self._resolve_hotkey_arm()
             await self._arm_internal(
                 ArmReason(
                     source="hotkey",
@@ -727,6 +734,27 @@ class ArmController:
                 self.detector.commit_close(now, close_reason)
         except Exception:
             log.exception("[arm] detector commit_close failed")
+
+        # Unified "processing" toast on every clean disarm — hotkey,
+        # pill click, check-in wrap-up, whitelist-ended, silence-close-
+        # confirmed. Skipped for SHUTDOWN (agent is going down) and any
+        # error/abort reason added later. The discard / saved toasts
+        # downstream (see app.py + upload_retry.py) close the loop on
+        # what actually happened to the capture.
+        _processing_reasons = (
+            SessionCloseReason.HOTKEY_END,
+            SessionCloseReason.CHECKIN_WRAP_UP,
+            SessionCloseReason.WHITELIST_ENDED,
+            SessionCloseReason.JOINT_SILENCE,
+        )
+        if close_reason in _processing_reasons:
+            try:
+                self.notifier.notify(
+                    "Got it",
+                    "Processing your capture. You'll see a notification when it's ready.",
+                )
+            except Exception:
+                log.debug("[arm] processing toast failed", exc_info=True)
 
         for task in (self._checkin_task, self._meeting_ended_task):
             if task is not None and not task.done():
@@ -1257,102 +1285,91 @@ class ArmController:
         except TypeError:
             await self.mic.start()
 
-    def _resolve_hotkey_arm_scope(self) -> tuple[tuple[int, ...], Optional[str]]:
-        """Smart-guess (target_pids, mic_device) for a hotkey-triggered arm.
+    def _resolve_hotkey_arm(self) -> tuple[tuple[int, ...], Optional[str]]:
+        """Decide ``(target_pids, mic_device)`` for a hotkey-triggered arm.
 
-        ``target_pids`` is the existing system-loopback scope; we only
-        commit to it when we're CONFIDENT the right app is identified,
-        otherwise endpoint scope so a user's explicit "record now"
-        intent never produces a silent system track.
+        Default (``system_scope=endpoint``, v2.9+ shipping default):
+        captures the whole endpoint regardless of which app holds the
+        mic. ``target_pids`` is ``()`` — no per-app scoping logic runs.
+        The MIC is still routed opportunistically to whatever device a
+        holder is using; recording where the mic is live beats
+        recording the built-in mic pointed at empty air. Unknown
+        holders are recorded to ``seen_apps`` for one-click promotion
+        in Settings.
 
-        ``mic_device`` follows a different rule: if the holder list is
-        non-empty AND we trust at least one holder enough to read its
-        device, route the mic there. Recording from the actually-active
-        capture device is strictly better than the OS default in every
-        case the user notices (multi-mic users with a non-default mic
-        in Zoom). Conservative scope on system audio + opportunistic
-        device routing on the mic is the right asymmetry.
+        Beta (``system_scope=arm_app``, Settings → Recording →
+        "Per-app audio capture (beta)"): narrows scope per-app when a
+        whitelisted holder is present. Unknown holder → endpoint
+        fallback (the v2.7.9 fix that prevents silent capture when
+        Steam Voice / ChatGPT-voice / Voice Recorder is the only
+        mic-holder).
 
-        **Windows** (``mic.holders`` from pycaw, one row per active
-        capture session across every endpoint):
-          1. Any whitelisted apps among the mic-holders → scope to
-             those holders' PIDs only (ignores Cortana / voice
-             assistants / other false-positives), mic device = the
-             whitelisted holder's device.
-          2. Otherwise (mic-holders exist but none are whitelisted) →
-             endpoint system-loopback scope (today's "avoid silent
-             capture" rationale), but mic device = the first holder's
-             device. The user told us to record; routing the mic to
-             where it's actually being used is fine even for an
-             unknown app. Unknown holders are still recorded to
-             ``seen_apps`` for one-click promotion in Settings.
-          3. No mic-holders → endpoint scope + OS default mic.
-
-        **macOS** (foreground app + ``audio-detect`` mic attribution):
-          Same rules; mic device comes from the matching holder's
-          ``device_name`` (populated by ``audio-detect`` Swift helper
-          since v2.7.12).
+        Mic-device routing rules are the same in both modes — always
+        opportunistic.
         """
         try:
             mic = self._snapshot_mic_state()
             fg = self._snapshot_foreground()
         except Exception:
-            log.debug("[arm] hotkey smart-guess snapshot failed", exc_info=True)
+            log.debug("[arm] hotkey resolve snapshot failed", exc_info=True)
             return ((), None)
 
         if sys.platform == "win32":
-            return self._resolve_hotkey_arm_scope_win(mic)
+            return self._resolve_hotkey_arm_win(mic)
         if sys.platform == "darwin":
-            return self._resolve_hotkey_arm_scope_mac(mic, fg)
+            return self._resolve_hotkey_arm_mac(mic, fg)
         return ((), None)
 
-    def _resolve_hotkey_arm_scope_win(
+    def _resolve_hotkey_arm_win(
         self, mic: MicState,
     ) -> tuple[tuple[int, ...], Optional[str]]:
         if not mic.holders:
             return ((), None)
-        whitelisted_proc_names: set[str] = set()
-        for spec in self.cfg.detectors:
-            if spec.disabled or spec.is_browser:
-                continue
-            for name in spec.process_names:
-                whitelisted_proc_names.add(name.lower())
-
-        whitelisted_pids: set[int] = set()
-        whitelisted_device: Optional[str] = None
-        for h in mic.holders:
-            if h.pid <= 0:
-                continue
-            if h.process_name.lower() in whitelisted_proc_names:
-                whitelisted_pids.add(h.pid)
-                if whitelisted_device is None and h.device_name:
-                    whitelisted_device = h.device_name
-
-        if whitelisted_pids:
-            log.info(
-                "[arm] hotkey smart-guess (win): scoping to %d whitelisted "
-                "mic-holder(s) on device=%r",
-                len(whitelisted_pids), whitelisted_device or "default",
-            )
-            return tuple(sorted(whitelisted_pids)), whitelisted_device
-
-        # Mic-holders exist but none are whitelisted. Endpoint scope on
-        # system-loopback (today's "avoid silent capture" rationale —
-        # Slack huddles, ChatGPT voice mode, Voice Recorder etc. would
-        # otherwise produce a silent system track if we scoped to their
-        # PID). For the MIC, though, we route to the device the first
-        # unknown holder is on: the user explicitly hotkey'd, recording
-        # from where the mic is actually being used beats recording the
-        # built-in laptop mic pointed at empty air.
         holder_names = sorted({h.process_name for h in mic.holders if h.process_name})
         first_device = next(
             (h.device_name for h in mic.holders if h.device_name), None,
         )
+
+        if self._system_scope_fn() != "arm_app":
+            log.info(
+                "[arm] hotkey scope: endpoint (mic-holders: %s) mic=%r",
+                ", ".join(holder_names) or "?", first_device or "default",
+            )
+            try:
+                self._record_unmatched_holders(mic, ForegroundInfo())
+            except Exception:
+                log.debug("[arm] hotkey seen_apps.record failed", exc_info=True)
+            return (), first_device
+
+        # Beta path: try to narrow to a whitelisted holder. Reuses the
+        # same matcher the whitelist auto-arm path uses (handles bundle
+        # id + helper-bundle prefix matching, not just process_name).
+        whitelisted_pids: set[int] = set()
+        for spec in self.cfg.detectors:
+            if spec.disabled or spec.is_browser:
+                continue
+            whitelisted_pids.update(_d._pids_for_desktop_holders(spec, mic))
+
+        if whitelisted_pids:
+            whitelisted_device = next(
+                (h.device_name for h in mic.holders
+                 if h.pid in whitelisted_pids and h.device_name),
+                None,
+            )
+            log.info(
+                "[arm] hotkey scope: per-app pids=%s (beta) mic=%r",
+                ",".join(str(p) for p in sorted(whitelisted_pids)),
+                whitelisted_device or "default",
+            )
+            return tuple(sorted(whitelisted_pids)), whitelisted_device
+
+        # Beta on but no whitelisted holder — fall back to endpoint to
+        # avoid silent capture from wrong-app mic-holders (Steam Voice,
+        # ChatGPT voice, Voice Recorder, …). v2.7.9 fix.
         log.info(
-            "[arm] hotkey smart-guess (win): %d unknown mic-holder(s) (%s) — "
-            "endpoint sys-loopback to avoid silent capture, mic=%r",
-            len(mic.holders), ", ".join(holder_names) or "?",
-            first_device or "default",
+            "[arm] hotkey scope: endpoint (beta on, no whitelisted holder "
+            "among %s) mic=%r",
+            ", ".join(holder_names) or "?", first_device or "default",
         )
         try:
             self._record_unmatched_holders(mic, ForegroundInfo())
@@ -1360,27 +1377,39 @@ class ArmController:
             log.debug("[arm] hotkey seen_apps.record failed", exc_info=True)
         return (), first_device
 
-    def _resolve_hotkey_arm_scope_mac(
+    def _resolve_hotkey_arm_mac(
         self, mic: MicState, fg: ForegroundInfo,
     ) -> tuple[tuple[int, ...], Optional[str]]:
         if not mic.active:
             return ((), None)
+        first_device = next(
+            (h.device_name for h in mic.holders if h.device_name), None,
+        )
+
+        if self._system_scope_fn() != "arm_app":
+            # Default endpoint path. Record unmatched foreground for
+            # the "Suggested to add" UI even when we're not scoping.
+            log.info(
+                "[arm] hotkey scope: endpoint mic=%r", first_device or "default",
+            )
+            try:
+                self._record_unmatched_holders(mic, fg)
+            except Exception:
+                log.debug("[arm] hotkey seen_apps.record failed", exc_info=True)
+            return ((), first_device)
+
+        # Beta path: foreground-driven per-app scoping.
         fg_proc = (fg.process_name or "").lower()
         fg_bundle = (fg.bundle_id or "").lower()
         if not fg_proc and not fg_bundle:
-            # Even with no foreground attribution, route the mic to
-            # whatever IS being captured — same opportunistic rule as
-            # Windows. seen_apps recording lives in the foreground
-            # path below; without a foreground bundle there's nothing
-            # to record.
-            first_device = next(
-                (h.device_name for h in mic.holders if h.device_name), None,
+            # No foreground attribution to match against — fall back to
+            # endpoint with opportunistic mic routing.
+            log.info(
+                "[arm] hotkey scope: endpoint (beta on, no foreground "
+                "attribution) mic=%r", first_device or "default",
             )
             return ((), first_device)
 
-        # Pass 1: foreground matches a whitelisted spec → use the real
-        # resolver for that spec (enumerates all PIDs matching its
-        # process_names + bundle_ids).
         for spec in self.cfg.detectors:
             if spec.disabled:
                 continue
@@ -1400,25 +1429,19 @@ class ArmController:
                 if pids:
                     device = self._pick_mic_device_for_pids(pids, label=spec.app_key)
                     log.info(
-                        "[arm] hotkey smart-guess (mac): scoping to "
-                        "whitelisted %s via foreground (%d pids, mic=%r)",
-                        spec.app_key, len(pids), device or "default",
+                        "[arm] hotkey scope: per-app pids=%d (beta, %s) mic=%r",
+                        len(pids), spec.app_key, device or "default",
                     )
                     return pids, device
-                # Resolver returned empty — fall through to Pass 2.
+                # Resolver returned empty — fall through to endpoint.
                 break
 
-        # Foreground is some identifiable app but not whitelisted.
-        # Endpoint sys-loopback scope (today's "avoid silent capture"
-        # rationale); route the mic to whatever's actually being held.
-        first_device = next(
-            (h.device_name for h in mic.holders if h.device_name), None,
-        )
+        # Beta on but foreground isn't whitelisted (or resolver returned
+        # empty). Fall back to endpoint to avoid silent capture.
         log.info(
-            "[arm] hotkey smart-guess (mac): foreground (%s) not whitelisted "
-            "— endpoint sys-loopback to avoid silent capture, mic=%r",
-            fg_bundle or fg_proc or "?",
-            first_device or "default",
+            "[arm] hotkey scope: endpoint (beta on, foreground %s not "
+            "whitelisted) mic=%r",
+            fg_bundle or fg_proc or "?", first_device or "default",
         )
         try:
             self._record_unmatched_holders(mic, fg)
@@ -1433,7 +1456,7 @@ class ArmController:
         # have no attributed holders but the mic might still be active
         # (rare edge case on macOS where audio_detect saw an unattributable
         # capturing process; consulted by the seen-apps recorder + the
-        # hotkey smart-guess foreground path).
+        # hotkey resolver's foreground path on macOS).
         active = bool(holders) or bool(self._q_is_mic_active())
         running = self._q_running_procs() or frozenset()
         return MicState(holders=list(holders), active=active, running_processes=running)

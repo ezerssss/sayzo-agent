@@ -248,10 +248,20 @@ def devices() -> None:
 
     import sounddevice as sd
 
+    hostapis = sd.query_hostapis()
+
+    def _host_name(host_idx) -> str:
+        if host_idx is None or not (0 <= host_idx < len(hostapis)):
+            return "?"
+        return hostapis[host_idx]["name"]
+
     click.echo("--- sounddevice (input) ---")
     for i, d in enumerate(sd.query_devices()):
         if d.get("max_input_channels", 0) > 0:
-            click.echo(f"  [{i}] {d['name']} (in={d['max_input_channels']})")
+            click.echo(
+                f"  [{i}] {d['name']} [{_host_name(d.get('hostapi'))}] "
+                f"(in={d['max_input_channels']})"
+            )
 
     if sys.platform == "win32":
         import pyaudiowpatch as pyaudio

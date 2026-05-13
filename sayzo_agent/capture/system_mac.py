@@ -184,8 +184,13 @@ class SystemCapture:
         ``--pids``. Empty list ⇒ global tap (today's behavior).
         """
         binary = _find_audio_tap()
-        # Safety-valve opt-out: user set system_scope=endpoint to force the
-        # pre-v1.7.0 global-tap behavior.
+        # Endpoint (global tap) is the default since v2.9 and the only
+        # path Sayzo uses when "Per-app audio capture (beta)" is off.
+        # Whitelist auto-arm with the beta toggle ON is the only caller
+        # that should pass non-empty target_pids; the hotkey path skips
+        # PID computation entirely when the toggle is off (see
+        # arm/controller.py::_resolve_hotkey_arm). If we still got PIDs
+        # while scope=endpoint, drop them.
         if self.system_scope == "endpoint" and target_pids:
             log.info(
                 "system capture: system_scope=endpoint — ignoring target_pids=%s "

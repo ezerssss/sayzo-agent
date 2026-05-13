@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import time
+import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -106,6 +107,7 @@ class UploadRetryManager:
         config: UploadConfig,
         auth_client: Any | None = None,
         clock: Callable[[], datetime] | None = None,
+        webapp_base_url: str | None = None,
     ) -> None:
         self._captures_dir = captures_dir
         self._upload_client = upload_client
@@ -114,6 +116,11 @@ class UploadRetryManager:
         self._cfg = config
         self._auth_client = auth_client
         self._now = clock or (lambda: datetime.now(timezone.utc))
+        # Base URL for the post-upload "Open in Sayzo" deep-link.
+        # ``{webapp_base_url}/app/conversations/{server_capture_id}`` — see
+        # reference_deeplink_url memory. ``None`` when there's no auth /
+        # NoopUploadClient path; the success toast is skipped cleanly.
+        self._webapp_base_url = webapp_base_url
 
         self._pause_state = PauseState()
         self._pause_lock = asyncio.Lock()
@@ -291,6 +298,27 @@ class UploadRetryManager:
 
         if outcome == UploadOutcome.SUCCESS:
             log.info("[upload] success id=%s server_id=%s", record.id, server_capture_id or "?")
+            if server_capture_id and self._webapp_base_url:
+                url = (
+                    self._webapp_base_url.rstrip("/")
+                    + f"/app/conversations/{server_capture_id}"
+                )
+                def _open_in_sayzo(u: str = url) -> None:
+                    try:
+                        webbrowser.open(u)
+                    except Exception:
+                        log.debug("[upload] webbrowser.open failed for %r", u, exc_info=True)
+
+                try:
+                    self._notifier.notify_actionable(
+                        "Capture saved to Sayzo",
+                        "Open it to see your transcript and drills.",
+                        button_label="Open in Sayzo",
+                        on_pressed=_open_in_sayzo,
+                        expire_after_secs=30.0,
+                    )
+                except Exception:
+                    log.debug("[upload] saved-toast failed", exc_info=True)
 
         return outcome
 

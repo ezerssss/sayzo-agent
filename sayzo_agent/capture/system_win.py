@@ -50,7 +50,7 @@ class SystemCapture:
         device: str | None = None,
         queue_maxsize: int = 200,
         *,
-        system_scope: str = "arm_app",
+        system_scope: str = "endpoint",  # matches CaptureConfig default since v2.9
     ) -> None:
         self.sample_rate = sample_rate
         self.frame_samples = int(sample_rate * frame_ms / 1000)
@@ -239,8 +239,13 @@ class SystemCapture:
         """
         self._loop = asyncio.get_running_loop()
         self._stop.clear()
-        # Safety-valve opt-out: user set system_scope=endpoint to force the
-        # pre-v1.7.0 behavior (e.g. per-app capture misbehaving on their box).
+        # Endpoint scope is the default since v2.9 and the only path
+        # Sayzo uses when "Per-app audio capture (beta)" is off.
+        # Whitelist auto-arm with the beta toggle ON is the only caller
+        # that should pass non-empty target_pids; the hotkey path skips
+        # PID computation entirely when the toggle is off (see
+        # arm/controller.py::_resolve_hotkey_arm). If we still got PIDs
+        # while scope=endpoint, drop them.
         if self.system_scope == "endpoint" and target_pids:
             log.info(
                 "system capture: system_scope=endpoint — ignoring target_pids=%s "

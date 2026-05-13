@@ -29,12 +29,58 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 import time
 
 import numpy as np
 import sounddevice as sd
 
 log = logging.getLogger(__name__)
+
+
+def _resolve_device_index(name: str | None) -> int | str | None:
+    """Resolve a device name to a numeric PortAudio index.
+
+    Same name under multiple host APIs (e.g. ``"Microphone (2- USB
+    Audio Device)"`` exposed by both DirectSound and WASAPI on Windows)
+    makes ``sd.InputStream(device=name)`` raise ``ValueError("Multiple
+    input devices found")``. Resolving up front to an index and
+    preferring WASAPI on Windows / Core Audio on macOS avoids that.
+
+    Returns:
+      - ``None`` for ``None``.
+      - The original name string if no input device matches (let
+        sounddevice raise its own error).
+      - A numeric index when at least one host API matches; preferred
+        host API wins if multiple match.
+    """
+    if name is None:
+        return None
+    try:
+        devices = sd.query_devices()
+        hostapis = sd.query_hostapis()
+    except Exception:
+        return name
+    preferred = {"win32": "Windows WASAPI", "darwin": "Core Audio"}.get(sys.platform)
+    first_match: int | None = None
+    preferred_match: int | None = None
+    for idx, dev in enumerate(devices):
+        if dev.get("max_input_channels", 0) <= 0:
+            continue
+        if dev.get("name") != name:
+            continue
+        if first_match is None:
+            first_match = idx
+        host_idx = dev.get("hostapi")
+        host = hostapis[host_idx]["name"] if host_idx is not None and 0 <= host_idx < len(hostapis) else ""
+        if preferred and host == preferred:
+            preferred_match = idx
+            break
+    if preferred_match is not None:
+        return preferred_match
+    if first_match is not None:
+        return first_match
+    return name
 
 
 class MicCapture:
@@ -141,13 +187,14 @@ class MicCapture:
         # Reset the de-aliasing anchor so the first new frame's stamp is
         # set by wall clock, not max(wall, last_old + frame_duration).
         self._last_emitted_ts = None
+        resolved = _resolve_device_index(self.device)
         try:
             self._stream = sd.InputStream(
                 samplerate=self.sample_rate,
                 blocksize=self.frame_samples,
                 channels=1,
                 dtype="float32",
-                device=self.device,
+                device=resolved,
                 callback=self._callback,
             )
             self._stream.start()

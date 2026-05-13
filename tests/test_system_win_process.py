@@ -159,7 +159,8 @@ class TestSystemCaptureFallback:
         """
         from sayzo_agent.capture import system_win
 
-        cap = system_win.SystemCapture()
+        # Per-app capture is opt-in beta since v2.9; explicit scope here.
+        cap = system_win.SystemCapture(system_scope="arm_app")
         original_queue = cap.queue  # what the consumer would have grabbed
 
         # Fake delegate returned by _try_start_process_loopback.
@@ -219,7 +220,7 @@ class TestSystemCaptureFallback:
     async def test_process_loopback_failure_falls_back_to_endpoint(self, monkeypatch, caplog):
         from sayzo_agent.capture import system_win
 
-        cap = system_win.SystemCapture()
+        cap = system_win.SystemCapture(system_scope="arm_app")
         monkeypatch.setattr(cap, "_run", lambda: None)
 
         async def fake_try_fail(target_pids):

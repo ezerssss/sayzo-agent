@@ -158,6 +158,7 @@ class Agent:
             executor=self._executor,
             config=config.upload,
             auth_client=auth_client,
+            webapp_base_url=config.auth.effective_server_url or None,
         )
         self._stop = asyncio.Event()
         self._paused = asyncio.Event()  # clear = running, set = paused
@@ -196,6 +197,7 @@ class Agent:
             vad_sys=self.vad_sys,
             notifier=self.notifier,
             data_dir=self.cfg.data_dir,
+            system_scope_fn=lambda: self.cfg.capture.system_scope,
         )
 
         # Optional daily-drill scheduler. Constructed by the service entry
@@ -505,6 +507,13 @@ class Agent:
                     "mic_total": round(gate.mic_total, 2),
                 },
             )
+            try:
+                self.notifier.notify(
+                    "Capture discarded",
+                    "Your speech was too brief to coach you on this one. Try a longer session.",
+                )
+            except Exception:
+                log.debug("[app] discard toast failed", exc_info=True)
             return
 
         # 2a. Language probe on the mic stream. Sayzo is English-only, so if
@@ -554,6 +563,13 @@ class Agent:
                         "prob": round(float(mic_lang_prob), 2),
                     },
                 )
+                try:
+                    self.notifier.notify(
+                        "Capture discarded",
+                        f"We only coach English right now (detected {mic_lang}). Discarded this session.",
+                    )
+                except Exception:
+                    log.debug("[app] discard toast failed", exc_info=True)
                 return
 
         # 2b. Transcribe both sources in the heavy worker.
@@ -604,6 +620,13 @@ class Agent:
             log.info("[session] DISCARDED (empty transcript)")
             self._captures_discarded += 1
             await self._write_dropped_async(buffers, "empty_transcript", proc_id)
+            try:
+                self.notifier.notify(
+                    "Capture discarded",
+                    "No clear speech was detected. Discarded this session.",
+                )
+            except Exception:
+                log.debug("[app] discard toast failed", exc_info=True)
             return
 
         # 4. Build the placeholder title — the server overwrites it post-upload.

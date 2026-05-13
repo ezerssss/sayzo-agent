@@ -354,9 +354,12 @@ class TestTargetPIDs:
         assert captured_args == ["/fake/audio-tap"]
 
     @pytest.mark.asyncio
-    async def test_start_with_pids_passes_flag(self, cap):
+    async def test_start_with_pids_passes_flag(self):
         """Non-empty target_pids must be forwarded as ``--pids 1234,5678`` so
-        the Swift helper can scope the CoreAudio tap."""
+        the Swift helper can scope the CoreAudio tap. Per-app capture is the
+        beta path since v2.9 — explicit system_scope here mirrors what the
+        ArmController passes when the user opts in via Settings."""
+        cap = SystemCapture(sample_rate=16_000, frame_ms=20, system_scope="arm_app")
         pcm = _make_pcm_bytes(cap._batch_native_samples)
         proc = FakeProc(stdout_data=_framed(pcm, 0.0))
 

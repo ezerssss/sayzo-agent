@@ -33,9 +33,9 @@ class FakeCapture:
         self.stop_count = 0
         self.fail_next_start = False
         # Latest values passed to start() — lets tests assert that
-        # whitelist / hotkey smart-guess PIDs reach the system capture
-        # layer (last_target_pids) and that the resolved mic device
-        # reaches the mic capture layer (last_device).
+        # whitelist auto-arm + per-app-beta PIDs reach the system
+        # capture layer (last_target_pids) and that the resolved mic
+        # device reaches the mic capture layer (last_device).
         self.last_target_pids: tuple[int, ...] = ()
         self.last_device: Optional[str] = None
 
@@ -113,6 +113,7 @@ def _make_controller(
     running: Optional[frozenset[str]] = None,
     foreground: Optional[ForegroundInfo] = None,
     cfg_overrides: Optional[dict] = None,
+    system_scope: str = "endpoint",
 ) -> tuple[ArmController, ConversationDetector, FakeCapture, FakeCapture, FakeVAD, FakeVAD, FakeNotifier]:
     cfg_kwargs = {
         "hotkey": "ctrl+alt+s",
@@ -150,6 +151,7 @@ def _make_controller(
         is_mic_active=lambda: mic_active,
         get_running_processes=lambda: running or frozenset(),
         get_foreground_info=lambda: foreground or ForegroundInfo(),
+        system_scope_fn=lambda: system_scope,
     )
     return ctrl, detector, mic, sys_cap, vad_m, vad_s, notifier
 
@@ -526,13 +528,12 @@ async def test_whitelist_arm_default_mic_when_holder_has_no_device():
     await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
 
 
-async def test_hotkey_smart_guess_win_routes_mic_to_unknown_holder_device(monkeypatch):
-    """Windows hotkey + unknown holder with a device_name: system
-    loopback stays endpoint-wide (today's "avoid silent capture"
-    rationale — the unknown app might not produce any system output)
-    BUT the mic follows the unknown holder's device. The user
-    explicitly hotkey'd; recording from where the mic is actually
-    being used beats recording the OS default pointed at empty air.
+async def test_hotkey_win_routes_mic_to_unknown_holder_device(monkeypatch):
+    """Windows hotkey (default endpoint scope) + unknown holder with a
+    device_name: system loopback stays endpoint-wide BUT the mic follows
+    the unknown holder's device. The user explicitly hotkey'd; recording
+    from where the mic is actually being used beats recording the OS
+    default pointed at empty air.
     """
     monkeypatch.setattr("sayzo_agent.arm.controller.sys.platform", "win32")
     notifier = FakeNotifier()
@@ -555,16 +556,50 @@ async def test_hotkey_smart_guess_win_routes_mic_to_unknown_holder_device(monkey
     await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
 
 
-async def test_hotkey_smart_guess_win_routes_mic_to_whitelisted_holder_device(monkeypatch):
-    """Windows hotkey: Zoom on a USB headset (whitelisted) + Cortana on
-    built-in mic. We scope sys-loopback to Zoom AND route the mic to the
-    USB headset (the whitelisted holder's device). Cortana's device must
-    not win even though its holder was also present."""
+async def test_hotkey_win_default_endpoint_ignores_whitelisted_holder(monkeypatch):
+    """Windows hotkey with the default endpoint scope: even when a
+    whitelisted holder (Zoom) is present we DO NOT narrow scope — the
+    user opted out of per-app capture, so the whole endpoint is what
+    they get. Mic still routes to the whitelisted holder's device
+    (opportunistic routing is independent of scope mode)."""
     monkeypatch.setattr("sayzo_agent.arm.controller.sys.platform", "win32")
     notifier = FakeNotifier()
     notifier.consent_script = ["yes"]
     ctrl, _, mic, sys_cap, *_ = _make_controller(
         notifier=notifier,
+        mic_holders=[
+            MicHolder(
+                process_name="zoom.exe",
+                pid=1234,
+                device_name="USB Headset Microphone",
+            ),
+            MicHolder(
+                process_name="cortana.exe",
+                pid=9999,
+                device_name="Internal Microphone Array",
+            ),
+        ],
+    )
+    await ctrl._on_hotkey_pressed()
+    assert ctrl.state == ArmState.ARMED
+    assert sys_cap.last_target_pids == ()
+    assert mic.last_device == "USB Headset Microphone"
+
+    await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
+
+
+async def test_hotkey_win_beta_routes_to_whitelisted_holder_device(monkeypatch):
+    """Windows hotkey + beta `system_scope=arm_app`: Zoom on a USB
+    headset (whitelisted) + Cortana on built-in mic. We scope sys-
+    loopback to Zoom AND route the mic to the USB headset (the
+    whitelisted holder's device). Cortana's device must not win even
+    though its holder was also present."""
+    monkeypatch.setattr("sayzo_agent.arm.controller.sys.platform", "win32")
+    notifier = FakeNotifier()
+    notifier.consent_script = ["yes"]
+    ctrl, _, mic, sys_cap, *_ = _make_controller(
+        notifier=notifier,
+        system_scope="arm_app",
         mic_holders=[
             MicHolder(
                 process_name="zoom.exe",
@@ -945,22 +980,26 @@ async def test_meeting_ended_keep_going_resets_on_mic_return():
     await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
 
 
-# ---- hotkey smart-guess (v1.7.0) -----------------------------------
+# ---- hotkey scope resolution (v2.9+: endpoint default, beta narrows) ----
 #
-# Verifies the Windows and macOS branches of `_resolve_hotkey_arm_scope`.
-# On Windows we drive with synthetic mic.holders; on macOS we flip
-# sys.platform and drive via foreground + mic.active + an injected resolver.
+# Verifies the Windows and macOS branches of `_resolve_hotkey_arm`.
+# Default scope (system_scope=endpoint) skips PID computation entirely;
+# beta scope (system_scope=arm_app) runs the whitelisted-holder logic
+# with an endpoint-fallback for unknown holders. On Windows we drive
+# with synthetic mic.holders; on macOS we flip sys.platform and drive
+# via foreground + mic.active + an injected resolver.
 
 
-async def test_hotkey_smart_guess_wins_whitelisted_over_unknown(monkeypatch):
-    """Windows multi-holder rule: Zoom + Cortana both holding mic → tap
-    Zoom only. The whitelisted-first tier keeps the voice-assistant
-    false-positive from contaminating the session."""
+async def test_hotkey_win_beta_scopes_whitelisted_over_unknown(monkeypatch):
+    """Windows hotkey + beta `arm_app`: Zoom + Cortana both holding mic
+    → tap Zoom only. The whitelisted-first tier keeps the voice-
+    assistant false-positive from contaminating the session."""
     monkeypatch.setattr("sayzo_agent.arm.controller.sys.platform", "win32")
     notifier = FakeNotifier()
     notifier.consent_script = ["yes"]
     ctrl, _, mic, sys_cap, *_ = _make_controller(
         notifier=notifier,
+        system_scope="arm_app",
         mic_holders=[
             MicHolder("zoom.exe", 1234),
             MicHolder("cortana.exe", 9999),
@@ -973,21 +1012,14 @@ async def test_hotkey_smart_guess_wins_whitelisted_over_unknown(monkeypatch):
     await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
 
 
-async def test_hotkey_smart_guess_win_endpoint_when_no_whitelisted_holder(monkeypatch):
-    """Windows: mic-holders exist but none are whitelisted → endpoint
-    scope (NOT scope to the unknowns).
+async def test_hotkey_win_default_endpoint_with_unknown_holders(monkeypatch):
+    """Windows hotkey (default endpoint scope): mic-holders exist but
+    none are whitelisted → endpoint scope.
 
-    The earlier behavior scoped the loopback to every unknown mic-holder
-    on the theory that one of them was a new meeting app worth catching.
-    In practice that produced silent captures whenever the wrong app
-    happened to hold the mic at hotkey time — Slack huddle / ChatGPT
-    voice mode / Voice Recorder / Steam Voice — and the actual audio
-    the user wanted captured was on a different app entirely. The
-    hotkey is the user's explicit "capture now" intent and a silent
-    file is the worst possible response to it; endpoint scope is the
-    safe fallback. (Unknown holders are recorded to seen_apps so the
-    user can promote them for next time — covered by the watcher-path
-    seen_apps tests.)
+    This is the v2.9+ shipping behavior — the hotkey path no longer
+    computes PIDs at all when the per-app beta toggle is off. (Unknown
+    holders are still recorded to seen_apps so the user can promote
+    them for next time.)
     """
     monkeypatch.setattr("sayzo_agent.arm.controller.sys.platform", "win32")
     notifier = FakeNotifier()
@@ -1008,9 +1040,33 @@ async def test_hotkey_smart_guess_win_endpoint_when_no_whitelisted_holder(monkey
     await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
 
 
-async def test_hotkey_smart_guess_wins_endpoint_when_no_holders(monkeypatch):
-    """Windows: nothing holds the mic → empty tuple → SystemCapture falls
-    back to endpoint-wide loopback (today's behavior)."""
+async def test_hotkey_win_beta_endpoint_fallback_when_no_whitelisted_holder(monkeypatch):
+    """Windows hotkey + beta `arm_app`: unknown mic-holders only →
+    endpoint fallback. This is the v2.7.9 safety-rule: when the toggle
+    is on but the only mic-holders aren't whitelisted (Steam Voice,
+    ChatGPT voice, Voice Recorder, …), scope to endpoint instead of
+    those PIDs to avoid silent capture."""
+    monkeypatch.setattr("sayzo_agent.arm.controller.sys.platform", "win32")
+    notifier = FakeNotifier()
+    notifier.consent_script = ["yes"]
+    ctrl, _, mic, sys_cap, *_ = _make_controller(
+        notifier=notifier,
+        system_scope="arm_app",
+        mic_holders=[
+            MicHolder("newmeeting.exe", 5555),
+            MicHolder("oldvoipapp.exe", 6666),
+        ],
+    )
+    await ctrl._on_hotkey_pressed()
+    assert ctrl.state == ArmState.ARMED
+    assert sys_cap.last_target_pids == ()
+
+    await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
+
+
+async def test_hotkey_win_endpoint_when_no_holders(monkeypatch):
+    """Windows: nothing holds the mic → empty tuple → SystemCapture
+    falls back to endpoint-wide loopback. Applies in both scope modes."""
     monkeypatch.setattr("sayzo_agent.arm.controller.sys.platform", "win32")
     notifier = FakeNotifier()
     notifier.consent_script = ["yes"]
@@ -1022,10 +1078,10 @@ async def test_hotkey_smart_guess_wins_endpoint_when_no_holders(monkeypatch):
     await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
 
 
-async def test_hotkey_smart_guess_mac_uses_whitelisted_resolver_on_match(monkeypatch):
-    """macOS: foreground matches a whitelisted spec → resolver populates
-    PIDs. On Mac, mic.holders is empty so the rule keys off foreground +
-    mic.active."""
+async def test_hotkey_mac_beta_uses_whitelisted_resolver_on_match(monkeypatch):
+    """macOS hotkey + beta `arm_app`: foreground matches a whitelisted
+    spec → resolver populates PIDs. On Mac, mic.holders is empty so the
+    rule keys off foreground + mic.active."""
     monkeypatch.setattr("sayzo_agent.arm.controller.sys.platform", "darwin")
 
     notifier = FakeNotifier()
@@ -1067,6 +1123,7 @@ async def test_hotkey_smart_guess_mac_uses_whitelisted_resolver_on_match(monkeyp
         get_running_processes=lambda: frozenset({"us.zoom.xos"}),
         get_foreground_info=lambda: ForegroundInfo(bundle_id="us.zoom.xos"),
         resolve_pids_for_spec=fake_resolver,
+        system_scope_fn=lambda: "arm_app",
     )
 
     await ctrl._on_hotkey_pressed()
@@ -1076,9 +1133,9 @@ async def test_hotkey_smart_guess_mac_uses_whitelisted_resolver_on_match(monkeyp
     await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
 
 
-async def test_hotkey_smart_guess_mac_endpoint_when_mic_inactive(monkeypatch):
+async def test_hotkey_mac_endpoint_when_mic_inactive(monkeypatch):
     """macOS: mic not active → endpoint fallback, regardless of what's in
-    the foreground."""
+    the foreground or which scope mode is set."""
     monkeypatch.setattr("sayzo_agent.arm.controller.sys.platform", "darwin")
     notifier = FakeNotifier()
     notifier.consent_script = ["yes"]
@@ -1094,7 +1151,7 @@ async def test_hotkey_smart_guess_mac_endpoint_when_mic_inactive(monkeypatch):
     await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
 
 
-async def test_hotkey_smart_guess_mac_endpoint_when_foreground_not_whitelisted(monkeypatch):
+async def test_hotkey_mac_beta_endpoint_when_foreground_not_whitelisted(monkeypatch):
     """macOS: mic active + foreground is some non-whitelisted app →
     endpoint scope (NOT scope to a synthetic spec for that foreground).
 
@@ -1151,12 +1208,14 @@ async def test_hotkey_smart_guess_mac_endpoint_when_foreground_not_whitelisted(m
         # Foreground = Apple Notes — definitely not in the whitelist.
         get_foreground_info=lambda: ForegroundInfo(bundle_id="com.apple.notes"),
         resolve_pids_for_spec=fake_resolver,
+        system_scope_fn=lambda: "arm_app",
     )
 
     await ctrl._on_hotkey_pressed()
     assert ctrl.state == ArmState.ARMED
-    # Endpoint scope — empty tuple — even though Notes is identifiable
-    # in the foreground and the resolver would happily return PIDs for it.
+    # Endpoint scope — empty tuple — even with beta ON, because Notes
+    # isn't whitelisted (the resolver would happily return PIDs for it
+    # but we skip the resolver call for non-whitelisted foreground).
     assert sys_cap.last_target_pids == ()
 
     await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
