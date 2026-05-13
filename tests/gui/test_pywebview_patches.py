@@ -22,6 +22,7 @@ def _isolate_modules():
             "webview",
             "webview.platforms",
             "webview.platforms.edgechromium",
+            "webview.platforms.winforms",
             "sayzo_agent.gui.common.pywebview_patches",
         )
     }
@@ -53,6 +54,29 @@ def _install_edgechrome_stub():
     sys.modules.setdefault("webview.platforms", types.ModuleType("webview.platforms"))
     sys.modules["webview.platforms.edgechromium"] = fake_module
     return EdgeChrome
+
+
+def _install_browserform_stub():
+    """Install a fake ``webview.platforms.winforms.BrowserView.BrowserForm``.
+
+    Returns the BrowserForm class so tests can read state off it.
+    """
+
+    class BrowserForm:
+        original_calls = []
+
+        def on_close(self, *args, **kwargs):
+            BrowserForm.original_calls.append((self, args, kwargs))
+            return "original-ran"
+
+    BrowserView = types.SimpleNamespace(BrowserForm=BrowserForm)
+
+    fake_module = types.ModuleType("webview.platforms.winforms")
+    fake_module.BrowserView = BrowserView
+    sys.modules.setdefault("webview", types.ModuleType("webview"))
+    sys.modules.setdefault("webview.platforms", types.ModuleType("webview.platforms"))
+    sys.modules["webview.platforms.winforms"] = fake_module
+    return BrowserForm
 
 
 def test_no_op_on_non_windows(monkeypatch):
@@ -187,3 +211,157 @@ def test_patched_delegates_to_original_when_corewebview2_alive(monkeypatch):
     assert cls.original_calls == [instance]
     # Patch did NOT call Dispose on the short-circuit path.
     instance.webview.Dispose.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# patch_on_close_swallow_teardown tests
+# ---------------------------------------------------------------------------
+
+
+def test_on_close_patch_no_op_on_non_windows(monkeypatch):
+    """macOS / Linux: patch returns False without touching pywebview."""
+    monkeypatch.setattr(sys, "platform", "darwin")
+
+    from sayzo_agent.gui.common.pywebview_patches import (
+        patch_on_close_swallow_teardown,
+    )
+
+    assert patch_on_close_swallow_teardown() is False
+
+
+def test_on_close_patch_returns_false_when_pywebview_missing(monkeypatch):
+    """If winforms can't import, patch logs + returns False (no crash)."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    sys.modules["webview.platforms.winforms"] = None  # type: ignore[assignment]
+
+    from sayzo_agent.gui.common.pywebview_patches import (
+        patch_on_close_swallow_teardown,
+    )
+
+    assert patch_on_close_swallow_teardown() is False
+
+
+def test_on_close_patch_installs_and_is_idempotent(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "win32")
+    cls = _install_browserform_stub()
+    original = cls.on_close
+
+    from sayzo_agent.gui.common.pywebview_patches import (
+        patch_on_close_swallow_teardown,
+    )
+
+    assert patch_on_close_swallow_teardown() is True
+    assert cls.on_close is not original
+    assert cls.on_close.__wrapped__ is original
+    assert getattr(cls, "_sayzo_on_close_swallow_teardown", False) is True
+
+    # Re-applying must not double-wrap.
+    first_method = cls.on_close
+    assert patch_on_close_swallow_teardown() is True
+    assert cls.on_close is first_method
+
+
+def test_on_close_patch_passes_through_happy_path(monkeypatch):
+    """No exception → original on_close runs, return value preserved."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    cls = _install_browserform_stub()
+
+    from sayzo_agent.gui.common.pywebview_patches import (
+        patch_on_close_swallow_teardown,
+    )
+
+    patch_on_close_swallow_teardown()
+
+    instance = MagicMock()
+    result = cls.on_close(instance, "arg1", kw="kw1")
+
+    assert result == "original-ran"
+    assert cls.original_calls == [(instance, ("arg1",), {"kw": "kw1"})]
+
+
+def test_on_close_patch_swallows_known_teardown_by_class_name(monkeypatch, caplog):
+    """A class named like a CLR teardown exception is swallowed silently."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    cls = _install_browserform_stub()
+
+    # Re-bind the original to one that raises the teardown exception. The
+    # class NAME is what the classifier matches against, so we name the
+    # exception class to mimic the real CLR exception that surfaces.
+    class InvalidComObjectException(Exception):
+        pass
+
+    def boom(self, *args, **kwargs):
+        raise InvalidComObjectException("COM object that has been separated from its underlying RCW cannot be used.")
+
+    cls.on_close = boom
+
+    from sayzo_agent.gui.common.pywebview_patches import (
+        patch_on_close_swallow_teardown,
+    )
+
+    patch_on_close_swallow_teardown()
+
+    with caplog.at_level("WARNING", logger="sayzo_agent.gui.common.pywebview_patches"):
+        # Must not raise.
+        result = cls.on_close(MagicMock())
+
+    assert result is None
+    assert any(
+        "on_close swallowed teardown exception" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+def test_on_close_patch_swallows_by_message_substring(monkeypatch, caplog):
+    """A vanilla exception class but with a teardown-shaped message is swallowed.
+
+    Real-world: pythonnet sometimes wraps CLR exceptions in plain Exception
+    subclasses; matching on the message text is the second line of defense.
+    """
+    monkeypatch.setattr(sys, "platform", "win32")
+    cls = _install_browserform_stub()
+
+    def boom(self, *args, **kwargs):
+        # Plain Exception (not in the class-name allowlist) but the message
+        # carries the unique RCW-detached substring.
+        raise Exception("something something separated from its underlying RCW something")
+
+    cls.on_close = boom
+
+    from sayzo_agent.gui.common.pywebview_patches import (
+        patch_on_close_swallow_teardown,
+    )
+
+    patch_on_close_swallow_teardown()
+
+    with caplog.at_level("WARNING", logger="sayzo_agent.gui.common.pywebview_patches"):
+        result = cls.on_close(MagicMock())
+
+    assert result is None
+    assert any(
+        "swallowed teardown exception" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+def test_on_close_patch_reraises_real_bugs(monkeypatch):
+    """A genuine bug (no teardown signature) must propagate unchanged."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    cls = _install_browserform_stub()
+
+    class GenuineBug(RuntimeError):
+        pass
+
+    def boom(self, *args, **kwargs):
+        raise GenuineBug("totally unrelated to shutdown")
+
+    cls.on_close = boom
+
+    from sayzo_agent.gui.common.pywebview_patches import (
+        patch_on_close_swallow_teardown,
+    )
+
+    patch_on_close_swallow_teardown()
+
+    with pytest.raises(GenuineBug, match="totally unrelated"):
+        cls.on_close(MagicMock())

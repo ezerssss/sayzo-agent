@@ -62,7 +62,9 @@ dialog and pywebview's Cocoa close path doesn't recurse the way
 from __future__ import annotations
 
 import logging
+import os
 import sys
+import threading
 from typing import TYPE_CHECKING, Callable, Optional
 
 if TYPE_CHECKING:
@@ -143,6 +145,12 @@ def _install_session_ending_handler(
                 log.warning(
                     "[win_shutdown] set_quitting callback raised", exc_info=True
                 )
+        # Belt-and-suspenders: if the message loop hasn't drained within
+        # the timeout, force-exit so we never block Windows shutdown waiting
+        # on a pywebview internal hang. Windows kills GUI apps after ~5s of
+        # not responding to WM_ENDSESSION; ``_HARD_EXIT_TIMEOUT_SECS`` is
+        # set well inside that budget.
+        _arm_hard_exit_timer()
         try:
             safe_quit_window(window)
         except Exception:
@@ -217,10 +225,19 @@ def _install_thread_exception_handler() -> None:
         try:
             WinForms.Application.SetUnhandledExceptionMode(
                 WinForms.UnhandledExceptionMode.CatchException,
-                # threadScope=True: only this UI thread, don't change the
-                # global default. We don't want to silently swallow
-                # exceptions on the agent process's other threads.
-                True,
+                # threadScope=False: apply the mode to ALL .NET threads in
+                # the subprocess, not just the calling thread. pywebview
+                # spawns a separate STA thread for ``Application.Run()``
+                # (see ``webview/platforms/winforms.py:683-686``), so the
+                # mode set here on Python's main thread would otherwise
+                # never reach the thread that actually fires FormClosed —
+                # which is why every prior "the safety net should have
+                # caught this" report slipped through. This is a Settings/
+                # Setup subprocess; it has no other "important" threads to
+                # protect from over-catching, and our filter at
+                # ``_looks_like_pywebview_teardown_crash`` still lets real
+                # bugs surface through the default handler.
+                False,
             )
         except Exception:
             log.warning(
@@ -248,16 +265,56 @@ _PYWEBVIEW_TEARDOWN_SIGNATURES = (
     #   1. v2.7.5 / KeyError('master') — `del BrowserView.instances[uid]`
     #   2. v2.7.11 trigger — Control.Invoke against a dead WebView2 process
     #   3. v2.14.1 trigger — EdgeChrome.clear_user_data reading BrowserProcessId
-    #      while CoreWebView2 is still None (form closed pre-init). Layer-1
-    #      fix is pywebview_patches.patch_clear_user_data_none_guard; this
-    #      signature is the belt-and-suspenders safety net for the same path.
+    #      while CoreWebView2 is still None (form closed pre-init). Root-caused
+    #      in v2.15.0 by setting ``private_mode=False`` on webview.start(),
+    #      which skips clear_user_data entirely.
+    #   4. v2.15.0 — InvalidComObjectException / MarshaledInvoke against a
+    #      detached RCW at Windows shutdown (WebView2 child process killed
+    #      first by the OS). Root-caused at the BrowserForm.on_close layer
+    #      by patch_on_close_swallow_teardown in pywebview_patches.py; this
+    #      signature is the layer-2 safety net.
     "Process with an Id of",
     "KeyError",
     "BrowserProcessId",
     "clear_user_data",
+    "InvalidComObjectException",
+    "MarshaledInvoke",
+    "separated from its underlying RCW",
 )
 
 
 def _looks_like_pywebview_teardown_crash(exc_text: str) -> bool:
     """Heuristic: does this .NET exception look like the pywebview shutdown bug?"""
     return any(sig in exc_text for sig in _PYWEBVIEW_TEARDOWN_SIGNATURES)
+
+
+# Hard timeout for the Settings/Setup subprocess after SessionEnding fires.
+# Windows gives GUI apps ~5 s to respond to WM_ENDSESSION before killing
+# them with WM_CLOSE / TerminateProcess. We pick a value well inside that
+# budget so the message loop has time to drain WM_QUIT first; if it
+# doesn't (pywebview internal hang, deadlocked Dispose, etc.), we exit
+# the process unconditionally. Better to die slightly early than block
+# the user's shutdown waiting on a stuck WebView2 teardown.
+_HARD_EXIT_TIMEOUT_SECS = 2.0
+
+
+def _arm_hard_exit_timer() -> None:
+    """Schedule ``os._exit(0)`` after ``_HARD_EXIT_TIMEOUT_SECS``.
+
+    Daemon thread so it doesn't block clean shutdown. If the message
+    loop drains and the process exits cleanly first, this thread dies
+    with the process. If something hangs, the timer fires and the
+    process exits without any further cleanup — by design, since at
+    SessionEnding time the OS is about to reclaim our resources anyway.
+    """
+    def _fire():
+        log.warning(
+            "[win_shutdown] hard-exit timer fired after %.1fs — forcing "
+            "process exit so Windows shutdown isn't blocked",
+            _HARD_EXIT_TIMEOUT_SECS,
+        )
+        os._exit(0)
+
+    timer = threading.Timer(_HARD_EXIT_TIMEOUT_SECS, _fire)
+    timer.daemon = True
+    timer.start()

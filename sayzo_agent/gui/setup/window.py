@@ -15,7 +15,10 @@ import webview
 
 from sayzo_agent.config import Config
 from sayzo_agent.gui.common.assets import icon_path, webui_index_path
-from sayzo_agent.gui.common.pywebview_patches import patch_clear_user_data_none_guard
+from sayzo_agent.gui.common.pywebview_patches import (
+    patch_clear_user_data_none_guard,
+    patch_on_close_swallow_teardown,
+)
 from sayzo_agent.gui.common.win_shutdown import install_shutdown_protection
 from sayzo_agent.gui.setup.bridge import Bridge, SetupResult
 
@@ -59,9 +62,11 @@ class SetupWindow:
         )
         self._bridge._attach_window(window)
 
-        # Both Windows-only, both must precede webview.start(); see their
-        # module docstrings for the rationale.
+        # Windows-only, all must precede webview.start(); see
+        # gui/common/pywebview_patches.py + win_shutdown.py for the
+        # rationale (zesty-zooming-taco.md plan).
         patch_clear_user_data_none_guard()
+        patch_on_close_swallow_teardown()
 
         # Windows-only: intercept SystemEvents.SessionEnding so we exit
         # cleanly via WM_QUIT before pywebview's FormClosed handler runs
@@ -90,11 +95,17 @@ class SetupWindow:
         # ``icon`` sets the taskbar/dock icon so the installer window shows
         # Sayzo in dev previews (in production the NSIS-installed shortcut
         # provides the icon via its AUMID).
+        #
+        # ``private_mode=False`` short-circuits pywebview's
+        # ``EdgeChrome.clear_user_data`` at shutdown — same rationale as
+        # Settings; OAuth flows through the system browser via PKCE, not
+        # the in-webview cookie jar. See gui/settings/window.py for the
+        # full explanation.
         icon_arg: dict = {}
         icon = icon_path()
         if icon is not None:
             icon_arg["icon"] = str(icon)
-        webview.start(debug=self._cfg.debug, **icon_arg)
+        webview.start(debug=self._cfg.debug, private_mode=False, **icon_arg)
 
         log.info("setup window closed: result=%s", self._bridge.result.value)
         return self._bridge.result

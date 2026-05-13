@@ -15,6 +15,31 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _no_real_hard_exit_timer(monkeypatch):
+    """Defang ``_arm_hard_exit_timer`` for the whole module.
+
+    Several tests fire ``SessionEnding``, which arms a real ``threading.Timer``
+    that calls ``os._exit(0)`` 2 s later. If a test runs slower than that
+    (or pytest doesn't tear down fast enough between tests), the timer
+    fires mid-suite and kills the pytest process. Mock the Timer class
+    so it stores the call but never actually fires. Tests that need to
+    inspect the timer arming behavior install their own stub on top.
+    """
+    import threading as _threading
+
+    class _NoopTimer:
+        def __init__(self, interval, function):
+            self.interval = interval
+            self.function = function
+            self.daemon = False
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(_threading, "Timer", _NoopTimer)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_modules():
     saved = {
         k: sys.modules.get(k)
@@ -153,8 +178,16 @@ def test_windows_installs_both_handlers(monkeypatch):
     assert len(stubs.session_events.handlers) == 1, "SessionEnding not subscribed"
     assert len(stubs.thread_events.handlers) == 1, "ThreadException not subscribed"
     # Mode switched so .NET routes unhandled exceptions to our handler
-    # instead of the JIT debugger.
+    # instead of the JIT debugger. threadScope=False is load-bearing —
+    # pywebview hosts the UI on a separate STA thread, so threadScope=True
+    # would leave that thread on the default mode and the safety net would
+    # silently miss every crash (the v2.7.11–v2.14.1 regression).
     stubs.set_mode.assert_called_once()
+    _mode_arg, thread_scope_arg = stubs.set_mode.call_args.args
+    assert thread_scope_arg is False, (
+        "SetUnhandledExceptionMode threadScope must be False so the mode "
+        "applies to pywebview's STA thread, not just Python main"
+    )
 
 
 def test_session_ending_calls_safe_quit(monkeypatch):
@@ -263,6 +296,50 @@ def test_thread_exception_passes_through_real_bugs(monkeypatch, caplog):
         "not swallowed" in rec.getMessage()
         for rec in caplog.records
     ), "expected pass-through log for non-pywebview exception"
+
+
+def test_session_ending_arms_hard_exit_timer(monkeypatch):
+    """SessionEnding must arm the os._exit fallback timer.
+
+    The user-visible contract: Windows shutdown is never blocked waiting on
+    a pywebview internal hang. If safe_quit_window's WM_QUIT post doesn't
+    drain the message loop in time, ``_HARD_EXIT_TIMEOUT_SECS`` later we
+    call os._exit unconditionally so the process gets out of Windows'
+    way. Test by mocking threading.Timer — we don't actually want
+    os._exit to fire during the test suite.
+    """
+    monkeypatch.setattr(sys, "platform", "win32")
+    stubs = _install_stubs()
+
+    import threading as _threading
+
+    timer_args = []
+
+    class _StubTimer:
+        def __init__(self, interval, function):
+            timer_args.append((interval, function))
+            self.daemon = False
+
+        def start(self):
+            timer_args.append("started")
+
+    monkeypatch.setattr(_threading, "Timer", _StubTimer)
+
+    from sayzo_agent.gui.common.win_shutdown import (
+        _HARD_EXIT_TIMEOUT_SECS,
+        install_shutdown_protection,
+    )
+
+    window = MagicMock()
+    window.uid = "master"
+    install_shutdown_protection(window)
+    stubs.session_events.fire(sender=None, args=types.SimpleNamespace(Reason="SystemShutdown"))
+
+    # Timer constructed with the documented delay and start() called.
+    interval, fire_fn = timer_args[0]
+    assert interval == _HARD_EXIT_TIMEOUT_SECS
+    assert timer_args[1] == "started"
+    assert callable(fire_fn)
 
 
 def test_session_ending_subscription_failure_does_not_propagate(monkeypatch):

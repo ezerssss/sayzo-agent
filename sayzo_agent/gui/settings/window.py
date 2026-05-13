@@ -30,7 +30,10 @@ import webview
 from sayzo_agent.config import Config
 from sayzo_agent.gui.common.assets import icon_path, webui_index_path
 from sayzo_agent.gui.common.safe_quit import safe_quit_window
-from sayzo_agent.gui.common.pywebview_patches import patch_clear_user_data_none_guard
+from sayzo_agent.gui.common.pywebview_patches import (
+    patch_clear_user_data_none_guard,
+    patch_on_close_swallow_teardown,
+)
 from sayzo_agent.gui.common.win_shutdown import install_shutdown_protection
 from sayzo_agent.gui.settings.bridge import Bridge
 
@@ -107,9 +110,11 @@ class SettingsWindow:
         )
         self._bridge._attach_window(window)
 
-        # Both Windows-only, both must precede webview.start(); see their
-        # module docstrings for the rationale.
+        # Windows-only, all must precede webview.start(); see
+        # gui/common/pywebview_patches.py + win_shutdown.py for the
+        # rationale (zesty-zooming-taco.md plan).
         patch_clear_user_data_none_guard()
+        patch_on_close_swallow_teardown()
 
         # Windows-only: intercept SystemEvents.SessionEnding so we exit
         # cleanly via WM_QUIT before pywebview's FormClosed handler runs
@@ -131,7 +136,15 @@ class SettingsWindow:
         # webview.start() blocks until the last window is destroyed. In
         # idle mode that only happens on the ``quit`` command (or stdin EOF
         # / parent death), since the X button hides instead of destroying.
-        webview.start(debug=self._cfg.debug, **icon_arg)
+        #
+        # ``private_mode=False`` is load-bearing: pywebview's default True
+        # forces ``EdgeChrome.clear_user_data`` to run at FormClosed and
+        # dereference ``self.webview.CoreWebView2.BrowserProcessId``, which
+        # is the root cause of the v2.14.0 boot-time JIT dialog. We load a
+        # file:// React bundle with no cookies / no in-webview auth, so
+        # disabling private mode has no UX impact. See plan
+        # ``zesty-zooming-taco.md`` RC-1.
+        webview.start(debug=self._cfg.debug, private_mode=False, **icon_arg)
         log.info("[settings] window closed")
 
     # ------------------------------------------------------------------
