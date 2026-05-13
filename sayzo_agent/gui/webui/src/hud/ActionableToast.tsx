@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { X } from "lucide-react";
 import { HudCard, HudCardBrandHeader } from "./HudCard";
 
 interface Props {
@@ -40,11 +41,29 @@ export function ActionableToast({
     onOutcome("pressed");
   }
 
+  function handleDismiss() {
+    // Manual dismiss counts as the same outcome as the natural
+    // timer expiry: the user didn't take the action. Same dispatch
+    // shape so the parent doesn't need a third "dismissed" branch.
+    if (calledRef.current) return;
+    calledRef.current = true;
+    onOutcome("expired");
+  }
+
   const progress = Math.max(0, Math.min(1, remaining / expireAfterSecs));
 
   return (
     <HudCard>
       <HudCardBrandHeader />
+      <button
+        type="button"
+        onClick={handleDismiss}
+        title="Dismiss"
+        aria-label="Dismiss"
+        className="hud-no-drag absolute right-3 top-3 flex h-6 w-6 items-center justify-center rounded-full text-ink-muted transition hover:bg-gray-100 hover:text-ink"
+      >
+        <X size={13} strokeWidth={2.5} />
+      </button>
       <div className="mt-3">
         <div className="text-sm font-semibold leading-tight">{title}</div>
         {body && (

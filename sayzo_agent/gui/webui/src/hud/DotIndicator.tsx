@@ -9,7 +9,13 @@ interface Props {
 function DotIndicatorImpl({ onExpand }: Props) {
   return (
     <div
-      className="hud-drag flex flex-col items-center rounded-2xl border border-ink-border bg-white px-2 pb-1.5 pt-1 shadow-md"
+      // Padding matches `StatePill` (px-1 horizontally / pb-2 below
+      // the GripDots) so the dot ends up the same height as the pill
+      // — collapse / expand becomes a width-only change with no
+      // vertical jump. The button is sized to the same 36×36 the
+      // pill's logo uses, so the visual mark stays identical between
+      // the two states.
+      className="hud-element-enter hud-drag flex flex-col items-center gap-1 rounded-2xl border border-ink-border bg-white px-1 pb-2 pt-1 text-ink shadow-md"
       style={{ pointerEvents: "auto" }}
     >
       <GripDots />
@@ -17,13 +23,13 @@ function DotIndicatorImpl({ onExpand }: Props) {
         type="button"
         onClick={onExpand}
         title="Expand"
-        className="hud-no-drag mt-0.5 flex h-14 w-14 items-center justify-center rounded-full transition hover:bg-gray-50"
+        className="hud-no-drag flex h-9 w-9 items-center justify-center rounded-full transition hover:bg-gray-50"
       >
         <img
           src={logoSvgUrl}
           alt="Sayzo"
-          width={44}
-          height={44}
+          width={36}
+          height={36}
           className="hud-logo-img animate-sayzo-pulse"
         />
       </button>

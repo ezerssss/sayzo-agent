@@ -13,7 +13,10 @@ interface Props {
 function StatePillImpl({ audioLevel, onStop, onCollapse }: Props) {
   return (
     <div
-      className="hud-drag flex flex-col rounded-2xl border border-ink-border bg-white px-1 pb-2 text-ink shadow-lg"
+      // Content-driven width. Whole pill is the drag region via
+      // `hud-drag`; the GripDots row is a visible affordance the user
+      // requested. Done/minimize opt out with `hud-no-drag`.
+      className="hud-element-enter hud-drag flex flex-col gap-1 rounded-2xl border border-ink-border bg-white px-1 pb-2 pt-1 text-ink shadow-lg"
       style={{ pointerEvents: "auto" }}
     >
       <GripDots />
@@ -21,8 +24,8 @@ function StatePillImpl({ audioLevel, onStop, onCollapse }: Props) {
         <img
           src={logoSvgUrl}
           alt="Sayzo"
-          width={44}
-          height={44}
+          width={36}
+          height={36}
           className="hud-logo-img animate-sayzo-pulse shrink-0"
         />
         <Waveform level={audioLevel} />
@@ -39,9 +42,9 @@ function StatePillImpl({ audioLevel, onStop, onCollapse }: Props) {
           type="button"
           onClick={onCollapse}
           title="Collapse"
-          className="hud-no-drag flex h-8 w-8 items-center justify-center rounded-full text-ink-muted transition hover:bg-gray-100 hover:text-ink"
+          className="hud-no-drag flex h-7 w-7 items-center justify-center rounded-full text-ink-muted transition hover:bg-gray-100 hover:text-ink"
         >
-          <Minimize2 size={14} />
+          <Minimize2 size={13} />
         </button>
       </div>
     </div>

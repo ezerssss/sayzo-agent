@@ -106,6 +106,13 @@ class HudLauncher:
         # Callbacks registered by the ArmController for pill events.
         self._on_pill_stop: Optional[Callable[[], None]] = None
         self._on_pill_collapsed: Optional[Callable[[bool], None]] = None
+        # Snapshot of the most recent ``show_pill`` kwargs (set on
+        # show, cleared on hide). Used by
+        # :meth:`ask_consent_pausing_pill` to restore the pill after a
+        # consent that the user opts to keep going from. Mirrors the
+        # behaviour ``ArmController._ask_consent_pausing_pill``
+        # previously implemented inline.
+        self._last_pill_params: Optional[dict[str, Any]] = None
         # Crash bookkeeping.
         self._respawn_count = 0
         self._respawn_window_started: float = 0.0
@@ -451,6 +458,46 @@ class HudLauncher:
             self._pending_cards.pop(request_id, None)
             return default_on_timeout
 
+    def ask_consent_pausing_pill(
+        self,
+        title: str,
+        body: str,
+        yes_label: str,
+        no_label: str,
+        timeout_secs: float,
+        default_on_timeout: ConsentResult = "no",
+    ) -> ConsentResult:
+        """Sync ``ask_consent`` wrapper that hides the pill for the duration.
+
+        Mirror of the pattern ``ArmController`` previously implemented
+        inline as ``_ask_consent_pausing_pill``: snapshot the active
+        pill, send hide-pill, ask for consent, restore the pill on
+        return iff the caller hasn't cleared it (e.g. via an
+        intervening ``hide_pill()``) in the meantime. Same sync
+        contract as ``ask_consent`` — must NOT be called from an
+        asyncio loop thread without ``run_in_executor``.
+
+        ``_last_pill_params`` is the single source of truth for "is
+        there a pill to restore"; both callers (ArmController via
+        executor, ``preview_hud.py``) read it instead of maintaining
+        their own bookkeeping dict.
+        """
+        snapshot = self._last_pill_params
+        if snapshot is not None:
+            # Send the IPC hide WITHOUT clearing ``_last_pill_params``
+            # so the restore branch can detect if the caller did its
+            # own explicit ``hide_pill()`` during the await (which
+            # clears the field).
+            self._send_threadsafe({"cmd": Cmd.HIDE_PILL})
+        try:
+            return self.ask_consent(
+                title, body, yes_label, no_label,
+                timeout_secs, default_on_timeout,
+            )
+        finally:
+            if snapshot is not None and self._last_pill_params is not None:
+                self._send_threadsafe({"cmd": Cmd.SHOW_PILL, **snapshot})
+
     # --- actionable toast (daily drill) -------------------------------
 
     def show_actionable(
@@ -503,18 +550,31 @@ class HudLauncher:
             return False
         if start_ts is None:
             start_ts = time.time()
-        return self._send_threadsafe({
-            "cmd": Cmd.SHOW_PILL,
+        params = {
             "reason": reason,
             "reason_label": reason_label,
             "start_ts": float(start_ts),
             "hotkey": hotkey,
-        })
+        }
+        self._last_pill_params = params
+        return self._send_threadsafe({"cmd": Cmd.SHOW_PILL, **params})
 
     def hide_pill(self) -> bool:
         if self._given_up:
             return False
+        self._last_pill_params = None
         return self._send_threadsafe({"cmd": Cmd.HIDE_PILL})
+
+    def hide_all(self) -> bool:
+        """Clear every visible HUD element (pill, cards, toasts, actionable).
+
+        Public counterpart to the ``hide_all`` JSON command. Used by
+        the preview-HUD test script's "hide all" menu option; the
+        production agent reaches the same state by going DISARMED.
+        """
+        if self._given_up:
+            return False
+        return self._send_threadsafe({"cmd": Cmd.HIDE_ALL})
 
     def set_pill_collapsed(self, collapsed: bool) -> bool:
         if self._given_up:

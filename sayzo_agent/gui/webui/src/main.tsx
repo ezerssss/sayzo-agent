@@ -36,21 +36,38 @@ function pickRoot(): JSX.Element {
   return <App />;
 }
 
-// The HUD route renders into a transparent pywebview window — override the
-// global white background set by index.css so we don't paint over the
-// frameless transparency. Also strip page-level scroll behaviour, since
-// HudShell uses `fixed inset-0` and never needs the viewport to scroll.
+// HUD-only page setup. The HUD route runs inside a Qt
+// `QWebEngineView` whose host widget uses `WA_TranslucentBackground`,
+// so the page's transparent regions are genuinely click-through.
+// Three things matter:
+//
+// 1. Backgrounds must be transparent so Qt's alpha compositor sees
+//    the page's per-pixel alpha (Chromium paints white by default
+//    otherwise).
+// 2. Page sizes to content via `fit-content` so the ResizeObserver
+//    in `HudApp.tsx` reports the actual content rect — overrides
+//    the `height: 100%` set in `index.css` for the Settings / Setup
+//    routes.
+// 3. Page-level scroll is killed — nothing to scroll, and a stray
+//    scrollbar would offset the content from the window edge.
 function applyHudPageStylesIfNeeded(): void {
   const params = readRouteParams();
   if (params.get("route") !== "hud") return;
   const transparent = "transparent";
+  const fit = "fit-content";
   document.documentElement.style.background = transparent;
+  document.documentElement.style.width = fit;
+  document.documentElement.style.height = fit;
   document.body.style.background = transparent;
   document.body.style.overflow = "hidden";
+  document.body.style.width = fit;
+  document.body.style.height = fit;
   const root = document.getElementById("root");
   if (root) {
     root.style.background = transparent;
     root.style.overflow = "hidden";
+    root.style.width = fit;
+    root.style.height = fit;
   }
 }
 

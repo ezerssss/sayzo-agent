@@ -15,7 +15,7 @@ export function HudCard({
 }: HudCardProps) {
   return (
     <div
-      className={`hud-drag flex flex-col overflow-hidden rounded-2xl border border-ink-border bg-white text-ink shadow-xl ${className}`}
+      className={`hud-element-enter hud-drag relative flex flex-col overflow-hidden rounded-2xl border border-ink-border bg-white text-ink shadow-xl ${className}`}
       style={{ pointerEvents: "auto", width }}
     >
       <GripDots />

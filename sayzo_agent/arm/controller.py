@@ -516,7 +516,14 @@ class ArmController:
         fut: asyncio.Future[None] = loop.create_future()
         self._hotkey_confirmation_yes = fut
 
-        toast_task = asyncio.ensure_future(self._ask_consent(
+        # Use the pill-pausing variant: when the hotkey is pressed
+        # while DISARMED (_confirm_and_arm) there's no pill to pause
+        # and the helper auto-no-ops via the ``_current_pill_params``
+        # gate. When pressed while ARMED (_disarm_with_confirm) the
+        # pill hides for the duration of the confirmation toast so
+        # the user isn't simultaneously asked "stop?" and told "still
+        # capturing".
+        toast_task = asyncio.ensure_future(self._ask_consent_pausing_pill(
             title, body, yes_label, no_label,
             timeout_secs=self.cfg.hotkey_confirm_timeout_secs,
             default_on_timeout="no",
@@ -649,8 +656,11 @@ class ArmController:
 
         # Show the persistent HUD pill — live timer + arm-reason label
         # + stop button. Mirrors the agent's arm state so the user
-        # always knows it's running. The pill stays visible until
-        # _disarm_internal hides it.
+        # always knows it's running. The launcher remembers the kwargs
+        # internally (``_last_pill_params``) so
+        # ``ask_consent_pausing_pill`` can restore the same pill
+        # verbatim (with the original ``start_ts``) after an "are you
+        # still here?" consent if the user opts to keep going.
         if self._hud_launcher is not None:
             self._hud_launcher.show_pill(
                 reason=reason.source,
@@ -734,6 +744,9 @@ class ArmController:
         # Hide the HUD pill the moment the state flip lands — same
         # ordering rationale as the tray-callback fire (UI should
         # reflect the user's decision before stream tear-down latency).
+        # The launcher's ``hide_pill`` clears its
+        # ``_last_pill_params`` snapshot, which is what makes any
+        # in-flight ``ask_consent_pausing_pill`` skip its restore.
         if self._hud_launcher is not None:
             self._hud_launcher.hide_pill()
 
@@ -756,7 +769,7 @@ class ArmController:
         asyncio.ensure_future(self._handle_pending_close(), loop=self._loop)
 
     async def _handle_pending_close(self) -> None:
-        result = await self._ask_consent(
+        result = await self._ask_consent_pausing_pill(
             "Was that the end of your meeting?",
             "It's been quiet for a bit. Wrap up and save, or keep going?",
             "Yes, done", "Not yet",
@@ -994,7 +1007,7 @@ class ArmController:
                     return
                 # Fire the check-in toast.
                 elapsed = time.monotonic() - session_start_mono
-                result = await self._ask_consent(
+                result = await self._ask_consent_pausing_pill(
                     "Still in the meeting?",
                     f"Sayzo has been capturing for {_human_duration(elapsed)}. "
                     "Keep going, or wrap up?",
@@ -1089,7 +1102,7 @@ class ArmController:
                     continue
                 # Fire meeting-ended toast.
                 name = reason.display_name or "your meeting app"
-                result = await self._ask_consent(
+                result = await self._ask_consent_pausing_pill(
                     "Looks like your meeting ended",
                     f"Sayzo noticed {name} stopped using the microphone. "
                     "Wrap up and save, or keep going?",
@@ -1530,6 +1543,40 @@ class ArmController:
             None,
             lambda: self.notifier.ask_consent(
                 title, body, yes, no, timeout_secs, default_on_timeout=default_on_timeout,
+            ),
+        )
+
+    async def _ask_consent_pausing_pill(
+        self, title: str, body: str, yes: str, no: str, timeout_secs: float,
+        default_on_timeout: ConsentResult,
+    ) -> ConsentResult:
+        """Ask for consent with the persistent pill hidden during the prompt.
+
+        Used by the four "are you still in a meeting?" flows
+        (joint-silence pending-close, long-meeting check-in,
+        meeting-ended watcher, hotkey-pressed-while-armed end
+        confirmation). Showing the live waveform pill while asking
+        "are you done?" is visually noisy.
+
+        Implementation lives on ``HudLauncher.ask_consent_pausing_pill``
+        — the launcher tracks the active pill kwargs internally as
+        ``_last_pill_params``, so a disarm-during-consent (via
+        ``_disarm_internal`` → ``launcher.hide_pill`` → clears
+        ``_last_pill_params``) automatically skips the restore.
+        Falls back to a plain ``_ask_consent`` when no HUD is wired
+        (NoopNotifier path in unit tests).
+        """
+        if self._hud_launcher is None:
+            return await self._ask_consent(
+                title, body, yes, no, timeout_secs,
+                default_on_timeout=default_on_timeout,
+            )
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self._hud_launcher.ask_consent_pausing_pill(
+                title, body, yes, no, timeout_secs,
+                default_on_timeout=default_on_timeout,
             ),
         )
 

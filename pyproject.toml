@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sayzo-agent"
-version = "2.10.0"
+version = "2.11.0"
 description = "Armed-only capture agent for Sayzo — records meetings on user consent (hotkey or whitelisted meeting app) and feeds them to downstream English-coaching analysis."
 requires-python = ">=3.10"
 dependencies = [
@@ -38,6 +38,16 @@ dependencies = [
     # `osascript display dialog` consent path are all gone — see
     # `project_custom_hud_shipped` in the auto-memory.
     "pywebview>=5.3,<6",
+    # HUD subprocess (v2.11+) runs on PySide6 + QtWebEngine instead of
+    # pywebview so we get genuine per-pixel alpha transparency on
+    # Windows 10+ (Qt's WA_TranslucentBackground hits Chromium's
+    # compositor the same way Electron does — no chromakey-click bug,
+    # no SetWindowRgn pixelation, no Win11-only DWM fallback). Settings
+    # and Setup keep pywebview because they don't need transparency.
+    # PySide6 is LGPL — fine for commercial use. PySide6-Addons pulls
+    # in QtWebEngineWidgets (~120 MB Chromium runtime).
+    "PySide6>=6.7,<7",
+    "PySide6-Addons>=6.7,<7",
     # Armed-only capture model (v1.0+).
     # Global hotkey listener + process / window queries.
     "pynput>=1.7",

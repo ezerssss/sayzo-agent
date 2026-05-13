@@ -1,76 +1,209 @@
-"""JS-callable bridge exposed to the HUD's React app.
+"""JS-callable bridge exposed to the HUD's React app via QWebChannel.
 
-A single method, :meth:`HudBridge.hud_event`, is exposed to JavaScript
-via pywebview's ``js_api`` mechanism. The React side calls it whenever it
-needs to ship a response or telemetry event back to the parent agent
-(consent card answer, actionable button outcome, pill button click,
-log). The bridge serializes the payload as a newline-delimited JSON
-record on ``sys.stdout`` — the parent's stdout reader thread picks it
-up and dispatches it.
+Four slots are exposed to JavaScript:
 
-Stdout is deliberately the only outbound channel — it's the same pipe
-the parent already holds open on the subprocess handle, so no separate
-IPC server / port file / TCP socket is needed. The Settings subprocess
-uses a loopback-TCP IPC server for similar talkback, but Settings is
-spawned ad-hoc by the user and runs as a sibling of the agent; the HUD
-is always a direct child, so the pipe is open by construction.
+* :meth:`set_window_visible(visible)` — toggles the host ``QWidget``
+  between its top-right (or last-dragged) anchor and the offscreen
+  anchor.
+* :meth:`set_window_size(width, height)` — resizes the host widget
+  to the React-reported content rectangle.
+* :meth:`start_system_move()` — hands a native window drag off to
+  Qt at the cursor's current position.
+* :meth:`hud_event(payload_json)` — forwards a React-emitted event
+  (``card_response``, ``actionable_response``, ``hud_ready``, …) to
+  ``sys.stdout`` for the parent agent's launcher to pick up.
+
+Visibility and size hooks are buffered: if React calls them before
+the HUD window has registered its callback (cold-boot race between
+QWebChannel setup and ``QWebEngineView.loadFinished``), the latest
+request replays on registration.
 """
 from __future__ import annotations
 
-import json
 import logging
 import sys
 import threading
-from typing import Any
+from typing import Callable, Optional
+
+from PySide6.QtCore import QObject, Slot
 
 log = logging.getLogger(__name__)
 
 
-class HudBridge:
-    """js_api object for the HUD pywebview window.
+class HudBridge(QObject):
+    """QObject exposed to the HUD's React app via QWebChannel.
 
-    Thread-safe: writes to stdout are serialized through a single lock
-    so two simultaneous JS calls can't interleave bytes.
+    Thread-safe: writes to stdout are serialized through a lock so two
+    simultaneous JS calls can't interleave bytes.
     """
 
     def __init__(self) -> None:
+        super().__init__()
         self._stdout_lock = threading.Lock()
-        # Out-of-band readiness latch: HudWindow waits on this before
-        # flushing any commands queued during early startup. JS calls
-        # ``hud_event({"event": "hud_ready"})`` once the React app has
-        # mounted and the subscriber is attached.
+        # Readiness latch — set when JS calls ``hud_event({"event":
+        # "hud_ready"})`` after the React app has mounted.
         self.ready_event = threading.Event()
+        # In-process callbacks registered by :class:`HudWindow` once the
+        # underlying QWidget handle is realised. The JS slots forward
+        # through these instead of doing window manipulation directly,
+        # so unit tests can swap in fakes.
+        self._set_visible_cb: Optional[Callable[[bool], None]] = None
+        self._set_size_cb: Optional[Callable[[int, int], None]] = None
+        # Native-drag hook. The JS side calls
+        # :meth:`start_system_move` from a mousedown handler on
+        # ``.hud-drag`` regions; this callback (registered by
+        # :class:`HudWindow`) asks Qt to begin a native window drag
+        # via ``QWindow.startSystemMove()``. No buffering — drag is
+        # user-initiated so it can never fire before the callback is
+        # registered.
+        self._start_system_move_cb: Optional[Callable[[], None]] = None
+        # If React calls a slot before the callback is wired, we buffer
+        # the latest request and replay it on registration. Earlier
+        # buffered values are dropped — the latest is authoritative.
+        self._pending_visibility: Optional[bool] = None
+        self._pending_size: Optional[tuple[int, int]] = None
+        self._window_lock = threading.Lock()
 
-    def hud_event(self, payload: Any) -> None:
-        """Called from JavaScript with an arbitrary JSON-serialisable payload.
+    # ------------------------------------------------------------------
+    # Python-only callback registration (no @Slot — not exposed to JS).
+    # ------------------------------------------------------------------
 
-        We treat the JS side as authoritative — every well-formed event
-        is forwarded verbatim. Malformed payloads are logged and dropped
-        rather than crashing the bridge.
+    def set_visibility_callback(
+        self, cb: Optional[Callable[[bool], None]],
+    ) -> None:
+        """Register the function the JS side will invoke to hide/show the window."""
+        with self._window_lock:
+            self._set_visible_cb = cb
+            pending = self._pending_visibility
+            self._pending_visibility = None
+        if cb is not None and pending is not None:
+            try:
+                cb(pending)
+            except Exception:
+                log.warning(
+                    "[hud-bridge] replayed visibility call raised", exc_info=True
+                )
+
+    def set_size_callback(
+        self, cb: Optional[Callable[[int, int], None]],
+    ) -> None:
+        """Register the function the JS side will invoke to resize the window."""
+        with self._window_lock:
+            self._set_size_cb = cb
+            pending = self._pending_size
+            self._pending_size = None
+        if cb is not None and pending is not None:
+            try:
+                cb(pending[0], pending[1])
+            except Exception:
+                log.warning(
+                    "[hud-bridge] replayed size call raised", exc_info=True
+                )
+
+    def set_start_system_move_callback(
+        self, cb: Optional[Callable[[], None]],
+    ) -> None:
+        """Register the callback the JS-callable :meth:`start_system_move` fires.
+
+        :class:`HudWindow` registers a closure that calls
+        ``self.windowHandle().startSystemMove()`` so the OS takes over
+        the drag at the cursor's current position.
         """
+        self._start_system_move_cb = cb
+
+    # ------------------------------------------------------------------
+    # JS-callable slots.
+    # ------------------------------------------------------------------
+
+    @Slot(bool)
+    def set_window_visible(self, visible: bool) -> None:
+        """Hide or show the HUD host window."""
+        target = bool(visible)
+        with self._window_lock:
+            cb = self._set_visible_cb
+            if cb is None:
+                self._pending_visibility = target
+                return
         try:
-            text = json.dumps(payload)
+            cb(target)
+        except Exception:
+            log.warning(
+                "[hud-bridge] set_window_visible callback raised", exc_info=True
+            )
+
+    @Slot(int, int)
+    def set_window_size(self, width: int, height: int) -> None:
+        """Resize the HUD host window to the React-reported content rect."""
+        try:
+            w = max(1, int(width))
+            h = max(1, int(height))
         except (TypeError, ValueError):
             log.warning(
-                "[hud-bridge] dropped non-serialisable payload: %r", payload
+                "[hud-bridge] set_window_size got non-int args: %r, %r",
+                width, height,
+            )
+            return
+        with self._window_lock:
+            cb = self._set_size_cb
+            if cb is None:
+                self._pending_size = (w, h)
+                return
+        try:
+            cb(w, h)
+        except Exception:
+            log.warning(
+                "[hud-bridge] set_window_size callback raised", exc_info=True
+            )
+
+    @Slot()
+    def start_system_move(self) -> None:
+        """Begin a native Qt window drag.
+
+        Called from the React app's mousedown handler when the user
+        clicks-and-drags on a ``.hud-drag`` region. Forwards to the
+        host widget which calls ``QWindow.startSystemMove()`` — the OS
+        then handles cursor tracking, snapping, and release natively.
+        """
+        cb = self._start_system_move_cb
+        if cb is None:
+            return
+        try:
+            cb()
+        except Exception:
+            log.warning(
+                "[hud-bridge] start_system_move callback raised", exc_info=True
+            )
+
+    @Slot(str)
+    def hud_event(self, payload_json: str) -> None:
+        """Forward a React-emitted event to the parent agent via stdout.
+
+        Receives a JSON-stringified payload (the JS side does
+        ``JSON.stringify(event)`` to keep marshaling simple — QWebChannel
+        does support QJsonObject auto-marshaling but stringified JSON is
+        more predictable for our use case).
+        """
+        if not isinstance(payload_json, str):
+            log.warning(
+                "[hud-bridge] dropped non-string payload: %r", type(payload_json),
             )
             return
 
-        # Tap the ready latch early so the launcher's wait_for_ready
-        # call unblocks even if the parent isn't actively reading stdout.
-        event = payload.get("event") if isinstance(payload, dict) else None
-        if event == "hud_ready":
+        # Substring-peek for the ready latch instead of parse+re-dump
+        # round-tripping every event — the parent reader does its own
+        # parse anyway and audio-level updates run at ~50 ms cadence.
+        if (
+            '"event":"hud_ready"' in payload_json
+            or '"event": "hud_ready"' in payload_json
+        ):
             self.ready_event.set()
 
         with self._stdout_lock:
             try:
-                sys.stdout.write(text)
+                sys.stdout.write(payload_json)
                 sys.stdout.write("\n")
                 sys.stdout.flush()
             except (BrokenPipeError, ValueError):
-                # Parent died or closed our stdout. There's nothing we
-                # can do — log and continue (the next quit-on-EOF in the
-                # stdin reader will tear us down).
                 log.warning(
                     "[hud-bridge] stdout broken — parent may have died"
                 )

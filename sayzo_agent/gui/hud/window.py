@@ -1,68 +1,51 @@
-"""HUD pywebview window — hosted in the ``sayzo-agent hud --idle`` subprocess.
+"""HUD subprocess window — PySide6 + QtWebEngine.
 
-A single frameless, transparent, always-on-top window pinned to the top-
-right of the primary monitor. The React app inside (see
-``gui/webui/src/HudApp.tsx``) handles all visual state — pill, dot,
-consent card, toast, actionable. Python's only job here is to:
+A frameless `QWidget` host (`WA_TranslucentBackground`) wrapping a
+`QWebEngineView` that renders the same React HUD bundle. JS↔Python
+bridging via `QWebChannel`; see :class:`sayzo_agent.gui.hud.bridge.HudBridge`.
 
-1. Host the window with the right platform flags so it doesn't steal
-   focus from the user's meeting app.
-2. Read newline-delimited JSON commands from stdin and forward them
-   into the webview via ``window.evaluate_js("window.hudBridge.dispatch(...)")``.
-3. Exit cleanly on ``quit`` or stdin EOF.
-
-Focus-stealing is the highest-risk regression and the reason we
-deliberately do not call ``activateIgnoringOtherApps_`` / ``SetForegroundWindow``
-anywhere. On macOS we install a Cocoa-level override that prevents the
-window from ever becoming "key" (input focus), so showing the HUD never
-takes the user out of their meeting app. On Windows the ``WS_EX_NOACTIVATE``
-extended style serves the same purpose. The minimum-viable defence works
-without those tweaks — the window is just unstyled and may briefly steal
-focus on appear; with the tweaks it stays out of the way entirely.
+The public ``HudWindow(cfg, demo).run_blocking()`` interface drives a
+self-contained `QApplication.exec()` so the standalone preview script
+and the ``sayzo-agent hud`` CLI can both spin up an HUD process.
 """
 from __future__ import annotations
 
 import json
 import logging
+import signal
 import sys
 import threading
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlencode
 
-import webview
+from PySide6.QtCore import QObject, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor
+from PySide6.QtWebChannel import QWebChannel
+from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtWidgets import QApplication, QVBoxLayout, QWidget
 
 from sayzo_agent.config import Config
 from sayzo_agent.gui.common.assets import webui_index_path
-from sayzo_agent.gui.common.safe_quit import safe_quit_window
-from sayzo_agent.gui.common.win_shutdown import install_shutdown_protection
 from sayzo_agent.gui.hud.bridge import HudBridge
 
 log = logging.getLogger(__name__)
 
 WINDOW_TITLE = "Sayzo HUD"
 
-# A fixed transparent canvas. React draws inside it via HudShell's
-# ``fixed inset-0`` layout, anchored to the top-right corner. Sized
-# generously so the pill + 3 stacked toasts + a card + demo control
-# strip all fit without dynamic resizing (we deliberately avoid
-# pywebview's ``Window.resize`` — it's quirky on Windows and a transparent
-# canvas with click-through has no visual cost for the extra real-estate).
-HUD_WIDTH = 420
-HUD_HEIGHT = 640
+# Initial host window size at construction time. React's ResizeObserver
+# overrides this within one frame of mount via
+# ``HudBridge.set_window_size``, so the user never sees this. The
+# window is created offscreen anyway.
+INITIAL_HUD_WIDTH = 100
+INITIAL_HUD_HEIGHT = 100
 
-# Distance from the screen edge to the HUD's anchor corner. Small enough
-# that the pill feels glued to the top-right, large enough to not clip
-# under the Windows accessibility border / macOS rounded screen corners.
+# Distance from the screen edge to the HUD's anchor corner.
 HUD_EDGE_INSET = 8
 
 
 def _hud_url(index: Path, *, demo: bool) -> str:
-    """Build a ``file://…/index.html#route=hud[&demo=1]`` URL.
-
-    Same hash-fragment convention as Settings — query strings get
-    mangled by WebView2 under file://.
-    """
+    """Build a ``file://…/index.html#route=hud[&demo=1]`` URL."""
     base = index.as_uri()
     params = {"route": "hud"}
     if demo:
@@ -70,206 +53,270 @@ def _hud_url(index: Path, *, demo: bool) -> str:
     return f"{base}#{urlencode(params)}"
 
 
-class HudWindow:
-    """Owns the pywebview HUD window for the subprocess lifetime."""
+class _HudHostWidget(QWidget):
+    """The actual Qt window. Encapsulates flags, geometry, web view."""
 
-    def __init__(self, cfg: Config, *, demo: bool = False) -> None:
+    # Emitted on each main-thread Qt event loop tick by a stdin reader.
+    # The reader runs on a daemon thread and emits this signal so the
+    # JS dispatch happens on the GUI thread (QWebEngineView is GUI-thread-only).
+    _command_received = Signal(str)
+
+    def __init__(self, cfg: Config, *, demo: bool) -> None:
+        super().__init__()
         self._cfg = cfg
         self._demo = demo
-        self._bridge = HudBridge()
-        # Filled in run_blocking. Used by the stdin reader to forward
-        # commands via evaluate_js once the window is realised.
-        self._window: Optional["webview.Window"] = None
         self._loaded_event = threading.Event()
-        # Buffer for commands that arrive over stdin before the window
-        # is loaded. Flushed in order once ``loaded`` fires.
+        # Queued commands that arrive before ``loadFinished`` fires.
         self._pending_commands: list[str] = []
         self._pending_lock = threading.Lock()
-        # Flipped by the stdin reader when it sees ``quit``. Distinguishes
-        # explicit teardown from a transient hide.
+        # If `loadFinished` never fires (page error, hung load),
+        # the stdin reader would otherwise grow this list unbounded
+        # — capping at 200 entries with FIFO drop keeps a wedged
+        # subprocess from holding megabytes of stale audio-level
+        # commands.
+        self._pending_commands_cap = 200
         self._quitting = False
+        # Last visibility / size decisions so duplicate calls are no-ops.
+        self._currently_visible = False
+        self._current_width = INITIAL_HUD_WIDTH
+        self._current_height = INITIAL_HUD_HEIGHT
+        # Right-edge anchor (screen width minus inset). Computed once;
+        # used as the INITIAL anchor when the HUD first comes onscreen.
+        self._screen_right_edge = _compute_screen_right_edge()
+        # Live "where the window's top-right corner currently sits"
+        # anchor. Updated by ``moveEvent`` whenever the window moves
+        # while visible (programmatic or user-initiated drag). On
+        # resize (collapse pill → dot, expand dot → pill, toast added)
+        # we pin the right edge to this and let the left edge slide,
+        # so the window grows / shrinks toward the left rather than
+        # snapping back to the screen's top-right corner if the user
+        # has dragged it elsewhere.
+        self._anchor_right_x = self._screen_right_edge
+        self._anchor_y = HUD_EDGE_INSET
+        # Set while we're doing a programmatic move / resize, so
+        # ``moveEvent`` only treats user-initiated drags as anchor
+        # updates. Without this guard, programmatic ``setGeometry``
+        # calls would clobber the anchor with stale geometry values
+        # if Qt fires ``moveEvent`` before ``resizeEvent``.
+        self._suppress_anchor_update = False
 
-    def run_blocking(self) -> None:
+        # Frameless, top-most, no taskbar/Alt-Tab, no focus theft.
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+            | Qt.WindowType.WindowDoesNotAcceptFocus
+        )
+        # Genuine per-pixel alpha — pixels the React app paints as
+        # transparent become OS-level transparent.
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        # Start at the offscreen anchor so we don't briefly flash the
+        # window during boot. React's ResizeObserver and
+        # ``set_window_visible(true)`` move + resize us when there's
+        # content.
+        offscreen_x, offscreen_y = _offscreen_anchor()
+        self.setGeometry(
+            offscreen_x, offscreen_y, INITIAL_HUD_WIDTH, INITIAL_HUD_HEIGHT,
+        )
+        self.setWindowTitle(WINDOW_TITLE)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self._view = QWebEngineView(self)
+        # Chromium needs an explicit transparent page bg or it paints
+        # an opaque white background underneath the React content,
+        # defeating the WA_TranslucentBackground host.
+        self._view.page().setBackgroundColor(QColor(0, 0, 0, 0))
+        layout.addWidget(self._view)
+
+        # Bridge + WebChannel. We expose the bridge as ``hudPyBridge``
+        # on the channel; the JS side reads it via ``QWebChannel``.
+        self._bridge = HudBridge()
+        self._channel = QWebChannel(self)
+        self._channel.registerObject("hudPyBridge", self._bridge)
+        self._view.page().setWebChannel(self._channel)
+
+        # Hook up load + command pipeline.
+        self._view.loadFinished.connect(self._on_load_finished)
+        self._command_received.connect(self._dispatch_command_on_gui_thread)
+
+        # Load the React bundle.
         index = webui_index_path()
         if not index.exists():
-            log.error(
-                "[hud] UI assets missing at %s — HUD will not start", index
-            )
+            log.error("[hud] UI assets missing at %s — HUD will not render", index)
             return
-
         url = _hud_url(index, demo=self._demo)
-        # Top-right anchor of the primary monitor. We probe through
-        # pywebview if possible (5.x exposes ``webview.screens``);
-        # otherwise default to (0, 0) and let the user drag. Both
-        # platforms position windows relative to the top-left of the
-        # primary monitor in pywebview's coordinate space.
-        x, y = _compute_top_right_anchor()
         log.info(
-            "[hud] opening window at %s (x=%s y=%s w=%s h=%s demo=%s)",
-            url, x, y, HUD_WIDTH, HUD_HEIGHT, self._demo,
+            "[hud] opening Qt window offscreen at (x=%s y=%s); right edge=%s "
+            "initial w=%s h=%s demo=%s url=%s",
+            offscreen_x, offscreen_y, self._screen_right_edge,
+            INITIAL_HUD_WIDTH, INITIAL_HUD_HEIGHT, self._demo, url,
         )
+        self._view.load(QUrl(url))
 
-        # Per-platform transparency choice.
-        #
-        # On macOS we want a genuinely see-through canvas so empty
-        # regions are click-through to the meeting app. The Cocoa
-        # NSWindow APIs (setOpaque_/setBackgroundColor_) handle this
-        # cleanly — applied in _apply_mac_overlay_tweaks.
-        #
-        # On Windows, pywebview's transparent=True path uses a WinForms
-        # TransparencyKey (chromakey at RGB(255,0,0)). WebView2's GPU
-        # compositing doesn't route mouse events correctly through a
-        # layered host with a chromakey: clicks land on the chromakey-
-        # pass-through pixels but get lost on the painted UI inside.
-        # We accept a visible solid-colored rectangle on Windows as a
-        # consequence — same as how Loom's recorder bar and most
-        # Electron-based overlay HUDs render on Windows. The visible
-        # rectangle is sized minimally (no big transparent canvas)
-        # so the chrome footprint is small.
-        want_transparent = sys.platform == "darwin"
-
-        self._window = webview.create_window(
-            title=WINDOW_TITLE,
-            url=url,
-            js_api=self._bridge,
-            width=HUD_WIDTH,
-            height=HUD_HEIGHT,
-            x=x,
-            y=y,
-            frameless=True,
-            resizable=False,
-            on_top=True,
-            transparent=want_transparent,
-            # Sayzo theme: light surface, dark ink (matches Settings + setup
-            # windows). On Windows where transparency is off, the user sees a
-            # white card; on macOS the BackColor is overridden to clear in
-            # _apply_mac_overlay_tweaks so transparency takes over.
-            background_color="#FFFFFF",
-            text_select=False,
-            # The HUD is always shown — there's no "idle pre-warm hidden"
-            # phase like Settings. The launcher gates visibility via
-            # ``hide_pill`` / ``hide_all`` commands; the React app just
-            # renders nothing in the hidden state.
-            hidden=False,
-        )
-
-        def _mark_quitting() -> None:
-            self._quitting = True
-
-        # Wire load + close hooks.
-        def on_closing() -> Optional[bool]:
-            # The HUD has no user-facing close button (frameless window).
-            # If something else triggers a close (shutdown, kill), let
-            # it through.
-            return None
-
-        def on_loaded() -> None:
-            log.info("[hud] WebView2 loaded — applying platform tweaks")
-            self._apply_platform_tweaks()
-            # Install the Windows shutdown handler AFTER the window has
-            # loaded — by then pywebview has initialized pythonnet and
-            # the Microsoft.Win32 / System.Windows.Forms namespaces are
-            # resolvable. Doing this pre-load (as Settings still does)
-            # logs harmless ImportError warnings about pythonnet not
-            # being ready yet.
-            try:
-                assert self._window is not None
-                install_shutdown_protection(self._window, set_quitting=_mark_quitting)
-            except Exception:
-                log.warning("[hud] install_shutdown_protection failed", exc_info=True)
-            self._loaded_event.set()
-            # Drain any commands that landed before the React app was
-            # ready. After this, the stdin reader will forward inline.
-            self._flush_pending_commands()
-
-        self._window.events.closing += on_closing
-        self._window.events.loaded += on_loaded
-
-        # Stdin reader runs in a daemon thread so webview.start() owns
-        # the main thread (required by Cocoa + pywebview).
-        reader = threading.Thread(
-            target=self._stdin_command_loop,
-            name="sayzo-hud-stdin",
-            daemon=True,
-        )
-        reader.start()
-
-        webview.start(debug=self._cfg.debug)
-        log.info("[hud] window closed — subprocess exiting")
+    @property
+    def bridge(self) -> HudBridge:
+        return self._bridge
 
     # ------------------------------------------------------------------
-    # Platform-specific tweaks: make the HUD an overlay that doesn't
-    # steal focus from the user's foreground app.
+    # Lifecycle hooks.
     # ------------------------------------------------------------------
 
-    def _apply_platform_tweaks(self) -> None:
+    def _on_load_finished(self, ok: bool) -> None:
+        if not ok:
+            log.warning("[hud] page load reported not-ok")
+        log.info("[hud] page loaded — wiring bridge callbacks")
+        # Apply macOS-specific overlay tweaks (status-window-level,
+        # collection behaviour, hides-on-deactivate=False) once Qt has
+        # realised the native NSWindow.
         if sys.platform == "darwin":
             self._apply_mac_overlay_tweaks()
-        elif sys.platform == "win32":
-            self._apply_win_overlay_tweaks()
+        # Wire the bridge callbacks now that the host widget is real.
+        # React may already have buffered set_window_visible /
+        # set_window_size requests via the bridge's pending buffers —
+        # those replay automatically on registration.
+        self._bridge.set_visibility_callback(self._set_window_visible)
+        self._bridge.set_size_callback(self._set_window_size)
+        self._bridge.set_start_system_move_callback(self._start_system_move)
+        self._loaded_event.set()
+        # Drain any commands that landed before the page was ready.
+        self._flush_pending_commands()
+
+    # ------------------------------------------------------------------
+    # Visibility — toggle the window between onscreen (top-right) and
+    # offscreen (-20000, 0) using setGeometry. No focus stealing
+    # because the window has Qt.WindowDoesNotAcceptFocus.
+    # ------------------------------------------------------------------
+
+    def _set_window_visible(self, visible: bool) -> None:
+        if visible == self._currently_visible:
+            return
+        self._currently_visible = visible
+        if visible:
+            # Use the live anchor: top-right corner by default, or
+            # wherever the user dragged the window last cycle.
+            x = self._anchor_right_x - self._current_width
+            y = self._anchor_y
+        else:
+            # Going hidden — reset the anchor back to the screen's
+            # top-right so the NEXT visibility cycle (new pill /
+            # card / toast after the previous batch fully cleared)
+            # starts fresh at the top-right corner. Without this the
+            # window would re-appear wherever the user dragged it
+            # last session, which on a "no content → new content"
+            # transition feels like a stale state from the previous
+            # arm cycle.
+            self._anchor_right_x = self._screen_right_edge
+            self._anchor_y = HUD_EDGE_INSET
+            x, y = _offscreen_anchor()
+        self._suppress_anchor_update = True
+        try:
+            self.move(int(x), int(y))
+        finally:
+            self._suppress_anchor_update = False
+        log.info("[hud] window visibility → %s", "shown" if visible else "hidden")
+
+    def _set_window_size(self, width: int, height: int) -> None:
+        if width == self._current_width and height == self._current_height:
+            return
+        self._current_width = int(width)
+        self._current_height = int(height)
+        if self._currently_visible:
+            # Pin the RIGHT edge to the live anchor so the window
+            # grows / shrinks toward the LEFT. Collapse (pill → dot)
+            # shrinks toward the right edge of the user's current
+            # window position instead of snapping back to the screen
+            # corner; expand (dot → pill) grows leftward from the
+            # dot's current right edge instead of overflowing off
+            # the right of the monitor.
+            x = self._anchor_right_x - self._current_width
+            y = self._anchor_y
+        else:
+            x, y = _offscreen_anchor()
+        self._suppress_anchor_update = True
+        try:
+            self.setGeometry(
+                int(x), int(y), self._current_width, self._current_height,
+            )
+        finally:
+            self._suppress_anchor_update = False
+        log.info(
+            "[hud] window size → %dx%d (visible=%s)",
+            self._current_width, self._current_height, self._currently_visible,
+        )
+
+    def moveEvent(self, event) -> None:  # noqa: ANN001 — Qt signature
+        """Track the window's right edge so future resizes keep it pinned.
+
+        Qt fires ``moveEvent`` on every position change — both
+        programmatic ``self.move()`` / ``self.setGeometry()`` and
+        user-initiated drags via ``startSystemMove``. We update the
+        live anchor only when we're NOT in the middle of a
+        programmatic call (``_suppress_anchor_update`` is set in
+        ``_set_window_visible`` / ``_set_window_size``) so the anchor
+        only reflects what the user explicitly did with a drag.
+        Without this guard, ``moveEvent`` firing before ``resizeEvent``
+        during a programmatic ``setGeometry`` would compute the
+        anchor against the OLD width and produce a glitched value.
+        """
+        super().moveEvent(event)
+        if self._currently_visible and not self._suppress_anchor_update:
+            self._anchor_right_x = self.x() + self.width()
+            self._anchor_y = self.y()
+
+    def _start_system_move(self) -> None:
+        """Hand off a window drag to the OS at the cursor's current position.
+
+        Routed here from the React mousedown handler via the bridge's
+        ``start_system_move`` slot. ``QWindow.startSystemMove()`` lets
+        the OS take over cursor tracking, snapping, and release —
+        native drag behaviour for a frameless window.
+        """
+        handle = self.windowHandle()
+        if handle is None:
+            log.warning("[hud] startSystemMove: no windowHandle")
+            return
+        try:
+            handle.startSystemMove()
+        except Exception:
+            log.warning("[hud] startSystemMove failed", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # macOS overlay tweaks: NSStatusWindowLevel + collection behaviour
+    # so the HUD floats above app windows, survives Spaces /
+    # fullscreen, doesn't take focus.
+    # ------------------------------------------------------------------
 
     def _apply_mac_overlay_tweaks(self) -> None:
-        """Float above app windows + survive Spaces / fullscreen + don't take focus.
-
-        Three calls in sequence:
-
-        * ``setLevel_(NSStatusWindowLevel)`` — keeps the HUD above
-          normal windows but below the menu bar and modal alerts.
-        * ``setCollectionBehavior_(...)`` — joins the union of every
-          space (so the user switching desktops doesn't lose the
-          HUD), survives fullscreen Zoom/Meet via
-          ``FullScreenAuxiliary``, and stays out of window-cycle UIs.
-        * ``setHidesOnDeactivate_(False)`` — defaults to True on
-          ``Accessory`` policy apps; we want the HUD visible while the
-          user is in another app, which is the entire point.
-
-        We also drop the app's activation policy to ``Accessory`` so
-        the subprocess doesn't add a Dock icon. ``canBecomeKeyWindow``
-        isn't overridden directly here — the combination above plus
-        never calling ``activateIgnoringOtherApps_`` keeps focus on the
-        user's foreground app in practice. If focus-theft reports come
-        in, the next step is an Objective-C category override of
-        ``canBecomeKeyWindow``.
-        """
         try:
             from AppKit import (  # type: ignore[import-not-found]
-                NSApp,
-                NSApplicationActivationPolicyAccessory,
                 NSWindowCollectionBehaviorCanJoinAllSpaces,
                 NSWindowCollectionBehaviorFullScreenAuxiliary,
                 NSWindowCollectionBehaviorIgnoresCycle,
                 NSWindowCollectionBehaviorTransient,
             )
+            import objc  # type: ignore[import-not-found]
         except Exception:
             log.warning(
-                "[hud] AppKit unavailable — cannot apply mac overlay tweaks",
+                "[hud] AppKit unavailable — mac overlay tweaks skipped",
                 exc_info=True,
             )
             return
 
-        # NSStatusWindowLevel = 25. We hardcode rather than rely on a
-        # pyobjc constant because the constant name has changed across
-        # macOS versions and pyobjc minor releases.
+        # Hide the Dock icon for the HUD subprocess via the shared
+        # helper that Settings + Setup already use.
+        from sayzo_agent.gui.common.mac_dock import set_dock_visible
+        set_dock_visible(False)
+
         NS_STATUS_WINDOW_LEVEL = 25
 
         try:
-            NSApp.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+            ns_window = objc.objc_object(c_void_p=int(self.winId()))
         except Exception:
-            log.warning(
-                "[hud] setActivationPolicy_(Accessory) failed",
-                exc_info=True,
-            )
-
-        try:
-            ns_window = self._cocoa_window()
-        except Exception:
-            log.warning(
-                "[hud] cocoa window introspection failed",
-                exc_info=True,
-            )
-            return
-        if ns_window is None:
-            log.warning("[hud] no NSWindow handle found — overlay tweaks skipped")
+            log.warning("[hud] could not bridge QWidget winId to NSWindow", exc_info=True)
             return
 
         try:
@@ -293,152 +340,15 @@ class HudWindow:
         except Exception:
             log.warning("[hud] setHidesOnDeactivate_ failed", exc_info=True)
 
-        # Opt out of the standard NSWindow "first responder takes focus"
-        # behaviour. ``setAcceptsMouseMovedEvents_`` and
-        # ``setMovableByWindowBackground_`` both reduce the chance the
-        # window pulls focus when the user mouses through it.
-        try:
-            ns_window.setMovableByWindowBackground_(True)
-        except Exception:
-            pass
-
-        # The window is borderless — sometimes pywebview's Cocoa backend
-        # forgets to mark it as opaque-or-not. Forcing opaque=False makes
-        # sure the transparent canvas under the React content actually
-        # composites against the desktop.
-        try:
-            ns_window.setOpaque_(False)
-            from AppKit import NSColor  # type: ignore[import-not-found]
-
-            ns_window.setBackgroundColor_(NSColor.clearColor())
-        except Exception:
-            log.warning("[hud] setOpaque_/clearColor failed", exc_info=True)
-
         log.info("[hud] mac overlay tweaks applied")
 
-    def _cocoa_window(self):  # type: ignore[no-untyped-def]
-        """Best-effort NSWindow lookup for the current pywebview window."""
-        # pywebview's cocoa backend stashes the NSWindow on its BrowserView
-        # singleton. The exact attribute name has been ``window`` since 5.0;
-        # we look it up by import path so a pywebview internal rename doesn't
-        # silently break this module.
-        try:
-            from webview.platforms import cocoa  # type: ignore[import-not-found]
-        except Exception:
-            return None
-        bv_instances = getattr(cocoa.BrowserView, "instances", None)
-        if not bv_instances:
-            return None
-        assert self._window is not None
-        bv = bv_instances.get(self._window.uid)
-        if bv is None:
-            return None
-        # ``bv.window`` is the NSWindow. Fall back to ``bv.webkit.window()``
-        # if that ever moves.
-        for attr in ("window", "_window"):
-            ns = getattr(bv, attr, None)
-            if ns is not None:
-                return ns
-        webkit = getattr(bv, "webkit", None)
-        if webkit is not None:
-            return webkit.window()
-        return None
-
-    def _apply_win_overlay_tweaks(self) -> None:
-        """Mark the HUD as a topmost tool window above normal Z-order.
-
-        ``WS_EX_TOOLWINDOW`` removes the HUD from Alt+Tab — it's a
-        floating overlay, not an app window. ``WS_EX_TOPMOST`` is set
-        by pywebview's ``on_top=True`` already; we re-assert it to be
-        sure since chained ``SetWindowLong`` calls otherwise drop
-        unrelated extended styles.
-
-        We deliberately do NOT set ``WS_EX_NOACTIVATE``. The flag would
-        prevent the HUD from stealing focus when shown, but it also
-        prevents WebView2 from routing mouse clicks to the embedded
-        content (WebView2's input pipeline requires the host window's
-        activation state to be valid). Clicking a consent prompt or
-        the stop button would silently no-op. Trade-off accepted:
-        clicking the HUD briefly takes focus (same behaviour as
-        Granola); merely *showing* the HUD does not take focus,
-        because we never call SetForegroundWindow on it.
-        """
-        try:
-            import ctypes
-            from ctypes import wintypes
-        except Exception:
-            log.warning("[hud] ctypes unavailable — win tweaks skipped")
-            return
-
-        # win32 constants — hardcoded to avoid the pywin32 dependency
-        # in this hot import path.
-        GWL_EXSTYLE = -20
-        WS_EX_TOOLWINDOW = 0x00000080
-        WS_EX_TOPMOST = 0x00000008
-
-        try:
-            hwnd = self._win_hwnd()
-        except Exception:
-            log.warning("[hud] win hwnd lookup failed", exc_info=True)
-            return
-        if hwnd == 0:
-            log.warning("[hud] win hwnd is 0 — overlay tweaks skipped")
-            return
-
-        user32 = ctypes.windll.user32
-        # Some Windows versions need the wide variants for 64-bit
-        # pointers; GetWindowLongPtrW falls back to GetWindowLongW on
-        # 32-bit builds.
-        try:
-            get_long = user32.GetWindowLongPtrW
-            set_long = user32.SetWindowLongPtrW
-        except AttributeError:
-            get_long = user32.GetWindowLongW
-            set_long = user32.SetWindowLongW
-
-        try:
-            current = get_long(wintypes.HWND(hwnd), GWL_EXSTYLE)
-        except Exception:
-            log.warning("[hud] GetWindowLong failed", exc_info=True)
-            return
-
-        new_style = current | WS_EX_TOOLWINDOW | WS_EX_TOPMOST
-        try:
-            set_long(wintypes.HWND(hwnd), GWL_EXSTYLE, new_style)
-            log.info(
-                "[hud] win overlay tweaks applied (exstyle: 0x%X → 0x%X)",
-                current, new_style,
-            )
-        except Exception:
-            log.warning("[hud] SetWindowLong failed", exc_info=True)
-
-    def _win_hwnd(self) -> int:
-        """Return the HWND for the HUD window, or 0 if unknown."""
-        try:
-            from webview.platforms.winforms import BrowserView  # type: ignore[import-not-found]
-        except Exception:
-            return 0
-        assert self._window is not None
-        bv = BrowserView.instances.get(self._window.uid)
-        if bv is None:
-            return 0
-        try:
-            return int(bv.Handle.ToInt64())
-        except Exception:
-            return 0
-
     # ------------------------------------------------------------------
-    # Stdin command pipeline.
+    # stdin command pipeline. The parent agent's launcher writes
+    # newline-delimited JSON commands; we read them on a daemon thread
+    # and forward into the React app via window.hudBridge.dispatch().
     # ------------------------------------------------------------------
 
     def _stdin_command_loop(self) -> None:
-        """Forward parent commands into the webview.
-
-        Commands are newline-delimited JSON. ``quit`` is also accepted
-        as a bare string for symmetry with the Settings subprocess
-        contract (and so a panicked parent can kill us with a single
-        ``echo quit > stdin``). EOF tears down the subprocess.
-        """
         try:
             for line in sys.stdin:
                 raw = line.strip()
@@ -447,7 +357,6 @@ class HudWindow:
                 if raw.lower() == "quit":
                     self._dispatch_quit()
                     return
-                # Parse as JSON. Malformed lines are logged and dropped.
                 try:
                     payload = json.loads(raw)
                 except json.JSONDecodeError:
@@ -457,24 +366,22 @@ class HudWindow:
                 if cmd == "quit":
                     self._dispatch_quit()
                     return
-                self._forward_command(raw)
+                # Forward via the Qt signal so the JS dispatch happens
+                # on the GUI thread (QWebEngineView is GUI-thread-only).
+                self._command_received.emit(raw)
         except Exception:
             log.warning("[hud] stdin reader crashed", exc_info=True)
         log.info("[hud] stdin closed — quitting")
         self._dispatch_quit()
 
-    def _forward_command(self, raw_json: str) -> None:
-        """Push a JSON command into the React app's bridge.
-
-        Commands that arrive before the React app is mounted are
-        buffered; otherwise we ``evaluate_js`` immediately.
-        """
-        # evaluate_js needs a JS string expression. We embed the JSON
-        # blob as a parsed object via ``JSON.parse`` so any quoting in
-        # the payload doesn't need escape juggling on the Python side.
+    def _dispatch_command_on_gui_thread(self, raw_json: str) -> None:
+        """Slot connected to ``_command_received`` — runs on GUI thread."""
         if not self._loaded_event.is_set():
             with self._pending_lock:
                 self._pending_commands.append(raw_json)
+                excess = len(self._pending_commands) - self._pending_commands_cap
+                if excess > 0:
+                    del self._pending_commands[:excess]
             return
         self._evaluate_js_dispatch(raw_json)
 
@@ -486,45 +393,86 @@ class HudWindow:
             self._evaluate_js_dispatch(raw)
 
     def _evaluate_js_dispatch(self, raw_json: str) -> None:
-        if self._window is None:
-            return
-        # Use a JS literal expression with JSON.parse so we don't have
-        # to worry about quote escaping in the Python string.
+        # Embed via JSON.parse to avoid quote-escape juggling. The
+        # React side's bridge exposes ``window.hudBridge.dispatch(cmd)``.
+        escaped = raw_json.replace("\\", "\\\\").replace("`", "\\`")
+        js = (
+            "(function(){"
+            "try{"
+            f"const payload = JSON.parse(`{escaped}`);"
+            "if (window.hudBridge && typeof window.hudBridge.dispatch === 'function') {"
+            "  window.hudBridge.dispatch(payload);"
+            "}"
+            "}catch(e){console.warn('hud dispatch err', e);}"
+            "})();"
+        )
         try:
-            # Escape any backticks and backslashes for the template literal.
-            escaped = raw_json.replace("\\", "\\\\").replace("`", "\\`")
-            js = (
-                "(function(){"
-                "try{"
-                f"const payload = JSON.parse(`{escaped}`);"
-                "if (window.hudBridge && typeof window.hudBridge.dispatch === 'function') {"
-                "  window.hudBridge.dispatch(payload);"
-                "}"
-                "}catch(e){console.warn('hud dispatch err', e);}"
-                "})();"
-            )
-            self._window.evaluate_js(js)
+            self._view.page().runJavaScript(js)
         except Exception:
-            log.warning("[hud] evaluate_js dispatch failed", exc_info=True)
+            log.warning("[hud] runJavaScript dispatch failed", exc_info=True)
 
     def _dispatch_quit(self) -> None:
         self._quitting = True
-        if self._window is None:
-            return
-        try:
-            safe_quit_window(self._window)
-        except Exception:
-            log.warning("[hud] safe_quit_window failed", exc_info=True)
+        # Schedule app quit on the GUI thread.
+        QApplication.instance().quit()
+
+    def start_stdin_reader(self) -> None:
+        reader = threading.Thread(
+            target=self._stdin_command_loop,
+            name="sayzo-hud-stdin",
+            daemon=True,
+        )
+        reader.start()
 
 
-def _compute_top_right_anchor() -> tuple[int, int]:
-    """Best-effort top-right corner of the primary monitor.
+class HudWindow:
+    """Public façade that preserves the pre-v2.11 ``run_blocking()`` interface.
 
-    pywebview 5.x exposes ``webview.screens`` after the GUI loop starts
-    — but we need a position *before* ``create_window``. Fall back to a
-    Windows ctypes probe / macOS Cocoa probe / sensible default.
+    Used by:
+    * ``scripts/preview_hud.py``'s ``_run_demo`` (calls
+      ``HudWindow(cfg, demo=True).run_blocking()``).
+    * ``sayzo_agent/__main__.py::hud`` (the ``sayzo-agent hud`` CLI).
+
+    Internally creates / reuses a ``QApplication``, constructs the
+    Qt host widget, starts the stdin reader, and enters the event
+    loop.
     """
-    width = HUD_WIDTH
+
+    def __init__(self, cfg: Config, *, demo: bool = False) -> None:
+        self._cfg = cfg
+        self._demo = demo
+
+    def run_blocking(self) -> None:
+        # PySide6 requires a QApplication before any QWidget. Reuse an
+        # existing one if the host process already has one (e.g.
+        # ``preview_hud.py launcher`` mode runs in the same process for
+        # tests).
+        app = QApplication.instance() or QApplication(sys.argv)
+        widget = _HudHostWidget(self._cfg, demo=self._demo)
+        widget.show()
+        widget.start_stdin_reader()
+        _install_sigint_handler(app)
+        exit_code = app.exec()
+        log.info("[hud] Qt event loop exited rc=%s", exit_code)
+
+
+# ----------------------------------------------------------------------
+# Module-level helpers.
+# ----------------------------------------------------------------------
+
+
+def _offscreen_anchor() -> tuple[int, int]:
+    """A point far enough off the primary monitor to be invisible."""
+    return (-20000, 0)
+
+
+def _compute_screen_right_edge() -> int:
+    """Pixel x-coordinate of "right edge minus inset" on the primary monitor.
+
+    Used as the right anchor for the HUD: regardless of the current
+    window width, the top-right corner snaps to this column. Falls back
+    to a ctypes / Cocoa probe / sensible default.
+    """
     if sys.platform == "win32":
         try:
             import ctypes
@@ -532,7 +480,7 @@ def _compute_top_right_anchor() -> tuple[int, int]:
             user32 = ctypes.windll.user32
             user32.SetProcessDPIAware()
             screen_w = user32.GetSystemMetrics(0)  # SM_CXSCREEN
-            return max(0, screen_w - width - HUD_EDGE_INSET), HUD_EDGE_INSET
+            return max(0, screen_w - HUD_EDGE_INSET)
         except Exception:
             log.warning("[hud] win screen probe failed", exc_info=True)
     if sys.platform == "darwin":
@@ -543,7 +491,45 @@ def _compute_top_right_anchor() -> tuple[int, int]:
             if main is not None:
                 frame = main.frame()
                 screen_w = int(frame.size.width)
-                return max(0, screen_w - width - HUD_EDGE_INSET), HUD_EDGE_INSET
+                return max(0, screen_w - HUD_EDGE_INSET)
         except Exception:
             log.warning("[hud] mac screen probe failed", exc_info=True)
-    return 1280, HUD_EDGE_INSET
+    return 1280
+
+
+def _install_sigint_handler(app: QApplication) -> None:
+    """Make Ctrl+C exit the Qt event loop cleanly.
+
+    Qt's ``QApplication.exec()`` doesn't return control to Python often
+    enough for the default SIGINT handler to fire, so ``Ctrl+C`` is
+    swallowed by the running event loop. We install our own handler
+    that calls ``app.quit()`` AND register a low-priority QTimer that
+    fires every 200 ms — the timer's callback returns control to
+    Python, which lets the pending SIGINT actually be delivered. This
+    is the canonical Qt-app pattern for honouring Ctrl+C.
+
+    Only meaningful when stdin is a TTY (i.e. someone running
+    ``scripts/preview_hud.py demo``). The agent's spawned HUD
+    subprocess has no TTY and the parent uses the ``quit`` stdin
+    command for shutdown, which works regardless.
+    """
+    def _handler(signum: int, _frame) -> None:  # noqa: ANN001
+        log.info("[hud] SIGINT received — quitting Qt event loop")
+        app.quit()
+
+    try:
+        signal.signal(signal.SIGINT, _handler)
+    except (ValueError, OSError):
+        # signal.signal can only be called from the main thread; the
+        # HUD subprocess always satisfies this, but be defensive.
+        return
+    # Tickle the Python interpreter periodically so the C-level signal
+    # is actually delivered. Reuse the timer across re-entrant
+    # ``run_blocking`` calls so we don't orphan QTimer objects when
+    # the same QApplication serves multiple HUD windows in one process
+    # (e.g. ``preview_hud.py`` test sequences).
+    if getattr(app, "_sayzo_sigint_timer", None) is None:
+        keep_alive_timer = QTimer()
+        keep_alive_timer.timeout.connect(lambda: None)
+        keep_alive_timer.start(200)
+        setattr(app, "_sayzo_sigint_timer", keep_alive_timer)

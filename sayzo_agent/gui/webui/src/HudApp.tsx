@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Sparkles } from "lucide-react";
 import { hudBridge, HudCommand } from "./lib/hud-bridge";
 import { HudShell } from "./hud/HudShell";
@@ -8,6 +8,14 @@ import { ConsentCard } from "./hud/ConsentCard";
 import { InfoToast } from "./hud/InfoToast";
 import { ActionableToast } from "./hud/ActionableToast";
 import { HudCard } from "./hud/HudCard";
+
+// Duration of the CSS opacity fade (see `index.css::.hud-fade`). When
+// content goes away we keep the OS window on-screen for this long so
+// the user sees the children fade out, then we tell Python to hide the
+// host window. Must match the CSS transition or the window will hide
+// mid-animation (still visible would-be content snapping to nothing) or
+// be left on screen long after the animation finishes.
+const HUD_FADE_MS = 180;
 
 // Top-right HUD root. Owns the state machine: pill visibility / collapsed,
 // queued consent cards (FIFO, one at a time), stacked toasts, the
@@ -83,6 +91,98 @@ export function HudApp() {
     if (params.get("demo") === "1") {
       setDemoMode(true);
     }
+  }, []);
+
+  // Pause-pill-during-consent at the React layer. Mirrors what
+  // `ArmController._ask_consent_pausing_pill` does in production:
+  // when a consent card appears while the pill is shown, hide the
+  // pill for the duration of the card; restore it once the card is
+  // dismissed. Necessary for the demo flow (where the demo buttons
+  // fire `show_card` without explicitly hiding the pill first);
+  // in production the ArmController already dispatches `hide_pill`
+  // before `show_card` so this effect is a no-op because the pill
+  // is already null when the card mounts.
+  const [pausedPill, setPausedPill] = useState<PillState | null>(null);
+  useEffect(() => {
+    if (cards.length > 0 && pill && !pausedPill) {
+      setPausedPill(pill);
+      setPill(null);
+      return;
+    }
+    if (cards.length === 0 && pausedPill) {
+      setPill(pausedPill);
+      setPausedPill(null);
+    }
+  }, [cards.length, pill, pausedPill]);
+
+  // Delegate window dragging to Qt. `-webkit-app-region: drag` (the
+  // CSS that worked in pywebview's Chromium host) is a no-op in
+  // QtWebEngine, so we intercept the mousedown ourselves: if the user
+  // clicks on a `.hud-drag` ancestor that isn't a button / input /
+  // `.hud-no-drag` element, we ask Qt to begin a native window drag
+  // via `QWindow.startSystemMove()`. The OS takes over from there —
+  // cursor tracking, snapping, and release are all native.
+  useEffect(() => {
+    const onMouseDown = (e: MouseEvent) => {
+      if (e.button !== 0) return;
+      const target = e.target as HTMLElement | null;
+      if (!target) return;
+      // Single closest() walk finds the nearest ancestor matching any
+      // of: drag-opt-out, interactive child, or drag region. Whichever
+      // appears first up the tree wins, so opt-outs/interactives
+      // automatically short-circuit before we'd ever hit a `.hud-drag`.
+      const hit = target.closest(
+        ".hud-no-drag, button, a, input, textarea, select, .hud-drag",
+      );
+      if (!hit) return;
+      if (hit.matches(".hud-drag")) {
+        e.preventDefault();
+        void hudBridge.startSystemMove();
+      }
+    };
+    document.addEventListener("mousedown", onMouseDown);
+    return () => document.removeEventListener("mousedown", onMouseDown);
+  }, []);
+
+  // Report content size to Python so the Qt host window can resize
+  // to *exactly* the rendered content rectangle. We observe the
+  // HudShell element directly via a ref — NOT
+  // ``document.documentElement.scrollWidth``, which is defined as
+  // max(viewport, content) and therefore never shrinks below the
+  // current Qt window's viewport. Without the direct measurement, a
+  // pill→dot collapse leaves the documentElement reporting the old
+  // (pill-sized) viewport, the window doesn't shrink, and the dot
+  // ends up left-aligned inside a too-wide window. rAF-coalesces to
+  // one resize per frame so transient flex layout passes don't fire
+  // a flood of IPC calls.
+  const shellRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const shell = shellRef.current;
+    if (!shell) return;
+    let rafId = 0;
+    let lastW = 0;
+    let lastH = 0;
+    const flush = () => {
+      rafId = 0;
+      const rect = shell.getBoundingClientRect();
+      const w = Math.ceil(rect.width);
+      const h = Math.ceil(rect.height);
+      if (w <= 0 || h <= 0) return;
+      if (w === lastW && h === lastH) return;
+      lastW = w;
+      lastH = h;
+      void hudBridge.setWindowSize(w, h);
+    };
+    const ro = new ResizeObserver(() => {
+      if (rafId !== 0) return;
+      rafId = requestAnimationFrame(flush);
+    });
+    ro.observe(shell);
+    rafId = requestAnimationFrame(flush);
+    return () => {
+      if (rafId !== 0) cancelAnimationFrame(rafId);
+      ro.disconnect();
+    };
   }, []);
 
   // Subscribe to incoming commands from Python. The bridge buffers any
@@ -221,6 +321,52 @@ export function HudApp() {
   // Only the FIFO head card is visible. Queued cards wait their turn.
   const activeCard = cards[0] ?? null;
 
+  // Anything-on-screen check. In production this drives the OS-level
+  // hide/show of the host pywebview window — without it the HUD would
+  // render as a permanent opaque rectangle in the top-right corner
+  // (on Windows where transparency isn't viable through WebView2).
+  // `demoMode` is included so the dev preview window stays visible
+  // while the demo controls are up.
+  const hasContent = useMemo(
+    () =>
+      !!pill ||
+      cards.length > 0 ||
+      toasts.length > 0 ||
+      !!actionable ||
+      demoMode,
+    [pill, cards.length, toasts.length, actionable, demoMode],
+  );
+
+  // Window visibility orchestration. Per-element CSS keyframes
+  // (`hud-element-enter` in index.css) drive the IN animation for
+  // each pill / card / toast as it mounts. The shell-level fade
+  // (`hud-fade-out` class on `HudShell`) is the OUT path only: when
+  // everything goes away we let the shell fade out before telling
+  // Python to move the OS window offscreen, so the user sees a soft
+  // dismissal rather than a snap.
+  const [windowShown, setWindowShown] = useState(false);
+
+  useEffect(() => {
+    const callOs = (v: boolean) => {
+      void hudBridge.setWindowVisible(v);
+    };
+    if (hasContent) {
+      if (!windowShown) {
+        setWindowShown(true);
+        callOs(true);
+      }
+      return;
+    }
+    // hasContent went false — let the shell fade-out class run, then
+    // hide the OS window after the fade settles.
+    if (!windowShown) return;
+    const t = window.setTimeout(() => {
+      setWindowShown(false);
+      callOs(false);
+    }, HUD_FADE_MS);
+    return () => window.clearTimeout(t);
+  }, [hasContent, windowShown]);
+
   // Demo controls — dispatch synthetic commands into the bridge so the
   // exact same code path the production launcher uses also drives the
   // preview. No mock state, no parallel renderers.
@@ -336,7 +482,7 @@ export function HudApp() {
   }, [demoActions]);
 
   return (
-    <HudShell>
+    <HudShell ref={shellRef} visible={hasContent}>
       {/* Base layer: pill or dot, shown only while armed. */}
       {pill && !pill.collapsed && (
         <StatePill

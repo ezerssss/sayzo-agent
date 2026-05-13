@@ -130,19 +130,32 @@ function installCapturesPreviewBridge(): void {
 }
 
 function installHudPreviewBridge(): void {
-  // The HUD has no Python methods it needs to call during preview except
-  // `hud_event` (used to ship card / actionable responses back to the
-  // launcher). In mock mode we just log those — there's no parent process
-  // to receive them.
-  console.info("[mock-bridge] HUD preview");
-  const overrides: Record<string, (...args: unknown[]) => Promise<unknown>> = {
+  // The HUD subprocess switched to PySide6 + QWebChannel in v2.11. In
+  // dev:hud (browser) mode there's no Qt host — we install a stub
+  // ``window.__sayzoMockHudBridge`` global that the React-side
+  // ``hud-bridge.ts`` recognises as a mock path (alongside the real
+  // QWebChannel-based path used in production). Method calls just log
+  // and resolve to null.
+  console.info("[mock-bridge] HUD preview (Qt-style stub)");
+  (window as unknown as Record<string, unknown>).__sayzoMockHudBridge = {
     hud_event: async (payload: unknown) => {
       console.info("[mock-bridge] hud_event", payload);
       return null;
     },
+    set_window_visible: async (visible: unknown) => {
+      console.info("[mock-bridge] set_window_visible", visible);
+      return null;
+    },
+    set_window_size: async (w: unknown, h: unknown) => {
+      console.info("[mock-bridge] set_window_size", w, h);
+      return null;
+    },
+    start_system_move: async () => {
+      // Browser tab has no host window to drag — log only.
+      console.info("[mock-bridge] start_system_move");
+      return null;
+    },
   };
-  const stubApi = makeStubApi(overrides);
-  (window as unknown as Record<string, unknown>).pywebview = { api: stubApi };
 
   // Force the HUD route (and any specific preview hint) into the hash if
   // not already there. Lets `npm run dev:hud` open the browser straight

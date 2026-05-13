@@ -1,32 +1,33 @@
-import { ReactNode } from "react";
+import { forwardRef, ReactNode } from "react";
 
-// Top-level layout for the HUD window. The pywebview window is a
-// transparent 400×340 canvas in the top-right; this shell sets the
-// click-through behaviour and arranges children in a vertical stack
-// from the top-right corner.
+// Top-level layout for the HUD. `inline-flex flex-col items-end` sizes
+// the shell to its widest visible child; `HudApp` observes this shell
+// via ref + ResizeObserver and reports the rect back to Qt so the host
+// window snaps to the same size.
 //
-// Click-through: the root div has `pointer-events: none` so the empty
-// regions of the canvas don't intercept clicks (the user can keep
-// clicking through to the meeting app underneath). Each child re-enables
-// `pointer-events: auto` on itself.
+// `.hud-drag` regions are claimed for native window drag by a global
+// mousedown listener in `HudApp.tsx` that delegates to Qt's
+// `QWindow.startSystemMove`. `.hud-no-drag` opts a child element back
+// out so buttons keep their normal click behaviour.
 //
-// macOS draggable region: the title-bar-equivalent drag handle uses
-// `-webkit-app-region: drag` which pywebview's cocoa backend honours on
-// WKWebView. Buttons use `-webkit-app-region: no-drag` so clicks still
-// register. On Windows WebView2 the same CSS is recognised as a no-op
-// — drag is implemented via pywin32 in window.py if/when we wire it.
+// `visible=false` applies the `hud-fade-out` class so the shell fades
+// to opacity 0 before `HudApp` tells Qt to move the host offscreen.
 
 interface Props {
   children: ReactNode;
+  visible: boolean;
 }
 
-export function HudShell({ children }: Props) {
-  return (
-    <div
-      className="fixed inset-0 flex flex-col items-end gap-2 p-3"
-      style={{ pointerEvents: "none" }}
-    >
-      {children}
-    </div>
-  );
-}
+export const HudShell = forwardRef<HTMLDivElement, Props>(
+  function HudShellImpl({ children, visible }, ref) {
+    return (
+      <div
+        ref={ref}
+        className={`hud-fade ${visible ? "hud-fade-in" : "hud-fade-out"} inline-flex flex-col items-end gap-2 p-3`}
+        style={{ pointerEvents: "none" }}
+      >
+        {children}
+      </div>
+    );
+  },
+);
