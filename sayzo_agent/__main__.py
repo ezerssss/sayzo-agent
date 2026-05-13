@@ -165,6 +165,44 @@ async def _do_login(
         click.echo("Login successful.")
 
 
+def _install_agent_side_hud_shutdown_propagation(hud_launcher) -> None:
+    """Agent-side belt-and-suspenders for the v2.16.0 HUD shutdown plan.
+
+    Subscribes to OS shutdown signals from the agent process (not the
+    HUD subprocess) and pushes ``hud_launcher.quit_sync()`` so the HUD
+    starts shutting down even if its own Qt ``commitDataRequest``
+    handler is slow to fire. Removes the single-point-of-failure in
+    parent → HUD propagation (RC-5 in the plan).
+
+    Both observers are no-ops on the wrong platform — calling either
+    on the other OS just returns False without raising.
+
+    Failures are logged at WARNING; the agent continues. The HUD's
+    own Qt-side hooks still defend the shutdown invariant if these
+    observers don't install.
+    """
+    from sayzo_agent.gui.common.mac_shutdown import observe_will_power_off
+    from sayzo_agent.gui.common.win_shutdown import (
+        install_session_ending_callback,
+    )
+
+    def _on_os_shutting_down() -> None:
+        log.warning("[agent] OS shutdown signal — pushing quit to HUD subprocess")
+        try:
+            hud_launcher.quit_sync(timeout_secs=1.0)
+        except Exception:
+            log.warning(
+                "[agent] hud_launcher.quit_sync raised during shutdown",
+                exc_info=True,
+            )
+
+    # Both helpers internally check sys.platform and silently no-op on
+    # the wrong OS, so we can call both unconditionally and let the
+    # platform check happen in one place per helper.
+    install_session_ending_callback(_on_os_shutting_down)
+    observe_will_power_off(_on_os_shutting_down)
+
+
 def _wait_for_install_lock_release(data_dir, log) -> None:
     """Block boot until any in-flight NSIS installer's File /r completes.
 
@@ -1186,6 +1224,7 @@ def run() -> None:
 
         if hud_launcher is not None:
             await hud_launcher.start()
+            _install_agent_side_hud_shutdown_propagation(hud_launcher)
 
         try:
             await agent.run()
@@ -1981,6 +2020,7 @@ def service(force_setup: bool, from_autostart: bool, open_settings: bool) -> Non
         # up the stdout reader.
         if hud_launcher is not None:
             await hud_launcher.start()
+            _install_agent_side_hud_shutdown_propagation(hud_launcher)
 
         def _sync_arm_state_to_tray() -> None:
             """Push ArmController.state → TrayState immediately.

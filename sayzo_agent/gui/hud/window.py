@@ -452,6 +452,15 @@ class HudWindow:
         widget.show()
         widget.start_stdin_reader()
         _install_sigint_handler(app)
+        # Wire Qt-level OS-shutdown hooks before app.exec() so they're
+        # active for the entire lifetime of the event loop. The handler
+        # uses a view_provider closure so the aboutToQuit teardown
+        # reads the LATEST view reference at fire time (not whatever
+        # was current at install time). See gui/hud/shutdown_hooks.py
+        # for the full rationale (v2.16.0 plan).
+        from sayzo_agent.gui.hud.shutdown_hooks import install_qt_shutdown_hooks
+
+        install_qt_shutdown_hooks(app, view_provider=lambda: widget._view)
         exit_code = app.exec()
         log.info("[hud] Qt event loop exited rc=%s", exit_code)
 

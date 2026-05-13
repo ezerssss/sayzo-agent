@@ -97,6 +97,68 @@ def install_shutdown_protection(
     _install_thread_exception_handler()
 
 
+def install_session_ending_callback(callback: Callable[[], None]) -> bool:
+    """Subscribe ``callback`` to ``SystemEvents.SessionEnding``.
+
+    Bare, window-agnostic wrapper. Used by the agent process (no
+    pywebview window) to be notified at ``WM_QUERYENDSESSION`` so it
+    can push a quit to the HUD subprocess via
+    ``HudLauncher.quit_sync()``. The pywebview-window-aware variant
+    above (``_install_session_ending_handler``) layers extra logic on
+    top of this same subscription, including ``safe_quit_window`` +
+    ``_arm_hard_exit_timer``.
+
+    Returns ``True`` if subscribed; ``False`` on non-Windows or if the
+    pythonnet bridge to ``Microsoft.Win32.SystemEvents`` can't be
+    imported. Lazy imports so this module stays cheap to load.
+
+    The callback runs on whichever thread ``SystemEvents`` dispatches
+    on — historically the WinForms message thread for the process that
+    set up the SystemEvents subscription. Callers should treat the
+    callback as a high-priority "OS is shutting down NOW" signal and
+    return quickly. Anything heavier than scheduling work on another
+    thread risks blocking the shutdown handshake.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        from Microsoft.Win32 import SystemEvents, SessionEndingEventHandler
+    except Exception:
+        log.warning(
+            "[win_shutdown] SystemEvents import failed for "
+            "install_session_ending_callback",
+            exc_info=True,
+        )
+        return False
+
+    def _on_session_ending(sender, args) -> None:
+        reason = "unknown"
+        try:
+            reason = str(args.Reason)
+        except Exception:
+            pass
+        log.warning(
+            "[win_shutdown] SessionEnding callback firing (reason=%s)", reason,
+        )
+        try:
+            callback()
+        except Exception:
+            log.warning(
+                "[win_shutdown] SessionEnding callback raised", exc_info=True
+            )
+
+    try:
+        SystemEvents.SessionEnding += SessionEndingEventHandler(_on_session_ending)
+        log.info("[win_shutdown] generic SessionEnding callback installed")
+        return True
+    except Exception:
+        log.warning(
+            "[win_shutdown] generic SessionEnding subscription failed",
+            exc_info=True,
+        )
+        return False
+
+
 def _install_session_ending_handler(
     window: "webview.Window",
     *,

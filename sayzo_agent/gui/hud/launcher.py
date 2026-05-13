@@ -180,6 +180,35 @@ class HudLauncher:
         except asyncio.TimeoutError:
             return False
 
+    def quit_sync(self, timeout_secs: float = 1.0) -> None:
+        """Synchronous wrapper around :meth:`quit` for non-asyncio callers.
+
+        Marshals the quit coroutine onto the launcher's running loop via
+        ``asyncio.run_coroutine_threadsafe``. Safe to call from any
+        thread that doesn't own the loop — specifically the
+        ``SystemEvents.SessionEnding`` callback on Windows and the
+        ``NSWorkspaceWillPowerOffNotification`` observer on macOS,
+        both of which run on platform-specific threads and need a way
+        to push a quit command without ``await``-ing.
+
+        Best-effort: silently no-ops if the loop isn't running yet, or
+        if the loop has been closed (we're racing the agent's own
+        shutdown). Timeout is short by design — these callbacks fire
+        when the OS is initiating a shutdown and we have ~5 s before
+        Windows / macOS starts force-killing processes.
+        """
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            log.warning("[hud] quit_sync called before loop ready or after close")
+            return
+        try:
+            fut = asyncio.run_coroutine_threadsafe(
+                self.quit(timeout_secs=timeout_secs), loop
+            )
+            fut.result(timeout=timeout_secs + 0.5)
+        except Exception:
+            log.warning("[hud] quit_sync failed", exc_info=True)
+
     async def quit(self, timeout_secs: float = 3.0) -> None:
         """Send ``quit`` and wait for the subprocess to exit."""
         async with self._lock:
