@@ -25,8 +25,11 @@ import time
 from math import gcd
 
 import numpy as np
-import pyaudiowpatch as pyaudio
-from scipy.signal import resample_poly
+
+# pyaudiowpatch + scipy.signal are imported inside ``_run`` instead of at
+# module load. Both are only needed once the capture thread spins up (i.e.
+# the user has armed); pulling them at import would add ~60 MB and several
+# hundred ms to the agent's boot path even when the user never arms.
 
 log = logging.getLogger(__name__)
 
@@ -64,8 +67,9 @@ class SystemCapture:
         self._target_pids: tuple[int, ...] = ()
         self._process_loopback = None  # filled when per-app capture wins
 
-    def _find_loopback_device(self, pa: pyaudio.PyAudio) -> dict:
+    def _find_loopback_device(self, pa) -> dict:
         """Find the WASAPI loopback device for the default speakers."""
+        import pyaudiowpatch as pyaudio
         wasapi_info = pa.get_host_api_info_by_type(pyaudio.paWASAPI)
         default_speakers = pa.get_device_info_by_index(
             wasapi_info["defaultOutputDevice"]
@@ -90,6 +94,8 @@ class SystemCapture:
         )
 
     def _run(self) -> None:
+        import pyaudiowpatch as pyaudio
+        from scipy.signal import resample_poly
         pa = pyaudio.PyAudio()
         try:
             loopback = self._find_loopback_device(pa)

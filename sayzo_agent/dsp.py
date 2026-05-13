@@ -16,20 +16,34 @@ restores the raw-PCM path exactly.
 from __future__ import annotations
 
 import logging
+import typing
 
 import numpy as np
-from scipy.signal import butter, sosfilt
 
 from .config import CaptureConfig
 
 log = logging.getLogger(__name__)
 
 
-try:
-    import noisereduce as _nr  # type: ignore
-except Exception as e:  # pragma: no cover - import-time fallback
-    _nr = None
-    log.warning("[dsp] noisereduce unavailable (%s); denoise will be skipped", e)
+# noisereduce eagerly imports torch under its torchgate path (~4 s + ~150 MB
+# RSS), even when only the stationary spectral-gate path is used. Defer the
+# load until the first denoise call so the agent's "Starting…" phase doesn't
+# pay it. ``_NR_SENTINEL`` distinguishes "not yet tried" from "tried, failed".
+_NR_SENTINEL = object()
+_nr: typing.Any = _NR_SENTINEL
+
+
+def _get_noisereduce():
+    global _nr
+    if _nr is not _NR_SENTINEL:
+        return _nr
+    try:
+        import noisereduce as nr  # type: ignore
+        _nr = nr
+    except Exception as e:
+        log.warning("[dsp] noisereduce unavailable (%s); denoise will be skipped", e)
+        _nr = None
+    return _nr
 
 
 # Cache SOS coefficients keyed by (cutoff_hz, sr, order). Sample rate +
@@ -41,6 +55,9 @@ def _butter_highpass(cutoff_hz: float, sr: int, order: int = 4) -> np.ndarray:
     key = (cutoff_hz, sr, order)
     sos = _BUTTER_CACHE.get(key)
     if sos is None:
+        # scipy.signal pulls ~60 MB of stats / special / signal at import; defer
+        # to first session-close so it doesn't sit in the boot path.
+        from scipy.signal import butter
         sos = butter(order, cutoff_hz, btype="highpass", fs=sr, output="sos")
         _BUTTER_CACHE[key] = sos
     return sos
@@ -49,6 +66,7 @@ def _butter_highpass(cutoff_hz: float, sr: int, order: int = 4) -> np.ndarray:
 def _apply_highpass(x: np.ndarray, cutoff_hz: float, sr: int) -> np.ndarray:
     if cutoff_hz <= 0 or x.size == 0:
         return x
+    from scipy.signal import sosfilt
     sos = _butter_highpass(cutoff_hz, sr)
     return sosfilt(sos, x).astype(np.float32, copy=False)
 
@@ -77,10 +95,13 @@ def _f32_to_i16(x: np.ndarray) -> bytes:
 
 
 def _denoise(x: np.ndarray, sr: int, strength: float) -> np.ndarray:
-    if _nr is None or x.size == 0:
+    if x.size == 0:
+        return x
+    nr = _get_noisereduce()
+    if nr is None:
         return x
     try:
-        out = _nr.reduce_noise(
+        out = nr.reduce_noise(
             y=x,
             sr=sr,
             stationary=True,

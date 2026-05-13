@@ -33,7 +33,13 @@ import sys
 import time
 
 import numpy as np
-import sounddevice as sd
+
+# ``sounddevice`` is imported inside the methods that touch PortAudio
+# (``_resolve_device_index`` + ``MicCapture.start``). Loading it eagerly
+# at module import pulls the PortAudio shared library and adds ~6 MB of
+# RSS for callers that never actually open a stream — pure-logic tests
+# import this module, and the agent's boot path goes through it before
+# the user has armed.
 
 log = logging.getLogger(__name__)
 
@@ -57,6 +63,7 @@ def _resolve_device_index(name: str | None) -> int | str | None:
     if name is None:
         return None
     try:
+        import sounddevice as sd
         devices = sd.query_devices()
         hostapis = sd.query_hostapis()
     except Exception:
@@ -175,6 +182,7 @@ class MicCapture:
         capture. The fallback is one-shot per ``start()`` call; we
         don't retry the named device.
         """
+        import sounddevice as sd
         self._loop = asyncio.get_running_loop()
         if device is not None:
             self.device = device

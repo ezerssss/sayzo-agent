@@ -38,6 +38,21 @@ from .vad import SileroVAD
 log = logging.getLogger(__name__)
 
 
+# --- HUD waveform audio-level normalization ---------------------------------
+# Frames arrive at 50 Hz (20 ms each, see capture/mic.py::frame_ms). Peaks
+# slow-decay so a brief silence doesn't immediately drag the peak down to
+# zero; a multi-second silence eventually does. Half-life ≈ ln(0.5)/ln(decay)
+# / 50 fps → with 0.995 that's ~2.8 s. MIN_PEAK_* is the denominator floor:
+# during true silence the peak decays toward zero, and dividing tiny ambient
+# RMS by tiny peak would amplify noise to 100% bars; the floor pins
+# silence-vs-noise correctly.
+_AUDIO_LEVEL_DECAY = 0.995
+_AUDIO_LEVEL_INIT_PEAK_MIC = 0.05
+_AUDIO_LEVEL_INIT_PEAK_SYS = 0.02
+_AUDIO_LEVEL_MIN_PEAK_MIC = 0.015
+_AUDIO_LEVEL_MIN_PEAK_SYS = 0.004
+
+
 def _format_duration(secs: float) -> str:
     if secs >= 60:
         return f"{int(round(secs / 60))} min"
@@ -171,13 +186,21 @@ class Agent:
         self._captures_discarded: int = 0
         self._echo_segments_dropped: int = 0
         self._echo_secs_dropped: float = 0.0
-        # Per-source RMS amplitudes. Updated in `_consume` from each
-        # captured frame, drained at ~15 Hz by `_audio_level_emitter`
-        # and pushed to the HUD pill's waveform. Plain floats — Python
-        # GIL makes the load/store atomic enough for telemetry-grade
-        # smoothness; we don't lock.
+        # Per-source NORMALIZED audio levels (not raw RMS). Computed in
+        # `_consume`: each frame's RMS is divided by a slow-decaying
+        # per-source peak so a quiet mic and a loud mic both fill the
+        # bars during speech and silence reads as silence. Drained at
+        # ~15 Hz by `_audio_level_emitter` and pushed to the HUD pill's
+        # waveform. Plain floats — Python GIL makes the load/store
+        # atomic enough for telemetry-grade smoothness; we don't lock.
         self._latest_mic_level: float = 0.0
         self._latest_sys_level: float = 0.0
+        # Slow-decaying peaks (one per source) that the normalizer
+        # divides by. Initial seeds picked so the FIRST frame of a new
+        # session doesn't normalize ambient noise to full scale; the
+        # decay + min-floor below stabilize them within a few seconds.
+        self._mic_peak: float = _AUDIO_LEVEL_INIT_PEAK_MIC
+        self._sys_peak: float = _AUDIO_LEVEL_INIT_PEAK_SYS
         # Settings → Captures pane reads this via IPC. Keys are the proc_id
         # (also reused as the eventual on-disk record id), values describe
         # what's currently being processed for the user-facing list.
@@ -217,6 +240,11 @@ class Agent:
         ``queue.get()`` so the disarm transition is noticed even if a few
         frames remain buffered.
         """
+        # Local arm-transition tracking so each fresh arm cycle starts
+        # with the seed peak — otherwise the previous session's residual
+        # peak (or worse, a peak that decayed to MIN during a long quiet
+        # tail) would warp the first few frames of the new session.
+        was_armed = False
         while not self._stop.is_set():
             if self._paused.is_set():
                 await asyncio.sleep(0.5)
@@ -226,9 +254,18 @@ class Agent:
             try:
                 await asyncio.wait_for(self.arm.armed_event.wait(), timeout=1.0)
             except asyncio.TimeoutError:
+                was_armed = False
                 continue
             if self._stop.is_set():
                 break
+            if not was_armed:
+                # Disarmed → armed transition: reset this source's peak so
+                # the normalizer doesn't inherit stale state.
+                if source == "mic":
+                    self._mic_peak = _AUDIO_LEVEL_INIT_PEAK_MIC
+                else:
+                    self._sys_peak = _AUDIO_LEVEL_INIT_PEAK_SYS
+                was_armed = True
             # Queue payload is a (capture_mono_ts, frame) tuple. Capture-
             # stamping happens at the hardware boundary in each capture
             # module (sounddevice callback / WASAPI read / audio-tap
@@ -242,19 +279,32 @@ class Agent:
             self.detector.on_frame(source, frame, capture_mono_ts, now)
             for seg in vad.feed(frame):
                 self.detector.on_segment(seg, now)
-            # Per-frame RMS for the HUD waveform. `np.mean(frame * frame,
-            # dtype=np.float32)` runs the squaring in int16 then accumulates
-            # into float32 — avoids the full int16→float32 copy that
-            # `frame.astype(np.float32) ** 2` allocates on every call.
+            # Per-frame RMS + per-source slow-peak normalization for the
+            # HUD waveform. Frames are float32 in [-1.0, 1.0] (see
+            # capture/mic.py and capture/system_win.py). Normalization
+            # makes a quiet laptop mic and a loud Blue Yeti fill the bars
+            # the same way during speech without per-machine tuning; the
+            # MIN_PEAK floor prevents true silence from being amplified
+            # to full scale by a peak that's decayed near zero.
             if frame.size:
                 try:
-                    rms = float(np.sqrt(np.mean(frame * frame, dtype=np.float32))) / 32768.0
+                    rms = float(np.sqrt(np.mean(frame * frame, dtype=np.float64)))
                 except Exception:
                     rms = 0.0
                 if source == "mic":
-                    self._latest_mic_level = rms
+                    if rms > self._mic_peak:
+                        self._mic_peak = rms
+                    else:
+                        self._mic_peak *= _AUDIO_LEVEL_DECAY
+                    denom = max(self._mic_peak, _AUDIO_LEVEL_MIN_PEAK_MIC)
+                    self._latest_mic_level = min(1.0, rms / denom)
                 else:
-                    self._latest_sys_level = rms
+                    if rms > self._sys_peak:
+                        self._sys_peak = rms
+                    else:
+                        self._sys_peak *= _AUDIO_LEVEL_DECAY
+                    denom = max(self._sys_peak, _AUDIO_LEVEL_MIN_PEAK_SYS)
+                    self._latest_sys_level = min(1.0, rms / denom)
 
     async def _audio_level_emitter(self) -> None:
         """Push per-source RMS amplitude to the HUD waveform at ~15 Hz.

@@ -38,9 +38,13 @@ class SileroVAD:
         self.min_speech_samples = int(self.SAMPLE_RATE * min_speech_ms / 1000)
         self.hangover_samples = int(self.SAMPLE_RATE * hangover_ms / 1000)
 
-        from silero_vad import load_silero_vad  # lazy import
-
-        self._model = load_silero_vad(onnx=True)
+        # silero-vad + its ONNX runtime cost ~3.5 s and ~200 MB on first
+        # load. The agent constructs two SileroVAD instances at boot, so
+        # eager-loading here is the single biggest contributor to the
+        # "Starting…" delay on cold boot. Defer until the first frame is
+        # actually fed — the user has just armed by then, so the cost
+        # lands on a path they're already expecting to take a moment.
+        self._model = None
 
         self._buf = np.zeros(0, dtype=np.float32)
         self._samples_seen = 0  # absolute samples consumed since session start
@@ -49,6 +53,12 @@ class SileroVAD:
         self._last_voiced: Optional[int] = None
         self._session_start_sample = 0  # for ts conversion
 
+    def _ensure_loaded(self) -> None:
+        if self._model is not None:
+            return
+        from silero_vad import load_silero_vad
+        self._model = load_silero_vad(onnx=True)
+
     def reset_session(self, start_sample: int = 0) -> None:
         self._buf = np.zeros(0, dtype=np.float32)
         self._samples_seen = start_sample
@@ -56,10 +66,11 @@ class SileroVAD:
         self._speech_start = None
         self._last_voiced = None
         self._session_start_sample = start_sample
-        try:
-            self._model.reset_states()
-        except Exception:
-            pass
+        if self._model is not None:
+            try:
+                self._model.reset_states()
+            except Exception:
+                pass
 
     def reset(self) -> None:
         """Reset the VAD to a cold-start state.
@@ -79,6 +90,7 @@ class SileroVAD:
         """Feed one PCM frame; yield any SpeechSegment(s) that closed."""
         import torch
 
+        self._ensure_loaded()
         self._buf = np.concatenate([self._buf, frame.astype(np.float32, copy=False)])
 
         while len(self._buf) >= self.SILERO_CHUNK:

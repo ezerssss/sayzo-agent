@@ -207,12 +207,16 @@ export function HudApp() {
         case "set_pill_collapsed":
           setPill((p) => (p ? { ...p, collapsed: cmd.collapsed } : p));
           break;
-        case "set_audio_levels":
-          // Display the louder of mic/system. The waveform is a single
-          // bar group — splitting into two columns could come later
-          // but adds visual noise on the compact pill.
+        case "set_audio_levels": {
+          // mic / system arrive already per-source-normalized to [0, 1]
+          // from the agent (see Agent._consume's slow-peak normalizer),
+          // so a quiet mic and a loud Blue Yeti both fill the bars
+          // similarly during speech. No per-source gain juggling here —
+          // we just pick the louder of the two and let Waveform's dB
+          // shaping handle perceptual feel.
           setAudioLevel(Math.max(0, Math.min(1, Math.max(cmd.mic, cmd.system))));
           break;
+        }
         case "show_card":
           setCards((cs) => [
             ...cs,

@@ -592,8 +592,11 @@ class HudLauncher:
         at ~10–20 Hz from the agent's capture pipeline while armed — any
         faster wastes pipe bandwidth, any slower starts to feel laggy.
 
-        Values are 0..1 RMS amplitude. The HUD does its own smoothing /
-        bar phase variation; the agent just needs to push raw levels.
+        Values are per-source NORMALIZED levels in [0, 1] (the agent's
+        ``Agent._consume`` divides raw RMS by a slow-decaying peak per
+        source). 0 ≈ silence, 1 ≈ current peak, so quiet and loud mics
+        both fill the bars during speech. The HUD applies a dB-shape
+        scale on top for perceptual feel.
         """
         if self._given_up:
             return False
