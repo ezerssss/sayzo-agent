@@ -46,6 +46,7 @@ def _isolate_modules():
             "Foundation",
             "Microsoft",
             "Microsoft.Win32",
+            "clr",
             "sayzo_agent.gui.hud.shutdown_hooks",
             "sayzo_agent.gui.common.mac_shutdown",
         )
@@ -280,7 +281,16 @@ def test_install_skips_cleanly_if_pyside_missing():
 
 
 def _install_systemevents_stub():
-    """Stub ``Microsoft.Win32.SystemEvents``."""
+    """Stub ``Microsoft.Win32.SystemEvents`` and ``clr.AddReference``."""
+
+    # ``clr`` must exist (and AddReference must succeed) before
+    # ``Microsoft.Win32`` is importable in production — see
+    # ``win_shutdown.install_session_ending_callback``. Test the same
+    # contract by stubbing ``clr`` and capturing the AddReference call.
+    add_references: list = []
+    fake_clr = types.ModuleType("clr")
+    fake_clr.AddReference = lambda name: add_references.append(name)
+    sys.modules["clr"] = fake_clr
 
     class _Event:
         def __init__(self) -> None:
@@ -301,7 +311,10 @@ def _install_systemevents_stub():
     fake_module.SessionEndingEventHandler = lambda fn: fn
     sys.modules.setdefault("Microsoft", types.ModuleType("Microsoft"))
     sys.modules["Microsoft.Win32"] = fake_module
-    return session_ending
+    return types.SimpleNamespace(
+        session_ending=session_ending,
+        add_references=add_references,
+    )
 
 
 def test_install_session_ending_callback_non_windows(monkeypatch):
@@ -316,7 +329,7 @@ def test_install_session_ending_callback_non_windows(monkeypatch):
 
 def test_install_session_ending_callback_subscribes(monkeypatch):
     monkeypatch.setattr(sys, "platform", "win32")
-    events = _install_systemevents_stub()
+    stubs = _install_systemevents_stub()
 
     from sayzo_agent.gui.common.win_shutdown import (
         install_session_ending_callback,
@@ -324,16 +337,50 @@ def test_install_session_ending_callback_subscribes(monkeypatch):
 
     fired: list = []
     assert install_session_ending_callback(lambda: fired.append("ok")) is True
-    assert len(events.handlers) == 1
+    assert len(stubs.session_ending.handlers) == 1
 
     # Firing the .NET event should call our Python callback.
-    events.fire(sender=None, args=types.SimpleNamespace(Reason="SystemShutdown"))
+    stubs.session_ending.fire(
+        sender=None, args=types.SimpleNamespace(Reason="SystemShutdown"),
+    )
     assert fired == ["ok"]
+
+
+def test_install_session_ending_callback_calls_clr_add_reference(monkeypatch):
+    """Regression: v2.16.0 shipped without clr.AddReference and the agent
+    process saw ``ModuleNotFoundError: No module named 'Microsoft'`` because
+    pythonnet hadn't loaded the System assembly yet. The function MUST call
+    ``clr.AddReference('System')`` before importing Microsoft.Win32.
+    """
+    monkeypatch.setattr(sys, "platform", "win32")
+    stubs = _install_systemevents_stub()
+
+    from sayzo_agent.gui.common.win_shutdown import (
+        install_session_ending_callback,
+    )
+
+    install_session_ending_callback(lambda: None)
+    assert "System" in stubs.add_references, (
+        "install_session_ending_callback must clr.AddReference('System') so "
+        "Microsoft.Win32 becomes importable in pythonnet-less processes"
+    )
+
+
+def test_install_session_ending_callback_returns_false_when_clr_missing(monkeypatch):
+    """If pythonnet isn't installed at all (no clr module), return cleanly."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    sys.modules["clr"] = None  # type: ignore[assignment]
+
+    from sayzo_agent.gui.common.win_shutdown import (
+        install_session_ending_callback,
+    )
+
+    assert install_session_ending_callback(lambda: None) is False
 
 
 def test_install_session_ending_callback_swallows_callback_errors(monkeypatch):
     monkeypatch.setattr(sys, "platform", "win32")
-    events = _install_systemevents_stub()
+    stubs = _install_systemevents_stub()
 
     from sayzo_agent.gui.common.win_shutdown import (
         install_session_ending_callback,
@@ -345,7 +392,7 @@ def test_install_session_ending_callback_swallows_callback_errors(monkeypatch):
     install_session_ending_callback(_raises)
     # Must not propagate — pythonnet would rethrow as a CLR exception inside
     # the SystemEvents dispatcher otherwise.
-    events.fire(sender=None, args=types.SimpleNamespace(Reason="Logoff"))
+    stubs.session_ending.fire(sender=None, args=types.SimpleNamespace(Reason="Logoff"))
 
 
 # ---------------------------------------------------------------------------

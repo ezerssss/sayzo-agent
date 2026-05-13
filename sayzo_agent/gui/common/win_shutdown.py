@@ -121,6 +121,29 @@ def install_session_ending_callback(callback: Callable[[], None]) -> bool:
     """
     if sys.platform != "win32":
         return False
+    # ``Microsoft.Win32.SystemEvents`` lives in the ``System.dll``
+    # assembly. pythonnet only exposes a .NET namespace as a Python
+    # module once that assembly has been added to the CLR's reference
+    # list via ``clr.AddReference``. The pywebview Settings/Setup
+    # subprocesses get this for free because pywebview itself calls
+    # ``clr.AddReference('System.Windows.Forms')`` etc. at import,
+    # which pulls in ``System``. But the agent process is pure Python
+    # — pycaw uses comtypes, not pythonnet — so without an explicit
+    # ``AddReference`` here, ``from Microsoft.Win32 import …`` raises
+    # ``ModuleNotFoundError: No module named 'Microsoft'``. v2.16.0
+    # shipped this function without the AddReference and the user hit
+    # exactly that error in the agent's startup log.
+    try:
+        import clr  # type: ignore[import-not-found]
+
+        clr.AddReference("System")
+    except Exception:
+        log.warning(
+            "[win_shutdown] clr.AddReference('System') failed — "
+            "pythonnet not available in this process",
+            exc_info=True,
+        )
+        return False
     try:
         from Microsoft.Win32 import SystemEvents, SessionEndingEventHandler
     except Exception:
