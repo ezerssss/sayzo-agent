@@ -184,9 +184,25 @@ Section "Install"
     ; the return. /T also kills child processes (e.g. the Settings pywebview
     ; subprocess holding its own DLL handles). The Task Scheduler task itself
     ; is re-created below with /F.
-    nsExec::ExecToLog 'schtasks /End /TN "Sayzo"'
-    nsExec::ExecToLog 'taskkill /IM sayzo-agent-service.exe /F /T'
-    nsExec::ExecToLog 'taskkill /IM sayzo-agent.exe /F /T'
+    ;
+    ; v3.0.2: SKIP this block in silent mode (/S). The silent path is reached
+    ; exclusively from sayzo_agent.update_apply_win.spawn_installer_and_exit,
+    ; which calls subprocess.Popen([payload, "/S"]) and IMMEDIATELY os._exit(0)s
+    ; the agent. The installer is a CHILD of the agent in the Win32 kernel
+    ; process tree (DETACHED_PROCESS only suppresses console inheritance; the
+    ; InheritedFromUniqueProcessId link remains). `taskkill /T` walks that
+    ; tree: it finds the dying agent, then walks its children, and KILLS
+    ; THIS INSTALLER. Symptom of the v3.0.0/v3.0.1 bug: install_in_progress.lock
+    ; is written (top of this Section), but File /r never runs, the lock is
+    ; never deleted, and silent_relaunch never fires - auto-update appears to
+    ; "do nothing" from the user's perspective. In interactive mode the user
+    ; double-clicked payload.exe from a download, so the running agent is a
+    ; sibling not a parent and the /T is safe.
+    IfSilent skip_kill_running_agent
+        nsExec::ExecToLog 'schtasks /End /TN "Sayzo"'
+        nsExec::ExecToLog 'taskkill /IM sayzo-agent-service.exe /F /T'
+        nsExec::ExecToLog 'taskkill /IM sayzo-agent.exe /F /T'
+    skip_kill_running_agent:
 
     ; Wait for Windows to fully release the killed processes' file handles
     ; before File /r tries to overwrite them. taskkill /F returns immediately
