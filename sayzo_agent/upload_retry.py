@@ -241,6 +241,7 @@ class UploadRetryManager:
         record: ConversationRecord,
         rec_dir: Path,
         bypass_pause_gate: bool = False,
+        live: bool = False,
     ) -> UploadOutcome | None:
         """Run one upload attempt for this record.
 
@@ -254,6 +255,15 @@ class UploadRetryManager:
         contact the server so a stale pause doesn't reject credits the user
         already topped up. The sweep stays gated (default False) to avoid
         hammering a known-blocked endpoint with a backlog of records.
+
+        ``live=True`` marks this call as coming from the live arm/capture
+        path (a session that just finished). Currently this only gates the
+        "Capture saved to Sayzo" success toast — sweep-triggered successes
+        stay silent so that draining a backlog of "couldn't upload" captures
+        (automatic sweep or the Settings → Captures Try Again button) doesn't
+        fire a burst of toasts the user has no use for after the fact. The
+        visual confirmation for sweep success lives in the Captures pane row
+        flipping out of the "Couldn't upload" state.
         """
         rec_id = record.id
         async with self._inflight_lock:
@@ -262,7 +272,7 @@ class UploadRetryManager:
                 return None
             self._inflight_rec_ids.add(rec_id)
         try:
-            return await self._run_attempt(record, rec_dir, bypass_pause_gate)
+            return await self._run_attempt(record, rec_dir, bypass_pause_gate, live)
         finally:
             async with self._inflight_lock:
                 self._inflight_rec_ids.discard(rec_id)
@@ -272,6 +282,7 @@ class UploadRetryManager:
         record: ConversationRecord,
         rec_dir: Path,
         bypass_pause_gate: bool = False,
+        live: bool = False,
     ) -> UploadOutcome:
         # Global pause gate. Live attempts (``bypass_pause_gate=True``) skip
         # this so a stale local pause never silently rejects a brand-new
@@ -349,8 +360,12 @@ class UploadRetryManager:
 
         if outcome == UploadOutcome.SUCCESS:
             log.info("[upload] success id=%s server_id=%s", record.id, server_capture_id or "?")
+            # Live-path only. Sweep successes (auto + user-triggered Try Again)
+            # stay silent to avoid a toast burst when a backlog drains; the
+            # Captures pane row flipping state is the user-visible signal there.
             if (
-                server_capture_id
+                live
+                and server_capture_id
                 and self._webapp_base_url
                 and self._notify_capture_saved
             ):

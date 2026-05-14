@@ -690,7 +690,12 @@ class Agent:
         # block doesn't silently reject a brand-new capture. If credits are
         # genuinely exhausted, the server's 402 re-arms the pause for the
         # sweep; if the user already topped up, the upload just goes through.
-        await self.retry_mgr.try_upload(record, rec_dir, bypass_pause_gate=True)
+        # ``live=True`` also opts this call into the "Capture saved to Sayzo"
+        # success toast — sweep-path retries (auto + manual Try Again) stay
+        # silent to avoid a toast burst when a backlog drains.
+        await self.retry_mgr.try_upload(
+            record, rec_dir, bypass_pause_gate=True, live=True
+        )
         self._captures_kept += 1
 
     # ---- lifecycle ---------------------------------------------------------

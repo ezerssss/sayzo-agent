@@ -107,9 +107,30 @@ class MockUploadClient:
 class MockNotifier:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
+        self.actionable_calls: list[dict[str, Any]] = []
 
     def notify(self, title: str, body: str) -> None:
         self.calls.append((title, body))
+
+    def notify_actionable(
+        self,
+        title: str,
+        body: str,
+        *,
+        button_label: str,
+        on_pressed: Any,
+        expire_after_secs: float | None = None,
+    ) -> bool:
+        self.actionable_calls.append(
+            {
+                "title": title,
+                "body": body,
+                "button_label": button_label,
+                "on_pressed": on_pressed,
+                "expire_after_secs": expire_after_secs,
+            }
+        )
+        return True
 
 
 class FakeClock:
@@ -309,6 +330,59 @@ async def test_upload_success_without_server_capture_id_skips_hook(env, tmp_path
     assert outcome == UploadOutcome.SUCCESS
     await asyncio.sleep(0)
     assert seen == []
+
+
+async def test_live_upload_fires_capture_saved_toast(env, tmp_path):
+    """Live-path try_upload(live=True) on success with a server_capture_id +
+    a webapp_base_url MUST fire the "Capture saved to Sayzo" actionable toast
+    with the deep-link button. This is the only path that fires it — sweep
+    successes are silent (see the sibling test)."""
+    captures_dir = tmp_path / "captures_live_toast"
+    captures_dir.mkdir()
+    mgr = UploadRetryManager(
+        captures_dir=captures_dir,
+        upload_client=env.upload,
+        notifier=env.notifier,
+        executor=env.executor,
+        config=env.cfg,
+        clock=env.clock,
+        webapp_base_url="https://sayzo.app",
+    )
+    rec_dir, record = _write_capture(captures_dir, "rec_live_toast", env.clock())
+    env.upload.enqueue("success", capture_id="srv_live")
+    outcome = await mgr.try_upload(record, rec_dir, bypass_pause_gate=True, live=True)
+    assert outcome == UploadOutcome.SUCCESS
+    assert len(env.notifier.actionable_calls) == 1
+    call = env.notifier.actionable_calls[0]
+    assert call["title"] == "Capture saved to Sayzo"
+    assert call["button_label"] == "Open in Sayzo"
+
+
+async def test_sweep_upload_does_not_fire_capture_saved_toast(env, tmp_path):
+    """Sweep-path try_upload (default live=False) on success MUST NOT fire
+    the "Capture saved to Sayzo" toast. Draining a backlog of "couldn't
+    upload" captures — auto-sweep or the user-triggered Try Again sweep —
+    would otherwise spam a burst of toasts; the Captures pane row flipping
+    state is the user-visible signal for sweep success instead."""
+    captures_dir = tmp_path / "captures_sweep_silent"
+    captures_dir.mkdir()
+    mgr = UploadRetryManager(
+        captures_dir=captures_dir,
+        upload_client=env.upload,
+        notifier=env.notifier,
+        executor=env.executor,
+        config=env.cfg,
+        clock=env.clock,
+        webapp_base_url="https://sayzo.app",
+    )
+    rec_dir, record = _write_capture(captures_dir, "rec_sweep_silent", env.clock())
+    env.upload.enqueue("success", capture_id="srv_sweep")
+    # Default live=False — emulates both the periodic sweep and the
+    # user-triggered Try Again sweep (both go through sweep_once → try_upload
+    # without setting live=True).
+    outcome = await mgr.try_upload(record, rec_dir)
+    assert outcome == UploadOutcome.SUCCESS
+    assert env.notifier.actionable_calls == []
 
 
 async def test_live_upload_transient_schedules_retry(env):
