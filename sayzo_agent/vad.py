@@ -6,6 +6,18 @@ sample), and it emits ``SpeechSegment`` events when contiguous voiced
 regions end (with hangover). Segment ``start_ts`` / ``end_ts`` are
 monotonic seconds — the detector subtracts ``session_t0_mono`` to get
 session-relative seconds at write time.
+
+Backend note: we load Silero via the torch JIT path
+(``load_silero_vad(onnx=False)``) — the JIT model is silero-vad's
+default and only requires ``torch`` + ``torchaudio``, both of which
+``feed()`` already imports for tensor work. Using the ONNX backend
+would force a third runtime (``onnxruntime``, ~39 MB) on top of torch
+without changing the inference pathway, and was the source of the
+v3.0.0 regression where dropping ``faster-whisper`` silently took
+``onnxruntime`` with it (faster-whisper was its only transitive
+provider — silero-vad declares onnxruntime as an ``[onnx-cpu]`` extra,
+not a real dep). Don't reintroduce ``onnx=True`` without first making
+``onnxruntime`` a direct dep in pyproject.toml.
 """
 from __future__ import annotations
 
@@ -20,15 +32,15 @@ from .models import SpeechSegment, Source
 
 log = logging.getLogger(__name__)
 
-# Shared across SileroVAD instances — silero-vad's onnxruntime load is
-# ~3.5 s on first call and isn't worth racing two of them in parallel.
-# Holding this around both ``_ensure_loaded`` and any pre-warm call from
-# a background thread guarantees we pay the cost exactly once.
+# Shared across SileroVAD instances — the torch JIT load is ~150 ms on
+# first call and isn't worth racing two of them in parallel. Holding
+# this around both ``_ensure_loaded`` and any pre-warm call from a
+# background thread guarantees we pay the cost exactly once.
 _LOAD_LOCK = threading.Lock()
 
 
 class SileroVAD:
-    """Lightweight stateful VAD around the Silero ONNX model.
+    """Lightweight stateful VAD around the Silero model (torch JIT backend).
 
     Silero expects 16 kHz mono float32 in chunks of 512 samples (32 ms).
     We accept arbitrary frame sizes and re-chunk internally.
@@ -50,12 +62,11 @@ class SileroVAD:
         self.min_speech_secs = min_speech_ms / 1000.0
         self.hangover_secs = hangover_ms / 1000.0
 
-        # silero-vad + its ONNX runtime cost ~3.5 s and ~200 MB on first
-        # load. The agent constructs two SileroVAD instances at boot, so
-        # eager-loading here is the single biggest contributor to the
-        # "Starting…" delay on cold boot. Defer until the first frame is
-        # actually fed — the user has just armed by then, so the cost
-        # lands on a path they're already expecting to take a moment.
+        # silero-vad's torch JIT load is ~150 ms on first call. Cheap
+        # enough on its own, but the agent constructs two SileroVAD
+        # instances at boot and ``Agent._prewarm_vads`` loads both off
+        # the event loop, so this stays lazy — the executor pre-warm
+        # pays the cost before the user arms.
         self._model = None
 
         self._buf = np.zeros(0, dtype=np.float32)
@@ -72,12 +83,12 @@ class SileroVAD:
             return
         # Lock so a background pre-warm thread (Agent._prewarm_vads) and a
         # concurrent first ``feed()`` from the consume loop can't race and
-        # pay the silero-vad + onnxruntime load cost twice.
+        # pay the silero-vad load cost twice.
         with _LOAD_LOCK:
             if self._model is not None:
                 return
             from silero_vad import load_silero_vad
-            self._model = load_silero_vad(onnx=True)
+            self._model = load_silero_vad(onnx=False)
 
     def reset(self) -> None:
         """Reset the VAD to a cold-start state.

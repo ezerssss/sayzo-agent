@@ -22,7 +22,8 @@ from sayzo_agent.vad import SileroVAD
 
 
 class _StubSileroModel:
-    """Drop-in for ``silero_vad.load_silero_vad(onnx=True)`` output.
+    """Drop-in for ``silero_vad.load_silero_vad(onnx=False)`` output
+    (a ``torch.jit.RecursiveScriptModule`` in production).
 
     Returns scripted probabilities in order. Anything past the script
     end returns 0.0 (unvoiced). Implements ``reset_states`` so VAD's

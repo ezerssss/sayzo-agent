@@ -52,12 +52,16 @@ datas = []
 # and the Click `--version` flag.
 datas += copy_metadata("sayzo-agent")
 
-# Silero VAD ONNX model — silero_vad ships it as package data.
+# Silero VAD torch JIT model — silero_vad ships it as package data.
+# silero-vad supports both ONNX and JIT backends; we use JIT
+# (see sayzo_agent/vad.py module docstring) so we only need to bundle
+# silero_vad.jit. The .onnx file (and the onnxruntime hidden-import that
+# went with it) were dropped in v3.0.1.
 import silero_vad
 silero_pkg = Path(silero_vad.__file__).parent
-silero_onnx = silero_pkg / "data" / "silero_vad.onnx"
-if silero_onnx.exists():
-    datas.append((str(silero_onnx), "silero_vad/data"))
+silero_jit = silero_pkg / "data" / "silero_vad.jit"
+if silero_jit.exists():
+    datas.append((str(silero_jit), "silero_vad/data"))
 
 # macOS: bundle the pre-compiled audio-tap binary (CoreAudio Process Taps helper).
 if sys.platform == "darwin":
@@ -103,9 +107,10 @@ hiddenimports = [
     # Audio / capture
     "sounddevice",
     "_sounddevice_data",
-    # VAD
+    # VAD — torch JIT backend (see sayzo_agent/vad.py module docstring
+    # for why we don't use onnx). torch + torchaudio are listed
+    # explicitly further down.
     "silero_vad",
-    "onnxruntime",
     # Audio encoding
     "av",
     # Config
@@ -118,8 +123,9 @@ hiddenimports = [
     "PIL.ImageDraw",
     # Networking
     "httpx",
-    # torch — required by Silero VAD feed()
+    # torch + torchaudio — required by Silero VAD feed() (torch JIT path).
     "torch",
+    "torchaudio",
     # Native toast notifications
     "desktop_notifier",
     # First-run GUI window

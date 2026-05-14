@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sayzo-agent"
-version = "3.0.0"
+version = "3.0.1"
 description = "Armed-only capture agent for Sayzo — records meetings on user consent (hotkey or whitelisted meeting app), uploads raw stereo OGG Opus to the server, polls for the post-transcription title/summary."
 requires-python = ">=3.10"
 dependencies = [
@@ -17,6 +17,11 @@ dependencies = [
     "sounddevice>=0.4.6",
     "PyAudioWPatch>=0.2.12; sys_platform == 'win32'",
     "silero-vad>=5.1",
+    # Direct deps (not transitive of silero-vad) so accidental graph
+    # changes can't drop them. Pinned to 2.x for silero-vad JIT model
+    # compatibility. Imported directly in vad.py + echo_guard.py.
+    "torch>=2.0",
+    "torchaudio>=2.0",
     "av>=12.0",
     "pydantic>=2.6",
     "pydantic-settings>=2.2",

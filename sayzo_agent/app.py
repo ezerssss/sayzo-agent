@@ -224,9 +224,30 @@ class Agent:
             except asyncio.TimeoutError:
                 continue  # re-check armed_event in case we disarmed
             now = time.monotonic()
-            self.detector.on_frame(source, frame, capture_mono_ts, now)
-            for seg in vad.feed(frame, capture_mono_ts):
-                self.detector.on_segment(seg, now)
+            try:
+                self.detector.on_frame(source, frame, capture_mono_ts, now)
+                for seg in vad.feed(frame, capture_mono_ts):
+                    self.detector.on_segment(seg, now)
+            except Exception as exc:
+                # An unhandled throw here used to silently kill the
+                # consume task: the agent kept running (heartbeat,
+                # hotkey, tray) while the capture queue filled forever
+                # (QueueFull spam, 0 s captures, gate_failed). Log
+                # critical + signal stop so the failure is visible.
+                # `_prewarm_vads` already validates VAD load at boot,
+                # so reaching this branch in production means something
+                # genuinely unexpected went wrong (e.g. a corrupted
+                # frame from a misbehaving driver) — full shutdown is
+                # safer than continuing in a half-broken state.
+                log.critical(
+                    "[agent] %s consume crashed (%s: %s) — shutting "
+                    "down so the failure surfaces instead of silently "
+                    "discarding sessions.",
+                    source, type(exc).__name__, exc,
+                    exc_info=True,
+                )
+                self._stop.set()
+                return
             # Per-frame RMS + per-source slow-peak normalization for the
             # HUD waveform. Frames are float32 in [-1.0, 1.0] (see
             # capture/mic.py and capture/system_win.py). Normalization
@@ -287,17 +308,29 @@ class Agent:
             await asyncio.sleep(1.0 / 15.0)
 
     async def _prewarm_vads(self) -> None:
-        """Load the Silero VAD ONNX model off the event loop, before the
+        """Load the Silero VAD model off the event loop, before the
         user arms for the first time.
 
         Defers cost away from the hot path so the first ``vad.feed()`` from
         ``_consume`` is a no-op fast path (``_model is not None`` check in
         ``vad.py::_ensure_loaded``). Without this, the first armed session
-        eats a ~7 s event-loop stall (silero-vad + onnxruntime first
-        import + load × 2 instances) and produces the asyncio
-        "Exception in callback Queue.put_nowait" spam from the mic queue
-        overflowing. The thread-pool path keeps the asyncio loop
-        responsive during the load.
+        eats an event-loop stall while silero-vad loads × 2 instances,
+        and the asyncio loop falls far enough behind the producer
+        callbacks (mic at 50 Hz, WASAPI loopback in 500 ms batches) that
+        ``mic.queue`` / ``sys.queue`` (both ``maxsize=200`` ≈ 4 s) start
+        rejecting frames as ``QueueFull``. The thread-pool path keeps
+        the asyncio loop responsive during the load.
+
+        Failure is **fatal**. A VAD that can't load means
+        ``_consume``'s ``vad.feed()`` throws on every frame, both
+        queues fill, every session captures 0 s of voiced time, and
+        the cheap gate drops everything as ``gate_failed`` — the
+        agent looks alive (heartbeat, hotkey, tray menu) while being
+        silently useless. v3.0.0 shipped this way (faster-whisper was
+        removed from pyproject.toml, taking ``onnxruntime`` with it as
+        a transitive; silero-vad's onnx backend then failed to load).
+        Crashing here surfaces the broken install instead of letting
+        the user record empty sessions for hours.
         """
         try:
             loop = asyncio.get_running_loop()
@@ -306,11 +339,15 @@ class Agent:
             log.info("[agent] VAD pre-warm complete (mic + system models loaded)")
         except asyncio.CancelledError:
             raise
-        except Exception:
-            log.warning(
-                "[agent] VAD pre-warm failed (will lazy-load on first frame)",
+        except Exception as exc:
+            log.critical(
+                "[agent] VAD load failed — agent cannot capture. Likely "
+                "a missing or broken silero-vad / torch install. "
+                "Shutting down. (%s: %s)",
+                type(exc).__name__, exc,
                 exc_info=True,
             )
+            self._stop.set()
 
     async def _ticker(self) -> None:
         while not self._stop.is_set():
@@ -687,13 +724,16 @@ class Agent:
             asyncio.create_task(self._audio_level_emitter()),
         ]
         # Pre-warm Silero VAD models in the background so the user's first
-        # arm doesn't pay the ~7 s synchronous ONNX load on the event loop.
-        # Without this, the first frame fed to vad.feed() blocks _consume
-        # for the load duration, mic.callback keeps pushing frames at 50
-        # Hz, mic.queue (maxsize=200 ≈ 4 s) overflows, and ~3 s of mic
-        # audio gets dropped at session 1 start (see the 2026-05-14 logs).
+        # arm doesn't pay the synchronous load on the event loop. Without
+        # this, the first frame fed to vad.feed() blocks _consume for the
+        # load duration, mic.callback keeps pushing frames at 50 Hz,
+        # mic.queue (maxsize=200 ≈ 4 s) overflows, and ~3 s of mic audio
+        # gets dropped at session 1 start (see the 2026-05-14 logs).
         # Once-per-process; runs in a thread-pool executor so it can't
-        # block the event loop.
+        # block the event loop. Also doubles as the startup health check
+        # for the silero-vad / torch install — `_prewarm_vads` signals
+        # `_stop` on failure so a broken bundle exits loudly instead of
+        # capturing empty sessions forever (see its docstring).
         prewarm_task = asyncio.create_task(self._prewarm_vads())
         self._background_tasks.add(prewarm_task)
         prewarm_task.add_done_callback(self._background_tasks.discard)

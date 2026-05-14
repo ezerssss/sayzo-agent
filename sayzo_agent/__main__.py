@@ -322,6 +322,91 @@ def devices() -> None:
         click.echo("  No device selection needed (all apps' audio is mixed).")
 
 
+@cli.command("healthcheck")
+def healthcheck() -> None:
+    """Exit non-zero if the agent's runtime deps can't actually load.
+
+    Exists because the v3.0.0 build shipped without ``onnxruntime`` —
+    ``faster-whisper`` had been the only transitive provider and got
+    removed from ``pyproject.toml`` together with the on-device STT
+    code; silero-vad declares onnxruntime only as an ``[onnx-cpu]``
+    extra, so a clean install left the bundle silent-broken. CI now
+    runs this against the built artifact (``dist/sayzo-agent/...``)
+    after PyInstaller and before NSIS / DMG packaging, so a regression
+    of that shape fails the build instead of the user.
+
+    Checks every runtime that's lazy-loaded enough to evade
+    PyInstaller's static analysis. Exits 0 with a summary line per
+    component if all pass, exits 1 with a clear "missing X" message
+    on the first failure.
+    """
+    # Imports are done one-by-one so a failure points at exactly the
+    # broken dep, not at a wall of stack frames. Click is already
+    # imported at module top, so click.echo is safe even if every
+    # third-party dep below is broken.
+    failures: list[str] = []
+
+    def _try(label: str, fn) -> None:
+        try:
+            fn()
+            click.echo(f"  ok  {label}")
+        except Exception as exc:  # noqa: BLE001 — the point IS to catch everything
+            failures.append(f"{label}: {type(exc).__name__}: {exc}")
+            click.echo(f"  FAIL {label}: {type(exc).__name__}: {exc}")
+
+    click.echo("Sayzo agent healthcheck")
+
+    def _check_silero() -> None:
+        # The exact load path _consume hits on the first armed frame.
+        # If torch / torchaudio / silero-vad's package data are missing
+        # or mismatched, this is what surfaces it.
+        from silero_vad import load_silero_vad
+        load_silero_vad(onnx=False)
+
+    def _check_torch_inference() -> None:
+        # silero-vad's JIT model runs through torch — confirm the JIT
+        # runtime is actually executable, not just importable. Catches
+        # the case where torch is importable but its C++ ops library
+        # didn't ship (VC++ redist mismatch, missing .so on Linux).
+        import torch
+        import numpy as np
+        x = torch.from_numpy(np.zeros(512, dtype=np.float32))
+        with torch.no_grad():
+            _ = (x * 2).sum().item()
+
+    _try("numpy import", lambda: __import__("numpy"))
+    _try("scipy.signal import", lambda: __import__("scipy.signal"))
+    _try("sounddevice import", lambda: __import__("sounddevice"))
+    if sys.platform == "win32":
+        _try("pyaudiowpatch import", lambda: __import__("pyaudiowpatch"))
+        _try("pycaw import", lambda: __import__("pycaw.pycaw"))
+        _try("win32gui import", lambda: __import__("win32gui"))
+    _try("torch import", lambda: __import__("torch"))
+    _try("torchaudio import", lambda: __import__("torchaudio"))
+    _try("torch inference", _check_torch_inference)
+    _try("silero-vad load (torch JIT)", _check_silero)
+    _try("av (PyAV) import", lambda: __import__("av"))
+    _try("noisereduce import", lambda: __import__("noisereduce"))
+    _try("pydantic import", lambda: __import__("pydantic"))
+    _try("httpx import", lambda: __import__("httpx"))
+    _try("pystray import", lambda: __import__("pystray"))
+    _try("PIL.Image import", lambda: __import__("PIL.Image"))
+    _try("pynput import", lambda: __import__("pynput"))
+    _try("psutil import", lambda: __import__("psutil"))
+    _try("pywebview import", lambda: __import__("webview"))
+    _try("PySide6.QtCore import", lambda: __import__("PySide6.QtCore"))
+    _try("PySide6.QtWebEngineWidgets import", lambda: __import__("PySide6.QtWebEngineWidgets"))
+
+    if failures:
+        click.echo("")
+        click.echo(f"healthcheck: {len(failures)} failure(s):")
+        for f in failures:
+            click.echo(f"  - {f}")
+        sys.exit(1)
+    click.echo("")
+    click.echo("healthcheck: all OK")
+
+
 @cli.command("test-capture", hidden=True)
 @click.option("--seconds", default=10)
 @click.option("--dump-wav", is_flag=True, help="Save captured mic/system audio as WAV files for inspection.")

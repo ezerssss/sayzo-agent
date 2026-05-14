@@ -49,7 +49,8 @@ def _get_silero_model():
     global _SILERO_MODEL
     if _SILERO_MODEL is None:
         from silero_vad import load_silero_vad
-        _SILERO_MODEL = load_silero_vad(onnx=True)
+        # Torch JIT backend; see sayzo_agent/vad.py module docstring.
+        _SILERO_MODEL = load_silero_vad(onnx=False)
     return _SILERO_MODEL
 
 

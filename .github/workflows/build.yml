@@ -54,6 +54,27 @@ jobs:
       - name: Build with PyInstaller
         run: pyinstaller sayzo-agent.spec
 
+      - name: Smoke-test built bundle (healthcheck)
+        # Runs every runtime import + the silero-vad torch JIT load
+        # AGAINST THE PYINSTALLER ARTIFACT (not the build venv) so
+        # missing transitive deps surface here instead of in
+        # production. v3.0.0 shipped without onnxruntime because the
+        # build venv had it as an orphan transitive of faster-whisper
+        # but the bundle didn't — no step ever executed the .exe, so
+        # the regression was invisible until users hit it. Fail-fast
+        # on a healthcheck non-zero exit prevents the same shape of
+        # bug from reaching the installer.
+        shell: pwsh
+        run: |
+          $exe = "dist\sayzo-agent\sayzo-agent.exe"
+          if (-not (Test-Path $exe)) {
+            throw "PyInstaller artifact not found at $exe"
+          }
+          & $exe healthcheck
+          if ($LASTEXITCODE -ne 0) {
+            throw "Built bundle failed healthcheck (exit=$LASTEXITCODE)"
+          }
+
       - name: Install NSIS
         run: choco install nsis -y
 
@@ -151,6 +172,28 @@ jobs:
 
       - name: Build with PyInstaller
         run: pyinstaller sayzo-agent.spec
+
+      - name: Smoke-test built bundle (healthcheck)
+        # Sister step to the Windows healthcheck. Runs every runtime
+        # import + the silero-vad torch JIT load AGAINST THE BUILT
+        # .app (not the build venv). Catches "transitive dep silently
+        # disappeared from pyproject.toml" regressions before they
+        # ship — see the Windows step for the v3.0.0 incident.
+        #
+        # `xattr -cr` clears any extended attributes (e.g. quarantine)
+        # that could make Gatekeeper refuse to execute the unsigned
+        # PyInstaller artifact. Locally-built binaries don't normally
+        # get com.apple.quarantine, but stripping defensively is free
+        # and removes one class of CI flake.
+        run: |
+          BIN="dist/Sayzo.app/Contents/MacOS/sayzo-agent"
+          if [ ! -x "$BIN" ]; then
+            echo "PyInstaller artifact not found at $BIN" >&2
+            ls -la dist/ dist/Sayzo.app/Contents/MacOS/ 2>&1 || true
+            exit 1
+          fi
+          xattr -cr "dist/Sayzo.app" || true
+          "$BIN" healthcheck
 
       - name: Import signing certificate
         # GitHub-hosted macOS runners ship without our Developer ID cert.
