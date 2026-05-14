@@ -320,6 +320,13 @@ Section "Install"
     WriteRegStr HKCU "${UNINSTALL_KEY}" "InstallLocation" "$INSTDIR"
     WriteRegStr HKCU "${UNINSTALL_KEY}" "Publisher" "${PRODUCT_PUBLISHER}"
     WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayVersion" "${PRODUCT_VERSION}"
+    ; DisplayIcon drives the icon rendered in Settings -> Apps & Features and
+    ; the legacy Programs and Features control panel. Point at the service
+    ; exe's embedded icon resource (index 0) - PyInstaller writes logo.ico
+    ; into both exes via the spec's `icon=app_icon`, so no separate .ico
+    ; needs to be shipped. Service exe (not the CLI exe) matches every other
+    ; user-facing reference (Start Menu shortcut, HKCU Run autostart).
+    WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayIcon" "$INSTDIR\${SERVICE_EXE},0"
     WriteRegDWORD HKCU "${UNINSTALL_KEY}" "NoModify" 1
     WriteRegDWORD HKCU "${UNINSTALL_KEY}" "NoRepair" 1
 
