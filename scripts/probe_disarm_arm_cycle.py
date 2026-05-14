@@ -60,7 +60,7 @@ async def _capture_session(
     """
     print(f"\n--- {label}: arming ---")
     arm_now = time.monotonic()
-    detector.reset_source_epochs()
+    detector.reset_per_source_streams()
     detector.open_session_on_arm(arm_now)
     queue_at_arm = mic.queue.qsize()
     print(f"  mic.queue at arm: {queue_at_arm} stale frame(s)")

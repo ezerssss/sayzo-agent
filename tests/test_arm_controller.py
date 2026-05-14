@@ -258,6 +258,53 @@ async def test_stream_start_failure_notifies_and_stays_disarmed():
     assert any("Couldn't start" in t for t, _ in notifier.fire_and_forget)
 
 
+async def test_arm_cycle_preserves_mono_timestamp_through_to_session():
+    """The seam between VAD-emits-monotonic-time and detector-rebases-to-
+    session-relative must produce correct session-relative segments.
+
+    Drive ArmController, set FakeVAD's pending segments with KNOWN monotonic
+    timestamps (relative to arm time), hotkey-stop, retrieve the closed
+    session, assert the rebased start_ts/end_ts match expectations within
+    one frame's tolerance.
+    """
+    notifier = FakeNotifier()
+    notifier.consent_script = ["yes", "yes"]
+    ctrl, detector, _mic, _sys, vad_m, _vad_s, _ = _make_controller(notifier=notifier)
+
+    arm_before = time.monotonic()
+    await ctrl._on_hotkey_pressed()
+    arm_after = time.monotonic()
+    assert ctrl.state == ArmState.ARMED
+    # session_t0_mono was anchored to whichever monotonic time the
+    # controller captured during _arm_internal — must fall in the
+    # arm_before..arm_after window.
+    session_t0 = detector._session_t0_mono
+    assert arm_before <= session_t0 <= arm_after
+
+    # VAD emits segments with monotonic timestamps (not session-relative).
+    # Pick mono times 1.0 and 5.5 seconds AFTER session_t0 so the rebase
+    # in detector.on_segment lands at (1.0, 5.5) session-relative.
+    expected_start_rel = 1.0
+    expected_end_rel = 5.5
+    vad_m.pending_on_flush = [
+        SpeechSegment("mic", session_t0 + expected_start_rel, session_t0 + expected_end_rel),
+    ]
+
+    await ctrl._on_hotkey_pressed()  # disarm confirmation "yes"
+    assert ctrl.state == ArmState.DISARMED
+
+    closed = detector.take_closed_session()
+    assert closed is not None
+    assert len(closed.mic_segments) == 1
+    seg = closed.mic_segments[0]
+    assert abs(seg.start_ts - expected_start_rel) < 0.001, (
+        f"rebased start_ts {seg.start_ts} != {expected_start_rel}"
+    )
+    assert abs(seg.end_ts - expected_end_rel) < 0.001, (
+        f"rebased end_ts {seg.end_ts} != {expected_end_rel}"
+    )
+
+
 async def test_hotkey_stop_flushes_vad_pending_segments_into_session():
     """Regression: when the user hotkey-stops mid-utterance, the still-open
     VAD segment must be flushed into the closed session, not dropped.

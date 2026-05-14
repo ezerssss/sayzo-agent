@@ -270,24 +270,21 @@ def test_shutdown_during_pending_close_commits_not_discards():
     assert closed.close_reason == SessionCloseReason.SHUTDOWN
 
 
-def test_reset_source_epochs_clears_state():
+def test_reset_per_source_streams_clears_stream_end():
     d = ConversationDetector(_cfg())
-    d._source_epoch_mono["mic"] = 100.0
-    d._source_frames_seen["mic"] = 50
     d._stream_end_mono["mic"] = 105.0
-    d.reset_source_epochs()
-    assert d._source_epoch_mono == {"mic": None, "system": None}
-    assert d._source_frames_seen == {"mic": 0, "system": 0}
+    d._stream_end_mono["system"] = 110.0
+    d.reset_per_source_streams()
     assert d._stream_end_mono == {"mic": None, "system": None}
 
 
-def test_reset_source_epochs_raises_when_not_idle():
+def test_reset_per_source_streams_raises_when_not_idle():
     d = ConversationDetector(_cfg())
     d.on_segment(SpeechSegment("mic", 0.0, 1.0), now=100.0)
     assert d.state == SessionState.OPEN
     import pytest
     with pytest.raises(RuntimeError):
-        d.reset_source_epochs()
+        d.reset_per_source_streams()
 
 
 def test_gate_passes_long_turn():
@@ -543,8 +540,8 @@ def test_stale_frames_across_arm_boundary_do_not_inject_zeros():
     d.commit_close(101.0, SessionCloseReason.WHITELIST_ENDED)
     assert d.state == SessionState.IDLE
 
-    # ---- 200 s of disarm. The detector resets epoch state on re-arm. ----
-    d.reset_source_epochs()
+    # ---- 200 s of disarm. The detector resets stream-end state on re-arm. ----
+    d.reset_per_source_streams()
     arm_now = 300.0
     d.open_session_on_arm(now=arm_now)
 

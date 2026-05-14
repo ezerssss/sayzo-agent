@@ -122,9 +122,14 @@ async def _main() -> int:
     print("[ok] armed via hotkey")
 
     # Simulate VAD holding an open segment when the user hotkey-stops mid-talk.
-    vad_m.pending = [SpeechSegment("mic", 0.0, 6.5)]
-    vad_s.pending = [SpeechSegment("system", 1.0, 4.2)]
-    print("[ok] pre-loaded pending segments (mic: 6.5s, system: 4.2s)")
+    # Anchor mono timestamps to the actual session_t0 so the detector's
+    # rebase produces predictable session-relative values (v2.18 contract).
+    session_t0 = detector._session_t0_mono
+    vad_m.pending = [SpeechSegment("mic", session_t0 + 0.5, session_t0 + 6.5)]
+    vad_s.pending = [SpeechSegment("system", session_t0 + 1.0, session_t0 + 4.2)]
+    expected_mic = (0.5, 6.5)
+    expected_sys = (1.0, 4.2)
+    print(f"[ok] pre-loaded pending segments (mic: {expected_mic}s, system: {expected_sys}s)")
 
     await ctrl._on_hotkey_pressed()  # disarm with "yes"
     if ctrl.state != ArmState.DISARMED:
@@ -142,8 +147,21 @@ async def _main() -> int:
         f"sys_segments={len(closed.sys_segments)})"
     )
 
-    mic_ok = vad_m.flush_count == 1 and len(closed.mic_segments) == 1
-    sys_ok = vad_s.flush_count == 1 and len(closed.sys_segments) == 1
+    def _within(actual: float, expected: float, tol: float = 0.001) -> bool:
+        return abs(actual - expected) < tol
+
+    mic_ok = (
+        vad_m.flush_count == 1
+        and len(closed.mic_segments) == 1
+        and _within(closed.mic_segments[0].start_ts, expected_mic[0])
+        and _within(closed.mic_segments[0].end_ts, expected_mic[1])
+    )
+    sys_ok = (
+        vad_s.flush_count == 1
+        and len(closed.sys_segments) == 1
+        and _within(closed.sys_segments[0].start_ts, expected_sys[0])
+        and _within(closed.sys_segments[0].end_ts, expected_sys[1])
+    )
 
     print("\nResult")
     print("------")

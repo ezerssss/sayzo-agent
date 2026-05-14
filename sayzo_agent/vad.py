@@ -1,7 +1,11 @@
 """Silero VAD wrapper.
 
-Stateful per-source: feed it 16 kHz float32 frames, it emits SpeechSegment
-events when contiguous voiced regions end (with hangover).
+Stateful per-source: feed it 16 kHz float32 frames + each frame's
+``frame_mono_ts`` (the ``time.monotonic()`` value of the frame's first
+sample), and it emits ``SpeechSegment`` events when contiguous voiced
+regions end (with hangover). Segment ``start_ts`` / ``end_ts`` are
+monotonic seconds — the detector subtracts ``session_t0_mono`` to get
+session-relative seconds at write time.
 """
 from __future__ import annotations
 
@@ -32,6 +36,7 @@ class SileroVAD:
 
     SILERO_CHUNK = 512  # samples at 16 kHz
     SAMPLE_RATE = 16000
+    _CHUNK_DURATION_SECS = SILERO_CHUNK / SAMPLE_RATE
 
     def __init__(
         self,
@@ -42,8 +47,8 @@ class SileroVAD:
     ) -> None:
         self.source = source
         self.threshold = threshold
-        self.min_speech_samples = int(self.SAMPLE_RATE * min_speech_ms / 1000)
-        self.hangover_samples = int(self.SAMPLE_RATE * hangover_ms / 1000)
+        self.min_speech_secs = min_speech_ms / 1000.0
+        self.hangover_secs = hangover_ms / 1000.0
 
         # silero-vad + its ONNX runtime cost ~3.5 s and ~200 MB on first
         # load. The agent constructs two SileroVAD instances at boot, so
@@ -54,11 +59,13 @@ class SileroVAD:
         self._model = None
 
         self._buf = np.zeros(0, dtype=np.float32)
-        self._samples_seen = 0  # absolute samples consumed since session start
+        # Monotonic time of ``_buf[0]``. Set when ``_buf`` is empty and a
+        # new frame arrives; advances by one chunk's duration each time
+        # we consume a chunk from the front of ``_buf``.
+        self._buf_start_mono: Optional[float] = None
         self._in_speech = False
-        self._speech_start: Optional[int] = None
-        self._last_voiced: Optional[int] = None
-        self._session_start_sample = 0  # for ts conversion
+        self._speech_start_mono: Optional[float] = None
+        self._last_voiced_mono: Optional[float] = None
 
     def _ensure_loaded(self) -> None:
         if self._model is not None:
@@ -72,45 +79,50 @@ class SileroVAD:
             from silero_vad import load_silero_vad
             self._model = load_silero_vad(onnx=True)
 
-    def reset_session(self, start_sample: int = 0) -> None:
+    def reset(self) -> None:
+        """Reset the VAD to a cold-start state.
+
+        Called when the agent re-arms after being disarmed. The internal
+        buffer + in-progress segment state rewind so the next frame is
+        treated as the first of a freshly-started stream.
+        """
         self._buf = np.zeros(0, dtype=np.float32)
-        self._samples_seen = start_sample
+        self._buf_start_mono = None
         self._in_speech = False
-        self._speech_start = None
-        self._last_voiced = None
-        self._session_start_sample = start_sample
+        self._speech_start_mono = None
+        self._last_voiced_mono = None
         if self._model is not None:
             try:
                 self._model.reset_states()
             except Exception:
                 pass
 
-    def reset(self) -> None:
-        """Reset the VAD to a cold-start state.
+    def feed(self, frame: np.ndarray, frame_mono_ts: float) -> Iterator[SpeechSegment]:
+        """Feed one PCM frame; yield any SpeechSegment(s) that closed.
 
-        Called when the agent re-arms after being disarmed. The sample counter
-        and model state rewind to zero so the next frame is treated as the
-        first frame on a freshly-started stream. The detector's
-        `_source_epoch_mono` also resets separately; together they ensure
-        VAD-derived timestamps anchor correctly against the new stream.
+        ``frame_mono_ts`` is the ``time.monotonic()`` value of the
+        FIRST sample in ``frame``. Yielded segments' ``start_ts`` /
+        ``end_ts`` are monotonic seconds, anchored to the actual capture
+        time of each chunk Silero processed.
         """
-        self.reset_session(start_sample=0)
-
-    def _to_ts(self, sample: int) -> float:
-        return (sample - self._session_start_sample) / self.SAMPLE_RATE
-
-    def feed(self, frame: np.ndarray) -> Iterator[SpeechSegment]:
-        """Feed one PCM frame; yield any SpeechSegment(s) that closed."""
         import torch
 
         self._ensure_loaded()
+        # Anchor ``_buf_start_mono`` when the buffer is empty. If there
+        # are leftover samples from a previous ``feed()`` call,
+        # ``_buf_start_mono`` already tracks ``_buf[0]`` — we just append
+        # at the tail and the anchor stays correct.
+        if len(self._buf) == 0:
+            self._buf_start_mono = frame_mono_ts
         self._buf = np.concatenate([self._buf, frame.astype(np.float32, copy=False)])
 
         while len(self._buf) >= self.SILERO_CHUNK:
             chunk = self._buf[: self.SILERO_CHUNK]
             self._buf = self._buf[self.SILERO_CHUNK :]
-            chunk_start = self._samples_seen
-            self._samples_seen += self.SILERO_CHUNK
+            assert self._buf_start_mono is not None  # set above when buf was empty
+            chunk_start_mono = self._buf_start_mono
+            chunk_end_mono = chunk_start_mono + self._CHUNK_DURATION_SECS
+            self._buf_start_mono = chunk_end_mono
 
             with torch.no_grad():
                 prob = float(
@@ -121,36 +133,39 @@ class SileroVAD:
             if voiced:
                 if not self._in_speech:
                     self._in_speech = True
-                    self._speech_start = chunk_start
-                self._last_voiced = self._samples_seen
-            else:
-                if self._in_speech and self._last_voiced is not None:
-                    silence = self._samples_seen - self._last_voiced
-                    if silence >= self.hangover_samples:
-                        # close segment
-                        assert self._speech_start is not None
-                        duration_samples = self._last_voiced - self._speech_start
-                        if duration_samples >= self.min_speech_samples:
-                            seg = SpeechSegment(
-                                source=self.source,
-                                start_ts=self._to_ts(self._speech_start),
-                                end_ts=self._to_ts(self._last_voiced),
-                            )
-                            yield seg
-                        self._in_speech = False
-                        self._speech_start = None
-                        self._last_voiced = None
+                    self._speech_start_mono = chunk_start_mono
+                self._last_voiced_mono = chunk_end_mono
+                continue
+
+            if self._in_speech and self._last_voiced_mono is not None:
+                silence = chunk_end_mono - self._last_voiced_mono
+                if silence >= self.hangover_secs:
+                    assert self._speech_start_mono is not None
+                    duration = self._last_voiced_mono - self._speech_start_mono
+                    if duration >= self.min_speech_secs:
+                        yield SpeechSegment(
+                            source=self.source,
+                            start_ts=self._speech_start_mono,
+                            end_ts=self._last_voiced_mono,
+                        )
+                    self._in_speech = False
+                    self._speech_start_mono = None
+                    self._last_voiced_mono = None
 
     def flush(self) -> Iterator[SpeechSegment]:
         """Force-close any in-progress segment (e.g. on session close)."""
-        if self._in_speech and self._speech_start is not None and self._last_voiced is not None:
-            duration_samples = self._last_voiced - self._speech_start
-            if duration_samples >= self.min_speech_samples:
+        if (
+            self._in_speech
+            and self._speech_start_mono is not None
+            and self._last_voiced_mono is not None
+        ):
+            duration = self._last_voiced_mono - self._speech_start_mono
+            if duration >= self.min_speech_secs:
                 yield SpeechSegment(
                     source=self.source,
-                    start_ts=self._to_ts(self._speech_start),
-                    end_ts=self._to_ts(self._last_voiced),
+                    start_ts=self._speech_start_mono,
+                    end_ts=self._last_voiced_mono,
                 )
         self._in_speech = False
-        self._speech_start = None
-        self._last_voiced = None
+        self._speech_start_mono = None
+        self._last_voiced_mono = None

@@ -100,7 +100,7 @@ class VADConfig(BaseSettings):
 class ConversationConfig(BaseSettings):
     joint_silence_close_secs: float = 45.0
     min_user_turn_secs: float = 8.0
-    min_user_total_secs: float = 15.0
+    min_user_total_secs: float = 10.0
     min_user_turns_for_total: int = 2
     min_sys_voiced_secs: float = 1.0
     # Density-based STT: when mic_total / elapsed < stt_full_density, transcribe

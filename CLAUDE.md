@@ -99,7 +99,7 @@ The pipeline is **staged by cost** — cheap stages run continuously (while arme
 ArmController (DISARMED on launch)
     ↕ [hotkey press → start-confirm toast → arm]
     ↕ [whitelist match → consent toast → arm]
-ArmController.arm() → vad.reset() + detector.reset_source_epochs()
+ArmController.arm() → vad.reset() + detector.reset_per_source_streams()
                     + detector.open_session_on_arm(now)  ← session opens at arm time, not at first VAD
                     + mic.start() + sys.start()
     ↓

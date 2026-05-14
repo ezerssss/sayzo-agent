@@ -278,7 +278,7 @@ class Agent:
                 continue  # re-check armed_event in case we disarmed
             now = time.monotonic()
             self.detector.on_frame(source, frame, capture_mono_ts, now)
-            for seg in vad.feed(frame):
+            for seg in vad.feed(frame, capture_mono_ts):
                 self.detector.on_segment(seg, now)
             # Per-frame RMS + per-source slow-peak normalization for the
             # HUD waveform. Frames are float32 in [-1.0, 1.0] (see

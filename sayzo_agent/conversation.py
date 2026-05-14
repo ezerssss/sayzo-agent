@@ -6,7 +6,7 @@ be unit-tested with synthetic VAD events.
 Session lifecycle
 -----------------
 Sessions open the moment the agent arms — ``open_session_on_arm(now)`` is
-called by ``ArmController._arm_internal`` right after ``reset_source_epochs``
+called by ``ArmController._arm_internal`` right after ``reset_per_source_streams``
 and before either capture stream actually starts. Frames that arrive while
 the detector is IDLE are dropped on the floor; in armed-only mode, the only
 producer of frames (mic / sys captures) is gated behind ``armed_event``, so
@@ -26,11 +26,15 @@ re-anchor instead of filling — a 200 s "gap" is never a real audio dropout,
 it's stale state, and zero-filling it would inject 200 s of silence into the
 session.
 
-Test-path compatibility: if ``on_segment`` is called without any preceding
-``on_frame`` calls on a source (i.e., ``_source_epoch_mono[src]`` is None),
-the detector falls back to the old behavior where VAD-sample-second
-timestamps are treated as if already on a shared timeline. The synthetic
-tests in ``tests/test_conversation.py`` rely on this.
+VAD segment contract: ``on_segment(seg, now)`` expects ``seg.start_ts``
+and ``seg.end_ts`` in **monotonic seconds** (the values
+``SileroVAD.feed`` produces by anchoring chunks to the ``frame_mono_ts``
+passed in). The detector rebases by subtracting ``_session_t0_mono`` so
+buffered segments come out session-relative. Synthetic tests that pass
+``SpeechSegment("mic", 0.0, 1.0)`` directly to ``on_segment`` without
+preceding ``on_frame`` calls still work: when state is IDLE,
+``_open_session`` anchors ``session_t0`` to ``seg.start_ts`` so the
+rebase ends up at 0.
 """
 from __future__ import annotations
 
@@ -106,16 +110,10 @@ class ConversationDetector:
         # Track the last voiced wall time on each source (monotonic seconds).
         self._last_voiced_mono: dict[Source, float] = {"mic": 0.0, "system": 0.0}
         self._session_start_mono: float = 0.0
-        # Monotonic-clock anchoring for each source. Set on the SECOND frame
-        # received (the first frame often carries device-priming stall); never
-        # modified afterward within a session. Used to convert VAD sample
-        # indices (which are in "real samples since this source started"
-        # units) into absolute monotonic seconds:
-        # ``mono(vad_sample) = _source_epoch_mono[src] + vad_sample / sr``.
-        self._source_epoch_mono: dict[Source, Optional[float]] = {"mic": None, "system": None}
-        self._source_frames_seen: dict[Source, int] = {"mic": 0, "system": 0}
         # Mono time of the tail of each source's session buffer. Advances by
-        # frame_duration on each append and by gap on each zero-fill.
+        # frame_duration on each append and by gap on each zero-fill. Used
+        # only by ``on_frame`` for gap-fill / re-anchor decisions; VAD-side
+        # timestamping is independent (segments carry their own mono times).
         self._stream_end_mono: dict[Source, Optional[float]] = {"mic": None, "system": None}
         # Monotonic time of sample 0 of ``session_pcm[src]`` once a session
         # opens. Equal to ``now`` at ``open_session_on_arm`` time.
@@ -128,20 +126,6 @@ class ConversationDetector:
             return self.cfg.gap_tolerance_secs_mic
         return self.cfg.gap_tolerance_secs_system
 
-    def _seg_mono(self, source: Source, vad_ts: float) -> float:
-        """Convert a VAD-derived sample-second timestamp to monotonic time.
-
-        VAD's internal sample counter is never reset, so ``vad_ts`` is in
-        "seconds since that source's VAD started". We add the source's
-        epoch to get absolute monotonic seconds. When no frames have been
-        seen (test path), treat ``vad_ts`` as already on a shared timeline
-        (equivalent to epoch=0).
-        """
-        epoch = self._source_epoch_mono[source]
-        if epoch is None:
-            return vad_ts
-        return epoch + vad_ts
-
     # ---- session lifecycle -------------------------------------------------
 
     def open_session_on_arm(
@@ -150,7 +134,7 @@ class ConversationDetector:
         """Open a session immediately at arm time, with empty buffers.
 
         Production entrypoint: ``ArmController._arm_internal`` calls this
-        right after ``reset_source_epochs`` and before opening capture
+        right after ``reset_per_source_streams`` and before opening capture
         streams. ``session_t0_mono`` is anchored to ``now`` (the arm
         timestamp); subsequent frames flow directly into ``mic_pcm`` /
         ``sys_pcm`` via ``on_frame`` with gap-fill bridging the small
@@ -187,12 +171,12 @@ class ConversationDetector:
         self._last_voiced_mono["system"] = now if trigger == "system" else 0.0
         # Session origin in monotonic time. Arm-triggered: anchored to ``now``
         # (the arm timestamp). VAD-triggered (legacy / test path): anchored
-        # to the segment's mono time.
+        # to the segment's mono time, which VAD already emits directly.
         if t0_mono is not None:
             session_t0 = t0_mono
         else:
             assert trigger is not None
-            session_t0 = self._seg_mono(trigger, trigger_start_ts)
+            session_t0 = trigger_start_ts
         self._session_t0_mono = session_t0
         self._buffers.session_t0_mono = session_t0
 
@@ -286,15 +270,6 @@ class ConversationDetector:
         frame_samples = len(frame)
         frame_duration = frame_samples / self.sample_rate
 
-        # Anchor epoch on the SECOND frame — the first frame after stream
-        # .start() often carries device-priming jitter (PortAudio startup
-        # buffer, pipe-read warmup). Skipping it costs ~one frame of
-        # fidelity and buys a stable anchor for VAD-segment timestamping.
-        self._source_frames_seen[source] += 1
-        if self._source_epoch_mono[source] is None and self._source_frames_seen[source] >= 2:
-            first_frame_duration = frame_duration  # assume uniform
-            self._source_epoch_mono[source] = capture_mono_ts - first_frame_duration
-
         dst = self._buffers.mic_pcm if source == "mic" else self._buffers.sys_pcm
         stream_end = self._stream_end_mono[source]
         if stream_end is None:
@@ -328,6 +303,10 @@ class ConversationDetector:
     def on_segment(self, seg: SpeechSegment, now: float) -> None:
         """Register a closed VAD segment on `seg.source`.
 
+        ``seg.start_ts`` / ``seg.end_ts`` arrive as monotonic seconds
+        (VAD anchors them to the frame timestamps passed into ``feed``).
+        We rebase to session-relative by subtracting ``_session_t0_mono``.
+
         If the detector is in PENDING_CLOSE when a segment arrives, the user
         has resumed speaking during the end-confirmation toast window — the
         pending close auto-reverts so the meeting continues as one capture.
@@ -342,16 +321,10 @@ class ConversationDetector:
             self._open_session(now, seg.source, seg.start_ts)
             assert self._buffers is not None
         assert self._buffers is not None
-        # Convert VAD sample-seconds → monotonic time → session-relative
-        # seconds. This correctly handles the case where mic and system VAD
-        # sample counters have drifted relative to each other (since both
-        # are anchored by their own `_source_epoch_mono`).
-        seg_start_mono = self._seg_mono(seg.source, seg.start_ts)
-        seg_end_mono = self._seg_mono(seg.source, seg.end_ts)
         rebased = SpeechSegment(
             source=seg.source,
-            start_ts=max(0.0, seg_start_mono - self._session_t0_mono),
-            end_ts=max(0.0, seg_end_mono - self._session_t0_mono),
+            start_ts=max(0.0, seg.start_ts - self._session_t0_mono),
+            end_ts=max(0.0, seg.end_ts - self._session_t0_mono),
         )
         if seg.source == "mic":
             self._buffers.mic_segments.append(rebased)
@@ -361,9 +334,9 @@ class ConversationDetector:
         log.debug(
             "[vad] %s speech %.2f→%.2f (%.1fs)",
             seg.source,
-            seg.start_ts,
-            seg.end_ts,
-            seg.duration,
+            rebased.start_ts,
+            rebased.end_ts,
+            rebased.duration,
         )
 
     def tick(self, now: float) -> None:
@@ -437,21 +410,17 @@ class ConversationDetector:
         if self.state in (SessionState.OPEN, SessionState.PENDING_CLOSE):
             self._close_session(now, SessionCloseReason.SHUTDOWN)
 
-    def reset_source_epochs(self) -> None:
-        """Reset the per-source clock anchors so the next frame behaves as if
-        the source started fresh. Called by the ArmController on every
-        disarm → arm transition, alongside SileroVAD.reset(). Together they
-        ensure re-armed sessions don't carry stale epoch anchors from a
-        previously-armed cold-session that has long since ended.
+    def reset_per_source_streams(self) -> None:
+        """Reset per-source stream-end anchors so the next frame behaves as
+        if the source started fresh. Called by the ArmController on every
+        disarm → arm transition, alongside ``SileroVAD.reset()``.
 
         Must only be called while IDLE.
         """
         if self.state != SessionState.IDLE:
             raise RuntimeError(
-                f"reset_source_epochs requires state=IDLE, got {self.state}"
+                f"reset_per_source_streams requires state=IDLE, got {self.state}"
             )
-        self._source_epoch_mono = {"mic": None, "system": None}
-        self._source_frames_seen = {"mic": 0, "system": 0}
         self._stream_end_mono = {"mic": None, "system": None}
 
     # ---- output API --------------------------------------------------------
