@@ -432,7 +432,7 @@ class ConversationDetector:
 
 
 def evaluate_user_turn_gate(buffers: SessionBuffers, cfg: ConversationConfig) -> GateResult:
-    """Cheap pre-STT gate: substantive user turn AND counterparty present."""
+    """Cheap pre-upload gate: substantive user turn AND counterparty present."""
     mic_total = buffers.mic_total_voiced()
     mic_max = buffers.mic_max_turn()
     mic_turns = buffers.mic_turn_count()
@@ -526,9 +526,8 @@ def build_windowed_pcm(
     [seg.start_ts - pad, seg.end_ts + pad] windows zero-filled.
 
     `pcm` is little-endian int16 mono at `sample_rate`. Timestamps are
-    preserved 1:1 so the windowed buffer can be passed to STT and the
-    resulting word timestamps will line up with the original session
-    timeline. Pure / unit-testable.
+    preserved 1:1, so windowed buffers index back into the same session
+    timeline as the source PCM. Pure / unit-testable.
     """
     if not pcm:
         return b""

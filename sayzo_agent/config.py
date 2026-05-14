@@ -56,11 +56,12 @@ class CaptureConfig(BaseSettings):
     opus_bitrate: int = 96000
     opus_application: str = "audio"
 
-    # Post-capture DSP (see dsp.py). Runs at session close, after
-    # transcription + speaker embedding (both use the raw PCM upstream), so
-    # these settings do not affect STT. `dsp_enabled=False` restores the
-    # raw-PCM path byte-for-byte (except for the opus_application setting,
-    # which is intrinsic to the encoder path).
+    # Post-capture DSP (see dsp.py). Runs at session close on the raw
+    # session PCM before Opus encoding — cleans up the on-disk audio
+    # without affecting the server-side transcription pipeline.
+    # `dsp_enabled=False` restores the raw-PCM path byte-for-byte (except
+    # for the opus_application setting, which is intrinsic to the encoder
+    # path).
     dsp_enabled: bool = True
     denoise_enabled: bool = True  # mic channel only
     # noisereduce prop_decrease, 0..1. At 0.85 the stationary spectral gate
@@ -103,12 +104,6 @@ class ConversationConfig(BaseSettings):
     min_user_total_secs: float = 10.0
     min_user_turns_for_total: int = 2
     min_sys_voiced_secs: float = 1.0
-    # Density-based STT: when mic_total / elapsed < stt_full_density, transcribe
-    # the system stream only in ±stt_context_pad_secs windows around mic VAD
-    # segments. Cuts STT cost on passive-media-with-occasional-talk sessions
-    # without changing the cheap-gate keep/drop decision upstream.
-    stt_full_density: float = 0.05
-    stt_context_pad_secs: float = 60.0
     # Pad around each VAD segment (mic or system) when building the final
     # saved audio. Regions outside any padded segment are zero-filled so
     # dead air + static artifacts don't end up in the on-disk capture. Small
@@ -140,32 +135,9 @@ class ConversationConfig(BaseSettings):
     max_gap_fill_secs: float = 2.0
 
 
-class STTConfig(BaseSettings):
-    model: str = "small"
-    compute_type: str = "int8"
-    device: str = "cpu"
-    # Force English transcription. Sayzo is an English coaching platform, so
-    # auto-detection is both unnecessary and actively harmful — Whisper-small
-    # frequently misidentifies accented-but-correct English as Tagalog/Malay/
-    # Indonesian and then "transcribes" nonsense. Set to None to re-enable
-    # auto-detect if you ever need multilingual support.
-    language: str | None = "en"
-    # If the mic stream's detected language is confidently non-English
-    # (prob >= this threshold), discard the whole session before STT. Guards
-    # against spending CPU on sessions where the user was clearly speaking
-    # another language (and Whisper would hallucinate English for). Set to
-    # 1.0 to disable the discard path. Default 0.85 = "really sure" only.
-    non_english_discard_prob: float = 0.85
-
-
-class SpeakerConfig(BaseSettings):
-    threshold: float = 0.70
-    max_other_speakers: int = 4
-
-
 class EchoGuardConfig(BaseSettings):
     """Per-segment classifier that drops speaker-to-mic bleed (echo) before
-    the substantive-user-turn gate and STT. See
+    the substantive-user-turn gate. See
     ~/.claude/plans/we-have-a-big-twinkling-wilkes.md for design.
 
     Biased toward keeping user speech — the prior enrollment-based approach
@@ -202,8 +174,8 @@ class EchoGuardConfig(BaseSettings):
     subdivide_window_secs: float = 1.0
     subdivide_hop_secs: float = 0.25
 
-    # Cosine fade at zero'd-region boundaries so Whisper's log-mel frontend
-    # doesn't see a spectral cliff at echo → user transitions.
+    # Cosine fade at zero'd-region boundaries so the encoder doesn't see a
+    # spectral cliff at echo → user transitions on the mic channel.
     taper_ms: float = 5.0
 
     # Opt-in: dump per-dropped-segment WAVs (mic + sys + residual) under
@@ -695,8 +667,6 @@ class Config(BaseSettings):
     capture: CaptureConfig = Field(default_factory=CaptureConfig)
     vad: VADConfig = Field(default_factory=VADConfig)
     conversation: ConversationConfig = Field(default_factory=ConversationConfig)
-    stt: STTConfig = Field(default_factory=STTConfig)
-    speaker: SpeakerConfig = Field(default_factory=SpeakerConfig)
     echo_guard: EchoGuardConfig = Field(default_factory=EchoGuardConfig)
     arm: ArmConfig = Field(default_factory=ArmConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)

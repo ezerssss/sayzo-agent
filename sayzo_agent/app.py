@@ -7,7 +7,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import Optional
 
 import numpy as np
@@ -15,6 +15,7 @@ import numpy as np
 from .arm import ArmController
 from .capture.mic import MicCapture
 from .capture import SystemCapture
+from .capture_poller import CapturePoller
 from .config import Config
 from .conversation import (
     ConversationDetector,
@@ -25,10 +26,8 @@ from .conversation import (
 )
 from .dsp import apply_mic_dsp, apply_sys_dsp
 from . import echo_guard
-from .models import SessionBuffers, SpeechSegment, TranscriptLine
+from .models import SessionBuffers
 from .sink import CaptureSink
-from .speaker import SpeakerIdentifier
-from .stt import WhisperSTT, TranscribedSegment
 from .notify import NoopNotifier, Notifier
 from .retry import empty_upload_state
 from .upload import NoopUploadClient, UploadClient
@@ -36,6 +35,13 @@ from .upload_retry import UploadRetryManager
 from .vad import SileroVAD
 
 log = logging.getLogger(__name__)
+
+
+def _format_duration(secs: float) -> str:
+    """Format a duration as a short, human-friendly string ("12s", "1 min")."""
+    if secs >= 60:
+        return f"{int(round(secs / 60))} min"
+    return f"{int(round(secs))}s"
 
 
 # --- HUD waveform audio-level normalization ---------------------------------
@@ -53,70 +59,6 @@ _AUDIO_LEVEL_MIN_PEAK_MIC = 0.015
 _AUDIO_LEVEL_MIN_PEAK_SYS = 0.004
 
 
-def _format_duration(secs: float) -> str:
-    if secs >= 60:
-        return f"{int(round(secs / 60))} min"
-    return f"{int(round(secs))}s"
-
-
-def _placeholder_title(arm_app_key: Optional[str], started_at: datetime) -> str:
-    """Build the client-side placeholder title for a kept capture.
-
-    Deterministic so the toast / Captures pane have something readable
-    immediately. The server overwrites this with a generated title in the
-    upload response (see ``metadata.placeholder_title=True`` in
-    ``_process_session_inner``).
-    """
-    stamp = started_at.strftime("%Y-%m-%d %H:%M")
-    if arm_app_key:
-        return f"{arm_app_key.title()} call · {stamp}"
-    return f"Conversation · {stamp}"
-
-
-# Split a Whisper segment whenever its internal words have a pause longer
-# than this. Catches cases where Whisper's own VAD grouping kept a
-# segment together across a turn-taking gap, which would place late-in-
-# segment words before the other speaker's interjection after sort.
-# Turn-taking pauses in natural conversation are typically 400-800 ms;
-# 0.8 s preserves intra-turn hesitation (thinking beats) but splits at
-# real hand-offs.
-TRANSCRIPT_WORD_GAP_SECS = 0.8
-
-
-def _split_segment_by_word_gaps(
-    seg: TranscribedSegment, gap_threshold_secs: float
-) -> list[tuple[float, float, str]]:
-    """Split a Whisper segment at internal word gaps longer than
-    ``gap_threshold_secs``. Returns a list of ``(start, end, text)`` triples
-    covering the same content as the input segment but with tighter start
-    times per sub-segment.
-
-    Falls back to the segment's own bounds when word-level timestamps
-    aren't available (e.g. Whisper didn't populate ``words`` for this
-    segment). Pure / cross-platform — no audio or OS access.
-    """
-    words = seg.words or []
-    if len(words) <= 1:
-        return [(seg.start, seg.end, seg.text)]
-
-    runs: list[list] = [[words[0]]]
-    for w in words[1:]:
-        prev = runs[-1][-1]
-        if w.start - prev.end > gap_threshold_secs:
-            runs.append([w])
-        else:
-            runs[-1].append(w)
-
-    if len(runs) == 1:
-        return [(seg.start, seg.end, seg.text)]
-
-    out: list[tuple[float, float, str]] = []
-    for run in runs:
-        text = "".join(w.text for w in run).strip()
-        if not text:
-            continue
-        out.append((run[0].start, run[-1].end, text))
-    return out or [(seg.start, seg.end, seg.text)]
 
 
 class Agent:
@@ -156,8 +98,6 @@ class Agent:
             hangover_ms=config.vad.hangover_ms,
         )
         self.detector = ConversationDetector(config.conversation, sample_rate=config.capture.sample_rate)
-        self.stt = WhisperSTT(config.stt, models_dir=str(config.models_dir))
-        self.speaker = SpeakerIdentifier(config.speaker)
         self.sink = CaptureSink(
             config.captures_dir,
             opus_bitrate=config.capture.opus_bitrate,
@@ -167,6 +107,11 @@ class Agent:
         self.notifier: Notifier = notifier or NoopNotifier()
 
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="sayzo-heavy")
+        self.poller = CapturePoller(
+            auth_client=auth_client,
+            captures_dir=config.captures_dir,
+            executor=self._executor,
+        )
         self.retry_mgr = UploadRetryManager(
             captures_dir=config.captures_dir,
             upload_client=self.upload,
@@ -175,6 +120,8 @@ class Agent:
             config=config.upload,
             auth_client=auth_client,
             webapp_base_url=config.auth.effective_server_url or None,
+            on_upload_success=self.poller.poll,
+            notify_capture_saved=config.notify_capture_saved,
         )
         self._stop = asyncio.Event()
         self._paused = asyncio.Event()  # clear = running, set = paused
@@ -540,7 +487,7 @@ class Agent:
         # `buffers.mic_segments` and record them on `buffers.mic_echo_segments`.
         # Runs BEFORE the gate so passive "user listens to a podcast" sessions
         # fail substantive-user-turn on real (non-echo-inflated) mic totals,
-        # saving STT cost and keeping polluted transcripts off the wire.
+        # avoiding upload of sessions where the user never actually spoke.
         eg_report = None
         if self.cfg.echo_guard.enabled:
             eg_report = await loop.run_in_executor(
@@ -593,130 +540,13 @@ class Agent:
                 log.debug("[app] discard toast failed", exc_info=True)
             return
 
-        # 2a. Language probe on the mic stream. Sayzo is English-only, so if
-        # the user was confidently speaking another language we bail now
-        # rather than burn CPU transcribing nonsense (Whisper forced to
-        # English on e.g. Tagalog produces hallucinated English). Set
-        # STTConfig.non_english_discard_prob=1.0 to disable.
-        #
-        # mic_bytes has the echo regions zero'd out (with a short cosine
-        # taper at boundaries) so Whisper never sees echo content and
-        # attributes it to the user. The raw buffers.mic_pcm is preserved
-        # for DSP at step 5a — noisereduce's stationary estimator needs a
-        # contiguous input and would collapse on long zero runs.
-        mic_bytes_raw = bytes(buffers.mic_pcm)
-        if buffers.mic_echo_segments:
-            mic_bytes = echo_guard.zero_out_echo_regions(
-                mic_bytes_raw,
-                [(s.start_ts, s.end_ts) for s in buffers.mic_echo_segments],
-                sample_rate=sr,
-                taper_ms=self.cfg.echo_guard.taper_ms,
-            )
-        else:
-            mic_bytes = mic_bytes_raw
-        if mic_bytes:
-            mic_lang, mic_lang_prob = await loop.run_in_executor(
-                self._executor, self.stt.detect_language, mic_bytes
-            )
-            log.info(
-                "[stt] mic language probe: %s (prob=%.2f)", mic_lang, mic_lang_prob
-            )
-            if (
-                mic_lang != "en"
-                and mic_lang_prob >= self.cfg.stt.non_english_discard_prob
-            ):
-                log.info(
-                    "[session] DISCARDED (mic confidently non-English: %s @ %.2f)",
-                    mic_lang,
-                    mic_lang_prob,
-                )
-                self._captures_discarded += 1
-                await self._write_dropped_async(
-                    buffers,
-                    "non_english",
-                    proc_id,
-                    extra={
-                        "detected_lang": mic_lang,
-                        "prob": round(float(mic_lang_prob), 2),
-                    },
-                )
-                try:
-                    self.notifier.notify(
-                        "Capture discarded",
-                        f"We only coach English right now (detected {mic_lang}). Discarded this session.",
-                    )
-                except Exception:
-                    log.debug("[app] discard toast failed", exc_info=True)
-                return
-
-        # 2b. Transcribe both sources in the heavy worker.
-        # Density branch: when the user was barely present (e.g. passive media
-        # + occasional comment), transcribe system audio only in ±pad windows
-        # around mic VAD segments. Cuts STT cost dramatically; the cheap
-        # pre-STT gate has already decided whether the session is kept.
-        elapsed = max(buffers.elapsed(), 1e-6)
-        density = gate.mic_total / elapsed
-        sys_pcm_full = bytes(buffers.sys_pcm)
-        if density < self.cfg.conversation.stt_full_density:
-            sys_pcm_for_stt = build_windowed_pcm(
-                sys_pcm_full,
-                buffers.mic_segments,
-                pad_secs=self.cfg.conversation.stt_context_pad_secs,
-                sample_rate=sr,
-            )
-            mode = "windowed"
-        else:
-            sys_pcm_for_stt = sys_pcm_full
-            mode = "full"
-        log.info(
-            "[stt] mode=%s density=%.3f transcribing mic=%.1fs sys=%.1fs (orig sys=%.1fs)",
-            mode,
-            density,
-            len(mic_bytes) / 2 / sr,
-            len(sys_pcm_for_stt) / 2 / sr,
-            len(sys_pcm_full) / 2 / sr,
-        )
-        mic_segs, sys_segs = await loop.run_in_executor(
-            self._executor, self._transcribe_both, mic_bytes, sys_pcm_for_stt, sr
-        )
-
-        # 3. Speaker tagging + transcript merge
-        transcript = await loop.run_in_executor(
-            self._executor,
-            self._build_transcript,
-            mic_segs,
-            sys_segs,
-            bytes(buffers.mic_pcm),
-            bytes(buffers.sys_pcm),
-            sr,
-        )
-        for line in transcript:
-            log.info("[transcript] %7.2fs %s: %s", line.start, line.speaker, line.text)
-
-        if not transcript:
-            log.info("[session] DISCARDED (empty transcript)")
-            self._captures_discarded += 1
-            await self._write_dropped_async(buffers, "empty_transcript", proc_id)
-            try:
-                self.notifier.notify(
-                    "Capture discarded",
-                    "No clear speech was detected. Discarded this session.",
-                )
-            except Exception:
-                log.debug("[app] discard toast failed", exc_info=True)
-            return
-
-        # 4. Build the placeholder title — the server overwrites it post-upload.
-        total_duration = max(len(buffers.mic_pcm), len(buffers.sys_pcm)) / 2 / sr
-
-        # 5a. Apply DSP to the raw session PCM. Mic gets the full chain
+        # 2. Apply DSP to the raw session PCM. Mic gets the full chain
         # (highpass + noisereduce + peak-norm); system gets a light touch
-        # (highpass + peak-norm). This must happen BEFORE the VAD zero-fill
-        # below — noisereduce's stationary-mode noise estimator would
-        # collapse to ~0 if it saw long stretches of synthetic zeros, and
-        # the denoiser would effectively disable itself. Transcription and
-        # speaker embedding already ran on raw PCM upstream so DSP here has
-        # zero impact on STT quality.
+        # (highpass + peak-norm). Runs on the raw buffers because
+        # noisereduce's stationary-mode noise estimator would collapse to
+        # ~0 if it saw long stretches of synthetic zeros and effectively
+        # disable itself; the per-channel windowing below removes echo /
+        # dead-air regions from the encoded output instead.
         mic_dsp, sys_dsp = await asyncio.gather(
             loop.run_in_executor(
                 self._executor, apply_mic_dsp,
@@ -728,19 +558,18 @@ class Agent:
             ),
         )
 
-        # 5b. Trim dead air from the final audio. Per-channel: each track
+        # 3. Trim dead air from the final audio. Per-channel: each track
         # trims against its OWN VAD segments. Mic uses mic_segments (already
         # echo-cleaned at step 0), so echo-only periods are silent on the
         # saved mic track; sys uses sys_segments and carries the far-side
-        # audio as usual. Timestamps are preserved 1:1 — `relevant_span` and
-        # transcript offsets still line up with the saved file.
+        # audio as usual.
         #
         # Before zeroing, merge any two segments on a channel whose gap is
         # shorter than `final_audio_merge_gap_secs`. This preserves
         # conversational pauses (response latency, thinking beats, intra-
         # turn hesitation) as real audio — those pauses are coachable
-        # signal for speech analysis. True dead air longer than the merge
-        # gap still gets removed.
+        # signal for the server-side analysis. True dead air longer than
+        # the merge gap still gets removed.
         gap = self.cfg.conversation.final_audio_merge_gap_secs
         pad = self.cfg.conversation.final_audio_speech_pad_secs
         mic_trim_segs = merge_close_segments(list(buffers.mic_segments), gap_secs=gap)
@@ -772,7 +601,7 @@ class Agent:
             full_secs,
         )
 
-        # 6. Sink + upload
+        # 4. Sink + upload
         # Derive wall-clock started_at / ended_at from the PCM timeline so
         # record.json lines up with the saved Opus file. `session_t0_mono`
         # may be earlier than `started_monotonic` (backfill extends the
@@ -782,21 +611,9 @@ class Agent:
         true_started_at = buffers.started_at - timedelta(seconds=backfill_secs)
         pcm_duration = buffers.pcm_duration(sr)
         ended_at = true_started_at + timedelta(seconds=pcm_duration)
-        # Placeholder title shipped client-side; server overwrites via the
-        # upload response (see metadata flags below). Summary is left empty
-        # for the server to fill.
-        placeholder_title = _placeholder_title(buffers.arm_app_key, true_started_at)
-        placeholder_summary = ""
-        full_span = (0.0, total_duration)
         metadata = {
             "close_reason": buffers.close_reason.value if buffers.close_reason else None,
             "upload": empty_upload_state(),
-            # Signals to the server that title/summary need server-side
-            # generation. Old clients omit ``local_llm_used``; missing OR
-            # True means the client title is real and shouldn't be
-            # regenerated.
-            "local_llm_used": False,
-            "placeholder_title": True,
         }
         if eg_report is not None:
             metadata["echo_guard"] = {
@@ -810,10 +627,7 @@ class Agent:
         record = await loop.run_in_executor(
             self._executor,
             lambda: self.sink.write(
-                transcript,
-                placeholder_title,
-                placeholder_summary,
-                full_span,
+                buffers.arm_app_key,
                 true_started_at,
                 ended_at,
                 mic_final,
@@ -826,93 +640,6 @@ class Agent:
         rec_dir = self.cfg.captures_dir / record.id
         await self.retry_mgr.try_upload(record, rec_dir)
         self._captures_kept += 1
-
-        duration_s = (ended_at - true_started_at).total_seconds()
-        if self.cfg.notify_capture_saved:
-            body = f"{placeholder_title} \u00b7 {_format_duration(duration_s)}"
-            await loop.run_in_executor(
-                self._executor, self.notifier.notify, "Conversation saved", body
-            )
-
-    def _transcribe_both(
-        self, mic_pcm: bytes, sys_pcm: bytes, sr: int
-    ) -> tuple[list[TranscribedSegment], list[TranscribedSegment]]:
-        mic_segs = self.stt.transcribe_pcm16(mic_pcm, sample_rate=sr) if mic_pcm else []
-        sys_segs = self.stt.transcribe_pcm16(sys_pcm, sample_rate=sr) if sys_pcm else []
-        return mic_segs, sys_segs
-
-    def _build_transcript(
-        self,
-        mic_segs: list[TranscribedSegment],
-        sys_segs: list[TranscribedSegment],
-        mic_pcm: bytes,
-        sys_pcm: bytes,
-        sr: int,
-    ) -> list[TranscriptLine]:
-        lines: list[TranscriptLine] = []
-
-        # Mic segments → always "user". The mic is the user's own device;
-        # whatever it picks up is treated as the user's speech. Split on
-        # internal word-gaps so late-segment words (after a turn-taking
-        # pause) land after the other speaker's interjection in the final
-        # sort, not before it.
-        for s in mic_segs:
-            for start, end, text in _split_segment_by_word_gaps(s, TRANSCRIPT_WORD_GAP_SECS):
-                if text:
-                    lines.append(
-                        TranscriptLine(speaker="user", start=start, end=end, text=text)
-                    )
-
-        # System segments → other_N via greedy clustering on embeddings.
-        # Embeddings use the ORIGINAL (unsplit) segment audio so voice-
-        # matching stays robust; sub-segments from one Whisper segment all
-        # inherit its speaker label.
-        sys_embeds: list[np.ndarray] = []
-        sys_keep_idx: list[int] = []
-        for i, s in enumerate(sys_segs):
-            pcm_slice = self._slice_pcm_float(sys_pcm, s.start, s.end, sr)
-            if pcm_slice.size == 0:
-                sys_embeds.append(np.zeros(256, dtype=np.float32))
-                sys_keep_idx.append(i)
-                continue
-            try:
-                emb = self.speaker.embed(pcm_slice)
-            except Exception:
-                log.warning(
-                    "[transcript] speaker embed failed for segment %.2f-%.2fs "
-                    "— labelling will fall back to all-zero embedding",
-                    s.start, s.end, exc_info=True,
-                )
-                emb = np.zeros(256, dtype=np.float32)
-            sys_embeds.append(emb)
-            sys_keep_idx.append(i)
-
-        labels = self.speaker.cluster_others(sys_embeds) if sys_embeds else []
-        for label, idx in zip(labels, sys_keep_idx):
-            s = sys_segs[idx]
-            speaker = f"other_{label + 1}"
-            for start, end, text in _split_segment_by_word_gaps(s, TRANSCRIPT_WORD_GAP_SECS):
-                if text:
-                    lines.append(
-                        TranscriptLine(speaker=speaker, start=start, end=end, text=text)
-                    )
-
-        lines.sort(key=lambda l: l.start)
-        return lines
-
-    @staticmethod
-    def _slice_pcm_float(pcm16: bytes, start_s: float, end_s: float, sr: int) -> np.ndarray:
-        a = max(0, int(start_s * sr)) * 2
-        b = max(a, int(end_s * sr)) * 2
-        chunk = pcm16[a:b]
-        if not chunk:
-            return np.zeros(0, dtype=np.float32)
-        arr = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
-        # Resemblyzer chokes on near-silent slices (divide-by-zero in dBFS).
-        # Treat anything below ~ -60 dBFS as empty so callers skip embedding.
-        if arr.size == 0 or float(np.sqrt(np.mean(arr * arr))) < 1e-3:
-            return np.zeros(0, dtype=np.float32)
-        return arr
 
     # ---- lifecycle ---------------------------------------------------------
 

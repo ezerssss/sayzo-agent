@@ -59,24 +59,6 @@ silero_onnx = silero_pkg / "data" / "silero_vad.onnx"
 if silero_onnx.exists():
     datas.append((str(silero_onnx), "silero_vad/data"))
 
-# faster-whisper's internal VAD ONNX — different file from silero_vad above.
-# Loaded lazily by faster_whisper.vad when transcribe(vad_filter=True) is used
-# (see sayzo_agent/stt.py), and PyInstaller doesn't pick up non-Python package
-# data without an explicit entry.
-import faster_whisper
-fw_pkg = Path(faster_whisper.__file__).parent
-fw_vad_onnx = fw_pkg / "assets" / "silero_vad_v6.onnx"
-if fw_vad_onnx.exists():
-    datas.append((str(fw_vad_onnx), "faster_whisper/assets"))
-
-# Resemblyzer ships pretrained speaker-embedding weights as package data.
-# VoiceEncoder() loads it at construction time (sayzo_agent/speaker.py).
-import resemblyzer
-resemblyzer_pkg = Path(resemblyzer.__file__).parent
-resemblyzer_pt = resemblyzer_pkg / "pretrained.pt"
-if resemblyzer_pt.exists():
-    datas.append((str(resemblyzer_pt), "resemblyzer"))
-
 # macOS: bundle the pre-compiled audio-tap binary (CoreAudio Process Taps helper).
 if sys.platform == "darwin":
     audio_tap = Path("sayzo_agent/capture/audio-tap/audio-tap")
@@ -124,13 +106,6 @@ hiddenimports = [
     # VAD
     "silero_vad",
     "onnxruntime",
-    # STT
-    "faster_whisper",
-    "ctranslate2",
-    # Speaker embedding
-    "resemblyzer",
-    "librosa",
-    "webrtcvad",
     # Audio encoding
     "av",
     # Config

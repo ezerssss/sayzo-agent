@@ -40,9 +40,9 @@ class SessionBuffers:
     After the detector closes a session, `mic_pcm` and `sys_pcm` are the same
     length and both start at `session_t0_mono` in `time.monotonic()` seconds:
     `mic_pcm[sample_N]` and `sys_pcm[sample_N]` correspond to the same
-    wall-clock moment. All `SpeechSegment.start_ts` / `end_ts` and all
-    Whisper-derived timestamps after STT are in session seconds (= seconds
-    from `session_t0_mono`) so they index either PCM buffer directly.
+    wall-clock moment. All `SpeechSegment.start_ts` / `end_ts` are in session
+    seconds (= seconds from `session_t0_mono`) so they index either PCM
+    buffer directly.
     """
 
     mic_pcm: bytearray = field(default_factory=bytearray)
@@ -51,7 +51,7 @@ class SessionBuffers:
     sys_segments: list[SpeechSegment] = field(default_factory=list)
     # Mic VAD segments that the echo guard classified as speaker-to-mic bleed
     # and removed from `mic_segments`. Preserved so downstream steps can zero
-    # the corresponding mic PCM before STT and include the spans in
+    # the corresponding mic PCM before encoding and include the spans in
     # record.json metadata / debug dumps. Empty when echo guard is disabled
     # or found nothing to drop.
     mic_echo_segments: list[SpeechSegment] = field(default_factory=list)
@@ -67,8 +67,9 @@ class SessionBuffers:
     close_reason: Optional[SessionCloseReason] = None
     # Arm-app key (e.g. "zoom", "discord") when the session was opened via a
     # whitelist match. None for hotkey arms or when the arm reason had no
-    # app attribution. Used downstream to build the placeholder title that
-    # ships with the upload until the server generates a real one.
+    # app attribution. Used by the sink to build the locally-cached
+    # placeholder title shown in Settings → Captures until polling fetches
+    # the server-generated one.
     arm_app_key: Optional[str] = None
 
     def mic_total_voiced(self) -> float:
@@ -93,21 +94,18 @@ class SessionBuffers:
 
 
 @dataclass
-class TranscriptLine:
-    speaker: str  # "user", "other_1", "other_2", ...
-    start: float
-    end: float
-    text: str
-
-
-@dataclass
 class ConversationRecord:
+    """On-disk metadata for one kept capture.
+
+    Transcript + speaker labels are server-side concerns now (Deepgram
+    Nova-3 multichannel + diarize). The agent persists the local placeholder
+    title at sink time and the capture poller overwrites it once the server
+    has a real one. ``summary`` starts empty and lands the same way.
+    """
+
     id: str
     started_at: datetime
     ended_at: datetime
-    transcript: list[TranscriptLine]
-    title: str
-    summary: str
-    audio_path: str  # relative to capture directory
-    relevant_span: tuple[float, float]
+    title: str         # local placeholder; polling overwrites once analyzed
+    summary: str       # "" until polling fills it
     metadata: dict = field(default_factory=dict)

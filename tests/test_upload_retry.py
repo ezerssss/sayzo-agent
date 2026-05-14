@@ -154,11 +154,8 @@ def _make_record(rec_id: str, started_at: datetime) -> ConversationRecord:
         id=rec_id,
         started_at=started_at,
         ended_at=started_at + timedelta(minutes=1),
-        transcript=[],
         title=f"Session {rec_id}",
-        summary="Test",
-        audio_path="audio.opus",
-        relevant_span=(0.0, 1.0),
+        summary="",
         metadata={"close_reason": "joint_silence", "upload": empty_upload_state()},
     )
 
@@ -246,89 +243,72 @@ async def test_live_upload_success_updates_metadata(env):
     assert state["last_error_kind"] is None
 
 
-async def test_server_response_overwrites_placeholder_title_and_summary(env):
-    """When the upload response carries title/summary/relevant_span, those
-    values overwrite the local placeholder and clear the placeholder flag."""
-    rec_dir, record = _write_capture(
-        env.captures_dir, "rec_overwrite", env.clock()
-    )
-    # Mark the local copy as a placeholder so we can verify the flag flips.
-    rec_data = json.loads((rec_dir / "record.json").read_text(encoding="utf-8"))
-    rec_data["title"] = "Conversation · 2026-04-21 12:00"
-    rec_data["summary"] = ""
-    rec_data["metadata"]["placeholder_title"] = True
-    rec_data["metadata"]["local_llm_used"] = False
-    (rec_dir / "record.json").write_text(json.dumps(rec_data), encoding="utf-8")
-    record = read_record_from_dir(rec_dir)
+async def test_upload_success_invokes_on_upload_success_hook(env, tmp_path):
+    """On UploadOutcome.SUCCESS with a server_capture_id, the manager must
+    spawn the on_upload_success hook (CapturePoller.poll in production) so
+    the poller can fetch the server-generated title/summary later. The
+    hook receives (rec_dir, server_capture_id) and runs fire-and-forget."""
+    captures_dir = tmp_path / "captures_hook"
+    captures_dir.mkdir()
+    seen: list[tuple[Path, str]] = []
 
-    env.upload.enqueue(
-        "success",
-        capture_id="srv_overwrite",
-        title="Standup with backend team",
-        summary="Discussed indexer rollout and migration plan.",
-        relevant_span=[12.5, 412.0],
+    async def _on_success(rec_dir: Path, server_capture_id: str) -> None:
+        seen.append((rec_dir, server_capture_id))
+
+    mgr = UploadRetryManager(
+        captures_dir=captures_dir,
+        upload_client=env.upload,
+        notifier=env.notifier,
+        executor=env.executor,
+        config=env.cfg,
+        clock=env.clock,
+        webapp_base_url="https://sayzo.app",
+        on_upload_success=_on_success,
     )
-    outcome = await env.mgr.try_upload(record, rec_dir)
+    rec_dir, record = _write_capture(captures_dir, "rec_hook", env.clock())
+    env.upload.enqueue("success", capture_id="srv_hook")
+    outcome = await mgr.try_upload(record, rec_dir)
     assert outcome == UploadOutcome.SUCCESS
-
-    overwritten = read_record_from_dir(rec_dir)
-    assert overwritten.title == "Standup with backend team"
-    assert overwritten.summary == "Discussed indexer rollout and migration plan."
-    assert overwritten.relevant_span == (12.5, 412.0)
-    assert overwritten.metadata.get("placeholder_title") is False
-    # Upload state is still updated correctly.
-    state = overwritten.metadata["upload"]
-    assert state["status"] == STATUS_UPLOADED
-    assert state["server_capture_id"] == "srv_overwrite"
+    # Hook fires as create_task — yield once so the task can run.
+    await asyncio.sleep(0)
+    assert seen == [(rec_dir, "srv_hook")]
 
 
-async def test_server_response_without_overwrite_leaves_placeholder(env):
-    """If the response only carries capture_id, the local placeholder
-    title/summary/span are kept untouched (server hasn't generated yet)."""
-    rec_dir, record = _write_capture(
-        env.captures_dir, "rec_no_overwrite", env.clock()
+async def test_upload_success_without_server_capture_id_skips_hook(env, tmp_path):
+    """If the upload response omits capture_id, the poller hook is NOT
+    spawned (there's nothing to poll on)."""
+    captures_dir = tmp_path / "captures_noid"
+    captures_dir.mkdir()
+    seen: list[tuple[Path, str]] = []
+
+    async def _on_success(rec_dir: Path, server_capture_id: str) -> None:
+        seen.append((rec_dir, server_capture_id))
+
+    mgr = UploadRetryManager(
+        captures_dir=captures_dir,
+        upload_client=env.upload,
+        notifier=env.notifier,
+        executor=env.executor,
+        config=env.cfg,
+        clock=env.clock,
+        webapp_base_url="https://sayzo.app",
+        on_upload_success=_on_success,
     )
-    rec_data = json.loads((rec_dir / "record.json").read_text(encoding="utf-8"))
-    rec_data["title"] = "Conversation · 2026-04-21 12:00"
-    rec_data["metadata"]["placeholder_title"] = True
-    (rec_dir / "record.json").write_text(json.dumps(rec_data), encoding="utf-8")
-    record = read_record_from_dir(rec_dir)
 
-    env.upload.enqueue("success", capture_id="srv_pending")
-    outcome = await env.mgr.try_upload(record, rec_dir)
+    # Replace the mock to return a response with no capture_id.
+    class _NoIdClient:
+        calls: list[str] = []
+
+        async def upload(self, record: ConversationRecord) -> dict | None:
+            self.calls.append(record.id)
+            return {}  # no capture_id
+
+    mgr._upload_client = _NoIdClient()
+    rec_dir, record = _write_capture(captures_dir, "rec_noid", env.clock())
+    outcome = await mgr.try_upload(record, rec_dir)
     assert outcome == UploadOutcome.SUCCESS
-
-    after = read_record_from_dir(rec_dir)
-    assert after.title == "Conversation · 2026-04-21 12:00"
-    # Placeholder flag stays True until server actually overwrites.
-    assert after.metadata.get("placeholder_title") is True
-
-
-async def test_server_partial_overwrite_only_touches_provided_fields(env):
-    """Server returning only `title` shouldn't blank the local summary."""
-    rec_dir, record = _write_capture(
-        env.captures_dir, "rec_partial", env.clock()
-    )
-    rec_data = json.loads((rec_dir / "record.json").read_text(encoding="utf-8"))
-    rec_data["title"] = "Conversation · placeholder"
-    rec_data["summary"] = ""  # placeholder
-    rec_data["metadata"]["placeholder_title"] = True
-    (rec_dir / "record.json").write_text(json.dumps(rec_data), encoding="utf-8")
-    record = read_record_from_dir(rec_dir)
-
-    env.upload.enqueue(
-        "success",
-        capture_id="srv_partial",
-        title="Real title only",
-    )
-    outcome = await env.mgr.try_upload(record, rec_dir)
-    assert outcome == UploadOutcome.SUCCESS
-
-    after = read_record_from_dir(rec_dir)
-    assert after.title == "Real title only"
-    # Summary unchanged (still the empty placeholder); span unchanged.
-    assert after.summary == ""
-    assert after.metadata.get("placeholder_title") is False
+    await asyncio.sleep(0)
+    assert seen == []
 
 
 async def test_live_upload_transient_schedules_retry(env):

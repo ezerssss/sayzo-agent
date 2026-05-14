@@ -1,27 +1,49 @@
-"""Persist ConversationRecord + compressed audio to disk."""
+"""Persist ConversationRecord + compressed audio to disk.
+
+Schema (v3.0+): the agent owns id / timestamps / a synthetic local placeholder
+title / arbitrary metadata only. Transcript, speaker labels, and the real
+title/summary live server-side; ``CapturePoller`` later overwrites the local
+placeholder title with the real one for display in Settings → Captures.
+
+Two serializers:
+
+- ``serialize_record`` — full local schema (id, timestamps, title, summary,
+  metadata). Goes to disk in ``record.json``.
+- ``serialize_record_for_upload`` — upload-only subset (id, timestamps,
+  metadata.close_reason). The HTTP body — server doesn't need our placeholder
+  or local-only metadata blobs.
+"""
 from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
+import time
 import uuid
-from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 
-from .models import ConversationRecord, TranscriptLine
+from .models import ConversationRecord
 
 log = logging.getLogger(__name__)
 
 
+# Filename of the encoded stereo Opus blob inside each capture directory.
+# Hard-coded — every consumer (sink, upload client, captures pane) derives
+# the path from the rec_id + this constant.
+AUDIO_FILENAME = "audio.opus"
+
+
 # Reasons a session can be dropped (silent skips that the Captures pane
-# surfaces under "Skipped"). The labels are the user-facing copy.
+# surfaces under "Skipped"). The labels are the user-facing copy. Legacy
+# reason values from older agent versions are rendered via
+# ``captures_index._DROPPED_LABELS`` on read.
 DROPPED_REASON_LABELS: dict[str, str] = {
     "gate_failed": "Skipped — not enough conversation",
-    "non_english": "Skipped — wasn't English",
-    "empty_transcript": "Skipped — nothing was transcribed",
 }
 
 # Most-recent N dropped stubs to keep on disk. Older are pruned at write time
@@ -39,6 +61,10 @@ def encode_opus_stereo(
     application: str = "audio",
 ) -> None:
     """Encode mic (L) + system (R) as a single stereo Opus file via PyAV.
+
+    Left=mic / right=system is load-bearing: the server's per-speaker
+    diarization (Deepgram multichannel) keys off the physical channel split.
+    Never collapse to mono.
 
     ``application`` maps to libopus's own ``application`` flag:
       - ``audio`` (default) — libopus's general-purpose mode; preserves high
@@ -88,32 +114,84 @@ def encode_opus_stereo(
     container.close()
 
 
+def _placeholder_title(arm_app_key: Optional[str], started_at: datetime) -> str:
+    """Build the local placeholder title shown in Settings → Captures.
+
+    Deterministic so the pane has something readable as soon as the capture
+    lands on disk. ``CapturePoller`` later overwrites it with the real
+    server-generated title once ``GET /api/captures/{id}`` reports the
+    capture is past the transcribed/analyzed milestones.
+    """
+    stamp = started_at.strftime("%Y-%m-%d %H:%M")
+    if arm_app_key:
+        return f"{arm_app_key.title()} call · {stamp}"
+    return f"Conversation · {stamp}"
+
+
 def serialize_record(record: ConversationRecord) -> dict:
+    """Full local schema — what goes to disk in ``record.json``."""
     return {
         "id": record.id,
         "started_at": record.started_at.isoformat(),
         "ended_at": record.ended_at.isoformat(),
         "title": record.title,
         "summary": record.summary,
-        "transcript": [asdict(t) for t in record.transcript],
-        "audio_path": record.audio_path,
-        "relevant_span": list(record.relevant_span),
         "metadata": record.metadata,
     }
 
 
+def serialize_record_for_upload(record: ConversationRecord) -> dict:
+    """Upload-only subset — what goes into the multipart ``record`` field.
+
+    The server only needs id + timestamps + close_reason to dedupe, file,
+    and emit lifecycle hooks. Title/summary it generates itself; transcript
+    + diarization come from Deepgram; ``metadata.upload`` and
+    ``metadata.echo_guard`` are local-only diagnostics.
+    """
+    return {
+        "id": record.id,
+        "started_at": record.started_at.isoformat(),
+        "ended_at": record.ended_at.isoformat(),
+        "metadata": {
+            "close_reason": record.metadata.get("close_reason"),
+        },
+    }
+
+
 def deserialize_record(data: dict) -> ConversationRecord:
+    """Read a record.json dict into ConversationRecord.
+
+    Pre-3.0 records carry extra top-level keys (``transcript``,
+    ``audio_path``, ``relevant_span``) and extra metadata keys
+    (``local_llm_used``, ``placeholder_title``). Those simply aren't read
+    here — `ConversationRecord` doesn't declare them — so legacy files
+    deserialize fine and the extra keys stay in `data` for whoever wants
+    them.
+    """
     return ConversationRecord(
         id=data["id"],
         started_at=datetime.fromisoformat(data["started_at"]),
         ended_at=datetime.fromisoformat(data["ended_at"]),
-        transcript=[TranscriptLine(**t) for t in data["transcript"]],
         title=data.get("title", ""),
-        summary=data["summary"],
-        audio_path=data["audio_path"],
-        relevant_span=tuple(data["relevant_span"]),
+        summary=data.get("summary", ""),
         metadata=data.get("metadata", {}),
     )
+
+
+def read_record_from_dir(rec_dir: Path) -> ConversationRecord:
+    """Read record.json from a capture directory into a ConversationRecord."""
+    with (rec_dir / "record.json").open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    return deserialize_record(data)
+
+
+def write_record_atomic(rec_dir: Path, record: ConversationRecord) -> None:
+    """Write record.json via temp-file + os.replace (atomic on Windows + POSIX)."""
+    target = rec_dir / "record.json"
+    tmp = rec_dir / f"record.json.tmp-{os.getpid()}-{time.monotonic_ns()}"
+    payload = json.dumps(serialize_record(record), indent=2, ensure_ascii=False)
+    tmp.write_text(payload, encoding="utf-8")
+    os.replace(tmp, target)
 
 
 class CaptureSink:
@@ -129,10 +207,7 @@ class CaptureSink:
 
     def write(
         self,
-        transcript: list[TranscriptLine],
-        title: str,
-        summary: str,
-        relevant_span: tuple[float, float],
+        arm_app_key: Optional[str],
         started_at: datetime,
         ended_at: datetime,
         mic_pcm16: bytes,
@@ -141,42 +216,40 @@ class CaptureSink:
         metadata: dict | None = None,
         rec_id: str | None = None,
     ) -> ConversationRecord:
+        """Persist a kept session: encode the stereo Opus blob + write
+        ``record.json`` with the local placeholder title.
+
+        The capture poller will later overwrite ``title`` / ``summary`` once
+        the server has the real ones.
+        """
         rec_id = rec_id or uuid.uuid4().hex[:12]
         rec_dir = self.captures_dir / rec_id
         rec_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save the FULL session audio and transcript. ``relevant_span`` is
-        # stored as metadata only; downstream server analysis decides what
-        # to trim. The agent now ships the full-session span by default
-        # (start=0, end=duration); cropping happens server-side when needed.
-        start_s, end_s = relevant_span
-        audio_rel = "audio.opus"
         encode_opus_stereo(
             bytes(mic_pcm16),
             bytes(sys_pcm16),
-            rec_dir / audio_rel,
+            rec_dir / AUDIO_FILENAME,
             sample_rate=sample_rate,
             bitrate=self.opus_bitrate,
             application=self.opus_application,
         )
 
+        title = _placeholder_title(arm_app_key, started_at)
         record = ConversationRecord(
             id=rec_id,
             started_at=started_at,
             ended_at=ended_at,
-            transcript=list(transcript),
             title=title,
-            summary=summary,
-            audio_path=audio_rel,
-            relevant_span=(start_s, end_s),
+            summary="",
             metadata=metadata or {},
         )
         json_path = rec_dir / "record.json"
         with json_path.open("w", encoding="utf-8") as f:
             json.dump(serialize_record(record), f, indent=2, ensure_ascii=False)
         log.info("[sink] wrote capture id=%s title=%r", rec_id, title)
-        log.info("[sink]   transcript: %s", json_path.resolve())
-        log.info("[sink]   audio:      %s", (rec_dir / audio_rel).resolve())
+        log.info("[sink]   record:     %s", json_path.resolve())
+        log.info("[sink]   audio:      %s", (rec_dir / AUDIO_FILENAME).resolve())
         return record
 
     def write_dropped(
@@ -190,10 +263,9 @@ class CaptureSink:
     ) -> str:
         """Persist a tiny stub for a dropped session — no audio.
 
-        Used by `app.py` at each discard point (gate fail, non-English, empty
-        transcript) so the user can see in Settings → Captures that Sayzo
-        heard them and decided not to keep this one. Returns the stub's
-        record id.
+        Used by `app.py` when the cheap gate fails so the user can see in
+        Settings → Captures that Sayzo heard them and decided not to keep
+        this one. Returns the stub's record id.
         """
         rec_id = rec_id or uuid.uuid4().hex[:12]
         rec_dir = self.captures_dir / rec_id
@@ -217,11 +289,8 @@ class CaptureSink:
             id=rec_id,
             started_at=started_at,
             ended_at=ended_at,
-            transcript=[],
             title="",
             summary="",
-            audio_path="",
-            relevant_span=(0.0, 0.0),
             metadata={
                 "dropped": dropped_meta,
                 "upload": discarded_locally_state(),

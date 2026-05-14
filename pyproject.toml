@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sayzo-agent"
-version = "2.18.1"
-description = "Armed-only capture agent for Sayzo — records meetings on user consent (hotkey or whitelisted meeting app) and feeds them to downstream English-coaching analysis."
+version = "3.0.0"
+description = "Armed-only capture agent for Sayzo — records meetings on user consent (hotkey or whitelisted meeting app), uploads raw stereo OGG Opus to the server, polls for the post-transcription title/summary."
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.26",
@@ -17,13 +17,6 @@ dependencies = [
     "sounddevice>=0.4.6",
     "PyAudioWPatch>=0.2.12; sys_platform == 'win32'",
     "silero-vad>=5.1",
-    "faster-whisper>=1.0.3",
-    # resemblyzer: install separately with --no-deps because it pins the
-    # source-only `webrtcvad`. See README. Order:
-    #   pip install webrtcvad-wheels librosa
-    #   pip install resemblyzer --no-deps
-    "webrtcvad-wheels>=2.0.14",
-    "librosa>=0.10",
     "av>=12.0",
     "pydantic>=2.6",
     "pydantic-settings>=2.2",

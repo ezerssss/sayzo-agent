@@ -21,7 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from .config import UploadConfig
 from .models import ConversationRecord
@@ -36,7 +36,7 @@ from .retry import (
     record_attempt_result,
     record_attempt_start,
 )
-from .sink import deserialize_record, serialize_record
+from .sink import read_record_from_dir, write_record_atomic
 from .upload import UploadClient
 
 log = logging.getLogger(__name__)
@@ -81,22 +81,6 @@ class PauseState:
         }
 
 
-def read_record_from_dir(rec_dir: Path) -> ConversationRecord:
-    """Read record.json from a capture directory into a ConversationRecord."""
-    with (rec_dir / "record.json").open("r", encoding="utf-8") as f:
-        data = json.load(f)
-    return deserialize_record(data)
-
-
-def write_record_atomic(rec_dir: Path, record: ConversationRecord) -> None:
-    """Write record.json via temp-file + os.replace (atomic on Windows + POSIX)."""
-    target = rec_dir / "record.json"
-    tmp = rec_dir / f"record.json.tmp-{os.getpid()}-{time.monotonic_ns()}"
-    payload = json.dumps(serialize_record(record), indent=2, ensure_ascii=False)
-    tmp.write_text(payload, encoding="utf-8")
-    os.replace(tmp, target)
-
-
 class UploadRetryManager:
     def __init__(
         self,
@@ -108,6 +92,8 @@ class UploadRetryManager:
         auth_client: Any | None = None,
         clock: Callable[[], datetime] | None = None,
         webapp_base_url: str | None = None,
+        on_upload_success: Callable[[Path, str], Awaitable[None]] | None = None,
+        notify_capture_saved: bool = True,
     ) -> None:
         self._captures_dir = captures_dir
         self._upload_client = upload_client
@@ -121,6 +107,11 @@ class UploadRetryManager:
         # reference_deeplink_url memory. ``None`` when there's no auth /
         # NoopUploadClient path; the success toast is skipped cleanly.
         self._webapp_base_url = webapp_base_url
+        # Optional hook spawned fire-and-forget after a successful upload —
+        # must accept (rec_dir, server_capture_id) and swallow its own
+        # errors. See ``CapturePoller.poll``.
+        self._on_upload_success = on_upload_success
+        self._notify_capture_saved = notify_capture_saved
 
         self._pause_state = PauseState()
         self._pause_lock = asyncio.Lock()
@@ -133,6 +124,11 @@ class UploadRetryManager:
 
         self._pause_state_path = self._captures_dir / self._cfg.pause_state_filename
         self._pause_loaded = False
+        # Keep strong refs to in-flight on_upload_success tasks. asyncio
+        # only weakly references running tasks via the event loop, so a
+        # task with no other ref can be GC'd mid-await; stash here and
+        # self-clean on completion. See asyncio.create_task docs.
+        self._success_tasks: set[asyncio.Task] = set()
 
     # ------------------------------------------------------------------
     # Pause state persistence
@@ -276,19 +272,17 @@ class UploadRetryManager:
             ),
         )
 
-        # Apply any server-generated title/summary/relevant_span on top of
-        # the local placeholder. Skipped silently if the response didn't
-        # carry these (old server, async generation pattern, etc.) — the
-        # placeholder stays and a future GET /api/captures/{id} sweep
-        # could pick up the upgrade.
-        if outcome == UploadOutcome.SUCCESS and isinstance(server_response, dict):
-            try:
-                await self._apply_server_overwrite(rec_dir, server_response)
-            except Exception:
-                log.warning(
-                    "[upload] server-overwrite failed id=%s (non-fatal)",
-                    record.id, exc_info=True,
-                )
+        # Fire-and-forget post-upload hook (see CapturePoller.poll).
+        if (
+            outcome == UploadOutcome.SUCCESS
+            and server_capture_id
+            and self._on_upload_success is not None
+        ):
+            task = asyncio.create_task(
+                self._on_upload_success(rec_dir, server_capture_id)
+            )
+            self._success_tasks.add(task)
+            task.add_done_callback(self._success_tasks.discard)
 
         # Global-pause + notification side effects.
         if outcome == UploadOutcome.CREDIT_LIMIT:
@@ -298,7 +292,11 @@ class UploadRetryManager:
 
         if outcome == UploadOutcome.SUCCESS:
             log.info("[upload] success id=%s server_id=%s", record.id, server_capture_id or "?")
-            if server_capture_id and self._webapp_base_url:
+            if (
+                server_capture_id
+                and self._webapp_base_url
+                and self._notify_capture_saved
+            ):
                 url = (
                     self._webapp_base_url.rstrip("/")
                     + f"/app/conversations/{server_capture_id}"
@@ -422,75 +420,6 @@ class UploadRetryManager:
             return new_upload
 
         return await loop.run_in_executor(self._executor, _do)
-
-    async def _apply_server_overwrite(self, rec_dir: Path, body: dict) -> bool:
-        """Overwrite local title / summary / relevant_span from the upload
-        response.
-
-        Called after a successful upload, on the body the server returned
-        alongside ``capture_id``. Each field is independent — we write
-        whichever ones the server supplied, leave the rest as the
-        client-side placeholder. Non-string title / non-string summary /
-        non-2-element-numeric span are ignored.
-
-        Returns True if record.json was rewritten, False otherwise.
-        """
-        title = body.get("title")
-        summary = body.get("summary")
-        span_raw = body.get("relevant_span")
-
-        new_title: str | None = None
-        if isinstance(title, str) and title.strip():
-            new_title = title
-
-        new_summary: str | None = None
-        if isinstance(summary, str):
-            new_summary = summary
-
-        new_span: tuple[float, float] | None = None
-        if (
-            isinstance(span_raw, (list, tuple))
-            and len(span_raw) == 2
-            and all(isinstance(v, (int, float)) for v in span_raw)
-        ):
-            new_span = (float(span_raw[0]), float(span_raw[1]))
-
-        if new_title is None and new_summary is None and new_span is None:
-            return False
-
-        loop = asyncio.get_running_loop()
-
-        def _do() -> bool:
-            record = read_record_from_dir(rec_dir)
-            changed = False
-            if new_title is not None and record.title != new_title:
-                record.title = new_title
-                changed = True
-            if new_summary is not None and record.summary != new_summary:
-                record.summary = new_summary
-                changed = True
-            if new_span is not None and tuple(record.relevant_span) != new_span:
-                record.relevant_span = new_span
-                changed = True
-            # Flip the placeholder flag once any server-generated value
-            # lands; the client-side title/summary are no longer the
-            # placeholder we shipped at upload time.
-            if changed and record.metadata.get("placeholder_title"):
-                record.metadata["placeholder_title"] = False
-            if changed:
-                write_record_atomic(rec_dir, record)
-            return changed
-
-        applied = await loop.run_in_executor(self._executor, _do)
-        if applied:
-            log.info(
-                "[upload] applied server overwrite id=%s (title=%s summary=%s span=%s)",
-                rec_dir.name,
-                "yes" if new_title is not None else "no",
-                "yes" if new_summary is not None else "no",
-                "yes" if new_span is not None else "no",
-            )
-        return applied
 
     # ------------------------------------------------------------------
     # Sweep (startup + periodic) — stubs; filled in next task.

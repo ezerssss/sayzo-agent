@@ -49,7 +49,7 @@ def _setup_file_logging(logs_dir) -> None:
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     root.addHandler(handler)
-    for noisy in ("httpx", "httpcore", "huggingface_hub", "filelock", "faster_whisper"):
+    for noisy in ("httpx", "httpcore", "filelock"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
@@ -803,7 +803,7 @@ def replay(audio_file: str, speed: float, channel: str, dump_wav: bool) -> None:
             # Give the ticker a couple seconds to pick up any just-closed session.
             await asyncio.sleep(3.0)
 
-        # Wait for all in-flight processing tasks (STT, sink) to finish.
+        # Wait for all in-flight processing tasks (DSP, sink, upload) to finish.
         if agent._processing_tasks:
             log.info("waiting for %d processing task(s)...", len(agent._processing_tasks))
             await asyncio.gather(*agent._processing_tasks, return_exceptions=True)
@@ -1511,9 +1511,9 @@ def service(force_setup: bool, from_autostart: bool, open_settings: bool) -> Non
 
     # Heavy-import bootstrap. Defers ``from .app import Agent``, ``from
     # .notify import …``, the Agent constructor, and the daily-drill
-    # scheduler — all together 4–10 s on the first cold path due to
-    # numpy / scipy / silero / faster-whisper / av / pywebview
-    # loading lazily — until AFTER the tray icon has painted.
+    # scheduler — all together 2–5 s on the first cold path due to
+    # numpy / scipy / silero / av / pywebview loading lazily — until
+    # AFTER the tray icon has painted.
     #
     # Dispatcher routes this:
     #   - macOS:   spawned on a worker thread BEFORE ``tray.run_main()``

@@ -15,30 +15,21 @@ Everything runs locally (no paid APIs in the hot path). Armed sessions are bound
 
 ## Install (Windows, Python 3.12)
 
-`resemblyzer` is the one trap. Follow this order on a fresh machine:
+One step on a fresh machine:
 
 ```bash
 py -3.12 -m venv .venv
 .venv\Scripts\activate
-
-# resemblyzer hard-pins source-only `webrtcvad`. Install its prebuilt
-# replacement first, then resemblyzer with --no-deps so pip doesn't
-# re-resolve the source one.
-pip install webrtcvad-wheels librosa
-pip install resemblyzer --no-deps
-
-# Now the rest.
 pip install -e .[dev]
 ```
 
-**New platform deps as of v1.0** (armed-only model):
+No special preamble — `faster-whisper` / `resemblyzer` / `webrtcvad-wheels` / `librosa` were dropped in v3.0 when on-device transcription + speaker embedding moved to the server (Deepgram Nova-3 multichannel + diarize). Contributors no longer need a C toolchain to set up the venv.
+
+**Platform deps**:
 - `pynput` + `psutil` (all platforms) — global hotkey + process queries.
 - `pycaw` + `pywin32` (Windows only, marker-conditional) — WASAPI mic-session enumeration + foreground window.
 - `pyobjc-framework-Cocoa` + `pyobjc-framework-ApplicationServices` (macOS only, marker-conditional) — NSWorkspace frontmost-app + AX browser window-title / URL reads. (CoreAudio bindings are no longer used from Python — the `audio-detect` Swift helper owns that surface; pyobjc-framework-CoreAudio dependency was dropped in v2.5.)
-
-These land via the normal `pip install -e .[dev]` step now — no special handling.
-
-`resemblyzer` will print a `pip` warning that `webrtcvad` and `typing` are missing. Both are harmless: `webrtcvad-wheels` provides the same `webrtcvad` Python module under a different distribution name, and Python 3.12 has `typing` built in.
+- `PySide6` + `PySide6-Addons` — HUD subprocess (QtWebEngine for per-pixel-alpha transparency on Windows 10+).
 
 ## Common commands
 
@@ -95,6 +86,8 @@ Toggle the entire system with `SAYZO_NOTIFICATIONS_ENABLED=0` (returns `NoopNoti
 
 The pipeline is **staged by cost** — cheap stages run continuously (while armed), expensive stages only run on data that survived the cheap gates. The arm model is layered on top: when disarmed, zero audio flows. When armed, the same pipeline the agent always had runs.
 
+Transcription and speaker labels are server-side concerns now (Deepgram Nova-3 with `multichannel=true` + `diarize=true`). The agent uploads stereo OGG Opus (left=mic, right=system) and minimal metadata; the server fills in transcript / title / summary asynchronously and a background poller caches the title/summary back to local `record.json` for the Settings → Captures pane.
+
 ```
 ArmController (DISARMED on launch)
     ↕ [hotkey press → start-confirm toast → arm]
@@ -112,20 +105,22 @@ ConversationDetector (silence-bounded sessions)
 [joint silence 45s → PENDING_CLOSE → end-confirmation toast]
 [toast Yes/timeout → commit_close → sink path; toast No/speech → revert]
     ↓
-Cheap pre-STT gate (substantive user turn rule)
+echo_guard (audio-energy classification; removes speaker-bleed segments from mic_segments)
+    ↓
+Cheap gate (substantive user turn rule)
     ↓ [whole session passes or whole session is dropped]
-faster-whisper (transcribe mic + system separately)
-    ↓
-Speaker tagging (mic = "user" by definition; Resemblyzer greedy clustering on system audio for "other_1", "other_2", …)
-    ↓
-Placeholder title + empty summary (server generates real ones post-upload — see `metadata.local_llm_used=False`, `metadata.placeholder_title=True` in upload payload)
-    ↓
 Post-capture DSP (highpass + spectral-gate denoise on mic; light HPF on system)
-    ↓ [cleans the on-disk audio without affecting STT, which already ran]
-CaptureSink (Opus stereo: mic=L, system=R; record.json)
+    ↓ [cleans the audio before encoding]
+Per-channel VAD windowing + trailing-silence trim (drops dead air + echo regions from the encoded file)
     ↓
-UploadClient (NoopUploadClient until user signs in)
+CaptureSink (Opus stereo: mic=L, system=R; record.json with synthetic placeholder title)
+    ↓
+UploadClient (POST /api/captures/upload, multipart audio + minimal record JSON, X-Agent-Version header)
+    ↓ [on success, server response carries capture_id]
+CapturePoller (background, GET /api/captures/{id} until status≥transcribed; caches title/summary into local record.json)
 ```
+
+Discard paths shrink to one: cheap-gate failure writes a `gate_failed` dropped-stub. Non-English language detection and empty-transcript checks were removed with the on-device STT cut — the server now decides what to do with multilingual / no-speech captures.
 
 ### Arm model (sayzo_agent/arm/)
 
@@ -169,16 +164,16 @@ These are the rules the conversation detector and gate logic encode. Several wer
 
 2. **The substantive-user-turn rule lives in `evaluate_user_turn_gate`** in `conversation.py`. A session passes only if the user has either (a) one continuous turn ≥ `min_user_turn_secs` (default 8 s), OR (b) cumulative voiced time ≥ `min_user_total_secs` over ≥ `min_user_turns_for_total` distinct turns. **The user's substantive turn may come anywhere in the session — including at the very end.** Discarding a session early because the first user turn was an "mhm" is a bug.
 
-3. **When a session passes the gate, the *whole* session is transcribed**, not a trimmed slice. The other-side speech surrounding the user's turns is required context for downstream analysis.
+3. **When a session passes the gate, the *whole* session uploads** — no trimming a slice "to save bytes." The server's Deepgram pass needs the surrounding other-side speech as context for diarization; the agent's job is to deliver a faithful stereo recording, not a curated excerpt.
 
-4. **`title` / `summary` / `relevant_span` are server-side concerns now.** The agent ships a placeholder title (`"Conversation · YYYY-MM-DD HH:MM"` or `"Zoom call · ..."` when an arm-app is known), an empty summary, and a full-session span. The upload payload sets `metadata.local_llm_used=False` + `metadata.placeholder_title=True` so the server knows to overwrite. Don't reintroduce client-side title/summary generation — keep the agent thin.
+4. **Transcript, speaker labels, title, summary are server-side concerns.** The agent writes a local placeholder title (`"Conversation · YYYY-MM-DD HH:MM"` or `"Zoom call · ..."` when the arm-app is known) into `record.json` so the Settings → Captures pane has something readable immediately. The upload payload (`serialize_record_for_upload`) carries only `id` / `started_at` / `ended_at` / `metadata.close_reason` plus the audio blob. `CapturePoller` overwrites the local placeholder title once the server reports `status≥transcribed`. Don't reintroduce on-device STT or speaker embedding — the agent is meant to stay small (~50 MB idle, no GB-class model loads).
 
-5. **Whisper hallucinates "Thank you" / "Thanks for watching" on silence.** Mitigated in `WhisperSTT.transcribe_pcm16` by `vad_filter=True`, `condition_on_previous_text=False`, and tightened `no_speech_threshold` / `log_prob_threshold`. Don't loosen these.
+5. **echo_guard is load-bearing.** `echo_guard.classify_buffers` runs energy-based detection (Welch coherence + Wiener-residual speech probability) on the mic VAD segments and removes speaker-bleed before the gate. The server's `isEchoLeakUtterance` pairs with this — removing echo_guard worsens server-side echo handling. It's pure audio math, no STT dependency.
 
 ### Module responsibilities
 
 - **`conversation.py`** — Pure (no I/O, no models). State machine (IDLE / OPEN / PENDING_CLOSE) + gate. Unit-tested with synthetic VAD events. The most behavior-critical file in the project; treat changes here with care.
-- **`app.py`** — Async orchestrator. Wires ArmController → capture → VAD → detector → heavy-worker pool → sink. `_consume` waits on `arm.armed_event` so frames only flow while armed. All STT / embedding / DSP work runs on a single-worker `ThreadPoolExecutor` so heavy stages never run in parallel and starve the CPU. Capture + VAD run on the asyncio loop. Builds the placeholder title via `_placeholder_title(buffers.arm_app_key, started_at)` and tags the upload `metadata` with `local_llm_used=False`.
+- **`app.py`** — Async orchestrator. Wires ArmController → capture → VAD → detector → heavy-worker pool → sink → upload → poller. `_consume` waits on `arm.armed_event` so frames only flow while armed. Echo_guard + DSP + Opus encoding run on a single-worker `ThreadPoolExecutor` so they never starve the asyncio loop. Capture + VAD run on the loop. The placeholder title is generated by the sink at write time from `buffers.arm_app_key` + `started_at`.
 - **`arm/controller.py`** — ArmController state machine. Owns stream lifecycle, hotkey confirmations, whitelist consent, PENDING_CLOSE handling, long-meeting check-ins, meeting-ended watcher. Unit-tested with fake capture / VAD / notifier / injected platform queries.
 - **`arm/detectors.py`** — Pure matching logic against `DetectorSpec` list from config. No OS calls. Skips specs with `disabled=True` (the Meeting Apps pane's off toggle).
 - **`arm/seen_apps.py`** — Persistence for unmatched mic-holders observed by the whitelist watcher. Written to `data_dir/seen_apps.json`. Capped at 20 entries, dedup'd by lower-cased key, scrubbed against the current whitelist on read. Drives the Settings → Meeting Apps "Suggested to add" section.
@@ -196,11 +191,12 @@ These are the rules the conversation detector and gate logic encode. Several wer
 - **`comtypes_setup.py`** — Redirects comtypes' runtime stub cache from `%TEMP%/comtypes_cache/<exe>-<py>` (volatile — Storage Sense, AV scanners, profile resets blow it away → unhandled exception on next launch) to `data_dir/comtypes_cache` (stable, owned by us). Defense in depth — CI's `scripts/prebake_comtypes.py` runs `comtypes.client.GetModule("UIAutomationCore.dll")` + `stdole2.tlb` before PyInstaller so the bundle ships pre-generated `comtypes.gen.UIAutomationClient` etc. as static .py files and the runtime cache rarely fires at all. Called from `service()` / `run()` in `__main__.py` immediately after logging setup, before any pycaw / uiautomation import. **Don't reintroduce `%TEMP%`-cached COM type-library generation** — it was the root cause of "unhandled exception on first launch after a long-running profile" reports.
 - **`__main__.py::_install_excepthooks`** — Routes unhandled `sys.excepthook` + `threading.excepthook` exceptions to `agent.log` via `log.critical(..., exc_info=...)` *before* the default handler runs. Without this, windowed-exe stderr is `/dev/null`, so the user sees a generic OS "unhandled exception" dialog and we get no traceback to debug from. Installed in both `service()` and `run()` immediately after the logging setup. Don't remove — every weird startup crash report depends on this for postmortem.
 - **`capture/system.py`** — Uses PyAudioWPatch for WASAPI loopback capture. Captures at the device's native sample rate (typically 48 kHz) and resamples to 16 kHz via scipy to avoid quality loss.
-- **`speaker.py`** — Greedy cosine clustering for other-speaker labels (avoids a sklearn dependency). Heavy imports (`resemblyzer`) are lazy so unit tests don't need them.
-- **`dsp.py`** — Pure numpy/scipy post-processing applied at session close, before Opus encoding. Butterworth highpass + `noisereduce` spectral-gate denoise (default `prop_decrease=0.5`, dialed down from 0.85 to avoid phasey artifacts) + peak-normalize on mic; light highpass + peak-normalize on system (no denoise — system audio is typically a clean digital stream already, and aggressive denoising damages music / low-volume speech from the far side). Runs on the heavy-worker executor and is fully decoupled from STT: transcription and speaker embedding read the raw `buffers.mic_pcm` upstream, so DSP here has zero impact on whisper accuracy. All stages are config-flagged under `CaptureConfig` — `SAYZO_CAPTURE__DSP_ENABLED=0` restores raw-PCM output byte-for-byte (minus the encoder's `application` setting, which is intrinsic to the sink path). Opus encoder knobs also live in `CaptureConfig` (`opus_bitrate`, `opus_application`). Default is `application="audio"` at 96 kbps stereo — transparent for speech, usable for music. Capture modules no longer apply per-batch RMS normalization (previously `_TARGET_RMS=0.02` caused audible pumping); raw captured levels flow through and DSP's peak-normalize at session close handles final loudness.
+- **`echo_guard.py`** — Pure numpy/scipy energy classifier. Operates on `SessionBuffers` mic + sys PCM, drops mic VAD segments that correlate strongly with the system channel (Welch coherence + Wiener residual). Removed segments land in `buffers.mic_echo_segments`. Load-bearing — server-side `isEchoLeakUtterance` pairs with it; see Critical design rule 5.
+- **`sink.py`** — Persists `ConversationRecord` (id, timestamps, synthetic placeholder title, empty summary, metadata) to `record.json` and encodes mic+system as a single stereo Opus blob (`audio.opus`, left=mic, right=system). Exposes two serializers: `serialize_record` (full local schema for disk) and `serialize_record_for_upload` (minimal subset for the multipart POST body — no title, summary, transcript, or local-only metadata).
+- **`capture_poller.py`** — Background polling for the server's late-arriving title/summary. After `UploadRetryManager` sees an `UploadOutcome.SUCCESS`, it fires `CapturePoller.poll(rec_dir, capture_id)` as a fire-and-forget asyncio task. Sparse schedule (10/30/60/120/240 s after upload), terminates on `status=analyzed` / `rejected` / `*_failed` or schedule exhaustion. Writes title/summary into `record.json` via `write_record_atomic` once the server reports a post-transcription status. No restart persistence — if the agent crashes mid-poll the placeholder stays; the webapp has its own polling for the live view.
+- **`upload_retry.py`** — Owns per-record retry state in `metadata.upload` and the global pause sidecar (`.upload_state.json`). On success spawns the poller via the injected `on_upload_success` hook. Toast wiring (the "Capture saved to Sayzo" actionable) gated on `Config.notify_capture_saved`.
+- **`dsp.py`** — Pure numpy/scipy post-processing applied at session close, before Opus encoding. Butterworth highpass + `noisereduce` spectral-gate denoise (default `prop_decrease=0.5`, dialed down from 0.85 to avoid phasey artifacts) + peak-normalize on mic; light highpass + peak-normalize on system (no denoise — system audio is typically a clean digital stream already, and aggressive denoising damages music / low-volume speech from the far side). Runs on the heavy-worker executor. All stages are config-flagged under `CaptureConfig` — `SAYZO_CAPTURE__DSP_ENABLED=0` restores raw-PCM output byte-for-byte (minus the encoder's `application` setting, which is intrinsic to the sink path). Opus encoder knobs also live in `CaptureConfig` (`opus_bitrate`, `opus_application`). Default is `application="audio"` at 96 kbps stereo — transparent for speech, usable for music. Capture modules no longer apply per-batch RMS normalization (previously `_TARGET_RMS=0.02` caused audible pumping); raw captured levels flow through and DSP's peak-normalize at session close handles final loudness.
 
 ## Known tech debt
 
-- `resemblyzer` forces source-build of `webrtcvad` → eventually replace with a directly-loaded ONNX speaker encoder. The dev-install instructions above pin `webrtcvad-wheels` first as a workaround so contributors don't need a C toolchain. The plan in `~/.claude/plans/linear-squishing-bird.md` has the full rationale.
-
-Production distribution itself is solid: Windows users get a signed NSIS installer; macOS users get a Developer-ID-signed + Apple-notarized DMG (the CI workflow at `.github/workflows/build.yml` does the signing + `xcrun notarytool` + `xcrun stapler` on every push). The `installer/install.sh` and `install.ps1` one-liners pull from the auto-update host. Auto-update via `latest.json` ships every release.
+Nothing currently blocking. Production distribution is solid: Windows users get a signed NSIS installer; macOS users get a Developer-ID-signed + Apple-notarized DMG (the CI workflow at `.github/workflows/build.yml` does the signing + `xcrun notarytool` + `xcrun stapler` on every push). The `installer/install.sh` and `install.ps1` one-liners pull from the auto-update host. Auto-update via `latest.json` ships every release.

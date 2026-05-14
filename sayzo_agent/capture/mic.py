@@ -172,9 +172,9 @@ class MicCapture:
         # indata: (frames, channels) float32. We always use mono. Raw levels
         # flow through; final loudness is set by DSP peak-normalize at session
         # close. Per-frame RMS normalization used to live here but caused
-        # audible volume pumping without helping STT (Whisper normalizes its
-        # own mel spectrogram internally) or VAD/speaker embedding (both are
-        # volume-robust).
+        # audible volume pumping without helping anything downstream (Silero
+        # VAD is volume-robust; server-side Deepgram does its own gain
+        # control on the uploaded Opus).
         mono = indata[:, 0].copy() if indata.ndim == 2 else indata.copy()
         if self._resample_fn is not None:
             mono = self._resample_fn(mono)

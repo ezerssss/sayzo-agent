@@ -6,9 +6,8 @@ Pipeline per channel:
     system: int16 -> float32 -> highpass(40Hz) ->         -> peak-norm -> int16
 
 This runs on the heavy-worker ``ThreadPoolExecutor`` so it never blocks the
-asyncio loop. Transcription and speaker embedding read the *raw*
-``buffers.mic_pcm`` upstream, so DSP here has zero impact on STT quality — it
-only changes what ends up on disk + uploaded.
+asyncio loop. Output is what ends up on disk + uploaded to the server for
+transcription.
 
 All stages are controlled by ``CaptureConfig`` flags; ``dsp_enabled=False``
 restores the raw-PCM path exactly.

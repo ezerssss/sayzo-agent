@@ -47,15 +47,15 @@ def _write_record(
 ) -> Path:
     rec_dir = captures_dir / rec_id
     rec_dir.mkdir(parents=True, exist_ok=True)
+    # v3.0+ record.json schema — no transcript / audio_path / relevant_span.
+    # has_audio is derived from the filesystem; the captures pane checks
+    # for audio.opus existence directly.
     data = {
         "id": rec_id,
         "started_at": started_at.isoformat(),
         "ended_at": (ended_at or started_at + timedelta(minutes=2)).isoformat(),
         "title": title,
         "summary": summary,
-        "transcript": [],
-        "audio_path": "audio.opus" if write_audio else "",
-        "relevant_span": [0.0, 1.0],
         "metadata": metadata or {},
     }
     (rec_dir / "record.json").write_text(json.dumps(data), encoding="utf-8")

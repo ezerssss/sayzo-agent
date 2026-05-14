@@ -372,39 +372,6 @@ def test_build_windowed_pcm_no_segments_returns_zeros():
     assert np.all(np.frombuffer(out, dtype=np.int16) == 0)
 
 
-def test_density_late_substantive_turn_is_above_threshold():
-    """Sanity: the late-substantive-turn fixture stays on the full-STT path."""
-    cfg = _cfg()
-    d = ConversationDetector(cfg)
-    d.on_segment(SpeechSegment("system", 0.0, 240.0), now=100.0)
-    d.on_segment(SpeechSegment("mic", 240.5, 241.5), now=341.5)
-    d.on_segment(SpeechSegment("system", 242.0, 360.0), now=460.0)
-    d.on_segment(SpeechSegment("mic", 361.0, 391.0), now=491.0)
-    d.on_segment(SpeechSegment("system", 392.0, 393.0), now=493.0)
-    d.tick(600.0)
-    closed = d.take_closed_session()
-    assert closed is not None
-    elapsed = closed.elapsed()
-    density = closed.mic_total_voiced() / max(elapsed, 1e-6)
-    assert density >= cfg.stt_full_density, (
-        f"late-substantive-turn fixture must stay on full STT path; got density={density:.4f}"
-    )
-
-
-def test_density_passive_media_is_below_threshold():
-    """A 60-min YouTube + one 10s comment should land in the windowed path."""
-    cfg = _cfg(joint_silence_close_secs=120.0)
-    d = ConversationDetector(cfg)
-    d.on_segment(SpeechSegment("system", 0.0, 1800.0), now=100.0)
-    d.on_segment(SpeechSegment("mic", 1800.0, 1810.0), now=1910.0)  # 10s comment
-    d.on_segment(SpeechSegment("system", 1810.0, 3600.0), now=3700.0)
-    d.tick(3900.0)
-    closed = d.take_closed_session()
-    assert closed is not None
-    density = closed.mic_total_voiced() / max(closed.elapsed(), 1e-6)
-    assert density < cfg.stt_full_density
-
-
 def test_gate_fails_no_counterparty():
     """User talks to themselves — must be discarded."""
     cfg = _cfg()

@@ -138,6 +138,10 @@ def friendly_label(
     return "Unknown", "gray"
 
 
+# Display labels for dropped-stub records. ``non_english`` and
+# ``empty_transcript`` only appear on legacy on-disk stubs from older
+# agent versions and are kept here so the Captures pane renders them
+# correctly; the live agent only writes ``gate_failed``.
 _DROPPED_LABELS: dict[str, str] = {
     "gate_failed": "Skipped — not enough conversation",
     "non_english": "Skipped — wasn't English",

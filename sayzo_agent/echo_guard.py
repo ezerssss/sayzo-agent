@@ -150,9 +150,11 @@ def classify_buffers(
       - `buffers.mic_segments` contains only user segments (echo spans
         removed, partial segments split around interior echo spans).
       - `buffers.mic_echo_segments` is populated with every dropped span.
-      - The raw `buffers.mic_pcm` / `buffers.sys_pcm` are NOT modified; the
-        caller is responsible for zeroing the echo regions before STT via
-        `zero_out_echo_regions`.
+      - The raw `buffers.mic_pcm` / `buffers.sys_pcm` are NOT modified. The
+        downstream pipeline removes echo regions from the encoded audio
+        via per-channel VAD windowing (the merged mic_segments no longer
+        include them); ``zero_out_echo_regions`` remains available for
+        callers that want a pre-zeroed mic PCM directly.
 
     Returns an `EchoGuardReport` for logging and record.json metadata.
     """
@@ -193,7 +195,7 @@ def classify_buffers(
         )
         for ks, ke in keep_spans:
             # Drop sub-segments shorter than 100 ms — below this they're not
-            # useful for gating or transcription.
+            # useful for gating or the encoded mic channel.
             if ke - ks >= 0.1:
                 new_mic_segments.append(
                     SpeechSegment(source="mic", start_ts=ks, end_ts=ke)
@@ -330,8 +332,8 @@ def zero_out_echo_regions(
     """Return a copy of `pcm16_bytes` with `echo_spans` zero'd out.
 
     A cosine-squared fade is applied across the first and last `taper_ms` of
-    each span, so Whisper's log-mel front end doesn't see a spectral cliff at
-    echo → user transitions. Pure / unit-testable.
+    each span so the Opus encoder doesn't see a spectral cliff at echo →
+    user transitions on the encoded mic channel. Pure / unit-testable.
     """
     if not echo_spans or not pcm16_bytes:
         return bytes(pcm16_bytes)
