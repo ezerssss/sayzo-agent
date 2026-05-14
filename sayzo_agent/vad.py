@@ -6,6 +6,7 @@ events when contiguous voiced regions end (with hangover).
 from __future__ import annotations
 
 import logging
+import threading
 from collections.abc import Iterator
 from typing import Optional
 
@@ -14,6 +15,12 @@ import numpy as np
 from .models import SpeechSegment, Source
 
 log = logging.getLogger(__name__)
+
+# Shared across SileroVAD instances — silero-vad's onnxruntime load is
+# ~3.5 s on first call and isn't worth racing two of them in parallel.
+# Holding this around both ``_ensure_loaded`` and any pre-warm call from
+# a background thread guarantees we pay the cost exactly once.
+_LOAD_LOCK = threading.Lock()
 
 
 class SileroVAD:
@@ -56,8 +63,14 @@ class SileroVAD:
     def _ensure_loaded(self) -> None:
         if self._model is not None:
             return
-        from silero_vad import load_silero_vad
-        self._model = load_silero_vad(onnx=True)
+        # Lock so a background pre-warm thread (Agent._prewarm_vads) and a
+        # concurrent first ``feed()`` from the consume loop can't race and
+        # pay the silero-vad + onnxruntime load cost twice.
+        with _LOAD_LOCK:
+            if self._model is not None:
+                return
+            from silero_vad import load_silero_vad
+            self._model = load_silero_vad(onnx=True)
 
     def reset_session(self, start_sample: int = 0) -> None:
         self._buf = np.zeros(0, dtype=np.float32)

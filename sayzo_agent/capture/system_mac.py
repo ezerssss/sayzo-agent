@@ -43,6 +43,8 @@ from pathlib import Path
 import numpy as np
 from scipy.signal import resample_poly
 
+from ._utils import drain_queue as _drain_queue_fn
+
 log = logging.getLogger(__name__)
 
 # audio-tap emits mono float32 PCM at this rate.
@@ -140,7 +142,14 @@ class SystemCapture:
         queue_maxsize: int = 200,
         *,
         system_scope: str = "arm_app",
+        silence_pump_enabled: bool = True,  # accepted for API parity; macOS doesn't silence-skip
     ) -> None:
+        # macOS uses CoreAudio Process Taps (audio-tap Swift helper),
+        # whose IO callback fires on the audio engine's clock regardless
+        # of input activity — silence frames are delivered continuously.
+        # The ``silence_pump_enabled`` knob is Windows-only and accepted
+        # here so the same CaptureConfig wiring in app.py works on both.
+        del silence_pump_enabled
         self.sample_rate = sample_rate
         self.frame_samples = int(sample_rate * frame_ms / 1000)
         self.frame_duration = self.frame_samples / sample_rate
@@ -183,6 +192,9 @@ class SystemCapture:
         renderers, work out of the box) and passed to the Swift helper as
         ``--pids``. Empty list ⇒ global tap (today's behavior).
         """
+        # Defense in depth: drain any frames left over from a previous arm
+        # cycle. Mirrors MicCapture._drain_queue.
+        self._drain_queue()
         binary = _find_audio_tap()
         # Endpoint (global tap) is the default since v2.9 and the only
         # path Sayzo uses when "Per-app audio capture (beta)" is off.
@@ -276,6 +288,12 @@ class SystemCapture:
         self._proc = None
         self._reader_task = None
         self._stderr_task = None
+        # Drain any frames the reader task enqueued before cancellation
+        # actually landed. Mirrors MicCapture.stop's drain.
+        self._drain_queue()
+
+    def _drain_queue(self) -> None:
+        _drain_queue_fn(self.queue)
 
     # ------------------------------------------------------------------
     # Internal tasks

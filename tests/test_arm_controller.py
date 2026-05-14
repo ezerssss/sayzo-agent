@@ -61,11 +61,28 @@ class FakeCapture:
 
 
 class FakeVAD:
-    def __init__(self) -> None:
+    def __init__(self, source: str = "mic") -> None:
+        self.source = source
         self.reset_count = 0
+        self.flush_count = 0
+        # Tests fill this with SpeechSegments to simulate an in-progress
+        # VAD segment that would only emit via flush() — exercises the
+        # close-time flush wiring without needing to feed real audio.
+        self.pending_on_flush: list[SpeechSegment] = []
 
     def reset(self) -> None:
         self.reset_count += 1
+        # Real SileroVAD.reset() drops the in-progress segment too —
+        # mirror that so a test can verify flush MUST happen BEFORE
+        # reset, not after.
+        self.pending_on_flush = []
+
+    def flush(self):
+        self.flush_count += 1
+        pending = self.pending_on_flush
+        self.pending_on_flush = []
+        for seg in pending:
+            yield seg
 
 
 class FakeNotifier:
@@ -137,8 +154,8 @@ def _make_controller(
     detector = ConversationDetector(conv_cfg)
     mic = FakeCapture()
     sys_cap = FakeCapture()
-    vad_m = FakeVAD()
-    vad_s = FakeVAD()
+    vad_m = FakeVAD(source="mic")
+    vad_s = FakeVAD(source="system")
     notifier = notifier or FakeNotifier()
     current_mic = list(mic_holders or [])
 
@@ -239,6 +256,50 @@ async def test_stream_start_failure_notifies_and_stays_disarmed():
     await ctrl._on_hotkey_pressed()
     assert ctrl.state == ArmState.DISARMED
     assert any("Couldn't start" in t for t, _ in notifier.fire_and_forget)
+
+
+async def test_hotkey_stop_flushes_vad_pending_segments_into_session():
+    """Regression: when the user hotkey-stops mid-utterance, the still-open
+    VAD segment must be flushed into the closed session, not dropped.
+
+    The armed-only model closes sessions abruptly on hotkey_end /
+    check-in wrap-up / meeting-ended / joint-silence-confirmed.
+    SileroVAD.feed() only emits a closed SpeechSegment after
+    ``hangover_ms`` (300 ms) of unvoiced chunks; an abrupt close
+    never delivers them, so without a flush hook the in-progress
+    segment would be discarded when the next arm calls
+    ``vad.reset()``. This was a real symptom in 2026-05-14 logs
+    where a user with 15+ s of continuous speech saw their longest
+    turn reported as 7.5 s — the longest turn was the one still
+    open when they pressed hotkey.
+    """
+    notifier = FakeNotifier()
+    notifier.consent_script = ["yes", "yes"]  # arm, disarm
+    ctrl, detector, _mic, _sys, vad_m, vad_s, _ = _make_controller(notifier=notifier)
+
+    await ctrl._on_hotkey_pressed()
+    assert ctrl.state == ArmState.ARMED
+
+    # Simulate VAD holding in-progress segments that only flush() can
+    # surface — mirrors SileroVAD with _in_speech=True at the moment
+    # the close hits.
+    vad_m.pending_on_flush = [SpeechSegment("mic", 0.0, 5.0)]
+    vad_s.pending_on_flush = [SpeechSegment("system", 1.0, 4.0)]
+
+    await ctrl._on_hotkey_pressed()  # disarm confirmation "yes"
+    assert ctrl.state == ArmState.DISARMED
+
+    # Both VADs flushed exactly once, BEFORE the session committed.
+    assert vad_m.flush_count == 1
+    assert vad_s.flush_count == 1
+
+    # The flushed segments landed in the now-closed session's segment
+    # lists. Without the flush hook, both lists would be empty and the
+    # gate would fail counterparty on sys_total=0.0s.
+    closed = detector.take_closed_session()
+    assert closed is not None
+    assert len(closed.mic_segments) == 1, "mic flush segment dropped"
+    assert len(closed.sys_segments) == 1, "system flush segment dropped"
 
 
 async def test_arm_opens_detector_session_immediately():
@@ -404,8 +465,8 @@ async def test_whitelist_arm_uses_resolver_when_match_has_no_pids():
     detector = ConversationDetector(conv_cfg)
     mic = FakeCapture()
     sys_cap = FakeCapture()
-    vad_m = FakeVAD()
-    vad_s = FakeVAD()
+    vad_m = FakeVAD(source="mic")
+    vad_s = FakeVAD(source="system")
 
     # Simulate macOS browser path: a Chrome holder with bundle id but a
     # helper PID (so _pids_for_browser_holders returns ()), plus a Meet
@@ -1110,8 +1171,8 @@ async def test_hotkey_mac_beta_uses_whitelisted_resolver_on_match(monkeypatch):
     detector = ConversationDetector(conv_cfg)
     mic = FakeCapture()
     sys_cap = FakeCapture()
-    vad_m = FakeVAD()
-    vad_s = FakeVAD()
+    vad_m = FakeVAD(source="mic")
+    vad_s = FakeVAD(source="system")
 
     ctrl = ArmController(
         cfg, detector,
@@ -1194,8 +1255,8 @@ async def test_hotkey_mac_beta_endpoint_when_foreground_not_whitelisted(monkeypa
     detector = ConversationDetector(conv_cfg)
     mic = FakeCapture()
     sys_cap = FakeCapture()
-    vad_m = FakeVAD()
-    vad_s = FakeVAD()
+    vad_m = FakeVAD(source="mic")
+    vad_s = FakeVAD(source="system")
 
     ctrl = ArmController(
         cfg, detector,

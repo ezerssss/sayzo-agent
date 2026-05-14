@@ -49,6 +49,8 @@ from typing import Optional
 import numpy as np
 from scipy.signal import resample_poly
 
+from ._utils import drain_queue as _drain_queue_fn
+
 log = logging.getLogger(__name__)
 
 # Minimum Windows 10 build for AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK.
@@ -820,6 +822,12 @@ class ProcessLoopbackCapture:
                 "(version 2004, May 2020) or newer"
             )
 
+        # Defense in depth: drain stale frames from the shared queue. The
+        # persistent thread can produce frames between deactivate() and
+        # the asyncio consumer noticing armed_event clear; without this,
+        # they'd pollute the next arm's session buffer.
+        self._drain_queue()
+
         loop = asyncio.get_running_loop()
 
         successes = 0
@@ -861,6 +869,10 @@ class ProcessLoopbackCapture:
             if pcap is not None:
                 pcap.deactivate()
         self._activated_pids = []
+        self._drain_queue()
+
+    def _drain_queue(self) -> None:
+        _drain_queue_fn(self.queue)
 
 
 # ---------------------------------------------------------------------------

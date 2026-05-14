@@ -72,11 +72,14 @@ class ConversationDetector:
     """State machine that opens/closes sessions based on joint silence.
 
     Inputs (push API):
-        - on_frame(source, frame, capture_mono_ts, now): raw PCM written to
-          the active session buffer if a session is open, or to the rolling
-          pre-buffer if idle. ``capture_mono_ts`` is the monotonic time of
-          the frame's first sample; used for gap-fill and cross-source
-          alignment.
+        - on_frame(source, frame, capture_mono_ts, now): raw PCM written
+          to the active session buffer if a session is OPEN or
+          PENDING_CLOSE; dropped on the floor when IDLE. (Pre-v2.1.7
+          there was a rolling pre-buffer for the always-on model — removed
+          when sessions opened on arm rather than on first VAD segment;
+          see [[project_no_pre_buffer]].) ``capture_mono_ts`` is the
+          monotonic time of the frame's first sample; used for gap-fill
+          and cross-source alignment.
         - on_segment(seg, now): a SpeechSegment closed by the VAD on
           ``seg.source``. Opens a session if idle, refreshes the joint-
           silence timer, and appends to the session's segment list.

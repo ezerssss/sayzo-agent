@@ -26,6 +26,8 @@ from math import gcd
 
 import numpy as np
 
+from ._utils import drain_queue as _drain_queue_fn
+
 # pyaudiowpatch + scipy.signal are imported inside ``_run`` instead of at
 # module load. Both are only needed once the capture thread spins up (i.e.
 # the user has armed); pulling them at import would add ~60 MB and several
@@ -54,12 +56,14 @@ class SystemCapture:
         queue_maxsize: int = 200,
         *,
         system_scope: str = "endpoint",  # matches CaptureConfig default since v2.9
+        silence_pump_enabled: bool = True,
     ) -> None:
         self.sample_rate = sample_rate
         self.frame_samples = int(sample_rate * frame_ms / 1000)
         self.frame_duration = self.frame_samples / sample_rate
         self.device_name = device
         self.system_scope = system_scope  # "arm_app" | "endpoint"
+        self.silence_pump_enabled = silence_pump_enabled
         self.queue: asyncio.Queue[tuple[float, np.ndarray]] = asyncio.Queue(maxsize=queue_maxsize)
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
@@ -67,38 +71,60 @@ class SystemCapture:
         self._target_pids: tuple[int, ...] = ()
         self._process_loopback = None  # filled when per-app capture wins
 
-    def _find_loopback_device(self, pa) -> dict:
+    def _snapshot_devices(self, pa) -> list[dict]:
+        """One-shot enumeration of every PortAudio device. Cached locally
+        in ``_run`` so both the loopback-lookup and the render-lookup
+        (for the silence pump) share a single walk."""
+        return [pa.get_device_info_by_index(i) for i in range(pa.get_device_count())]
+
+    def _find_loopback_device(self, pa, devices: list[dict]) -> dict:
         """Find the WASAPI loopback device for the default speakers."""
         import pyaudiowpatch as pyaudio
         wasapi_info = pa.get_host_api_info_by_type(pyaudio.paWASAPI)
         default_speakers = pa.get_device_info_by_index(
             wasapi_info["defaultOutputDevice"]
         )
-
-        if self.device_name:
-            target_name = self.device_name
-        else:
-            target_name = default_speakers["name"]
-
-        for i in range(pa.get_device_count()):
-            dev = pa.get_device_info_by_index(i)
-            if (
-                dev.get("isLoopbackDevice")
-                and target_name in dev["name"]
-            ):
+        target_name = self.device_name or default_speakers["name"]
+        for dev in devices:
+            if dev.get("isLoopbackDevice") and target_name in dev["name"]:
                 return dev
-
         raise RuntimeError(
             f"No WASAPI loopback device found for '{target_name}'. "
-            f"Available devices: {[pa.get_device_info_by_index(i)['name'] for i in range(pa.get_device_count())]}"
+            f"Available devices: {[d['name'] for d in devices]}"
         )
+
+    def _find_render_device_for_loopback(self, pa, loopback: dict, devices: list[dict]) -> dict:
+        """Find the render-side WASAPI device paired with our loopback.
+
+        pyaudiowpatch exposes the same endpoint as TWO devices: a normal
+        render device, and a ``[Loopback]`` variant. We want the render
+        one so the silence-pump output stream engages the audio engine
+        for the same endpoint the loopback is capturing — that's what
+        keeps WASAPI delivering continuous loopback packets even when
+        no other app is rendering.
+        """
+        import pyaudiowpatch as pyaudio
+        base_name = loopback["name"].replace(" [Loopback]", "").strip()
+        for dev in devices:
+            if dev.get("isLoopbackDevice"):
+                continue
+            if int(dev.get("maxOutputChannels", 0)) <= 0:
+                continue
+            if dev.get("name") == base_name:
+                return dev
+        # Fallback: WASAPI default output. Same audio engine on Windows so
+        # the pump still keeps loopback flowing even if the exact pair is
+        # different.
+        wasapi_info = pa.get_host_api_info_by_type(pyaudio.paWASAPI)
+        return pa.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
 
     def _run(self) -> None:
         import pyaudiowpatch as pyaudio
         from scipy.signal import resample_poly
         pa = pyaudio.PyAudio()
+        devices = self._snapshot_devices(pa)
         try:
-            loopback = self._find_loopback_device(pa)
+            loopback = self._find_loopback_device(pa, devices)
         except Exception:
             log.error(
                 "system capture: failed to find WASAPI loopback device — "
@@ -140,6 +166,7 @@ class SystemCapture:
         )
 
         stream = None
+        pump_stream = None
         try:
             stream = pa.open(
                 format=pyaudio.paFloat32,
@@ -149,6 +176,53 @@ class SystemCapture:
                 input_device_index=loopback["index"],
                 frames_per_buffer=batch_native_samples,
             )
+
+            # Silence-pump (WASAPI silence-skip workaround): when nothing
+            # is rendering on the endpoint, WASAPI delivers no loopback
+            # packets and ``stream.read()`` blocks. Opening a tiny silent
+            # render stream on the same endpoint keeps the audio engine
+            # ticking. See Microsoft / PortAudio #935 / NAudio docs.
+            # Open AFTER the loopback; failure is non-fatal.
+            if self.silence_pump_enabled:
+                try:
+                    render_dev = self._find_render_device_for_loopback(pa, loopback, devices)
+                    render_channels = max(1, int(render_dev.get("maxOutputChannels", 0)))
+                    render_rate = int(render_dev["defaultSampleRate"])
+                    pump_buffer_frames = 480  # 10 ms @ 48 kHz
+                    silence_buffer = bytes(render_channels * 4 * pump_buffer_frames)
+
+                    def _pump_callback(in_data, frame_count, time_info, status):  # noqa: ANN001
+                        # WASAPI may request a different frame_count than our
+                        # frames_per_buffer hint; size the slice/extension to it.
+                        need = frame_count * render_channels * 4
+                        if need <= len(silence_buffer):
+                            return (silence_buffer[:need], pyaudio.paContinue)
+                        return (silence_buffer + bytes(need - len(silence_buffer)), pyaudio.paContinue)
+
+                    pump_stream = pa.open(
+                        format=pyaudio.paFloat32,
+                        channels=render_channels,
+                        rate=render_rate,
+                        output=True,
+                        output_device_index=int(render_dev["index"]),
+                        frames_per_buffer=pump_buffer_frames,
+                        stream_callback=_pump_callback,
+                    )
+                    pump_stream.start_stream()
+                    log.info(
+                        "system capture: silence pump active on device=%s "
+                        "(rate=%d ch=%d) — WASAPI loopback delivers continuous frames",
+                        render_dev["name"], render_rate, render_channels,
+                    )
+                except Exception:
+                    log.warning(
+                        "system capture: silence pump open failed; loopback "
+                        "may silence-skip when nothing else is playing. "
+                        "Set SAYZO_CAPTURE__SYSTEM_SILENCE_PUMP_ENABLED=0 "
+                        "to suppress this warning.",
+                        exc_info=True,
+                    )
+                    pump_stream = None
 
             # Establish a stream-time → monotonic correlation. PortAudio's
             # `stream.get_time()` gives the current stream clock position
@@ -211,21 +285,28 @@ class SystemCapture:
                 # time.
                 if self._loop is None:
                     continue
+                # ``call_soon_threadsafe`` doesn't raise QueueFull — the
+                # put_nowait runs on the event loop and any QueueFull
+                # surfaces there as an asyncio "Exception in callback"
+                # log line. We don't try/except here.
                 pos = 0
                 while pos + self.frame_samples <= len(samples):
                     frame = samples[pos : pos + self.frame_samples]
                     frame_mono = batch_first_sample_mono + (pos / self.sample_rate)
                     pos += self.frame_samples
-                    try:
-                        self._loop.call_soon_threadsafe(
-                            self.queue.put_nowait, (frame_mono, frame)
-                        )
-                    except asyncio.QueueFull:
-                        log.warning("system queue full, dropping frame")
+                    self._loop.call_soon_threadsafe(
+                        self.queue.put_nowait, (frame_mono, frame)
+                    )
 
         except Exception:
             log.exception("system capture loop crashed")
         finally:
+            if pump_stream is not None:
+                try:
+                    pump_stream.stop_stream()
+                    pump_stream.close()
+                except Exception:
+                    log.debug("system capture: silence pump close failed", exc_info=True)
             if stream is not None:
                 stream.stop_stream()
                 stream.close()
@@ -245,6 +326,10 @@ class SystemCapture:
         """
         self._loop = asyncio.get_running_loop()
         self._stop.clear()
+        # Drop any frames the producer thread enqueued between the previous
+        # ``stop()`` signalling and the thread actually exiting; without
+        # this they'd pollute the next session's buffer.
+        self._drain_queue()
         # Endpoint scope is the default since v2.9 and the only path
         # Sayzo uses when "Per-app audio capture (beta)" is off.
         # Whitelist auto-arm with the beta toggle ON is the only caller
@@ -335,3 +420,9 @@ class SystemCapture:
             except Exception:
                 log.debug("process-loopback delegate stop failed", exc_info=True)
             self._process_loopback = None
+        # Drain any frames the capture thread enqueued after stop signal
+        # but before it actually exited. Mirrors MicCapture.stop's drain.
+        self._drain_queue()
+
+    def _drain_queue(self) -> None:
+        _drain_queue_fn(self.queue)

@@ -141,6 +141,7 @@ class Agent:
             frame_ms=config.capture.frame_ms,
             device=config.capture.sys_device,
             system_scope=config.capture.system_scope,
+            silence_pump_enabled=config.capture.system_silence_pump_enabled,
         )
         self.vad_mic = SileroVAD(
             "mic",
@@ -337,6 +338,32 @@ class Agent:
                 prev_mic = mic
                 prev_sys = sys_lvl
             await asyncio.sleep(1.0 / 15.0)
+
+    async def _prewarm_vads(self) -> None:
+        """Load the Silero VAD ONNX model off the event loop, before the
+        user arms for the first time.
+
+        Defers cost away from the hot path so the first ``vad.feed()`` from
+        ``_consume`` is a no-op fast path (``_model is not None`` check in
+        ``vad.py::_ensure_loaded``). Without this, the first armed session
+        eats a ~7 s event-loop stall (silero-vad + onnxruntime first
+        import + load × 2 instances) and produces the asyncio
+        "Exception in callback Queue.put_nowait" spam from the mic queue
+        overflowing. The thread-pool path keeps the asyncio loop
+        responsive during the load.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(self._executor, self.vad_mic._ensure_loaded)
+            await loop.run_in_executor(self._executor, self.vad_sys._ensure_loaded)
+            log.info("[agent] VAD pre-warm complete (mic + system models loaded)")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.warning(
+                "[agent] VAD pre-warm failed (will lazy-load on first frame)",
+                exc_info=True,
+            )
 
     async def _ticker(self) -> None:
         while not self._stop.is_set():
@@ -932,6 +959,17 @@ class Agent:
             asyncio.create_task(self._ticker()),
             asyncio.create_task(self._audio_level_emitter()),
         ]
+        # Pre-warm Silero VAD models in the background so the user's first
+        # arm doesn't pay the ~7 s synchronous ONNX load on the event loop.
+        # Without this, the first frame fed to vad.feed() blocks _consume
+        # for the load duration, mic.callback keeps pushing frames at 50
+        # Hz, mic.queue (maxsize=200 ≈ 4 s) overflows, and ~3 s of mic
+        # audio gets dropped at session 1 start (see the 2026-05-14 logs).
+        # Once-per-process; runs in a thread-pool executor so it can't
+        # block the event loop.
+        prewarm_task = asyncio.create_task(self._prewarm_vads())
+        self._background_tasks.add(prewarm_task)
+        prewarm_task.add_done_callback(self._background_tasks.discard)
         log.info(
             "[agent] running. Shortcut: %s. Ctrl+C to stop.",
             self.arm.current_hotkey,

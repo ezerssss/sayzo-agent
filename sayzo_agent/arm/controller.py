@@ -708,6 +708,32 @@ class ArmController:
                 self._run_meeting_ended_watcher(reason), name="arm-meeting-ended"
             )
 
+    def _flush_vads_into_detector(self, now: float) -> None:
+        """Yield any in-progress VAD segments into the detector before the
+        session is committed.
+
+        The armed-only model closes sessions abruptly (hotkey_end, check-in
+        wrap-up, meeting-ended, joint-silence-confirmed). VAD's normal
+        hangover-close path requires ``hangover_ms`` (300 ms) of unvoiced
+        chunks to actually emit the closing segment; an abrupt close never
+        delivers them, and the still-open segment would be discarded when
+        the next arm calls ``vad.reset()``. Flushing here recovers it.
+
+        Matches the replay-teardown shape in ``__main__.py``'s replay
+        command verbatim. Non-fatal on raise — the session still commits
+        with whatever segments did close normally.
+        """
+        try:
+            for seg in self.vad_mic.flush():
+                self.detector.on_segment(seg, now)
+        except Exception:
+            log.exception("[arm] vad_mic flush before close failed (non-fatal)")
+        try:
+            for seg in self.vad_sys.flush():
+                self.detector.on_segment(seg, now)
+        except Exception:
+            log.exception("[arm] vad_sys flush before close failed (non-fatal)")
+
     async def _disarm_internal(
         self,
         close_reason: SessionCloseReason,
@@ -731,6 +757,7 @@ class ArmController:
         try:
             now = time.monotonic()
             if self.detector.state in (SessionState.OPEN, SessionState.PENDING_CLOSE):
+                self._flush_vads_into_detector(now)
                 self.detector.commit_close(now, close_reason)
         except Exception:
             log.exception("[arm] detector commit_close failed")
@@ -823,6 +850,7 @@ class ArmController:
             # Race: session already committed by another path.
             return
         if result in ("yes", "timeout"):
+            self._flush_vads_into_detector(now)
             self.detector.commit_close(now, SessionCloseReason.JOINT_SILENCE)
             await self._disarm_internal(SessionCloseReason.JOINT_SILENCE)
         else:  # "no" → Not yet

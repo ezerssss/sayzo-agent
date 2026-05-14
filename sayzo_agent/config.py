@@ -73,6 +73,23 @@ class CaptureConfig(BaseSettings):
     highpass_sys_hz: float = 40.0  # lighter HPF on system (just kill DC/rumble)
     peak_normalize_dbfs: float = -1.0  # post-DSP peak norm target
 
+    # Windows-only: opens a silent render stream on the same WASAPI endpoint
+    # as the loopback capture, for the lifetime of an armed session. WASAPI
+    # loopback documented behavior: when nothing is rendering on the endpoint,
+    # the capture client receives NO packets (silence is skipped, not delivered
+    # as zeros). ``stream.read()`` then blocks until something plays. This was
+    # the root cause of intermittent ``sys_total=0.0s`` on hotkey-armed
+    # sessions where the user played short bursts of audio with quiet stretches
+    # between them. The pump's all-zeros render keeps the endpoint clock
+    # ticking so the loopback delivers continuous frames (real audio +
+    # actual silence). Industry-standard workaround — Microsoft's own sample
+    # (Matthew van Eerde), NAudio docs, and ScreenRecorderLib all do it.
+    # macOS uses CoreAudio Process Taps which deliver silence frames
+    # continuously, so this flag is a no-op there.
+    # ``SAYZO_CAPTURE__SYSTEM_SILENCE_PUMP_ENABLED=0`` disables if a driver
+    # rejects the second stream open.
+    system_silence_pump_enabled: bool = True
+
 
 class VADConfig(BaseSettings):
     threshold: float = 0.5
@@ -82,10 +99,6 @@ class VADConfig(BaseSettings):
 
 class ConversationConfig(BaseSettings):
     joint_silence_close_secs: float = 45.0
-    # max_session_secs was the 60-min safety cap used in the always-on model.
-    # Removed in the armed model: the user explicitly armed, can hotkey-stop,
-    # and the long-meeting check-in toast (see ArmConfig) is the backstop for
-    # unattended long sessions.
     min_user_turn_secs: float = 8.0
     min_user_total_secs: float = 15.0
     min_user_turns_for_total: int = 2
