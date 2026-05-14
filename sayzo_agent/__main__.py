@@ -1886,7 +1886,10 @@ def service(force_setup: bool, from_autostart: bool, open_settings: bool) -> Non
                 return {"started": False, "reason": "already_running"}
             agent._sweep_in_progress = True
             agent._upload_sweep_last = time.monotonic()
-            task = asyncio.create_task(agent._run_periodic_sweep())
+            # User-triggered: clear any active credit pause before sweeping
+            # so a stale 24h lockout doesn't block a top-up that already
+            # happened server-side.
+            task = asyncio.create_task(agent._run_user_triggered_sweep())
             agent._background_tasks.add(task)
             task.add_done_callback(agent._background_tasks.discard)
             return {"started": True}

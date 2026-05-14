@@ -367,25 +367,115 @@ async def test_credit_limit_sets_pause_and_notifies_once(env):
     assert "Sayzo" in body or "credit" in body.lower() or "actions" in body.lower()
 
 
-async def test_two_consecutive_402s_notify_only_once(env):
-    # First 402: live path for record A.
+async def test_gate_path_skips_server_and_stays_silent_during_pause(env):
+    """Default ``bypass_pause_gate=False`` (sweep-path semantics) gates a
+    second upload during an active credit pause: no server call, no new
+    toast. This avoids hammering a known-blocked endpoint when the sweep
+    backlog runs. The live path uses bypass=True to opt out — see
+    test_live_path_bypass_always_hits_server_during_pause."""
     a_dir, a_rec = _write_capture(env.captures_dir, "recA", env.clock())
     env.upload.enqueue("credit_limit")
     await env.mgr.try_upload(a_rec, a_dir)
 
-    # Second capture comes in during the lockout. The live path should NOT
-    # even call upload — should_attempt() returns False — and no new toast.
     b_dir, b_rec = _write_capture(env.captures_dir, "recB", env.clock() + timedelta(seconds=30))
     prior_upload_calls = len(env.upload.calls)
     outcome = await env.mgr.try_upload(b_rec, b_dir)
     assert outcome == UploadOutcome.CREDIT_LIMIT
-    # Server NOT hit the second time.
     assert len(env.upload.calls) == prior_upload_calls
-    # Record B marked credit_blocked without hitting the server.
     state = _read_upload_state(b_dir)
     assert state["status"] == STATUS_CREDIT_BLOCKED
-    # Still only one toast total.
     assert len(env.notifier.calls) == 1
+
+
+async def test_credit_limit_toast_names_specific_record(env):
+    """The per-upload toast names the specific capture that got blocked so
+    the user can tell which meeting it's about — not just a generic 'paused'."""
+    rec_dir, record = _write_capture(env.captures_dir, "rec_named", env.clock())
+    env.upload.enqueue("credit_limit")
+    await env.mgr.try_upload(record, rec_dir)
+    assert len(env.notifier.calls) == 1
+    _, body = env.notifier.calls[0]
+    # _make_record sets title = f"Session {rec_id}".
+    assert "Session rec_named" in body
+
+
+async def test_live_path_bypass_always_hits_server_during_pause(env):
+    """``bypass_pause_gate=True`` (the live path) must contact the server even
+    when the local pause is active. If the server returns 402 again it fires
+    the toast and re-arms the pause; if credits were topped up it just
+    succeeds. Without bypass the gate kicks in (sweep behavior)."""
+    # Prime: first 402 arms the pause.
+    a_dir, a_rec = _write_capture(env.captures_dir, "recA_live", env.clock())
+    env.upload.enqueue("credit_limit")
+    await env.mgr.try_upload(a_rec, a_dir)
+    assert not await env.mgr.should_attempt()
+    assert len(env.upload.calls) == 1
+    assert len(env.notifier.calls) == 1
+
+    # Live attempt during pause: hits the server, gets 402 again, fires a
+    # second toast naming the new record.
+    b_dir, b_rec = _write_capture(env.captures_dir, "recB_live", env.clock() + timedelta(seconds=30))
+    env.upload.enqueue("credit_limit")
+    outcome = await env.mgr.try_upload(b_rec, b_dir, bypass_pause_gate=True)
+    assert outcome == UploadOutcome.CREDIT_LIMIT
+    assert len(env.upload.calls) == 2  # server WAS contacted
+    assert len(env.notifier.calls) == 2
+    _, body = env.notifier.calls[1]
+    assert "Session recB_live" in body
+
+    # Sweep-style (no bypass) still hits the gate and stays silent.
+    c_dir, c_rec = _write_capture(env.captures_dir, "recC_gated", env.clock() + timedelta(seconds=60))
+    prior_calls = len(env.upload.calls)
+    await env.mgr.try_upload(c_rec, c_dir)
+    assert len(env.upload.calls) == prior_calls  # gated, no server contact
+    assert len(env.notifier.calls) == 2  # no new toast
+
+
+async def test_live_path_bypass_succeeds_when_credits_restored(env):
+    """If the server has credits when the live attempt fires, the bypass lets
+    the upload through — even though the local 24h pause is still 'active'."""
+    a_dir, a_rec = _write_capture(env.captures_dir, "recA_restore", env.clock())
+    env.upload.enqueue("credit_limit")
+    await env.mgr.try_upload(a_rec, a_dir)
+    assert not await env.mgr.should_attempt()
+
+    # Server now has credits (the user topped up). Live attempt with bypass
+    # contacts the server and succeeds.
+    b_dir, b_rec = _write_capture(env.captures_dir, "recB_restore", env.clock() + timedelta(seconds=30))
+    env.upload.enqueue("success")
+    outcome = await env.mgr.try_upload(b_rec, b_dir, bypass_pause_gate=True)
+    assert outcome == UploadOutcome.SUCCESS
+    state = _read_upload_state(b_dir)
+    assert state["status"] == STATUS_UPLOADED
+
+
+async def test_clear_credit_pause_drops_lockout(env):
+    """clear_credit_pause() removes the credit lockout so the next sweep
+    actually contacts the server. Returns True when it cleared something,
+    False when there was nothing to clear."""
+    # Nothing to clear initially.
+    assert await env.mgr.clear_credit_pause() is False
+
+    # Arm the pause.
+    rec_dir, record = _write_capture(env.captures_dir, "rec_clear", env.clock())
+    env.upload.enqueue("credit_limit")
+    await env.mgr.try_upload(record, rec_dir)
+    assert not await env.mgr.should_attempt()
+
+    # Clear it.
+    assert await env.mgr.clear_credit_pause() is True
+    assert await env.mgr.should_attempt() is True
+    # Sidecar reflects the clear.
+    sidecar = env.captures_dir / env.cfg.pause_state_filename
+    data = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert data["credit_blocked_until"] is None
+
+    # Auth pause is independent — clear_credit_pause leaves it alone.
+    env.upload.enqueue("auth_required")
+    await env.mgr.try_upload(record, rec_dir)
+    assert not await env.mgr.should_attempt()
+    assert await env.mgr.clear_credit_pause() is False
+    assert not await env.mgr.should_attempt()  # auth still blocked
 
 
 async def test_credit_lockout_expires_and_resumes(env):

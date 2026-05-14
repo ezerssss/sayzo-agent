@@ -45,13 +45,36 @@ log = logging.getLogger(__name__)
 PAUSE_STATE_SCHEMA_VERSION = 1
 
 
+def _per_record_block_body(
+    record: "ConversationRecord | None",
+    *,
+    reason: str,
+    fallback: str,
+    suffix: str | None = None,
+) -> str:
+    """Compose a toast body that names the specific capture that got blocked.
+
+    Centralises the "[Title] couldn't upload — [reason]. [fallback / suffix]"
+    shape so credit + auth toasts read consistently. ``record`` may be None
+    for callers that don't have one in hand; the body falls back to a generic
+    line in that case.
+    """
+    reason_clean = (reason or "").strip().rstrip(".") or "upload paused"
+    if record is None:
+        return f"{reason_clean}. {fallback}".strip()
+    title_hint = ((record.title or "").strip() or "Your latest meeting").rstrip(".")
+    tail = suffix if suffix is not None else fallback
+    return f"{title_hint} couldn't upload — {reason_clean}. {tail}".strip()
+
+
 @dataclass
 class PauseState:
     """Global pause state persisted at {captures_dir}/.upload_state.json.
 
-    Notification throttling is implicit in the state machine: a transition
-    from "not blocked" to "blocked" fires the toast; calls while already
-    blocked are silent.
+    The credit + auth states arm the sweep gate so background retries don't
+    hammer a known-blocked endpoint. Live-path uploads bypass the gate and
+    re-test the server every time, so a stale local pause never silently
+    rejects a fresh capture after the user tops up credits server-side.
     """
 
     credit_blocked_until: Optional[datetime] = None
@@ -193,17 +216,44 @@ class UploadRetryManager:
                 return False
             return True
 
+    async def clear_credit_pause(self) -> bool:
+        """Drop any active credit lockout so the next upload attempt actually
+        contacts the server. Called when the user clicks Try Again — they've
+        topped up server-side and the local 24h timer would otherwise keep
+        rejecting attempts. If credits really are still out the next 402 will
+        re-arm the pause via ``_handle_credit_limit``. Returns True if a pause
+        was actually cleared."""
+        await self._ensure_pause_state_loaded()
+        async with self._pause_lock:
+            if self._pause_state.credit_blocked_until is None:
+                return False
+            self._pause_state.credit_blocked_until = None
+            await self._persist_pause_state()
+        log.info("[upload] credit pause cleared by user retry request")
+        return True
+
     # ------------------------------------------------------------------
     # Public: try_upload (used by live path + sweep)
     # ------------------------------------------------------------------
 
-    async def try_upload(self, record: ConversationRecord, rec_dir: Path) -> UploadOutcome | None:
+    async def try_upload(
+        self,
+        record: ConversationRecord,
+        rec_dir: Path,
+        bypass_pause_gate: bool = False,
+    ) -> UploadOutcome | None:
         """Run one upload attempt for this record.
 
         Returns the outcome, or ``None`` if the attempt was skipped because
         another task is already uploading this record. Global pauses produce
         a real ``CREDIT_LIMIT`` / ``AUTH_REQUIRED`` outcome (the record is
         marked blocked on disk).
+
+        ``bypass_pause_gate=True`` is for the live-path call from
+        ``app._process_session``: a fresh user-driven upload should always
+        contact the server so a stale pause doesn't reject credits the user
+        already topped up. The sweep stays gated (default False) to avoid
+        hammering a known-blocked endpoint with a backlog of records.
         """
         rec_id = record.id
         async with self._inflight_lock:
@@ -212,16 +262,23 @@ class UploadRetryManager:
                 return None
             self._inflight_rec_ids.add(rec_id)
         try:
-            return await self._run_attempt(record, rec_dir)
+            return await self._run_attempt(record, rec_dir, bypass_pause_gate)
         finally:
             async with self._inflight_lock:
                 self._inflight_rec_ids.discard(rec_id)
 
-    async def _run_attempt(self, record: ConversationRecord, rec_dir: Path) -> UploadOutcome:
-        # Global pause gate. If blocked, write the block status to record.json
-        # so the user can see why this particular record is waiting.
-        if not await self.should_attempt():
-            # Determine WHICH pause is active so we can label the record correctly.
+    async def _run_attempt(
+        self,
+        record: ConversationRecord,
+        rec_dir: Path,
+        bypass_pause_gate: bool = False,
+    ) -> UploadOutcome:
+        # Global pause gate. Live attempts (``bypass_pause_gate=True``) skip
+        # this so a stale local pause never silently rejects a brand-new
+        # capture — we always re-test the server, and a fresh 402 re-arms
+        # the pause for the sweep. The gate still protects the sweep from
+        # hammering a known-blocked endpoint.
+        if not bypass_pause_gate and not await self.should_attempt():
             async with self._pause_lock:
                 if self._pause_state.credit_blocked_until:
                     blocked_outcome = UploadOutcome.CREDIT_LIMIT
@@ -286,9 +343,9 @@ class UploadRetryManager:
 
         # Global-pause + notification side effects.
         if outcome == UploadOutcome.CREDIT_LIMIT:
-            await self._handle_credit_limit(message)
+            await self._handle_credit_limit(message, record)
         elif outcome == UploadOutcome.AUTH_REQUIRED:
-            await self._handle_auth_required(message)
+            await self._handle_auth_required(message, record)
 
         if outcome == UploadOutcome.SUCCESS:
             log.info("[upload] success id=%s server_id=%s", record.id, server_capture_id or "?")
@@ -324,40 +381,50 @@ class UploadRetryManager:
     # Notification-throttled pause handlers
     # ------------------------------------------------------------------
 
-    async def _handle_credit_limit(self, server_message: str | None) -> None:
-        fire_toast = False
+    async def _handle_credit_limit(
+        self,
+        server_message: str | None,
+        record: ConversationRecord | None = None,
+    ) -> None:
+        """Re-arm the credit pause and fire a per-record toast.
+
+        Fires every time a real 402 lands so the user gets feedback on each
+        specific upload that's blocked, not only the first one. The pause
+        window is (re-)extended each time so the sweep stays gated. The live
+        path bypasses the gate, so subsequent new captures still reach the
+        server and re-fire this handler on their own 402."""
         async with self._pause_lock:
             now = self._now()
-            current = self._pause_state.credit_blocked_until
-            if current is None or current <= now:
-                # Transition off → on (either fresh lockout or expired window
-                # just got renewed by a fresh 402 — either way notify).
-                self._pause_state.credit_blocked_until = now + timedelta(
-                    seconds=self._cfg.credit_lockout_secs
-                )
-                await self._persist_pause_state()
-                fire_toast = True
-        if fire_toast:
-            body = server_message or "You've used all your free Sayzo actions."
-            await self._fire_notification("Sayzo: upload paused", body)
-
-    async def _handle_auth_required(self, _server_message: str | None) -> None:
-        fire_toast = False
-        async with self._pause_lock:
-            if not self._pause_state.auth_blocked:
-                self._pause_state.auth_blocked = True
-                await self._persist_pause_state()
-                fire_toast = True
-        if fire_toast:
-            # Body guides packaged-app users to the Settings → Account pane.
-            # CLI users can still run `sayzo-agent login` but most installs
-            # these days are .app / .exe and have no terminal surface.
-            await self._fire_notification(
-                "Sayzo: sign-in required",
-                "Your Sayzo session expired. Click the Sayzo icon in the "
-                "menu bar and open Settings → Account to sign in again — "
-                "captures will keep saving locally until then.",
+            self._pause_state.credit_blocked_until = now + timedelta(
+                seconds=self._cfg.credit_lockout_secs
             )
+            await self._persist_pause_state()
+        base = (server_message or "You've used all your free Sayzo actions.").strip()
+        body = _per_record_block_body(
+            record,
+            reason=base,
+            fallback="Your meeting is saved locally and we'll retry once credits are available.",
+        )
+        await self._fire_notification("Sayzo: upload paused", body)
+
+    async def _handle_auth_required(
+        self,
+        _server_message: str | None,
+        record: ConversationRecord | None = None,
+    ) -> None:
+        async with self._pause_lock:
+            self._pause_state.auth_blocked = True
+            await self._persist_pause_state()
+        body = _per_record_block_body(
+            record,
+            reason="Your Sayzo session expired",
+            fallback=(
+                "Open Settings → Account to sign in again — captures keep "
+                "saving locally until then."
+            ),
+            suffix="Open Settings → Account to sign in again.",
+        )
+        await self._fire_notification("Sayzo: sign-in required", body)
 
     async def _check_auth_recovery(self) -> None:
         """If we're auth-blocked, probe the auth client to see if tokens are

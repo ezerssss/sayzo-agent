@@ -466,6 +466,17 @@ class Agent:
         finally:
             self._sweep_in_progress = False
 
+    async def _run_user_triggered_sweep(self) -> None:
+        """User-clicked Try Again sweep. Clears any active credit pause
+        first — the click means the user has topped up and wants a fresh
+        server attempt. If credits are still out, the next 402 will re-arm
+        the pause via the regular handler."""
+        try:
+            await self.retry_mgr.clear_credit_pause()
+        except Exception:
+            log.warning("[upload] clear_credit_pause failed", exc_info=True)
+        await self._run_periodic_sweep()
+
     async def _process_session(self, buffers: SessionBuffers) -> None:
         """Public entry — registers an in-progress row for the Captures pane,
         then runs the actual pipeline. The proc_id is reused as the eventual
@@ -675,7 +686,11 @@ class Agent:
             ),
         )
         rec_dir = self.cfg.captures_dir / record.id
-        await self.retry_mgr.try_upload(record, rec_dir)
+        # Live path bypasses the pause gate so a stale local credit/auth
+        # block doesn't silently reject a brand-new capture. If credits are
+        # genuinely exhausted, the server's 402 re-arms the pause for the
+        # sweep; if the user already topped up, the upload just goes through.
+        await self.retry_mgr.try_upload(record, rec_dir, bypass_pause_gate=True)
         self._captures_kept += 1
 
     # ---- lifecycle ---------------------------------------------------------

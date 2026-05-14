@@ -11,6 +11,11 @@ import { SegmentedTab } from "../components/ui/SegmentedTab";
 import { cn } from "../lib/cn";
 
 const REFRESH_INTERVAL_MS = 5_000;
+// How long to hold the optimistic "Trying to upload…" override after a retry
+// click before reverting to the on-disk badge. Long enough for a healthy
+// agent to start the upload (the IPC nudge runs sweep_once immediately), but
+// short enough that an offline-agent click eventually re-enables the button.
+const RETRY_OPTIMISTIC_TTL_MS = 15_000;
 
 const TABS: { bucket: CaptureBucket; label: string }[] = [
   { bucket: "in_progress", label: "In progress" },
@@ -34,6 +39,13 @@ export function CapturesPane() {
   const [captures, setCaptures] = useState<CaptureSummary[] | null>(null);
   const [active, setActive] = useState<CaptureBucket>("in_progress");
   const [error, setError] = useState<string | null>(null);
+  // Per-row retry state: captureId → click timestamp. Drives the disabled
+  // button + "Trying to upload…" badge override so the user sees feedback
+  // the instant they click and can't spam-click while the agent's sweep is
+  // starting up. Entries clear when the real on-disk status moves past the
+  // failure states, or after RETRY_OPTIMISTIC_TTL_MS so an agent-offline
+  // retry eventually reverts.
+  const [retrying, setRetrying] = useState<Map<string, number>>(() => new Map());
 
   const refresh = useCallback(async (silent = false) => {
     try {
@@ -55,6 +67,25 @@ export function CapturesPane() {
     return () => window.clearInterval(id);
   }, [refresh]);
 
+  // Overlay the optimistic retry state onto the latest captures snapshot so
+  // counts + visible derive from one list. Keep the bucket alone — the row
+  // stays in "Couldn't upload" until the real on-disk status advances, which
+  // avoids a jarring tab-jump on click.
+  const augmentedCaptures = useMemo(() => {
+    if (captures == null) return null;
+    if (retrying.size === 0) return captures;
+    return captures.map((c) =>
+      retrying.has(c.id)
+        ? {
+            ...c,
+            badge_label: "Trying to upload…",
+            badge_tone: "blue" as const,
+            detail: "Sayzo is reaching the server now.",
+          }
+        : c,
+    );
+  }, [captures, retrying]);
+
   const counts = useMemo(() => {
     const out: Record<CaptureBucket, number> = {
       in_progress: 0,
@@ -62,29 +93,87 @@ export function CapturesPane() {
       failed: 0,
       skipped: 0,
     };
-    for (const c of captures ?? []) {
+    for (const c of augmentedCaptures ?? []) {
       out[c.bucket] += 1;
     }
     return out;
-  }, [captures]);
+  }, [augmentedCaptures]);
 
   const visible = useMemo(() => {
-    if (captures == null) return [];
-    return captures.filter((c) => c.bucket === active);
-  }, [captures, active]);
+    if (augmentedCaptures == null) return [];
+    return augmentedCaptures.filter((c) => c.bucket === active);
+  }, [augmentedCaptures, active]);
 
   const handleRetry = useCallback(
     async (id: string) => {
+      // The button is disabled during retry, but a quick double-tap can
+      // slip through React's event flush before re-render — guard here too.
+      if (retrying.has(id)) return;
+      setRetrying((prev) => {
+        const next = new Map(prev);
+        next.set(id, Date.now());
+        return next;
+      });
+      let succeeded = false;
       try {
-        await settingsBridge.retryCaptureUpload(id);
+        const result = await settingsBridge.retryCaptureUpload(id);
+        succeeded = result.retrying === true;
+        if (!succeeded) {
+          setError(
+            result.error
+              ? `Couldn't retry: ${result.error}`
+              : "Couldn't retry that capture right now.",
+          );
+        }
       } catch (e) {
         setError(`Couldn't retry: ${String(e)}`);
-        return;
+      }
+      if (!succeeded) {
+        // Bridge said no — drop the optimistic state immediately so the row
+        // doesn't sit lying about an upload that never started.
+        setRetrying((prev) => {
+          const next = new Map(prev);
+          next.delete(id);
+          return next;
+        });
       }
       await refresh();
     },
-    [refresh],
+    [refresh, retrying],
   );
+
+  // Drop optimistic retry entries once the on-disk status moves past the
+  // failure states, or after the TTL expires. The 5 s refresh interval keeps
+  // this firing periodically so an agent-offline retry reverts cleanly.
+  useEffect(() => {
+    if (retrying.size === 0) return;
+    const now = Date.now();
+    const next = new Map(retrying);
+    let mutated = false;
+    for (const [id, startedAt] of retrying) {
+      if (now - startedAt > RETRY_OPTIMISTIC_TTL_MS) {
+        next.delete(id);
+        mutated = true;
+        continue;
+      }
+      const c = captures?.find((x) => x.id === id);
+      if (c == null) {
+        next.delete(id);
+        mutated = true;
+        continue;
+      }
+      const stillFailing =
+        c.status === "failed_transient" ||
+        c.status === "failed_permanent" ||
+        c.status === "auth_blocked" ||
+        c.status === "credit_blocked";
+      if (!stillFailing) {
+        next.delete(id);
+        mutated = true;
+      }
+    }
+    if (mutated) setRetrying(next);
+  }, [captures, retrying]);
 
   const handleOpen = useCallback(async (id: string) => {
     try {
@@ -153,6 +242,7 @@ export function CapturesPane() {
               <CaptureRow
                 key={c.id}
                 capture={c}
+                isRetrying={retrying.has(c.id)}
                 onRetry={() => void handleRetry(c.id)}
                 onOpen={() => void handleOpen(c.id)}
                 onDelete={() => void handleDelete(c)}
@@ -167,24 +257,33 @@ export function CapturesPane() {
 
 interface CaptureRowProps {
   capture: CaptureSummary;
+  isRetrying: boolean;
   onRetry: () => void;
   onOpen: () => void;
   onDelete: () => void;
 }
 
-function CaptureRow({ capture, onRetry, onOpen, onDelete }: CaptureRowProps) {
+function CaptureRow({
+  capture,
+  isRetrying,
+  onRetry,
+  onOpen,
+  onDelete,
+}: CaptureRowProps) {
   const title = capture.title?.trim() || "Untitled meeting";
 
-  // Action buttons depend on what the row can actually do.
+  // Action buttons depend on what the row can actually do. The retry button
+  // stays mounted while in-flight (as a disabled "Trying…") so the user gets
+  // continuous feedback that their click was registered.
   const showRetry =
+    isRetrying ||
     capture.bucket === "failed" ||
     capture.status === "credit_blocked" ||
     capture.status === "auth_blocked";
   const showOpen = capture.has_audio && capture.bucket !== "skipped";
-  // Delete is always available — even processing rows drop out cleanly
-  // because they're synthetic; we just hide it for processing to avoid
-  // confusion (there's no on-disk state to delete yet).
-  const showDelete = !capture.is_processing;
+  // Hide delete while a retry is in flight — clicking delete mid-retry is
+  // ambiguous and the optimistic state would race the deletion.
+  const showDelete = !capture.is_processing && !isRetrying;
 
   return (
     <li className="flex items-start justify-between gap-4 py-4">
@@ -203,8 +302,12 @@ function CaptureRow({ capture, onRetry, onOpen, onDelete }: CaptureRowProps) {
         <Badge tone={capture.badge_tone}>{capture.badge_label}</Badge>
         <div className="flex items-center gap-1">
           {showRetry && (
-            <Button variant="secondary" onClick={onRetry}>
-              Try again now
+            <Button
+              variant="secondary"
+              onClick={onRetry}
+              disabled={isRetrying}
+            >
+              {isRetrying ? "Trying…" : "Try again now"}
             </Button>
           )}
           {showOpen && (
