@@ -8,5 +8,24 @@
     <true/>
     <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
     <true/>
+    <!--
+      Required for the QtWebEngine HUD subprocess to work under Hardened
+      Runtime. QtWebEngine bundles a Chromium renderer (V8 JS engine).
+      On Apple Silicon, V8 allocates its CodeRange with MAP_JIT (the
+      only macOS-supported way to get concurrent W+X memory under
+      hardware-enforced W^X), which requires this specific entitlement.
+      Without allow-jit the renderer crashes immediately at boot with
+      "V8 process OOM (Failed to reserve virtual memory for CodeRange)"
+      and the HUD subprocess loads to a blank page — fires loadFinished
+      with ok=False, no JS runs, no React mounts, no toast ever shows.
+      `allow-unsigned-executable-memory` (above) is NOT a substitute on
+      Apple Silicon — that grants W^X with explicit page-flips, but V8
+      uses MAP_JIT exclusively on arm64. This bit Jhoanna 2026-05-15
+      after the v2.10 HUD pywebview→Qt migration; pre-Qt the HUD ran
+      in-process and reused the agent's Python interpreter so V8 never
+      came into play.
+    -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
 </dict>
 </plist>
