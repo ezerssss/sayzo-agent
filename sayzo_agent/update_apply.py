@@ -25,16 +25,27 @@ returns normally and the agent stays on its current version.
 """
 from __future__ import annotations
 
+import json
 import logging
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 from .update import is_newer
-from .update_stage import read_staged
+from .update_stage import STAGED_DIR_NAME, clear_staged, read_staged
 
 log = logging.getLogger(__name__)
 
 QUIT_APPLY_FLAG_NAME = "quit_with_apply.flag"
+
+# Cap on how many times we'll re-spawn the platform installer / swap helper
+# for the SAME staged version before giving up. Prevents an unrecoverable
+# boot-loop when the helper consistently fails (e.g. a bad DMG mount, perm
+# error on /Applications, NSIS rejected on a managed Windows endpoint). A
+# new staged version resets the counter — see :func:`_record_apply_attempt`.
+MAX_APPLY_ATTEMPTS = 3
+APPLY_ATTEMPTS_FILE = "apply_attempts.json"
 
 
 def _flag_path(data_dir: Path) -> Path:
@@ -100,6 +111,17 @@ def apply_staged_if_newer(data_dir: Path, current_version: str, *, where: str) -
 
     ``where`` is a short tag ("boot", "quit", "settings") that flows into the
     log line so support can tell which path triggered the apply.
+
+    Bounded by :data:`MAX_APPLY_ATTEMPTS` per staged version. Once a version
+    has been attempted that many times without producing a successful upgrade
+    (which the boot path detects via :mod:`.last_version` and clears the
+    staged slot), the stage is cleared and a flag is left for the next boot
+    to surface as a "Sayzo update failed" toast (see
+    :func:`get_failed_apply_version`). Without the cap, a broken stage made
+    the agent unbootable into its tray — every boot would re-spawn the
+    helper, the helper would fail the same way, the user would see only
+    "exiting agent for swap" before the agent vanished, and there was no
+    in-app way out.
     """
     staged = read_staged(data_dir)
     if staged is None:
@@ -110,9 +132,25 @@ def apply_staged_if_newer(data_dir: Path, current_version: str, *, where: str) -
         # __main__.py clears these). Don't apply; let the caller continue.
         return
 
+    attempts = _record_apply_attempt(data_dir, staged.version)
+    if attempts > MAX_APPLY_ATTEMPTS:
+        log.warning(
+            "[update] apply for v%s exceeded %d attempts at %s; clearing "
+            "staged slot and surfacing failure toast on next boot",
+            staged.version, MAX_APPLY_ATTEMPTS, where,
+        )
+        # Drop the payload + manifest so the next boot doesn't re-enter this
+        # path. Leaves apply_attempts.json in place — the boot path reads it
+        # via get_failed_apply_version() to fire the user-visible toast and
+        # then clears it via clear_apply_attempts(). The user can re-trigger
+        # the install from Settings (which will re-stage from scratch and
+        # reset the counter via the version-mismatch branch below).
+        clear_staged(data_dir)
+        return
+
     log.warning(
-        "[update] applying staged v%s at %s (currently running v%s)",
-        staged.version, where, current_version,
+        "[update] applying staged v%s at %s (attempt %d/%d, currently running v%s)",
+        staged.version, where, attempts, MAX_APPLY_ATTEMPTS, current_version,
     )
     try:
         if sys.platform == "win32":
@@ -130,3 +168,84 @@ def apply_staged_if_newer(data_dir: Path, current_version: str, *, where: str) -
             "[update] apply at %s failed — staying on current version", where,
             exc_info=True,
         )
+
+
+# ---------------------------------------------------------------------------
+# Per-version apply-attempt tracking. Persisted at
+# ``<data_dir>/staged_update/apply_attempts.json`` so the counter survives
+# the agent restart that the swap helper triggers — without persistence we
+# couldn't distinguish "this is the first attempt" from "the helper has
+# failed twice in a row already" across boots.
+# ---------------------------------------------------------------------------
+
+
+def _attempts_path(data_dir: Path) -> Path:
+    return data_dir / STAGED_DIR_NAME / APPLY_ATTEMPTS_FILE
+
+
+def _read_attempts(data_dir: Path) -> dict:
+    path = _attempts_path(data_dir)
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        log.debug("[update] apply_attempts unreadable at %s", path, exc_info=True)
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _write_attempts(data_dir: Path, payload: dict) -> None:
+    path = _attempts_path(data_dir)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        log.debug("[update] couldn't write apply_attempts at %s", path, exc_info=True)
+
+
+def _record_apply_attempt(data_dir: Path, version: str) -> int:
+    """Bump the attempt counter for ``version`` and return the new total.
+
+    A version mismatch resets the counter — a fresh download is its own
+    fresh slate, the previous version's failures don't penalize it.
+    """
+    payload = _read_attempts(data_dir)
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if payload.get("version") != version:
+        payload = {"version": version, "attempts": 0, "first_attempt_at": now}
+    payload["attempts"] = int(payload.get("attempts", 0) or 0) + 1
+    payload["last_attempt_at"] = now
+    _write_attempts(data_dir, payload)
+    return int(payload["attempts"])
+
+
+def get_failed_apply_version(data_dir: Path) -> Optional[str]:
+    """Return the version whose apply attempts exceeded :data:`MAX_APPLY_ATTEMPTS`,
+    or ``None`` if no failed attempt is on record.
+
+    Boot path uses this to fire a user-visible toast nudging the user to
+    download manually from sayzo.app — the in-app retry path is failing
+    consistently and continuing to silently retry every boot is worse than
+    saying so out loud. Caller is expected to consume the marker via
+    :func:`clear_apply_attempts` once the toast has fired.
+    """
+    payload = _read_attempts(data_dir)
+    version = payload.get("version")
+    attempts = payload.get("attempts", 0)
+    if (isinstance(version, str) and version
+            and isinstance(attempts, int)
+            and attempts >= MAX_APPLY_ATTEMPTS):
+        return version
+    return None
+
+
+def clear_apply_attempts(data_dir: Path) -> None:
+    """Remove the apply-attempts record. Safe when missing."""
+    path = _attempts_path(data_dir)
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        log.debug("[update] failed to clear apply_attempts at %s", path, exc_info=True)

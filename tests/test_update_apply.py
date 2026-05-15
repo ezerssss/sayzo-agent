@@ -7,6 +7,7 @@ is on the recorded ``Popen`` invocation.
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -14,20 +15,30 @@ from pathlib import Path
 
 import pytest
 
-from sayzo_agent.update_stage import StagedUpdate
+from sayzo_agent.update_stage import STAGED_DIR_NAME, StagedUpdate
 from sayzo_agent import update_apply, update_apply_win
 from sayzo_agent import update_apply_mac
 from sayzo_agent.update_apply import (
+    APPLY_ATTEMPTS_FILE,
+    MAX_APPLY_ATTEMPTS,
     QUIT_APPLY_FLAG_NAME,
     apply_staged_if_newer,
+    clear_apply_attempts,
     clear_quit_apply_intent,
+    get_failed_apply_version,
     has_quit_apply_intent,
     set_quit_apply_intent,
 )
 
 
-class _ExitSentinel(Exception):
-    """Raised by patched ``os._exit`` so the test process survives."""
+class _ExitSentinel(BaseException):
+    """Raised by patched ``os._exit`` so the test process survives.
+
+    Inherits from BaseException (not Exception) because it represents process
+    termination — same semantics as SystemExit / KeyboardInterrupt — and must
+    NOT be swallowed by the ``except Exception:`` guard inside
+    :func:`update_apply.apply_staged_if_newer`.
+    """
 
 
 def _patch_exit(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -272,3 +283,151 @@ def test_apply_staged_if_newer_noop_when_stage_not_newer(
     monkeypatch.setattr(subprocess, "Popen", rec)
     apply_staged_if_newer(tmp_path, "1.0.0", where="quit")
     assert rec.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Apply-attempt retry cap (boot-loop guard)
+#
+# A broken stage (DMG hash matched but mount/rsync failed; NSIS rejected by
+# managed-endpoint policy) used to make the agent unbootable into its tray —
+# every restart re-detected the staged version, re-spawned the helper, the
+# helper failed the same way, and the user saw only "exiting agent for swap"
+# in the agent log before the process vanished. The cap stops the loop and
+# the boot path surfaces a "Sayzo update failed" toast on the next launch.
+# ---------------------------------------------------------------------------
+
+
+def _stub_staged(monkeypatch: pytest.MonkeyPatch, *, version: str = "9.9.9") -> None:
+    """Make ``update_apply.read_staged`` always return a strictly-newer stage."""
+    fake = StagedUpdate(
+        version=version, platform="x", sha256="x", notes="",
+        payload_path=Path("/dev/null"), ready_at="x",
+    )
+    monkeypatch.setattr(update_apply, "read_staged", lambda data_dir: fake)
+
+
+def _stub_helpers(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Replace both platform spawn helpers with a recorder. Returns a list
+    that's appended to on each call, so tests can assert spawn count without
+    caring which platform branch the dispatcher took.
+    """
+    spawned: list[str] = []
+
+    def _fake_win(staged):
+        spawned.append("win")
+        raise _ExitSentinel(0)
+
+    def _fake_mac(staged):
+        spawned.append("mac")
+        raise _ExitSentinel(0)
+
+    monkeypatch.setattr(update_apply_win, "spawn_installer_and_exit", _fake_win)
+    monkeypatch.setattr(update_apply_mac, "spawn_swap_helper_and_exit", _fake_mac)
+    return spawned
+
+
+def test_apply_attempt_counter_increments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stub_staged(monkeypatch)
+    spawned = _stub_helpers(monkeypatch)
+    # First two attempts should each spawn (and exit via sentinel).
+    for _ in range(2):
+        with pytest.raises(_ExitSentinel):
+            apply_staged_if_newer(tmp_path, "1.0.0", where="boot")
+    assert len(spawned) == 2
+
+    payload = json.loads((tmp_path / STAGED_DIR_NAME / APPLY_ATTEMPTS_FILE).read_text())
+    assert payload["attempts"] == 2
+    assert payload["version"] == "9.9.9"
+
+
+def test_apply_caps_at_max_attempts_and_clears_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stub_staged(monkeypatch)
+    spawned = _stub_helpers(monkeypatch)
+    cleared = []
+    monkeypatch.setattr(
+        update_apply, "clear_staged",
+        lambda data_dir: cleared.append(data_dir),
+    )
+
+    # Burn through MAX_APPLY_ATTEMPTS spawns.
+    for _ in range(MAX_APPLY_ATTEMPTS):
+        with pytest.raises(_ExitSentinel):
+            apply_staged_if_newer(tmp_path, "1.0.0", where="boot")
+    assert len(spawned) == MAX_APPLY_ATTEMPTS
+    assert cleared == []
+
+    # The (MAX+1)th call must NOT spawn — the cap fires first, clearing the
+    # stage and returning normally so the agent can keep booting.
+    apply_staged_if_newer(tmp_path, "1.0.0", where="boot")
+    assert len(spawned) == MAX_APPLY_ATTEMPTS  # unchanged
+    assert cleared == [tmp_path]
+    # Attempts file is preserved past the cap so the next boot can read it
+    # via get_failed_apply_version().
+    assert (tmp_path / STAGED_DIR_NAME / APPLY_ATTEMPTS_FILE).is_file()
+
+
+def test_apply_attempt_resets_on_new_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawned = _stub_helpers(monkeypatch)
+
+    # Burn the cap on v9.9.9.
+    _stub_staged(monkeypatch, version="9.9.9")
+    monkeypatch.setattr(update_apply, "clear_staged", lambda data_dir: None)
+    for _ in range(MAX_APPLY_ATTEMPTS):
+        with pytest.raises(_ExitSentinel):
+            apply_staged_if_newer(tmp_path, "1.0.0", where="boot")
+    apply_staged_if_newer(tmp_path, "1.0.0", where="boot")  # cap fires
+    assert len(spawned) == MAX_APPLY_ATTEMPTS
+
+    # New version drops in (fresh download). Counter must reset, so the next
+    # call spawns even though the previous version was capped.
+    _stub_staged(monkeypatch, version="9.9.10")
+    with pytest.raises(_ExitSentinel):
+        apply_staged_if_newer(tmp_path, "1.0.0", where="boot")
+    assert len(spawned) == MAX_APPLY_ATTEMPTS + 1
+
+
+def test_get_failed_apply_version_after_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stub_staged(monkeypatch, version="9.9.9")
+    _stub_helpers(monkeypatch)
+    monkeypatch.setattr(update_apply, "clear_staged", lambda data_dir: None)
+
+    # Below the cap → no failed version reported.
+    for _ in range(MAX_APPLY_ATTEMPTS - 1):
+        with pytest.raises(_ExitSentinel):
+            apply_staged_if_newer(tmp_path, "1.0.0", where="boot")
+    assert get_failed_apply_version(tmp_path) is None
+
+    # Cross the cap (one more spawn brings us to MAX, the next call caps).
+    with pytest.raises(_ExitSentinel):
+        apply_staged_if_newer(tmp_path, "1.0.0", where="boot")
+    apply_staged_if_newer(tmp_path, "1.0.0", where="boot")
+    assert get_failed_apply_version(tmp_path) == "9.9.9"
+
+
+def test_clear_apply_attempts_consumes_failure_marker(tmp_path: Path) -> None:
+    target = tmp_path / STAGED_DIR_NAME / APPLY_ATTEMPTS_FILE
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps({
+        "version": "9.9.9",
+        "attempts": MAX_APPLY_ATTEMPTS,
+        "first_attempt_at": "x",
+        "last_attempt_at": "x",
+    }))
+    assert get_failed_apply_version(tmp_path) == "9.9.9"
+    clear_apply_attempts(tmp_path)
+    assert get_failed_apply_version(tmp_path) is None
+    # Idempotent — second call must not raise.
+    clear_apply_attempts(tmp_path)
+
+
+def test_clear_apply_attempts_safe_when_missing(tmp_path: Path) -> None:
+    clear_apply_attempts(tmp_path)
+    assert get_failed_apply_version(tmp_path) is None

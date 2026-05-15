@@ -86,7 +86,11 @@ fi
 sleep 1
 
 # Mount the staged DMG. -nobrowse keeps Finder from popping a window.
-MOUNT_OUTPUT=$(hdiutil attach "$DMG_PATH" -nobrowse -quiet 2>&1) || \
+# Do NOT add -quiet here: it suppresses the device/mount-point table on
+# stdout, leaving the parse below with nothing to chew on (root cause of
+# the v3.1.x apply-fail loop on macOS — agent kept re-spawning the helper
+# every boot because the helper exited 1 before reaching the DMG cleanup).
+MOUNT_OUTPUT=$(hdiutil attach "$DMG_PATH" -nobrowse 2>&1) || \
     fail "hdiutil attach failed: $MOUNT_OUTPUT"
 MOUNT_POINT=$(echo "$MOUNT_OUTPUT" | tail -n1 | awk '{for (i=3; i<=NF; i++) printf "%s ", $i; print ""}' | sed 's/[[:space:]]*$//')
 if [ -z "$MOUNT_POINT" ] || [ ! -d "$MOUNT_POINT" ]; then

@@ -1428,6 +1428,7 @@ def service(force_setup: bool, from_autostart: bool, open_settings: bool) -> Non
     # after the notifier is constructed downstream (see _build_pipeline_state).
     from .last_version import read_last_seen, write_last_seen
     from .update import is_newer as _update_is_newer
+    from .update_apply import clear_apply_attempts, get_failed_apply_version
     from .update_stage import clear_staged
 
     _prior_version = read_last_seen(cfg.data_dir)
@@ -1439,7 +1440,27 @@ def service(force_setup: bool, from_autostart: bool, open_settings: bool) -> Non
         )
         _pending_upgrade_toast = (_prior_version, __version__)
         clear_staged(cfg.data_dir)
+        # Apply succeeded — wipe any leftover attempts marker from the
+        # version we just upgraded TO so a future apply-fail toast can't
+        # fire stale.
+        clear_apply_attempts(cfg.data_dir)
     write_last_seen(cfg.data_dir, __version__)
+
+    # Apply-failed toast: if a previous boot exhausted MAX_APPLY_ATTEMPTS on
+    # a staged version that's still newer than what we're running, surface a
+    # toast so the user knows to download the build manually instead of
+    # waiting for the in-app updater that's been silently looping. Consume
+    # the marker so the toast only fires once per failure episode.
+    _pending_apply_failed_toast: typing.Optional[str] = None
+    _failed_apply_version = get_failed_apply_version(cfg.data_dir)
+    if (_failed_apply_version is not None
+            and _update_is_newer(__version__, _failed_apply_version)):
+        log.warning(
+            "[update] previous apply attempts for v%s exhausted — queueing "
+            "user-visible failure toast", _failed_apply_version,
+        )
+        _pending_apply_failed_toast = _failed_apply_version
+    clear_apply_attempts(cfg.data_dir)
 
     # macOS bundle self-heal: strip the com.apple.quarantine xattr and,
     # for unsigned dev builds only, ad-hoc-sign the Swift helpers so
@@ -1706,6 +1727,25 @@ def service(force_setup: bool, from_autostart: bool, open_settings: bool) -> Non
                 )
             except Exception:
                 log.warning("[update] post-upgrade toast failed", exc_info=True)
+
+        # Apply-failed toast: surfaces a previous boot's exhausted apply-
+        # attempt cap so the user has an actionable next step instead of
+        # silently looping. Mutually exclusive with the post-upgrade toast
+        # in practice (one means "install worked", the other means "install
+        # didn't"), but we don't enforce that — they read different markers.
+        if _pending_apply_failed_toast is not None and cfg.notifications_enabled:
+            try:
+                notifier.notify(
+                    "Sayzo update failed",
+                    f"Couldn't install v{_pending_apply_failed_toast}. "
+                    "Download the latest from sayzo.app to update manually.",
+                )
+                log.info(
+                    "[update] apply-failed toast fired for v%s",
+                    _pending_apply_failed_toast,
+                )
+            except Exception:
+                log.warning("[update] apply-failed toast failed", exc_info=True)
 
         # Daily-drill scheduler — per-workday notification opening that day's
         # 60-second drill in the user's default browser. Constructed only when
