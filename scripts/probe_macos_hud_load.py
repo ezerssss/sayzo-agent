@@ -273,12 +273,37 @@ def run_webengine_probe(
     print(f"sys.executable:   {sys.executable}")
     print()
 
-    # Console-message severity → printable name.
-    LEVEL_NAMES = {
-        QWebEnginePage.JavaScriptConsoleMessageLevel.InfoMessageLevel: "INFO ",
-        QWebEnginePage.JavaScriptConsoleMessageLevel.WarningMessageLevel: "WARN ",
-        QWebEnginePage.JavaScriptConsoleMessageLevel.ErrorMessageLevel: "ERROR",
-    }
+    # PySide6 6.10 changed how enum members expose their integer value:
+    # ``int(member)`` raises TypeError; ``member.value`` is the new
+    # canonical access. Keep a fallback for older builds where
+    # ``int(member)`` still works and ``.value`` may not exist.
+    def _enum_int(member) -> int:  # noqa: ANN001
+        try:
+            return int(member.value)
+        except Exception:
+            try:
+                return int(member)
+            except Exception:
+                return -1
+
+    def _enum_name(member) -> str:  # noqa: ANN001
+        return getattr(member, "name", str(member))
+
+    # Console-message severity → printable name. Built lazily so we
+    # don't crash at import time on PySide6 builds that rename the
+    # enum members.
+    def _level_label(level) -> str:  # noqa: ANN001
+        try:
+            name = _enum_name(level)
+            if "Info" in name:
+                return "INFO "
+            if "Warning" in name:
+                return "WARN "
+            if "Error" in name:
+                return "ERROR"
+            return name
+        except Exception:
+            return f"L{_enum_int(level)}"
 
     console_messages: list[str] = []
     intercepted_requests: list[tuple[str, str, str]] = []  # (method, type, url)
@@ -287,19 +312,35 @@ def run_webengine_probe(
         def javaScriptConsoleMessage(  # type: ignore[override] # noqa: N802 — Qt selector
             self, level, message, line_number, source_id  # noqa: ANN001
         ) -> None:
-            label = LEVEL_NAMES.get(level, f"L{int(level)}")
+            label = _level_label(level)
             line = f"[console] {label} {message}  ({source_id}:{line_number})"
             console_messages.append(line)
             print(line)
 
     class _LoggingInterceptor(QWebEngineUrlRequestInterceptor):
         def interceptRequest(self, info) -> None:  # type: ignore[override] # noqa: N802 — Qt selector, ANN001
+            # Each accessor wrapped independently — newer PySide6 returns
+            # ``str`` for requestMethod() (not QByteArray), and resource
+            # types are full enum members (not ints). Don't let one
+            # broken accessor turn the whole row into "?".
             try:
-                method = bytes(info.requestMethod()).decode("ascii", "replace")
-                url = info.requestUrl().toString()
-                rt = int(info.resourceType())
+                rm = info.requestMethod()
+                if isinstance(rm, str):
+                    method = rm
+                elif hasattr(rm, "decode"):
+                    method = rm.decode("ascii", "replace")
+                else:
+                    method = str(rm)
             except Exception:
-                method, url, rt = "?", "?", -1
+                method = "?"
+            try:
+                url = info.requestUrl().toString()
+            except Exception:
+                url = "?"
+            try:
+                rt = _enum_int(info.resourceType())
+            except Exception:
+                rt = -1
             intercepted_requests.append((method, str(rt), url))
             if verbose:
                 print(f"[interceptor] {method} type={rt} {url}")
@@ -339,13 +380,17 @@ def run_webengine_probe(
 
         def _on_loading_info(info: QWebEngineLoadingInfo) -> None:
             try:
-                status = int(info.status())
-                err = int(info.errorCode())
+                status_raw = info.status()
+                status = _enum_int(status_raw)
+                status_name = _enum_name(status_raw)
+                err_raw = info.errorCode()
+                err = _enum_int(err_raw)
+                err_name = _enum_name(err_raw)
                 err_str = info.errorString()
                 url = info.url().toString()
                 print(
-                    f"[load] LoadingInfo status={status} errorCode={err} "
-                    f"errorString={err_str!r} url={url}"
+                    f"[load] LoadingInfo status={status_name}({status}) "
+                    f"errorCode={err_name}({err}) errorString={err_str!r} url={url}"
                 )
             except Exception as e:
                 print(f"[load] LoadingInfo read failed: {e}")
@@ -358,8 +403,8 @@ def run_webengine_probe(
     # Render-process death is a separate signal.
     def _on_render_terminated(status, exit_code) -> None:  # noqa: ANN001
         print(
-            f"[process] renderProcessTerminated status={int(status)} "
-            f"exitCode={exit_code}"
+            f"[process] renderProcessTerminated status={_enum_name(status)}"
+            f"({_enum_int(status)}) exitCode={exit_code}"
         )
 
     page.renderProcessTerminated.connect(_on_render_terminated)
