@@ -137,11 +137,43 @@ def _hud_subprocess_env() -> dict[str, str]:
     ``NSApp.setActivationPolicy_(NSApplicationActivationPolicyAccessory)``,
     so it stays Dock-icon-less without needing the inherited bundle
     identity. No-op on non-darwin (those vars aren't set there).
+
+    v3.1.7 update — ``__CFBundleIdentifier`` is REPLACED, not removed
+    ----------------------------------------------------------------
+    v3.1.6 popped ``__CFBundleIdentifier`` entirely. Diagnostic in
+    proc-state diff (2026-05-15) showed this caused the HUD subprocess
+    to have ``bundleID=[NULL]`` / ``!cgsConnection`` in lsappinfo —
+    i.e. Cocoa silently failed to register with LaunchServices at all,
+    not just "registered as helper." The env var being PRESENT (with
+    any value) is load-bearing for Cocoa's init. The working
+    Scenario-C from the diff had ``__CFBundleIdentifier=com.apple.Terminal``
+    (inherited from Terminal) and still registered correctly as
+    ``com.sayzo.agent`` because Cocoa walks the binary path to find
+    the actual bundle Info.plist.
+
+    So we now REPLACE rather than remove — set it to a non-Sayzo
+    sentinel (``com.apple.Terminal``) so Cocoa's init proceeds. The
+    binary-path walk identifies the HUD subprocess as
+    ``com.sayzo.agent`` correctly, but the parent-bundle attribution
+    chain breaks because the env var no longer matches the parent
+    agent's identity, so LaunchServices doesn't classify the HUD as
+    a helper of the running com.sayzo.agent — it gets its own ASN
+    + CGS connection.
     """
     env = dict(os.environ)
     if sys.platform == "darwin":
-        for key in ("__CFBundleIdentifier", "XPC_SERVICE_NAME", "XPC_FLAGS"):
+        # XPC_SERVICE_NAME and XPC_FLAGS: still scrub. These tell
+        # libxpc "this process is a launchd-managed XPC service" and
+        # carry the parent's specific service name. Inherited values
+        # are wrong for the HUD subprocess.
+        for key in ("XPC_SERVICE_NAME", "XPC_FLAGS"):
             env.pop(key, None)
+        # __CFBundleIdentifier: REPLACE, don't remove. Removing it
+        # caused v3.1.6's regression (Cocoa silently failed to
+        # register with LS — ``bundleID=[NULL]`` / ``!cgsConnection``).
+        # Setting it to a non-Sayzo value preserves Cocoa init while
+        # severing the parent-bundle attribution chain.
+        env["__CFBundleIdentifier"] = "com.apple.Terminal"
     return env
 
 
