@@ -63,6 +63,7 @@ def observe_will_power_off(callback: Callable[[], None]) -> bool:
     try:
         from AppKit import NSWorkspace  # type: ignore[import-not-found]
         from Foundation import NSObject  # type: ignore[import-not-found]
+        import objc  # type: ignore[import-not-found]
     except Exception:
         log.warning(
             "[mac_shutdown] AppKit / Foundation import failed — "
@@ -77,7 +78,12 @@ def observe_will_power_off(callback: Callable[[], None]) -> bool:
         _py_callback = None
 
         def initWithCallback_(self, cb):  # noqa: N802 — ObjC selector
-            self = NSObject.init(self)
+            # ``NSObject.init(self)`` raises "Need 0 arguments, got 1" under
+            # PyObjC because ``init`` is a 0-arg selector — the receiver
+            # is implicit. Use ``objc.super`` to dispatch to the parent
+            # init the way every other PyObjC subclass in this codebase
+            # does (see ``mac_reopen.py::_ReopenDelegate``).
+            self = objc.super(_ShutdownObserver, self).init()
             if self is None:
                 return None
             self._py_callback = cb

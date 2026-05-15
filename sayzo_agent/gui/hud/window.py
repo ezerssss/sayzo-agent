@@ -505,10 +505,29 @@ class _HudHostWidget(QWidget):
 
         NS_STATUS_WINDOW_LEVEL = 25
 
+        # Qt's ``QWidget.winId()`` returns the native NSView pointer on
+        # macOS — NOT the NSWindow. Calling ``setLevel_`` /
+        # ``setCollectionBehavior_`` / ``setHidesOnDeactivate_`` on the
+        # bridged NSView raises AttributeError because those are
+        # NSWindow selectors. Bridge the view, then walk to its host
+        # NSWindow via ``-[NSView window]``.
         try:
-            ns_window = objc.objc_object(c_void_p=int(self.winId()))
+            ns_view = objc.objc_object(c_void_p=int(self.winId()))
         except Exception:
-            log.warning("[hud] could not bridge QWidget winId to NSWindow", exc_info=True)
+            log.warning("[hud] could not bridge QWidget winId to NSView", exc_info=True)
+            return
+
+        try:
+            ns_window = ns_view.window()
+        except Exception:
+            log.warning("[hud] NSView.window() lookup failed", exc_info=True)
+            return
+        if ns_window is None:
+            log.warning(
+                "[hud] NSView has no NSWindow yet — overlay tweaks skipped "
+                "(HUD will inherit default window level / hidesOnDeactivate=YES; "
+                "expect HUD to disappear when agent loses focus)"
+            )
             return
 
         try:
@@ -528,6 +547,13 @@ class _HudHostWidget(QWidget):
             log.warning("[hud] setCollectionBehavior_ failed", exc_info=True)
 
         try:
+            # Without this, Qt's ``Qt.WindowType.Tool`` flag maps to an
+            # NSPanel-style window with ``hidesOnDeactivate=YES`` by
+            # default. The HUD subprocess never has focus (it's
+            # LSUIElement-style, no Dock icon), so AppKit treats it as
+            # "always inactive" and the window is hidden the moment any
+            # other app is frontmost. Pinning this False keeps the HUD
+            # visible regardless of which app currently has focus.
             ns_window.setHidesOnDeactivate_(False)
         except Exception:
             log.warning("[hud] setHidesOnDeactivate_ failed", exc_info=True)
