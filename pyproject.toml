@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sayzo-agent"
-version = "3.2.0"
+version = "3.2.1"
 description = "Armed-only capture agent for Sayzo — records meetings on user consent (hotkey or whitelisted meeting app), uploads raw stereo OGG Opus to the server, polls for the post-transcription title/summary."
 requires-python = ">=3.10"
 dependencies = [

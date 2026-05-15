@@ -154,34 +154,63 @@ def _hud_subprocess_argv() -> list[str]:
 def _hud_subprocess_env() -> dict[str, str]:
     """Env for the HUD subprocess.
 
-    On macOS we DON'T need to scrub anything anymore. The v3.2.0
-    Helper.app pattern (see _hud_subprocess_argv) makes the HUD a
-    spawned-by-wrapper process inside a separate ``SayzoHud.app``
-    bundle with its own ``CFBundleIdentifier=com.sayzo.agent.hud``,
-    so LaunchServices registers it as an independent app regardless
-    of what the parent agent's env contains. The earlier v3.1.5/6/7
-    env-scrub hacks are gone because they:
+    macOS LaunchServices identity overrides (v3.2.1)
+    ------------------------------------------------
+    On macOS we override three env vars before posix_spawn so
+    LaunchServices registers the HUD as a separate app instance
+    backed by ``SayzoHud.app`` (built by the v3.2.0 Helper.app
+    pattern), not as an internal helper of the running agent:
 
-      - v3.1.5: did nothing (the V8 entitlement was the v3.1.5 win,
-        not env scrub — env scrub was added in v3.1.6).
-      - v3.1.6: stripped ``__CFBundleIdentifier`` completely,
-        which caused Cocoa to silently fail LaunchServices
-        registration entirely (``bundleID=[NULL]`` /
-        ``!cgsConnection`` in lsappinfo).
-      - v3.1.7: replaced ``__CFBundleIdentifier`` with
-        ``com.apple.Terminal``, also did not work in production.
+      * ``__CFBundleIdentifier`` ← ``com.sayzo.agent.hud``
+        Tells Cocoa's NSBundle/LaunchServices "I am the helper
+        bundle." LSRegister validates this against the disk-resident
+        ``Sayzo.app/Contents/Frameworks/SayzoHud.app`` (which DOES
+        have that ID), accepts the override, and registers us as a
+        fresh com.sayzo.agent.hud instance — own ASN, own CGS
+        connection, windows render.
+      * ``XPC_SERVICE_NAME`` ← popped
+        Otherwise the child inherits the agent's XPC slot
+        (``application.com.sayzo.agent.<numbers>``), which marks the
+        process as part of the agent's XPC service and triggers the
+        same "internal helper, no registration" path even with a
+        different __CFBundleIdentifier.
+      * ``XPC_FLAGS`` ← popped (paranoia — usually 0x0, but no
+        reason to inherit any XPC config from the parent).
 
-    The Helper.app pattern (Architecture A — see installer/macos/
-    SayzoHud.app skeleton + sayzo_hud_wrapper.c) is what Chrome,
-    Electron, and every multi-process Mac app uses. We adopt it and
-    drop the env-var experiments.
+    Why this works in v3.2.1 but the v3.1.7 env hack didn't
+    --------------------------------------------------------
+    v3.1.7 set ``__CFBundleIdentifier=com.apple.Terminal`` to "spoof
+    Terminal." The bundle ID Terminal.app lives at
+    ``/System/Applications/Utilities/Terminal.app`` — completely
+    different binary tree from our HUD's ``sayzo-agent`` binary at
+    ``/Applications/Sayzo.app/Contents/MacOS/sayzo-agent``.
+    LaunchServices apparently treated that as a bogus override and
+    fell through to the same "internal helper" classification.
 
-    Returns a copy of the parent env unchanged (so this is a no-op
-    on every platform, including Windows where it was always a
-    no-op). Kept as a function rather than inlined so future per-
-    subprocess env tweaks have one place to land.
+    In v3.2.1 the override is ``com.sayzo.agent.hud`` and that
+    bundle ID IS valid on disk (``SayzoHud.app`` shipped with
+    v3.2.0). So LSRegister accepts it. The Helper.app bundle from
+    v3.2.0 was necessary scaffolding — without a real
+    ``com.sayzo.agent.hud`` bundle on disk, LSRegister has nothing
+    to validate the env var against.
+
+    Diagnosed 2026-05-16 via ``ps eww $HUD_PID`` + ``lsappinfo info
+    $HUD_PID`` against a v3.2.0 production install. Output:
+    ``__CFBundleIdentifier=com.sayzo.agent`` inherited (wrapper is
+    transparent for env), ``bundleID=[NULL]`` + ``!cgsConnection``
+    in lsappinfo (LS classified as internal helper of running
+    com.sayzo.agent agent). See
+    ``project_macos_hud_helper_app_v3_2_0`` memory + the v3.2.1
+    follow-up note for the full fix history.
+
+    Dev (non-frozen) runs and Windows return the env unchanged.
     """
-    return dict(os.environ)
+    env = dict(os.environ)
+    if sys.platform == "darwin" and getattr(sys, "frozen", False):
+        env["__CFBundleIdentifier"] = "com.sayzo.agent.hud"
+        env.pop("XPC_SERVICE_NAME", None)
+        env.pop("XPC_FLAGS", None)
+    return env
 
 
 class HudLauncher:
