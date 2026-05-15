@@ -180,7 +180,7 @@ def _apply_mac_overlay_tweaks(widget: QWidget) -> None:
         print(f"[probe] mac overlay tweaks failed: {e}")
 
 
-def build_window(mode: str) -> QWidget:
+def build_window(mode: str, custom_url: Optional[str] = None) -> QWidget:
     w = QWidget()
     flags = (
         Qt.WindowType.FramelessWindowHint
@@ -210,14 +210,29 @@ def build_window(mode: str) -> QWidget:
         view.page().setBackgroundColor(QColor(0, 0, 0, 0))
     layout.addWidget(view)
 
-    # Load the test HTML by setting it directly so we don't need a file.
-    view.setHtml(TEST_HTML)
+    if custom_url:
+        # Load the actual React HUD bundle (or any URL the user passes).
+        # In demo mode the React app self-renders content without needing
+        # a bridge, so we can see if it paints anything at all.
+        from PySide6.QtWebChannel import QWebChannel  # type: ignore[import-not-found]
+
+        channel = QWebChannel(view)
+        view.page().setWebChannel(channel)
+        # No `hudPyBridge` registered — the React app falls back to a
+        # no-op transport (we saw this in the earlier probe). With
+        # ``#demo=1`` in the URL, the React app renders demo content
+        # without needing real bridge calls.
+        print(f"[probe] loading custom URL: {custom_url}")
+        view.load(QUrl(custom_url))
+    else:
+        # Load the test HTML by setting it directly so we don't need a file.
+        view.setHtml(TEST_HTML)
     return w
 
 
-def run(mode: str, wait_secs: float) -> int:
+def run(mode: str, wait_secs: float, custom_url: Optional[str] = None) -> int:
     print("=" * 72)
-    print(f"VISIBILITY PROBE — mode={mode}")
+    print(f"VISIBILITY PROBE — mode={mode}{' url=' + custom_url if custom_url else ''}")
     print("=" * 72)
 
     app = QApplication.instance() or QApplication(sys.argv)
@@ -225,7 +240,7 @@ def run(mode: str, wait_secs: float) -> int:
     right_x, top_y = _compute_top_right_anchor()
     print(f"[probe] screen anchor: right_x={right_x} top_y={top_y}")
 
-    widget = build_window(mode)
+    widget = build_window(mode, custom_url=custom_url)
 
     # Spawn offscreen, then show — same lifecycle as HudWindow.
     ox, oy = _offscreen()
@@ -302,8 +317,18 @@ def main(argv: Optional[list[str]] = None) -> int:
         default=2.0,
         help="Seconds to wait offscreen before STEP 1 (default: 2)",
     )
+    p.add_argument(
+        "--url",
+        type=str,
+        default=None,
+        help=(
+            "Load this URL instead of the built-in magenta test page. Use "
+            "to test the actual bundled React HUD: "
+            "--url 'file:///Applications/Sayzo.app/Contents/Frameworks/sayzo_agent/gui/webui/dist/index.html#route=hud&demo=1'"
+        ),
+    )
     args = p.parse_args(argv)
-    return run(args.mode, args.initial_wait)
+    return run(args.mode, args.initial_wait, custom_url=args.url)
 
 
 if __name__ == "__main__":

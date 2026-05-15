@@ -92,6 +92,59 @@ def _hud_subprocess_argv() -> list[str]:
     return [sys.executable, "-m", "sayzo_agent", "hud"]
 
 
+def _hud_subprocess_env() -> dict[str, str]:
+    """Env for the HUD subprocess — strip LaunchServices identity vars on macOS.
+
+    When the agent is launched via Finder / Dock / login-item /
+    LaunchServices, macOS sets four env vars on the agent process
+    (verified 2026-05-15 on a Finder-launched v3.1.5 install):
+
+      - ``__CFBundleIdentifier=com.sayzo.agent``
+      - ``XPC_SERVICE_NAME=application.com.sayzo.agent.<n>.<n>``
+      - ``XPC_FLAGS=1``  (bit 0 = "managed by launchd as XPC service")
+      - ``__CF_USER_TEXT_ENCODING=0x1F5:0x0:0x0``  (locale, harmless)
+
+    The first three together tell Chromium's renderer in QtWebEngine
+    that the process is "this is the agent for the com.sayzo.agent
+    bundle, which has ``LSUIElement=YES`` and is launchd-managed".
+    Chromium's process-classification logic then treats the HUD's
+    NSWindows as belonging to a background accessory app, fires its
+    "occluded / not visible" heuristic, and stops painting the page.
+    Result: HUD logs ``window visibility → shown`` but the user sees
+    nothing on macOS.
+
+    Terminal-launched runs of the agent have NONE of these set, so
+    the HUD subprocess is treated as an independent process and
+    renders normally — that's the diagnostic A/B that pinned this
+    down. ``__CFBundleIdentifier`` alone, set from a terminal launch,
+    does NOT reproduce the bug, confirming the trigger is one (or
+    more) of the XPC vars.
+
+    We strip all three load-bearing vars to be safe. ``XPC_FLAGS=1``
+    in particular signals to libxpc that "this process is an XPC
+    service managed by launchd"; without it the HUD subprocess is
+    just a regular Cocoa process whose window-server interaction
+    isn't gated by the parent bundle's LSUIElement metadata.
+    ``__CF_USER_TEXT_ENCODING`` is left alone (it's just the user's
+    text-encoding locale, used by CoreFoundation for CFString /
+    encoding conversion — unrelated to window rendering, and
+    stripping it would force the default encoding which can produce
+    subtle text-rendering bugs in non-en_US locales).
+
+    The HUD subprocess's own startup code
+    (``window.py::_apply_mac_overlay_tweaks`` →
+    ``mac_dock.set_dock_visible(False)``) explicitly calls
+    ``NSApp.setActivationPolicy_(NSApplicationActivationPolicyAccessory)``,
+    so it stays Dock-icon-less without needing the inherited bundle
+    identity. No-op on non-darwin (those vars aren't set there).
+    """
+    env = dict(os.environ)
+    if sys.platform == "darwin":
+        for key in ("__CFBundleIdentifier", "XPC_SERVICE_NAME", "XPC_FLAGS"):
+            env.pop(key, None)
+    return env
+
+
 class HudLauncher:
     """Manage the HUD subprocess + dispatch its event stream."""
 
@@ -152,6 +205,11 @@ class HudLauncher:
                 stdout=asyncio.subprocess.PIPE,
                 # stderr inherits — HUD logs land in agent.log via the
                 # standard logging config the CLI command installs.
+                # env: scrub LaunchServices identity vars on macOS so
+                # Chromium's renderer doesn't treat the HUD as a
+                # background accessory-app window. See
+                # ``_hud_subprocess_env`` for the full rationale.
+                env=_hud_subprocess_env(),
             )
         except Exception:
             log.warning("[hud] subprocess spawn failed", exc_info=True)
