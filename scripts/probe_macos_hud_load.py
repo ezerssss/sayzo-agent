@@ -217,31 +217,59 @@ def run_webengine_probe(
             "click 'inspect' on the page to attach full DevTools.\n"
         )
 
+    # Import each subsystem separately so we can give a precise error
+    # if a single symbol is missing rather than a misleading "PySide6
+    # not installed". ``QT_VERSION_STR`` in particular varies across
+    # PySide6 builds (6.6+ exports it from QtCore, older builds don't);
+    # ``qVersion()`` is the universal API.
     try:
-        from PySide6 import __version__ as pyside_ver  # type: ignore[import-not-found]
-        from PySide6.QtCore import QT_VERSION_STR, QTimer, QUrl  # type: ignore[import-not-found]
+        import PySide6  # type: ignore[import-not-found]
+        from PySide6.QtCore import QTimer, QUrl, qVersion  # type: ignore[import-not-found]
+    except ImportError as e:
+        print(
+            "ERROR: PySide6 / PySide6.QtCore unavailable.\n"
+            "Run:  python3 -m pip install --user 'PySide6>=6.5' 'PySide6-Addons>=6.5'\n"
+            f"Underlying error: {e}"
+        )
+        return 2
+    try:
+        from PySide6.QtWidgets import QApplication  # type: ignore[import-not-found]
+    except ImportError as e:
+        print(f"ERROR: PySide6.QtWidgets unavailable: {e}")
+        return 2
+    try:
         from PySide6.QtWebChannel import QWebChannel  # type: ignore[import-not-found]
+    except ImportError as e:
+        print(
+            "ERROR: PySide6.QtWebChannel unavailable — install the addons "
+            f"package:\n  python3 -m pip install --user 'PySide6-Addons>=6.5'\n"
+            f"Underlying error: {e}"
+        )
+        return 2
+    try:
         from PySide6.QtWebEngineCore import (  # type: ignore[import-not-found]
             QWebEnginePage,
             QWebEngineSettings,
             QWebEngineUrlRequestInterceptor,
         )
         from PySide6.QtWebEngineWidgets import QWebEngineView  # type: ignore[import-not-found]
-        from PySide6.QtWidgets import QApplication  # type: ignore[import-not-found]
     except ImportError as e:
         print(
-            "ERROR: PySide6 not installed in this Python.\n"
-            "Run:  python3 -m pip install --user 'PySide6>=6.5' 'PySide6-Addons>=6.5'\n"
+            "ERROR: QtWebEngine unavailable — install the addons package:\n"
+            "  python3 -m pip install --user 'PySide6-Addons>=6.5'\n"
             f"Underlying error: {e}"
         )
         return 2
 
+    pyside_ver = getattr(PySide6, "__version__", "unknown")
+    qt_ver = qVersion()
     print("=" * 72)
     print("QT WEBENGINE PROBE")
     print("=" * 72)
     print(f"PySide6 version:  {pyside_ver}")
-    print(f"Qt version:       {QT_VERSION_STR}")
+    print(f"Qt version:       {qt_ver}")
     print(f"sys.platform:     {sys.platform}")
+    print(f"sys.version:      {sys.version.split()[0]}")
     print(f"sys.executable:   {sys.executable}")
     print()
 
