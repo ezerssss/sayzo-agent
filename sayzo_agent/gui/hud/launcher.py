@@ -93,88 +93,36 @@ def _hud_subprocess_argv() -> list[str]:
 
 
 def _hud_subprocess_env() -> dict[str, str]:
-    """Env for the HUD subprocess — strip LaunchServices identity vars on macOS.
+    """Env for the HUD subprocess.
 
-    When the agent is launched via Finder / Dock / login-item /
-    LaunchServices, macOS sets four env vars on the agent process
-    (verified 2026-05-15 on a Finder-launched v3.1.5 install):
+    On macOS we DON'T need to scrub anything anymore. The v3.2.0
+    Helper.app pattern (see _hud_subprocess_argv) makes the HUD a
+    spawned-by-wrapper process inside a separate ``SayzoHud.app``
+    bundle with its own ``CFBundleIdentifier=com.sayzo.agent.hud``,
+    so LaunchServices registers it as an independent app regardless
+    of what the parent agent's env contains. The earlier v3.1.5/6/7
+    env-scrub hacks are gone because they:
 
-      - ``__CFBundleIdentifier=com.sayzo.agent``
-      - ``XPC_SERVICE_NAME=application.com.sayzo.agent.<n>.<n>``
-      - ``XPC_FLAGS=1``  (bit 0 = "managed by launchd as XPC service")
-      - ``__CF_USER_TEXT_ENCODING=0x1F5:0x0:0x0``  (locale, harmless)
+      - v3.1.5: did nothing (the V8 entitlement was the v3.1.5 win,
+        not env scrub — env scrub was added in v3.1.6).
+      - v3.1.6: stripped ``__CFBundleIdentifier`` completely,
+        which caused Cocoa to silently fail LaunchServices
+        registration entirely (``bundleID=[NULL]`` /
+        ``!cgsConnection`` in lsappinfo).
+      - v3.1.7: replaced ``__CFBundleIdentifier`` with
+        ``com.apple.Terminal``, also did not work in production.
 
-    The first three together tell Chromium's renderer in QtWebEngine
-    that the process is "this is the agent for the com.sayzo.agent
-    bundle, which has ``LSUIElement=YES`` and is launchd-managed".
-    Chromium's process-classification logic then treats the HUD's
-    NSWindows as belonging to a background accessory app, fires its
-    "occluded / not visible" heuristic, and stops painting the page.
-    Result: HUD logs ``window visibility → shown`` but the user sees
-    nothing on macOS.
+    The Helper.app pattern (Architecture A — see installer/macos/
+    SayzoHud.app skeleton + sayzo_hud_wrapper.c) is what Chrome,
+    Electron, and every multi-process Mac app uses. We adopt it and
+    drop the env-var experiments.
 
-    Terminal-launched runs of the agent have NONE of these set, so
-    the HUD subprocess is treated as an independent process and
-    renders normally — that's the diagnostic A/B that pinned this
-    down. ``__CFBundleIdentifier`` alone, set from a terminal launch,
-    does NOT reproduce the bug, confirming the trigger is one (or
-    more) of the XPC vars.
-
-    We strip all three load-bearing vars to be safe. ``XPC_FLAGS=1``
-    in particular signals to libxpc that "this process is an XPC
-    service managed by launchd"; without it the HUD subprocess is
-    just a regular Cocoa process whose window-server interaction
-    isn't gated by the parent bundle's LSUIElement metadata.
-    ``__CF_USER_TEXT_ENCODING`` is left alone (it's just the user's
-    text-encoding locale, used by CoreFoundation for CFString /
-    encoding conversion — unrelated to window rendering, and
-    stripping it would force the default encoding which can produce
-    subtle text-rendering bugs in non-en_US locales).
-
-    The HUD subprocess's own startup code
-    (``window.py::_apply_mac_overlay_tweaks`` →
-    ``mac_dock.set_dock_visible(False)``) explicitly calls
-    ``NSApp.setActivationPolicy_(NSApplicationActivationPolicyAccessory)``,
-    so it stays Dock-icon-less without needing the inherited bundle
-    identity. No-op on non-darwin (those vars aren't set there).
-
-    v3.1.7 update — ``__CFBundleIdentifier`` is REPLACED, not removed
-    ----------------------------------------------------------------
-    v3.1.6 popped ``__CFBundleIdentifier`` entirely. Diagnostic in
-    proc-state diff (2026-05-15) showed this caused the HUD subprocess
-    to have ``bundleID=[NULL]`` / ``!cgsConnection`` in lsappinfo —
-    i.e. Cocoa silently failed to register with LaunchServices at all,
-    not just "registered as helper." The env var being PRESENT (with
-    any value) is load-bearing for Cocoa's init. The working
-    Scenario-C from the diff had ``__CFBundleIdentifier=com.apple.Terminal``
-    (inherited from Terminal) and still registered correctly as
-    ``com.sayzo.agent`` because Cocoa walks the binary path to find
-    the actual bundle Info.plist.
-
-    So we now REPLACE rather than remove — set it to a non-Sayzo
-    sentinel (``com.apple.Terminal``) so Cocoa's init proceeds. The
-    binary-path walk identifies the HUD subprocess as
-    ``com.sayzo.agent`` correctly, but the parent-bundle attribution
-    chain breaks because the env var no longer matches the parent
-    agent's identity, so LaunchServices doesn't classify the HUD as
-    a helper of the running com.sayzo.agent — it gets its own ASN
-    + CGS connection.
+    Returns a copy of the parent env unchanged (so this is a no-op
+    on every platform, including Windows where it was always a
+    no-op). Kept as a function rather than inlined so future per-
+    subprocess env tweaks have one place to land.
     """
-    env = dict(os.environ)
-    if sys.platform == "darwin":
-        # XPC_SERVICE_NAME and XPC_FLAGS: still scrub. These tell
-        # libxpc "this process is a launchd-managed XPC service" and
-        # carry the parent's specific service name. Inherited values
-        # are wrong for the HUD subprocess.
-        for key in ("XPC_SERVICE_NAME", "XPC_FLAGS"):
-            env.pop(key, None)
-        # __CFBundleIdentifier: REPLACE, don't remove. Removing it
-        # caused v3.1.6's regression (Cocoa silently failed to
-        # register with LS — ``bundleID=[NULL]`` / ``!cgsConnection``).
-        # Setting it to a non-Sayzo value preserves Cocoa init while
-        # severing the parent-bundle attribution chain.
-        env["__CFBundleIdentifier"] = "com.apple.Terminal"
-    return env
+    return dict(os.environ)
 
 
 class HudLauncher:
