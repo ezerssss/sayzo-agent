@@ -86,10 +86,69 @@ def _hud_subprocess_argv() -> list[str]:
     Frozen builds use the single bundled binary; dev runs use
     ``python -m sayzo_agent hud`` so the entry point resolves without
     relying on the ``sayzo-agent`` console-script being on PATH.
+
+    macOS Helper.app pattern (v3.2.0)
+    ---------------------------------
+    On macOS frozen builds, we route through the nested ``SayzoHud.app``
+    helper bundle's wrapper binary (``installer/macos/sayzo_hud_wrapper.c``,
+    bundled at ``Sayzo.app/Contents/Frameworks/SayzoHud.app/Contents/MacOS/SayzoHud``).
+    The wrapper does ``posix_spawn`` of the real ``sayzo-agent hud --idle``
+    and waits, inheriting stdin/stdout pipes from this launcher.
+
+    Why: macOS LaunchServices treats child processes spawned directly by
+    a process whose binary is in the SAME ``.app`` bundle as "internal
+    helpers" of the already-registered parent app — refuses to grant
+    them their own ASN / CGS (window server) connection. No CGS → no
+    rendering. By inserting the wrapper (whose binary is in
+    ``SayzoHud.app`` with ``CFBundleIdentifier=com.sayzo.agent.hud``,
+    NOT ``com.sayzo.agent``), the spawned HUD's parent has a different
+    bundle ID. LaunchServices then registers the HUD as an independent
+    ``com.sayzo.agent`` instance with its own ASN + CGS connection.
+
+    Diagnosed 2026-05-15 via ``scripts/probe_macos_hud_proc_state.py``.
+    Validated 2026-05-16 via ``scripts/validate_helper_app.sh`` —
+    HUD spawned via wrapper showed ``bundleID="com.sayzo.agent"`` and
+    proper ASN, vs. ``bundleID=[NULL] !cgsConnection`` for direct spawn.
+    See ``installer/macos/sayzo_hud_wrapper.c`` for full rationale.
+
+    Dev (non-frozen) runs on macOS bypass the wrapper since the helper
+    bundle isn't built. The bug only manifests when the parent agent
+    is itself in a fully-registered ``.app`` bundle, which doesn't
+    happen in dev.
     """
-    if getattr(sys, "frozen", False):
+    if not getattr(sys, "frozen", False):
+        return [sys.executable, "-m", "sayzo_agent", "hud"]
+
+    if sys.platform == "darwin":
+        # Frozen macOS: route through the helper bundle's wrapper.
+        # sys.executable points at Sayzo.app/Contents/MacOS/sayzo-agent;
+        # the helper wrapper lives at Sayzo.app/Contents/Frameworks/
+        # SayzoHud.app/Contents/MacOS/SayzoHud — i.e. one level up
+        # from Contents/MacOS/, then into Frameworks/SayzoHud.app/...
+        contents_dir = Path(sys.executable).parent.parent
+        wrapper = (
+            contents_dir / "Frameworks" / "SayzoHud.app" /
+            "Contents" / "MacOS" / "SayzoHud"
+        )
+        if wrapper.exists():
+            # Wrapper expects: SayzoHud <target_binary> [target_args...]
+            # The target is the real sayzo-agent binary in `hud --idle` mode.
+            return [str(wrapper), sys.executable, "hud"]
+        # Defensive fallback: if the helper bundle isn't present (older
+        # build, manual install corruption), spawn the binary directly
+        # — HUD will be invisible per the v3.1.x bug, but the agent
+        # won't crash. Logged loudly so we notice in the field.
+        log.warning(
+            "[hud] SayzoHud helper bundle not found at %s — falling back "
+            "to direct spawn (HUD will be invisible on Finder-launched agent)",
+            wrapper,
+        )
         return [sys.executable, "hud"]
-    return [sys.executable, "-m", "sayzo_agent", "hud"]
+
+    # Frozen Windows / Linux: same as before, no wrapper needed (Windows
+    # has no LaunchServices and renders fine; Linux build path doesn't
+    # exist yet).
+    return [sys.executable, "hud"]
 
 
 def _hud_subprocess_env() -> dict[str, str]:

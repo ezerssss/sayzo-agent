@@ -417,3 +417,49 @@ if sys.platform == "darwin":
     _dst_apply.write_bytes(_src_apply.read_bytes())
     _dst_apply.chmod(0o755)
     print(f"sayzo-agent.spec: bundled apply_update.sh at {_dst_apply}")
+
+    # SayzoHud.app — nested helper bundle for the HUD subprocess (v3.2.0).
+    #
+    # The HUD subprocess (PySide6 + QtWebEngine) renders invisibly when
+    # spawned directly by the parent agent (both binaries are in
+    # com.sayzo.agent → macOS LaunchServices classifies the HUD as an
+    # "internal helper" and skips ASN/CGS registration — see
+    # ``installer/macos/sayzo_hud_wrapper.c`` for the full diagnosis).
+    #
+    # Helper.app pattern (canonical Chrome/Electron architecture): nest
+    # a separate ``.app`` bundle with a different ``CFBundleIdentifier``
+    # inside ``Contents/Frameworks/``. The helper bundle's ``MacOS/SayzoHud``
+    # is a tiny native wrapper that posix_spawns the real ``sayzo-agent
+    # hud --idle`` binary. Because the wrapper sits in ``com.sayzo.agent.hud``
+    # bundle (NOT ``com.sayzo.agent``), the spawned HUD's parent has a
+    # different bundle ID — LaunchServices grants the HUD its own ASN
+    # and CGS connection, windows render correctly.
+    #
+    # The wrapper binary is compiled in CI by the
+    # ``Compile sayzo_hud_wrapper`` step (.github/workflows/build.yml)
+    # via ``installer/macos/build_sayzo_hud_wrapper.sh``, which writes
+    # to ``installer/macos/SayzoHud.app/Contents/MacOS/SayzoHud`` —
+    # i.e. directly into the source skeleton tree. We copy the entire
+    # assembled bundle into ``Sayzo.app/Contents/Frameworks/`` here.
+    # The ``--deep`` codesign in CI then recursively signs the nested
+    # bundle with the same Developer ID + entitlements as the parent.
+    _hud_helper_src = Path("installer/macos/SayzoHud.app")
+    _hud_helper_wrapper = _hud_helper_src / "Contents" / "MacOS" / "SayzoHud"
+    if not _hud_helper_wrapper.exists():
+        raise SystemExit(
+            f"SayzoHud wrapper not built: {_hud_helper_wrapper} missing. "
+            "Run `bash installer/macos/build_sayzo_hud_wrapper.sh` first "
+            "(or in CI, ensure the 'Compile sayzo_hud_wrapper' step ran)."
+        )
+    _frameworks_dir = _bundle_path / "Contents" / "Frameworks"
+    _frameworks_dir.mkdir(parents=True, exist_ok=True)
+    _hud_helper_dst = _frameworks_dir / "SayzoHud.app"
+    if _hud_helper_dst.exists():
+        # Stale copy from prior build — wipe and recopy.
+        import shutil
+        shutil.rmtree(_hud_helper_dst)
+    import shutil
+    shutil.copytree(_hud_helper_src, _hud_helper_dst, symlinks=True)
+    # Re-chmod +x in case copytree didn't preserve it on the runner FS.
+    (_hud_helper_dst / "Contents" / "MacOS" / "SayzoHud").chmod(0o755)
+    print(f"sayzo-agent.spec: bundled SayzoHud.app helper at {_hud_helper_dst}")
