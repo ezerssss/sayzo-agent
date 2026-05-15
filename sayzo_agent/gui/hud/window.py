@@ -19,8 +19,8 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlencode
 
-from PySide6.QtCore import QObject, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor
+from PySide6.QtCore import QObject, QRect, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QCursor, QGuiApplication
 from PySide6.QtWebChannel import QWebChannel
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWidgets import QApplication, QVBoxLayout, QWidget
@@ -80,9 +80,16 @@ class _HudHostWidget(QWidget):
         self._currently_visible = False
         self._current_width = INITIAL_HUD_WIDTH
         self._current_height = INITIAL_HUD_HEIGHT
-        # Right-edge anchor (screen width minus inset). Computed once;
-        # used as the INITIAL anchor when the HUD first comes onscreen.
-        self._screen_right_edge = _compute_screen_right_edge()
+        # Top-right anchor of the chosen screen, in Qt coordinate space.
+        # Refreshed on every visibility-show transition (see
+        # :meth:`_refresh_screen_anchor`) so a late-arriving display
+        # config — agent auto-starts before Windows finishes painting
+        # the desktop, user docks a laptop mid-session, resolution
+        # change — gets picked up on the next toast rather than
+        # baking a stale value for the whole HUD lifetime. The
+        # initial value here is the best guess at construction time
+        # and seeds the first show.
+        self._screen_right_edge, self._screen_top_edge = self._compute_screen_anchor()
         # Live "where the window's top-right corner currently sits"
         # anchor. Updated by ``moveEvent`` whenever the window moves
         # while visible (programmatic or user-initiated drag). On
@@ -92,7 +99,7 @@ class _HudHostWidget(QWidget):
         # snapping back to the screen's top-right corner if the user
         # has dragged it elsewhere.
         self._anchor_right_x = self._screen_right_edge
-        self._anchor_y = HUD_EDGE_INSET
+        self._anchor_y = self._screen_top_edge
         # Set while we're doing a programmatic move / resize, so
         # ``moveEvent`` only treats user-initiated drags as anchor
         # updates. Without this guard, programmatic ``setGeometry``
@@ -143,6 +150,22 @@ class _HudHostWidget(QWidget):
         self._view.loadFinished.connect(self._on_load_finished)
         self._command_received.connect(self._dispatch_command_on_gui_thread)
 
+        # Listen for display-config changes so a docked-laptop /
+        # plugged-in-monitor / resolution-change mid-session re-anchors
+        # the HUD instead of leaving it on a screen that no longer
+        # exists or at coordinates that no longer map anywhere visible.
+        gui_app = QGuiApplication.instance()
+        if gui_app is not None:
+            gui_app.primaryScreenChanged.connect(self._on_screen_config_changed)
+            gui_app.screenAdded.connect(self._on_screen_config_changed)
+            gui_app.screenRemoved.connect(self._on_screen_config_changed)
+
+        # One-time dump of every detected screen at HUD boot. Triages
+        # the next "I can't see the HUD" report in one grep — without
+        # this we have to ask the user to run a separate PowerShell
+        # snippet to enumerate monitors.
+        self._log_all_screens()
+
         # Load the React bundle.
         index = webui_index_path()
         if not index.exists():
@@ -150,9 +173,9 @@ class _HudHostWidget(QWidget):
             return
         url = _hud_url(index, demo=self._demo)
         log.info(
-            "[hud] opening Qt window offscreen at (x=%s y=%s); right edge=%s "
+            "[hud] opening Qt window offscreen at (x=%s y=%s); right edge=%s top edge=%s "
             "initial w=%s h=%s demo=%s url=%s",
-            offscreen_x, offscreen_y, self._screen_right_edge,
+            offscreen_x, offscreen_y, self._screen_right_edge, self._screen_top_edge,
             INITIAL_HUD_WIDTH, INITIAL_HUD_HEIGHT, self._demo, url,
         )
         self._view.load(QUrl(url))
@@ -196,28 +219,55 @@ class _HudHostWidget(QWidget):
             return
         self._currently_visible = visible
         if visible:
-            # Use the live anchor: top-right corner by default, or
-            # wherever the user dragged the window last cycle.
+            # Refresh the chosen-screen anchor on every show. The
+            # value captured at HUD-subprocess __init__ is suspect
+            # in two common scenarios — agent auto-starts at boot
+            # before Windows finishes painting the desktop, and the
+            # user reconfigures monitors between captures — so we
+            # re-probe Qt's screen API here. After this, even if the
+            # init-time value was wrong, the very first show lands
+            # the window correctly.
+            self._refresh_screen_anchor()
+            # Snap the live anchor back to the freshly-computed
+            # top-right of the chosen screen. The user-drag override
+            # in ``moveEvent`` only persists within a single visible
+            # session — once the previous batch cleared and we went
+            # hidden, the next cycle starts fresh at top-right. This
+            # is the same behavior as before, just on the refreshed
+            # screen geometry.
+            self._anchor_right_x = self._screen_right_edge
+            self._anchor_y = self._screen_top_edge
             x = self._anchor_right_x - self._current_width
             y = self._anchor_y
+            # Last-resort safety net: if for some reason the target
+            # rect lies outside every detected screen (screen was
+            # removed between refresh and move, fallback values
+            # are stale, …), clamp to a primary-screen position
+            # the user can definitely see. We'd rather show the HUD
+            # in an "unexpected but visible" spot than hide it forever.
+            x, y = self._clamp_to_visible_screen(x, y)
         else:
-            # Going hidden — reset the anchor back to the screen's
-            # top-right so the NEXT visibility cycle (new pill /
-            # card / toast after the previous batch fully cleared)
-            # starts fresh at the top-right corner. Without this the
-            # window would re-appear wherever the user dragged it
-            # last session, which on a "no content → new content"
-            # transition feels like a stale state from the previous
-            # arm cycle.
+            # Going hidden — reset the anchor back to the (currently
+            # known) screen's top-right so the NEXT visibility cycle
+            # (new pill / card / toast after the previous batch fully
+            # cleared) starts fresh at the top-right corner. Without
+            # this the window would re-appear wherever the user
+            # dragged it last session, which on a "no content → new
+            # content" transition feels like a stale state from the
+            # previous arm cycle.
             self._anchor_right_x = self._screen_right_edge
-            self._anchor_y = HUD_EDGE_INSET
+            self._anchor_y = self._screen_top_edge
             x, y = _offscreen_anchor()
         self._suppress_anchor_update = True
         try:
             self.move(int(x), int(y))
         finally:
             self._suppress_anchor_update = False
-        log.info("[hud] window visibility → %s", "shown" if visible else "hidden")
+        log.info(
+            "[hud] window visibility → %s (pos=%d,%d size=%dx%d)",
+            "shown" if visible else "hidden",
+            int(x), int(y), self._current_width, self._current_height,
+        )
 
     def _set_window_size(self, width: int, height: int) -> None:
         if width == self._current_width and height == self._current_height:
@@ -234,6 +284,10 @@ class _HudHostWidget(QWidget):
             # the right of the monitor.
             x = self._anchor_right_x - self._current_width
             y = self._anchor_y
+            # Resize can push the rect off-screen too (e.g. window
+            # widened past the right edge of a narrow screen); apply
+            # the same safety clamp the visibility path uses.
+            x, y = self._clamp_to_visible_screen(x, y)
         else:
             x, y = _offscreen_anchor()
         self._suppress_anchor_update = True
@@ -283,6 +337,144 @@ class _HudHostWidget(QWidget):
             handle.startSystemMove()
         except Exception:
             log.warning("[hud] startSystemMove failed", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Screen-anchor management. Used by ``_set_window_visible`` and
+    # the screen-change signal handlers to keep the HUD on a screen
+    # the user can actually see across boot-time display races,
+    # docking / undocking, resolution changes, and monitor unplug.
+    # ------------------------------------------------------------------
+
+    def _compute_screen_anchor(self) -> tuple[int, int]:
+        """Return ``(right_x, top_y)`` of the chosen screen's anchor.
+
+        Uses Qt's screen API rather than Win32 ``GetSystemMetrics``:
+        the value is in the same coordinate space ``setGeometry()``
+        interprets, so we don't get a DPI mismatch on non-100% scale
+        monitors. Picks the screen under the cursor (with primary as
+        fallback) so a toast lands on whichever monitor the user is
+        actively working on rather than always on primary.
+
+        Returns ``(1280, HUD_EDGE_INSET)`` as a last-ditch fallback
+        if no QGuiApplication / no screens are available; the
+        sanity-clamp in ``_clamp_to_visible_screen`` catches any
+        case where that fallback is actually offscreen.
+        """
+        gui_app = QGuiApplication.instance()
+        if gui_app is None:
+            log.warning("[hud] _compute_screen_anchor: no QGuiApplication yet")
+            return 1280, HUD_EDGE_INSET
+        cursor_pos = QCursor.pos()
+        screen = gui_app.screenAt(cursor_pos) or gui_app.primaryScreen()
+        if screen is None:
+            log.warning("[hud] _compute_screen_anchor: no screens detected")
+            return 1280, HUD_EDGE_INSET
+        geom = screen.availableGeometry()
+        right_x = geom.right() - HUD_EDGE_INSET
+        top_y = geom.top() + HUD_EDGE_INSET
+        log.info(
+            "[hud] screen anchor: name=%s availableGeometry=(%d,%d %dx%d) "
+            "cursor=(%d,%d) → right_x=%d top_y=%d",
+            screen.name(),
+            geom.x(), geom.y(), geom.width(), geom.height(),
+            cursor_pos.x(), cursor_pos.y(),
+            right_x, top_y,
+        )
+        return right_x, top_y
+
+    def _refresh_screen_anchor(self) -> None:
+        """Re-probe Qt for the chosen screen and store the result."""
+        self._screen_right_edge, self._screen_top_edge = self._compute_screen_anchor()
+
+    def _log_all_screens(self) -> None:
+        """One-time diagnostic dump of every detected screen at HUD boot.
+
+        Logged once in ``__init__`` so any future "I can't see the HUD"
+        report has the full display topology available without a
+        follow-up PowerShell snippet. Includes per-screen DPI so we can
+        spot scaling-related misplacements.
+        """
+        gui_app = QGuiApplication.instance()
+        if gui_app is None:
+            log.warning("[hud] _log_all_screens: no QGuiApplication")
+            return
+        primary = gui_app.primaryScreen()
+        screens = gui_app.screens()
+        log.info("[hud] screens detected: count=%d", len(screens))
+        for screen in screens:
+            full = screen.geometry()
+            avail = screen.availableGeometry()
+            log.info(
+                "[hud]   screen name=%s primary=%s "
+                "geometry=(%d,%d %dx%d) available=(%d,%d %dx%d) "
+                "devicePixelRatio=%.2f logicalDpi=%.0f",
+                screen.name(), screen is primary,
+                full.x(), full.y(), full.width(), full.height(),
+                avail.x(), avail.y(), avail.width(), avail.height(),
+                screen.devicePixelRatio(), screen.logicalDotsPerInch(),
+            )
+
+    def _clamp_to_visible_screen(self, x: int, y: int) -> tuple[int, int]:
+        """Ensure ``(x, y, current_w, current_h)`` overlaps at least one screen.
+
+        If the target rect lies entirely outside every screen's
+        ``availableGeometry``, fall back to the primary screen's
+        top-left plus ``HUD_EDGE_INSET``. This is the last-resort
+        safety net — every layer above (Qt-coord-space probe,
+        recompute-on-show, screen-change signal handler) should
+        already keep us on a visible screen, but if something has
+        regressed at least the HUD lands somewhere the user can
+        find it.
+        """
+        gui_app = QGuiApplication.instance()
+        if gui_app is None:
+            return x, y
+        rect = QRect(int(x), int(y), self._current_width, self._current_height)
+        for screen in gui_app.screens():
+            if screen.availableGeometry().intersects(rect):
+                return x, y
+        primary = gui_app.primaryScreen()
+        if primary is None:
+            log.warning(
+                "[hud] clamp: target (%d,%d %dx%d) outside all screens "
+                "and no primary — keeping it",
+                x, y, self._current_width, self._current_height,
+            )
+            return x, y
+        geom = primary.availableGeometry()
+        fallback_x = geom.left() + HUD_EDGE_INSET
+        fallback_y = geom.top() + HUD_EDGE_INSET
+        log.warning(
+            "[hud] clamp: target (%d,%d %dx%d) outside all screens — "
+            "falling back to primary top-left (%d,%d)",
+            x, y, self._current_width, self._current_height,
+            fallback_x, fallback_y,
+        )
+        return fallback_x, fallback_y
+
+    def _on_screen_config_changed(self, *_args) -> None:
+        """Handle ``primaryScreenChanged`` / ``screenAdded`` / ``screenRemoved``.
+
+        Re-probe the chosen-screen anchor and, if the HUD is currently
+        visible, snap it to the new top-right. Catches docking /
+        undocking, monitor unplug, and resolution-change mid-session
+        without waiting for the next hide-show cycle.
+        """
+        log.info("[hud] screen configuration changed — re-anchoring")
+        self._log_all_screens()
+        self._refresh_screen_anchor()
+        if not self._currently_visible:
+            return
+        self._anchor_right_x = self._screen_right_edge
+        self._anchor_y = self._screen_top_edge
+        x = self._anchor_right_x - self._current_width
+        y = self._anchor_y
+        x, y = self._clamp_to_visible_screen(x, y)
+        self._suppress_anchor_update = True
+        try:
+            self.move(int(x), int(y))
+        finally:
+            self._suppress_anchor_update = False
 
     # ------------------------------------------------------------------
     # macOS overlay tweaks: NSStatusWindowLevel + collection behaviour
@@ -473,37 +665,6 @@ class HudWindow:
 def _offscreen_anchor() -> tuple[int, int]:
     """A point far enough off the primary monitor to be invisible."""
     return (-20000, 0)
-
-
-def _compute_screen_right_edge() -> int:
-    """Pixel x-coordinate of "right edge minus inset" on the primary monitor.
-
-    Used as the right anchor for the HUD: regardless of the current
-    window width, the top-right corner snaps to this column. Falls back
-    to a ctypes / Cocoa probe / sensible default.
-    """
-    if sys.platform == "win32":
-        try:
-            import ctypes
-
-            user32 = ctypes.windll.user32
-            user32.SetProcessDPIAware()
-            screen_w = user32.GetSystemMetrics(0)  # SM_CXSCREEN
-            return max(0, screen_w - HUD_EDGE_INSET)
-        except Exception:
-            log.warning("[hud] win screen probe failed", exc_info=True)
-    if sys.platform == "darwin":
-        try:
-            from AppKit import NSScreen  # type: ignore[import-not-found]
-
-            main = NSScreen.mainScreen()
-            if main is not None:
-                frame = main.frame()
-                screen_w = int(frame.size.width)
-                return max(0, screen_w - HUD_EDGE_INSET)
-        except Exception:
-            log.warning("[hud] mac screen probe failed", exc_info=True)
-    return 1280
 
 
 def _install_sigint_handler(app: QApplication) -> None:

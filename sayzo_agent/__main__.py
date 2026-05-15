@@ -2573,6 +2573,15 @@ def hud(idle: bool, demo: bool) -> None:
 
     cfg = load_config()
     _setup_logging("INFO", debug=cfg.debug)
+    # File logging + excepthooks mirror what `service()` does. Without
+    # these, every `[hud] ...` line and any startup crash traceback
+    # vanishes — the HUD subprocess inherits stderr from a windowed
+    # PyInstaller exe, which is /dev/null. Critical for triaging
+    # "I can't see the HUD" reports: the subprocess's own
+    # window-position + screen-detection logs land in agent.log
+    # alongside the parent's `[hud] spawning subprocess` line.
+    _setup_file_logging(cfg.logs_dir)
+    _install_excepthooks()
     log = logging.getLogger("hud")
 
     from .gui.hud.window import HudWindow
