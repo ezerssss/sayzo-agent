@@ -35,8 +35,8 @@ WINDOW_TITLE = "Sayzo HUD"
 
 # Initial host window size at construction time. React's ResizeObserver
 # overrides this within one frame of mount via
-# ``HudBridge.set_window_size``, so the user never sees this. The
-# window is created offscreen anyway.
+# ``HudBridge.set_window_size``. The window is created at opacity 0
+# so the initial 100×100 box is never seen.
 INITIAL_HUD_WIDTH = 100
 INITIAL_HUD_HEIGHT = 100
 
@@ -106,6 +106,10 @@ class _HudHostWidget(QWidget):
         # calls would clobber the anchor with stale geometry values
         # if Qt fires ``moveEvent`` before ``resizeEvent``.
         self._suppress_anchor_update = False
+        # Bounded retry counter for the macOS overlay-tweak path —
+        # NSWindow realization can lag Qt's loadFinished signal by a
+        # tick under load. See :meth:`_apply_mac_overlay_tweaks`.
+        self._overlay_tweak_attempts = 0
 
         # Frameless, top-most, no taskbar/Alt-Tab, no focus theft.
         self.setWindowFlags(
@@ -118,13 +122,23 @@ class _HudHostWidget(QWidget):
         # transparent become OS-level transparent.
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
-        # Start at the offscreen anchor so we don't briefly flash the
-        # window during boot. React's ResizeObserver and
-        # ``set_window_visible(true)`` move + resize us when there's
-        # content.
-        offscreen_x, offscreen_y = _offscreen_anchor()
+        # Realize the native window at the real top-right anchor from
+        # boot so macOS WindowServer establishes a CGS connection for
+        # the subprocess immediately. Hide via opacity, NOT via offscreen
+        # geometry — pre-v3.3.0 we set geometry to (-20000, 0) and let
+        # ``_set_window_visible(true)`` move it on-screen when content
+        # arrived. On macOS that left the NSWindow unrealized
+        # (transparent frameless widget shown outside every screen ⇒
+        # WindowServer never allocates a backing surface), which is why
+        # the agent-spawned HUD never appeared even though
+        # ``sayzo-agent hud --demo`` did (demo's URL hash forces
+        # ``hasContent=true`` immediately, so the move-on-screen lands
+        # before WindowServer commits to "unrealized" state).
+        self.setWindowOpacity(0.0)
+        init_x = self._screen_right_edge - INITIAL_HUD_WIDTH
+        init_y = self._screen_top_edge
         self.setGeometry(
-            offscreen_x, offscreen_y, INITIAL_HUD_WIDTH, INITIAL_HUD_HEIGHT,
+            init_x, init_y, INITIAL_HUD_WIDTH, INITIAL_HUD_HEIGHT,
         )
         self.setWindowTitle(WINDOW_TITLE)
 
@@ -173,12 +187,18 @@ class _HudHostWidget(QWidget):
             return
         url = _hud_url(index, demo=self._demo)
         log.info(
-            "[hud] opening Qt window offscreen at (x=%s y=%s); right edge=%s top edge=%s "
+            "[hud] opening Qt window at (x=%s y=%s opacity=0.0); right edge=%s top edge=%s "
             "initial w=%s h=%s demo=%s url=%s",
-            offscreen_x, offscreen_y, self._screen_right_edge, self._screen_top_edge,
+            init_x, init_y, self._screen_right_edge, self._screen_top_edge,
             INITIAL_HUD_WIDTH, INITIAL_HUD_HEIGHT, self._demo, url,
         )
         self._view.load(QUrl(url))
+        log.info(
+            "[hud] post-init state: isVisible=%s windowHandle=%s geometry=%s",
+            self.isVisible(),
+            self.windowHandle() is not None,
+            self.geometry().getRect(),
+        )
 
     @property
     def bridge(self) -> HudBridge:
@@ -191,11 +211,21 @@ class _HudHostWidget(QWidget):
     def _on_load_finished(self, ok: bool) -> None:
         if not ok:
             log.warning("[hud] page load reported not-ok")
-        log.info("[hud] page loaded — wiring bridge callbacks")
+        log.info(
+            "[hud] loadFinished: ok=%s isVisible=%s windowHandle=%s geometry=%s",
+            ok,
+            self.isVisible(),
+            self.windowHandle() is not None,
+            self.geometry().getRect(),
+        )
         # Apply macOS-specific overlay tweaks (status-window-level,
         # collection behaviour, hides-on-deactivate=False) once Qt has
-        # realised the native NSWindow.
+        # realised the native NSWindow. Probe lsappinfo first — that
+        # single line is the kill-criterion for "did macOS WindowServer
+        # actually register us?" and would have shortcut the entire
+        # v3.1.6 → v3.2.1 LaunchServices chase if we'd been logging it.
         if sys.platform == "darwin":
+            self._log_lsappinfo_self()
             self._apply_mac_overlay_tweaks()
         # Wire the bridge callbacks now that the host widget is real.
         # React may already have buffered set_window_visible /
@@ -209,8 +239,10 @@ class _HudHostWidget(QWidget):
         self._flush_pending_commands()
 
     # ------------------------------------------------------------------
-    # Visibility — toggle the window between onscreen (top-right) and
-    # offscreen (-20000, 0) using setGeometry. No focus stealing
+    # Visibility — toggle via setWindowOpacity(0/1). The NSWindow stays
+    # realized for the entire HUD lifecycle; moving it offscreen would
+    # cause WindowServer on macOS to drop the backing surface (the
+    # original v3.0-era bug that v3.3.0 fixes). No focus stealing
     # because the window has Qt.WindowDoesNotAcceptFocus.
     # ------------------------------------------------------------------
 
@@ -219,77 +251,74 @@ class _HudHostWidget(QWidget):
             return
         self._currently_visible = visible
         if visible:
-            # Refresh the chosen-screen anchor on every show. The
-            # value captured at HUD-subprocess __init__ is suspect
-            # in two common scenarios — agent auto-starts at boot
-            # before Windows finishes painting the desktop, and the
-            # user reconfigures monitors between captures — so we
-            # re-probe Qt's screen API here. After this, even if the
-            # init-time value was wrong, the very first show lands
-            # the window correctly.
+            # Refresh the chosen-screen anchor on every show. The value
+            # captured at HUD-subprocess __init__ is suspect in two
+            # common scenarios — agent auto-starts at boot before
+            # Windows finishes painting the desktop, and the user
+            # reconfigures monitors between captures — so we re-probe
+            # Qt's screen API here. After this, even if the init-time
+            # value was wrong, the very first show lands the window
+            # correctly.
             self._refresh_screen_anchor()
             # Snap the live anchor back to the freshly-computed
-            # top-right of the chosen screen. The user-drag override
-            # in ``moveEvent`` only persists within a single visible
+            # top-right of the chosen screen. The user-drag override in
+            # ``moveEvent`` only persists within a single visible
             # session — once the previous batch cleared and we went
-            # hidden, the next cycle starts fresh at top-right. This
-            # is the same behavior as before, just on the refreshed
-            # screen geometry.
+            # hidden, the next cycle starts fresh at top-right.
             self._anchor_right_x = self._screen_right_edge
             self._anchor_y = self._screen_top_edge
             x = self._anchor_right_x - self._current_width
             y = self._anchor_y
             # Last-resort safety net: if for some reason the target
             # rect lies outside every detected screen (screen was
-            # removed between refresh and move, fallback values
-            # are stale, …), clamp to a primary-screen position
-            # the user can definitely see. We'd rather show the HUD
-            # in an "unexpected but visible" spot than hide it forever.
+            # removed between refresh and move, fallback values are
+            # stale, …), clamp to a primary-screen position the user
+            # can definitely see.
             x, y = self._clamp_to_visible_screen(x, y)
+            self._suppress_anchor_update = True
+            try:
+                self.move(int(x), int(y))
+            finally:
+                self._suppress_anchor_update = False
+            self.setWindowOpacity(1.0)
+            log.info(
+                "[hud] window visibility → shown (pos=%d,%d size=%dx%d opacity=1.0)",
+                int(x), int(y), self._current_width, self._current_height,
+            )
         else:
-            # Going hidden — reset the anchor back to the (currently
-            # known) screen's top-right so the NEXT visibility cycle
-            # (new pill / card / toast after the previous batch fully
-            # cleared) starts fresh at the top-right corner. Without
-            # this the window would re-appear wherever the user
-            # dragged it last session, which on a "no content → new
-            # content" transition feels like a stale state from the
-            # previous arm cycle.
+            # Going hidden: fade out via opacity, leave geometry in
+            # place. Reset the anchor back to the screen's top-right so
+            # the NEXT visibility cycle starts fresh at the top-right
+            # corner. Without this the window would re-appear wherever
+            # the user dragged it last session, which on a "no content
+            # → new content" transition feels like a stale state from
+            # the previous arm cycle.
             self._anchor_right_x = self._screen_right_edge
             self._anchor_y = self._screen_top_edge
-            x, y = _offscreen_anchor()
-        self._suppress_anchor_update = True
-        try:
-            self.move(int(x), int(y))
-        finally:
-            self._suppress_anchor_update = False
-        log.info(
-            "[hud] window visibility → %s (pos=%d,%d size=%dx%d)",
-            "shown" if visible else "hidden",
-            int(x), int(y), self._current_width, self._current_height,
-        )
+            self.setWindowOpacity(0.0)
+            log.info(
+                "[hud] window visibility → hidden (opacity=0.0, geometry unchanged)",
+            )
 
     def _set_window_size(self, width: int, height: int) -> None:
         if width == self._current_width and height == self._current_height:
             return
         self._current_width = int(width)
         self._current_height = int(height)
-        if self._currently_visible:
-            # Pin the RIGHT edge to the live anchor so the window
-            # grows / shrinks toward the LEFT. Collapse (pill → dot)
-            # shrinks toward the right edge of the user's current
-            # window position instead of snapping back to the screen
-            # corner; expand (dot → pill) grows leftward from the
-            # dot's current right edge instead of overflowing off
-            # the right of the monitor.
-            x = self._anchor_right_x - self._current_width
-            y = self._anchor_y
-            # Resize can push the rect off-screen too (e.g. window
-            # widened past the right edge of a narrow screen); apply
-            # the same safety clamp the visibility path uses.
-            x, y = self._clamp_to_visible_screen(x, y)
-        else:
-            x, y = _offscreen_anchor()
+        # Pin the RIGHT edge to the live anchor so the window grows /
+        # shrinks toward the LEFT. Collapse (pill → dot) shrinks toward
+        # the right edge of the user's current window position instead
+        # of snapping back to the screen corner; expand (dot → pill)
+        # grows leftward from the dot's current right edge instead of
+        # overflowing off the right of the monitor. Always pin against
+        # the live anchor — when hidden the window stays at the same
+        # geometry (just at opacity 0), so the anchor math is the same.
+        x = self._anchor_right_x - self._current_width
+        y = self._anchor_y
+        # Resize can push the rect off-screen too (e.g. window widened
+        # past the right edge of a narrow screen); apply the same
+        # safety clamp the visibility path uses.
+        x, y = self._clamp_to_visible_screen(x, y)
         self._suppress_anchor_update = True
         try:
             self.setGeometry(
@@ -482,6 +511,29 @@ class _HudHostWidget(QWidget):
     # fullscreen, doesn't take focus.
     # ------------------------------------------------------------------
 
+    def _log_lsappinfo_self(self) -> None:
+        """Log ``lsappinfo info <self_pid>`` so we can see how macOS
+        registered this HUD subprocess with WindowServer / LaunchServices.
+
+        Look for ``bundleID="com.sayzo.agent"`` + a present ``cgsConnection``
+        in the output — that's the kill-criterion for "HUD is realized."
+        ``bundleID=[NULL]`` + ``!cgsConnection`` = realization failed,
+        check the geometry / opacity init path.
+        """
+        import os
+        import subprocess
+        try:
+            out = subprocess.run(
+                ["lsappinfo", "info", str(os.getpid())],
+                capture_output=True, text=True, timeout=2,
+            ).stdout
+            log.info("[hud] lsappinfo self (pid=%d):\n%s", os.getpid(), out)
+        except Exception:
+            log.warning("[hud] lsappinfo probe failed", exc_info=True)
+
+    _OVERLAY_TWEAK_MAX_RETRIES = 3
+    _OVERLAY_TWEAK_RETRY_MS = 500
+
     def _apply_mac_overlay_tweaks(self) -> None:
         try:
             from AppKit import (  # type: ignore[import-not-found]
@@ -506,11 +558,8 @@ class _HudHostWidget(QWidget):
         NS_STATUS_WINDOW_LEVEL = 25
 
         # Qt's ``QWidget.winId()`` returns the native NSView pointer on
-        # macOS — NOT the NSWindow. Calling ``setLevel_`` /
-        # ``setCollectionBehavior_`` / ``setHidesOnDeactivate_`` on the
-        # bridged NSView raises AttributeError because those are
-        # NSWindow selectors. Bridge the view, then walk to its host
-        # NSWindow via ``-[NSView window]``.
+        # macOS — NOT the NSWindow. Bridge the view, then walk to its
+        # host NSWindow via ``-[NSView window]``.
         try:
             ns_view = objc.objc_object(c_void_p=int(self.winId()))
         except Exception:
@@ -523,15 +572,35 @@ class _HudHostWidget(QWidget):
             log.warning("[hud] NSView.window() lookup failed", exc_info=True)
             return
         if ns_window is None:
-            log.warning(
-                "[hud] NSView has no NSWindow yet — overlay tweaks skipped "
+            # With v3.3.0's opacity-based hiding the NSWindow should be
+            # realized at loadFinished. If it isn't, the realization
+            # might just be a tick behind Qt's loadFinished signal —
+            # retry up to 3 times before giving up. Promoted to error
+            # (was warning) because the opacity fix is supposed to
+            # guarantee a realized NSWindow here.
+            self._overlay_tweak_attempts += 1
+            if self._overlay_tweak_attempts <= self._OVERLAY_TWEAK_MAX_RETRIES:
+                log.warning(
+                    "[hud] NSView has no NSWindow yet — retrying in %dms (attempt %d/%d)",
+                    self._OVERLAY_TWEAK_RETRY_MS,
+                    self._overlay_tweak_attempts,
+                    self._OVERLAY_TWEAK_MAX_RETRIES,
+                )
+                QTimer.singleShot(
+                    self._OVERLAY_TWEAK_RETRY_MS, self._apply_mac_overlay_tweaks,
+                )
+                return
+            log.error(
+                "[hud] NSView has no NSWindow after %d retries — overlay tweaks skipped "
                 "(HUD will inherit default window level / hidesOnDeactivate=YES; "
-                "expect HUD to disappear when agent loses focus)"
+                "expect HUD to disappear when agent loses focus)",
+                self._OVERLAY_TWEAK_MAX_RETRIES,
             )
             return
 
         try:
             ns_window.setLevel_(NS_STATUS_WINDOW_LEVEL)
+            log.info("[hud] setLevel_ ok (NSStatusWindowLevel=25)")
         except Exception:
             log.warning("[hud] setLevel_ failed", exc_info=True)
 
@@ -543,6 +612,7 @@ class _HudHostWidget(QWidget):
                 | NSWindowCollectionBehaviorIgnoresCycle
             )
             ns_window.setCollectionBehavior_(behavior)
+            log.info("[hud] setCollectionBehavior_ ok")
         except Exception:
             log.warning("[hud] setCollectionBehavior_ failed", exc_info=True)
 
@@ -555,6 +625,7 @@ class _HudHostWidget(QWidget):
             # other app is frontmost. Pinning this False keeps the HUD
             # visible regardless of which app currently has focus.
             ns_window.setHidesOnDeactivate_(False)
+            log.info("[hud] setHidesOnDeactivate_(False) ok")
         except Exception:
             log.warning("[hud] setHidesOnDeactivate_ failed", exc_info=True)
 
@@ -686,11 +757,6 @@ class HudWindow:
 # ----------------------------------------------------------------------
 # Module-level helpers.
 # ----------------------------------------------------------------------
-
-
-def _offscreen_anchor() -> tuple[int, int]:
-    """A point far enough off the primary monitor to be invisible."""
-    return (-20000, 0)
 
 
 def _install_sigint_handler(app: QApplication) -> None:

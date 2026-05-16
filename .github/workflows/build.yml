@@ -153,24 +153,6 @@ jobs:
             -framework CoreAudio \
             -framework Foundation
 
-      - name: Compile sayzo_hud_wrapper (Helper.app pattern, v3.2.0)
-        # Tiny native wrapper that posix_spawns the real sayzo-agent
-        # binary in `hud --idle` mode. Lives at
-        # SayzoHud.app/Contents/MacOS/SayzoHud — a nested helper bundle
-        # inside Sayzo.app/Contents/Frameworks/SayzoHud.app/. Different
-        # CFBundleIdentifier (com.sayzo.agent.hud vs com.sayzo.agent)
-        # is what stops macOS LaunchServices from classifying the HUD
-        # subprocess as an internal helper of the parent agent — which
-        # was the root cause of the v3.1.x macOS HUD invisibility bug.
-        # See installer/macos/sayzo_hud_wrapper.c for full diagnosis.
-        #
-        # Writes the binary into installer/macos/SayzoHud.app/Contents/MacOS/SayzoHud
-        # so that the next step (PyInstaller build via sayzo-agent.spec)
-        # can copy the assembled helper bundle into the final
-        # Sayzo.app/Contents/Frameworks/.
-        run: |
-          bash installer/macos/build_sayzo_hud_wrapper.sh
-
       - name: Generate logo.icns from logo.png
         run: |
           cd installer/assets
