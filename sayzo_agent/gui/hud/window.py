@@ -293,6 +293,20 @@ class _HudHostWidget(QWidget):
                 "[hud] window visibility → shown (pos=%d,%d size=%dx%d)",
                 int(x), int(y), self._current_width, self._current_height,
             )
+            # macOS: force the NSWindow into the visible Z-stack via
+            # ``orderFrontRegardless``. Required when the parent process
+            # is an LSUIElement app (the production Sayzo agent): the
+            # HUD subprocess gets a real CGS connection (lsappinfo
+            # confirms ``bundleID="com.sayzo.agent"`` + own ASN) but
+            # WindowServer doesn't compose the window into the visible
+            # output — exactly the v3.3.0–v3.3.2 symptom. Demo from
+            # Terminal works because Terminal is a regular Application,
+            # not LSUIElement, and WindowServer composes those children
+            # automatically. ``orderFrontRegardless`` (Apple's documented
+            # API for this exact case) moves the window to the front of
+            # its level even when the owning app isn't active.
+            if sys.platform == "darwin":
+                self._force_order_front_mac()
         else:
             # Going hidden: leave geometry in place — the actual visual
             # disappearance is React rendering all-transparent pixels.
@@ -520,6 +534,43 @@ class _HudHostWidget(QWidget):
     # fullscreen, doesn't take focus.
     # ------------------------------------------------------------------
 
+    def _force_order_front_mac(self) -> None:
+        """Force the HUD's NSWindow into the visible Z-stack.
+
+        Workaround for the agent-spawned-HUD-invisible bug that
+        survived v3.3.0–v3.3.2: WindowServer registers the subprocess
+        correctly (lsappinfo shows valid ASN + bundleID) but doesn't
+        compose the window into visible output when the parent process
+        is itself LSUIElement (the production Sayzo agent). Calling
+        ``orderFrontRegardless`` on the NSWindow forces it to the
+        front of its level even when the owning app isn't active —
+        Apple's documented API for this exact case.
+
+        Safe to call even if the NSWindow isn't realized yet (early
+        return with a debug log). Call on every visibility-shown
+        transition; order can shift over time as other apps' windows
+        move around.
+        """
+        try:
+            import objc  # type: ignore[import-not-found]
+        except Exception:
+            log.warning("[hud] objc unavailable — orderFrontRegardless skipped", exc_info=True)
+            return
+        try:
+            ns_view = objc.objc_object(c_void_p=int(self.winId()))
+            ns_window = ns_view.window()
+        except Exception:
+            log.warning("[hud] orderFrontRegardless: NSView/NSWindow lookup failed", exc_info=True)
+            return
+        if ns_window is None:
+            log.debug("[hud] orderFrontRegardless: NSWindow not realized yet — skip")
+            return
+        try:
+            ns_window.orderFrontRegardless()
+            log.info("[hud] orderFrontRegardless ok")
+        except Exception:
+            log.warning("[hud] orderFrontRegardless failed", exc_info=True)
+
     def _log_lsappinfo_self(self) -> None:
         """Log ``lsappinfo info <self_pid>`` so we can see how macOS
         registered this HUD subprocess with WindowServer / LaunchServices.
@@ -639,6 +690,15 @@ class _HudHostWidget(QWidget):
             log.warning("[hud] setHidesOnDeactivate_ failed", exc_info=True)
 
         log.info("[hud] mac overlay tweaks applied")
+
+        # One-shot orderFrontRegardless at boot so the NSWindow is in
+        # the visible Z-stack from the start. Without this, the first
+        # content arrival might paint to a backing surface that
+        # WindowServer hasn't composed into the visible output yet
+        # (the exact agent-spawned-HUD-invisible bug from v3.3.0–v3.3.2).
+        # Subsequent visibility-show transitions also call this — see
+        # ``_set_window_visible``.
+        self._force_order_front_mac()
 
     # ------------------------------------------------------------------
     # stdin command pipeline. The parent agent's launcher writes
