@@ -239,6 +239,11 @@ class _HudHostWidget(QWidget):
         self._bridge.set_visibility_callback(self._set_window_visible)
         self._bridge.set_size_callback(self._set_window_size)
         self._bridge.set_start_system_move_callback(self._start_system_move)
+        # Boot defaults to click-through ON — the HUD starts with no
+        # React content, so its top-right footprint must not steal
+        # clicks from the user's app underneath. The first
+        # ``_set_window_visible(True)`` from React will flip it off.
+        self._set_click_through(True)
         self._loaded_event.set()
         # Drain any commands that landed before the page was ready.
         self._flush_pending_commands()
@@ -307,6 +312,9 @@ class _HudHostWidget(QWidget):
             # its level even when the owning app isn't active.
             if sys.platform == "darwin":
                 self._force_order_front_mac()
+            # Window is now content-bearing — let it receive clicks so
+            # the user can interact with the card / pill / actionable.
+            self._set_click_through(False)
         else:
             # Going hidden: leave geometry in place — the actual visual
             # disappearance is React rendering all-transparent pixels.
@@ -321,6 +329,15 @@ class _HudHostWidget(QWidget):
             log.info(
                 "[hud] window visibility → hidden (per-pixel alpha will paint transparent)",
             )
+            # Window is now content-empty — let clicks pass through to
+            # whatever app is underneath. Without this the HUD's
+            # geometry (which persists at the top-right via the
+            # v3.3.x always-on-screen design) creates a dead-click
+            # zone there. Pre-v3.3.0 the offscreen-move pattern hid
+            # the window from click-hit-testing entirely; the
+            # opacity / per-pixel-alpha approach we use now needs an
+            # explicit OS-level toggle.
+            self._set_click_through(True)
 
     def _set_window_size(self, width: int, height: int) -> None:
         if width == self._current_width and height == self._current_height:
@@ -533,6 +550,74 @@ class _HudHostWidget(QWidget):
     # so the HUD floats above app windows, survives Spaces /
     # fullscreen, doesn't take focus.
     # ------------------------------------------------------------------
+
+    def _set_click_through(self, ignore: bool) -> None:
+        """Toggle OS-level click-through on the host window.
+
+        With v3.3.x's always-on-screen HUD design (window holds its
+        position even when React's content is empty), the HUD would
+        otherwise create a dead-click zone at the top-right corner of
+        the screen — clicks land on the Qt window and never reach the
+        app underneath. Toggle this OFF when there's content to
+        interact with (consent card, pill) and ON when the HUD is
+        idle (React renders nothing). CSS ``pointer-events: none`` on
+        the HudShell isn't enough on its own — that only affects
+        QtWebEngine's CSS hit-testing, not the OS-level click
+        intercept on the host window.
+
+        macOS uses ``NSWindow.setIgnoresMouseEvents:`` and Windows
+        uses ``WS_EX_TRANSPARENT``; both are the canonical
+        platform APIs for window-level mouse pass-through.
+        """
+        if sys.platform == "darwin":
+            self._set_click_through_mac(ignore)
+        elif sys.platform == "win32":
+            self._set_click_through_win(ignore)
+
+    def _set_click_through_mac(self, ignore: bool) -> None:
+        try:
+            import objc  # type: ignore[import-not-found]
+        except Exception:
+            log.warning("[hud] objc unavailable — click-through toggle skipped", exc_info=True)
+            return
+        try:
+            ns_view = objc.objc_object(c_void_p=int(self.winId()))
+            ns_window = ns_view.window()
+        except Exception:
+            log.warning("[hud] click-through: NSView/NSWindow lookup failed", exc_info=True)
+            return
+        if ns_window is None:
+            log.debug("[hud] click-through: NSWindow not realized yet — skip")
+            return
+        try:
+            ns_window.setIgnoresMouseEvents_(bool(ignore))
+            log.info("[hud] setIgnoresMouseEvents_(%s) ok", ignore)
+        except Exception:
+            log.warning("[hud] setIgnoresMouseEvents_ failed", exc_info=True)
+
+    def _set_click_through_win(self, ignore: bool) -> None:
+        try:
+            import ctypes
+        except Exception:
+            return
+        GWL_EXSTYLE = -20
+        WS_EX_TRANSPARENT = 0x20
+        WS_EX_LAYERED = 0x80000
+        try:
+            hwnd = int(self.winId())
+            user32 = ctypes.windll.user32
+            style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            if ignore:
+                # WS_EX_TRANSPARENT requires WS_EX_LAYERED on a window
+                # that doesn't already have it. WA_TranslucentBackground
+                # usually sets LAYERED, but assert it to be safe.
+                new_style = style | WS_EX_TRANSPARENT | WS_EX_LAYERED
+            else:
+                new_style = style & ~WS_EX_TRANSPARENT
+            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, new_style)
+            log.info("[hud] WS_EX_TRANSPARENT %s ok", "set" if ignore else "cleared")
+        except Exception:
+            log.warning("[hud] WS_EX_TRANSPARENT toggle failed", exc_info=True)
 
     def _force_order_front_mac(self) -> None:
         """Force the HUD's NSWindow into the visible Z-stack.
