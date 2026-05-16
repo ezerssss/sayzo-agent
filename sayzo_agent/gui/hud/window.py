@@ -119,22 +119,27 @@ class _HudHostWidget(QWidget):
             | Qt.WindowType.WindowDoesNotAcceptFocus
         )
         # Genuine per-pixel alpha — pixels the React app paints as
-        # transparent become OS-level transparent.
+        # transparent become OS-level transparent. This is what gives us
+        # "invisible when there's no content" without needing any
+        # opacity / show / hide manipulation: when React's hasContent
+        # is false it renders an empty page, every pixel is alpha=0,
+        # and the user sees nothing. When content arrives, React
+        # renders the card and those pixels become opaque.
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
         # Realize the native window at the real top-right anchor from
         # boot so macOS WindowServer establishes a CGS connection for
-        # the subprocess immediately. Hide via opacity, NOT via offscreen
-        # geometry — pre-v3.3.0 we set geometry to (-20000, 0) and let
-        # ``_set_window_visible(true)`` move it on-screen when content
-        # arrived. On macOS that left the NSWindow unrealized
-        # (transparent frameless widget shown outside every screen ⇒
-        # WindowServer never allocates a backing surface), which is why
-        # the agent-spawned HUD never appeared even though
-        # ``sayzo-agent hud --demo`` did (demo's URL hash forces
-        # ``hasContent=true`` immediately, so the move-on-screen lands
-        # before WindowServer commits to "unrealized" state).
-        self.setWindowOpacity(0.0)
+        # the subprocess immediately. Pre-v3.3.0 we set geometry to
+        # (-20000, 0) which left the NSWindow unrealized on macOS
+        # (WindowServer doesn't allocate a backing surface for a
+        # transparent frameless widget shown outside every screen) —
+        # that's why the agent-spawned HUD never appeared even though
+        # ``sayzo-agent hud --demo`` did. v3.3.0 fixed that with
+        # opacity-init, but `setWindowOpacity` on a `WA_TranslucentBackground`
+        # window collides with QtWebEngine's compositor on macOS and
+        # the window stayed invisible even after opacity went to 1.0.
+        # v3.3.1: realize on-screen at full opacity and rely on
+        # per-pixel alpha for the empty-state invisibility.
         init_x = self._screen_right_edge - INITIAL_HUD_WIDTH
         init_y = self._screen_top_edge
         self.setGeometry(
@@ -187,8 +192,8 @@ class _HudHostWidget(QWidget):
             return
         url = _hud_url(index, demo=self._demo)
         log.info(
-            "[hud] opening Qt window at (x=%s y=%s opacity=0.0); right edge=%s top edge=%s "
-            "initial w=%s h=%s demo=%s url=%s",
+            "[hud] opening Qt window at (x=%s y=%s); right edge=%s top edge=%s "
+            "initial w=%s h=%s demo=%s url=%s (invisibility via per-pixel alpha)",
             init_x, init_y, self._screen_right_edge, self._screen_top_edge,
             INITIAL_HUD_WIDTH, INITIAL_HUD_HEIGHT, self._demo, url,
         )
@@ -239,11 +244,15 @@ class _HudHostWidget(QWidget):
         self._flush_pending_commands()
 
     # ------------------------------------------------------------------
-    # Visibility — toggle via setWindowOpacity(0/1). The NSWindow stays
-    # realized for the entire HUD lifecycle; moving it offscreen would
-    # cause WindowServer on macOS to drop the backing surface (the
-    # original v3.0-era bug that v3.3.0 fixes). No focus stealing
-    # because the window has Qt.WindowDoesNotAcceptFocus.
+    # Visibility — driven entirely by React's per-pixel alpha. When
+    # React has no content, every pixel is transparent and the user
+    # sees nothing. When content arrives, those pixels become opaque.
+    # This method's only job is anchor management: snap to top-right
+    # at the start of a new visible session, reset anchor on hide so
+    # the next cycle starts fresh. No opacity / show / hide
+    # manipulation — those caused the v3.3.0 invisibility regression
+    # on macOS (setWindowOpacity collides with the WA_TranslucentBackground
+    # + QtWebEngine compositor path).
     # ------------------------------------------------------------------
 
     def _set_window_visible(self, visible: bool) -> None:
@@ -280,24 +289,23 @@ class _HudHostWidget(QWidget):
                 self.move(int(x), int(y))
             finally:
                 self._suppress_anchor_update = False
-            self.setWindowOpacity(1.0)
             log.info(
-                "[hud] window visibility → shown (pos=%d,%d size=%dx%d opacity=1.0)",
+                "[hud] window visibility → shown (pos=%d,%d size=%dx%d)",
                 int(x), int(y), self._current_width, self._current_height,
             )
         else:
-            # Going hidden: fade out via opacity, leave geometry in
-            # place. Reset the anchor back to the screen's top-right so
-            # the NEXT visibility cycle starts fresh at the top-right
+            # Going hidden: leave geometry in place — the actual visual
+            # disappearance is React rendering all-transparent pixels.
+            # Reset the anchor back to the screen's top-right so the
+            # NEXT visibility cycle starts fresh at the top-right
             # corner. Without this the window would re-appear wherever
             # the user dragged it last session, which on a "no content
             # → new content" transition feels like a stale state from
             # the previous arm cycle.
             self._anchor_right_x = self._screen_right_edge
             self._anchor_y = self._screen_top_edge
-            self.setWindowOpacity(0.0)
             log.info(
-                "[hud] window visibility → hidden (opacity=0.0, geometry unchanged)",
+                "[hud] window visibility → hidden (per-pixel alpha will paint transparent)",
             )
 
     def _set_window_size(self, width: int, height: int) -> None:
@@ -327,8 +335,9 @@ class _HudHostWidget(QWidget):
         finally:
             self._suppress_anchor_update = False
         log.info(
-            "[hud] window size → %dx%d (visible=%s)",
-            self._current_width, self._current_height, self._currently_visible,
+            "[hud] window size → %dx%d at (%d,%d) (visible=%s)",
+            self._current_width, self._current_height,
+            int(x), int(y), self._currently_visible,
         )
 
     def moveEvent(self, event) -> None:  # noqa: ANN001 — Qt signature

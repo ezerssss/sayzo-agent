@@ -134,6 +134,22 @@
     background: #ffffff;
     color: #1a1a1a;
   }
+
+  /* HUD-overlay mode — the HUD route renders on top of the user's
+     desktop in a frameless transparent Qt window. The default
+     ``background: #ffffff`` above is correct for the Setup / Settings
+     windows (opaque app windows), but in the HUD it paints an opaque
+     white rectangle over the entire window area — visible to the user
+     as a 24x24 white box (the HudShell's `p-3` padding when empty) on
+     Windows, and on macOS preventing the WindowServer from compositing
+     the translucent window at all. ``HudApp.tsx`` adds the
+     ``hud-overlay`` class to body at mount; CSS opts every layer back
+     out to transparent. */
+  body.hud-overlay,
+  body.hud-overlay #root,
+  html:has(body.hud-overlay) {
+    background: transparent !important;
+  }
   body {
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;

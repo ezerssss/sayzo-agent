@@ -93,6 +93,18 @@ export function HudApp() {
     }
   }, []);
 
+  // Opt this React app's body OUT of the default opaque white background
+  // declared in index.css for Setup / Settings windows. The HUD is an
+  // overlay on top of the user's desktop — it MUST be fully transparent
+  // except for the actual React content it renders. Without this, an
+  // empty HudShell painted a 24x24 white square on Windows and may have
+  // been preventing macOS WindowServer from compositing the translucent
+  // window at all. CSS rule lives at `body.hud-overlay` in index.css.
+  useEffect(() => {
+    document.body.classList.add("hud-overlay");
+    return () => document.body.classList.remove("hud-overlay");
+  }, []);
+
   // Pause-pill-during-consent at the React layer. Mirrors what
   // `ArmController._ask_consent_pausing_pill` does in production:
   // when a consent card appears while the pill is shown, hide the
