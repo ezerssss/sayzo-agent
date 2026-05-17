@@ -146,6 +146,90 @@ def _diagnostics_log_tail(logs_dir, max_lines: int = 200) -> str:
     return f"--- log tail unavailable (looked in {logs_dir}) ---"
 
 
+def _macos_update_diagnostics(max_lines: int = 200) -> str:
+    """Three macOS-only diagnostics sections that disambiguate auto-update
+    failures: bundle path (translocated vs normal), Spotlight scan for
+    duplicate Sayzo bundles, and the apply_update.sh log tail.
+
+    Returns an empty string on Windows / Linux so the caller can append
+    unconditionally. Best-effort on every section — a missing or
+    permission-denied subprocess / file produces an explanatory stub
+    instead of raising so the rest of the diagnostics still ship.
+    """
+    if sys.platform != "darwin":
+        return ""
+
+    import subprocess
+    from pathlib import Path
+
+    sections: list[str] = []
+
+    # 1. Resolved bundle path. Translocated installs show up as
+    #    /private/var/folders/<random>/T/AppTranslocation/<uuid>/d/Sayzo.app
+    #    (Apple TN2206 "macOS Code Signing In Depth"). A normal install
+    #    is /Applications/Sayzo.app or ~/Applications/Sayzo.app. When the
+    #    affected user's blob shows a translocation prefix, the bug is
+    #    "user never dragged the DMG into /Applications" — rsync wrote
+    #    into a read-only translocated copy and the original install
+    #    stayed at vN.
+    try:
+        exe = Path(sys.executable).resolve()
+        if len(exe.parents) >= 3 and exe.parents[2].suffix == ".app":
+            bundle_path = str(exe.parents[2])
+        else:
+            bundle_path = f"<non-bundle>: {exe}"
+    except Exception:
+        bundle_path = "<failed to resolve>"
+    sections.append(f"--- macOS bundle path ---\n{bundle_path}")
+
+    # 2. mdfind multi-bundle scan. Catches the case where two installs
+    #    coexist (/Applications + ~/Applications) and only one got
+    #    rsync'd while LaunchServices / Dock launched the other.
+    try:
+        result = subprocess.run(
+            ["mdfind", 'kMDItemCFBundleIdentifier == "com.sayzo.agent"'],
+            capture_output=True, text=True, timeout=3.0,
+        )
+        if result.returncode == 0:
+            paths = (result.stdout or "").strip() or "(none)"
+            sections.append(f"--- macOS Sayzo bundles found ---\n{paths}")
+        else:
+            sections.append(
+                f"--- macOS Sayzo bundles found ---\n"
+                f"(mdfind exited {result.returncode}; Spotlight may be paused)"
+            )
+    except Exception:
+        sections.append(
+            "--- macOS Sayzo bundles found ---\n(mdfind unavailable)"
+        )
+
+    # 3. apply_update.log tail. Path is fixed in apply_update.sh:25-27 to
+    #    $HOME/.sayzo/agent/logs/apply_update.log regardless of any
+    #    SAYZO_DATA_DIR override (the shell helper can't see Python env
+    #    overrides), so hardcoding the same path here matches what the
+    #    swap helper actually wrote.
+    log_path = Path.home() / ".sayzo" / "agent" / "logs" / "apply_update.log"
+    try:
+        if log_path.exists():
+            with open(log_path, encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+            tail = lines[-max_lines:]
+            sections.append(
+                f"--- apply_update.log tail (last {len(tail)} of {len(lines)} lines) ---\n"
+                + "".join(tail).rstrip()
+            )
+        else:
+            sections.append(
+                f"--- apply_update.log not found at {log_path} ---\n"
+                "(no auto-update has been attempted on this install)"
+            )
+    except Exception:
+        log.debug("[settings.bridge] apply_update.log read failed", exc_info=True)
+        sections.append(f"--- apply_update.log unreadable at {log_path} ---")
+
+    return "\n\n".join(sections)
+
+
 class Bridge:
     """JS-side API. Constructed once per :class:`SettingsWindow` lifetime."""
 
@@ -286,7 +370,11 @@ class Bridge:
             f"Logs:      {self._cfg.logs_dir}",
             f"Signed in: {'yes' if signed_in else 'no'}",
         ])
-        return {"text": header + "\n\n" + _diagnostics_log_tail(self._cfg.logs_dir)}
+        body = header + "\n\n" + _diagnostics_log_tail(self._cfg.logs_dir)
+        macos_extra = _macos_update_diagnostics()
+        if macos_extra:
+            body += "\n\n" + macos_extra
+        return {"text": body}
 
     # ------------------------------------------------------------------
     # JS-callable methods — Captures pane

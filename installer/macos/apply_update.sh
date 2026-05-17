@@ -118,8 +118,18 @@ log "new app inside DMG: $NEW_APP"
 # accumulate stale resources across upgrades. Trailing slashes matter:
 # they mean "contents of src into dst" not "src into dst" (which would
 # nest Sayzo.app/Sayzo.app).
+#
+# Hard-fail on non-zero rsync exit. Pre-v3.3.5 we logged WARN and called
+# `open --args service` regardless, which relaunched a half-replaced /
+# unwritable / broken bundle and surfaced as "Install Now worked but
+# About still shows old version" (silent indeterminate state). Apply
+# attempts are counted in apply_attempts.json by the agent's
+# apply_staged_if_newer; after MAX_APPLY_ATTEMPTS the staged slot is
+# cleared and the "Sayzo update failed" toast fires on the next boot.
+# Better that than a forever-broken bundle the user can't diagnose.
 if ! rsync -a --delete "$NEW_APP/" "$APP_PATH/" 2>>"$LOG_FILE"; then
-    log "WARN: rsync exited non-zero, attempting unmount + relaunch anyway"
+    hdiutil detach "$MOUNT_POINT" -quiet 2>/dev/null || true
+    fail "rsync failed (see log above for stderr)"
 fi
 log "rsync complete"
 

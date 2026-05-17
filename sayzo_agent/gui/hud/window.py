@@ -774,6 +774,32 @@ class _HudHostWidget(QWidget):
         except Exception:
             log.warning("[hud] setHidesOnDeactivate_ failed", exc_info=True)
 
+        try:
+            # Qt.WindowType.Tool maps to NSPanel on macOS, and NSWindow.hasShadow
+            # defaults to YES for every NSWindow subclass (Apple ref:
+            # developer.apple.com/documentation/appkit/nswindow/1419117-hasshadow).
+            # WindowServer draws that shadow around the FRAME rect, not the
+            # opaque-pixel mask — so a frameless transparent host whose React
+            # content is fully alpha=0 still gets a faint shadow / border drawn
+            # at the boot-time geometry (100x100, top-right). This shadow is
+            # the "phantom transparent box" users see at top-right when the
+            # HUD has no content. Suppress it.
+            ns_window.setHasShadow_(False)
+            log.info("[hud] setHasShadow_(False) ok")
+        except Exception:
+            log.warning("[hud] setHasShadow_ failed", exc_info=True)
+
+        try:
+            # WA_TranslucentBackground should already set this to NO on macOS,
+            # but assert it — belt-and-suspenders against a future Qt regression
+            # where Tool windows quietly default back to opaque. Opaque + zero-
+            # alpha content would render solid black, which is far worse than
+            # the current "faint box" — keep the invariant explicit.
+            ns_window.setOpaque_(False)
+            log.info("[hud] setOpaque_(False) ok")
+        except Exception:
+            log.warning("[hud] setOpaque_ failed", exc_info=True)
+
         log.info("[hud] mac overlay tweaks applied")
 
         # One-shot orderFrontRegardless at boot so the NSWindow is in
