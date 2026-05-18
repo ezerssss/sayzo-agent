@@ -675,40 +675,50 @@ class Bridge:
         ``cfg.capture.system_scope``: True ⇒ ``arm_app`` (per-app capture
         enabled), False ⇒ ``endpoint`` (whole-system capture). The Settings
         pane phrases it as opt-in to per-app to match the beta framing.
+
+        ``aec_enabled`` mirrors ``cfg.aec.enabled`` directly (WebRTC AEC3
+        pre-pass, see sayzo_agent/aec.py).
         """
         return {
             "per_app_capture": self._cfg.capture.system_scope == "arm_app",
+            "aec_enabled": bool(self._cfg.aec.enabled),
         }
 
     def set_recording_setting(self, key: str, value: bool) -> dict[str, Any]:
         """Persist a single recording-pane toggle.
 
-        Returns ``requires_restart=True`` because the capture pipeline is
-        constructed once at agent startup (``app.py`` builds ``SystemCapture``
-        with the config-time ``system_scope``) and isn't reconstructed
-        between arms. The Settings UI surfaces this to the user. Live
-        reload would require restructuring the Agent lifecycle and is out
-        of scope for the beta rollout.
+        Returns ``requires_restart=True`` for every recording key because
+        both the capture pipeline (``SystemCapture``) and the AEC pre-pass
+        (``aec`` module's lazy-loaded APM) bind their config at agent
+        startup and aren't reconstructed between arms. Live reload would
+        require restructuring the Agent lifecycle and is out of scope.
         """
-        if key != "per_app_capture":
+        coerced = bool(value)
+
+        if key == "per_app_capture":
+            new_scope = "arm_app" if coerced else "endpoint"
+            try:
+                self._cfg.capture.system_scope = new_scope  # type: ignore[assignment]
+            except Exception:
+                log.debug(
+                    "[settings.bridge] cfg.capture.system_scope mutation failed",
+                    exc_info=True,
+                )
+            patch: dict[str, Any] = {"capture": {"system_scope": new_scope}}
+        elif key == "aec_enabled":
+            try:
+                self._cfg.aec.enabled = coerced
+            except Exception:
+                log.debug(
+                    "[settings.bridge] cfg.aec.enabled mutation failed",
+                    exc_info=True,
+                )
+            patch = {"aec": {"enabled": coerced}}
+        else:
             return {"saved": False, "error": f"unknown recording key: {key}"}
 
-        coerced = bool(value)
-        new_scope = "arm_app" if coerced else "endpoint"
-
         try:
-            self._cfg.capture.system_scope = new_scope  # type: ignore[assignment]
-        except Exception:
-            log.debug(
-                "[settings.bridge] cfg.capture.system_scope mutation failed",
-                exc_info=True,
-            )
-
-        try:
-            settings_store.save(
-                self._cfg.data_dir,
-                {"capture": {"system_scope": new_scope}},
-            )
+            settings_store.save(self._cfg.data_dir, patch)
         except Exception:
             log.warning(
                 "[settings.bridge] persist recording setting %s failed",

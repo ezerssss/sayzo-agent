@@ -17,7 +17,7 @@ export function RecordingPane() {
         const s = await settingsBridge.getRecordingSettings();
         if (!cancelled) setSettings(s);
       } catch {
-        if (!cancelled) setSettings({ per_app_capture: false });
+        if (!cancelled) setSettings({ per_app_capture: false, aec_enabled: false });
       }
     })();
     return () => {
@@ -54,7 +54,7 @@ export function RecordingPane() {
         How Sayzo picks up audio when a meeting is being captured.
       </p>
 
-      <div className="mt-8">
+      <div className="mt-8 space-y-2">
         <label className="flex cursor-pointer items-start justify-between gap-4 rounded-md py-2">
           <div className="flex-1">
             <div className="flex items-center gap-2">
@@ -79,6 +79,31 @@ export function RecordingPane() {
             ariaLabel="Per-app audio capture (beta)"
           />
         </label>
+
+        <label className="flex cursor-pointer items-start justify-between gap-4 rounded-md py-2">
+          <div className="flex-1">
+            <div className="flex items-center gap-2">
+              <span className="text-sm font-medium text-ink">
+                Echo cancellation
+              </span>
+              <span className="rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-amber-600">
+                Beta
+              </span>
+            </div>
+            <p className="mt-1 max-w-md text-xs leading-relaxed text-ink-muted">
+              If you use your laptop speakers (not headphones) during
+              meetings, the other person's voice can bleed into your
+              mic. Turn this on to subtract that bleed before Sayzo
+              uploads. Headphone users can leave it off.
+            </p>
+          </div>
+          <Switch
+            checked={settings.aec_enabled}
+            onChange={(v) => void handleToggle("aec_enabled", v)}
+            ariaLabel="Echo cancellation (beta)"
+          />
+        </label>
+
         {restartHint && (
           <p className="mt-2 text-xs text-amber-600">
             Restart Sayzo for this change to take effect.

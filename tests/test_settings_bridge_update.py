@@ -370,16 +370,62 @@ def _async_returning(value: Any):
 
 def test_get_recording_settings_reflects_endpoint_default(cfg: Config) -> None:
     """Fresh config (post-v2.9.0 default flip): per_app_capture should be False
-    because system_scope defaults to 'endpoint'."""
+    because system_scope defaults to 'endpoint'. aec_enabled defaults to False
+    in v3.5.0 until a later patch flips the default ON."""
     b = Bridge(cfg)
-    assert b.get_recording_settings() == {"per_app_capture": False}
+    assert b.get_recording_settings() == {
+        "per_app_capture": False,
+        "aec_enabled": False,
+    }
 
 
 def test_get_recording_settings_reflects_arm_app_override(cfg: Config) -> None:
     """User has opted into per-app capture (Beta toggle on)."""
     cfg.capture.system_scope = "arm_app"  # type: ignore[assignment]
     b = Bridge(cfg)
-    assert b.get_recording_settings() == {"per_app_capture": True}
+    assert b.get_recording_settings() == {
+        "per_app_capture": True,
+        "aec_enabled": False,
+    }
+
+
+def test_get_recording_settings_reflects_aec_enabled(cfg: Config) -> None:
+    """User has enabled AEC from the Settings UI (Beta toggle on)."""
+    cfg.aec.enabled = True
+    b = Bridge(cfg)
+    assert b.get_recording_settings() == {
+        "per_app_capture": False,
+        "aec_enabled": True,
+    }
+
+
+def test_set_recording_setting_enables_aec(cfg: Config) -> None:
+    """Toggle on: cfg.aec.enabled mutates, user_settings.json gets aec.enabled,
+    requires_restart=True is returned (APM is bound at first session-close)."""
+    from sayzo_agent import settings_store as ss
+
+    b = Bridge(cfg)
+    result = b.set_recording_setting("aec_enabled", True)
+
+    assert result == {"saved": True, "requires_restart": True}
+    assert cfg.aec.enabled is True
+    persisted = ss.load(cfg.data_dir)
+    assert persisted == {"aec": {"enabled": True}}
+
+
+def test_set_recording_setting_disables_aec(cfg: Config) -> None:
+    """Toggle off: persists False explicitly so the user's choice survives
+    even if the default flips on later."""
+    from sayzo_agent import settings_store as ss
+
+    cfg.aec.enabled = True
+    b = Bridge(cfg)
+    result = b.set_recording_setting("aec_enabled", False)
+
+    assert result == {"saved": True, "requires_restart": True}
+    assert cfg.aec.enabled is False
+    persisted = ss.load(cfg.data_dir)
+    assert persisted == {"aec": {"enabled": False}}
 
 
 def test_set_recording_setting_enables_per_app(cfg: Config) -> None:

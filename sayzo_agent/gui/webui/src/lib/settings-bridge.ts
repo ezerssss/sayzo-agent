@@ -57,6 +57,7 @@ export type NotificationKey = keyof NotificationFlags;
 
 export type RecordingSettings = {
   per_app_capture: boolean;
+  aec_enabled: boolean;
 };
 
 export type RecordingSettingKey = keyof RecordingSettings;
