@@ -23,6 +23,17 @@ from sayzo_agent.config import AecConfig
 SR = 16000
 
 
+def _aec_only_cfg(**overrides) -> AecConfig:
+    """Config with AEC on but NS/HPF off — for tests that measure AEC
+    behavior in isolation. The default ``AecConfig`` now turns NS3 + HPF
+    on alongside AEC3, but NS3 over-attenuates the synthetic harmonic
+    signals these tests use (it's calibrated for real speech). Separate
+    tests below cover the NS3-on path with appropriate inputs."""
+    base = dict(enabled=True, noise_suppression=False, high_pass_filter=False)
+    base.update(overrides)
+    return AecConfig(**base)
+
+
 # --------------------------------------------------------------------------
 # Synthetic signal helpers — non-periodic so the xcorr lag estimator works
 # (sine waves have ambiguous lag; chirps and modulated voices do not).
@@ -146,7 +157,7 @@ def test_pure_echo_suppressed_at_least_20db():
     mic_bytes = _f32_to_i16_bytes(echo)
     sys_bytes = _f32_to_i16_bytes(sys)
 
-    out, rep = cancel_echo(mic_bytes, sys_bytes, SR, AecConfig(enabled=True))
+    out, rep = cancel_echo(mic_bytes, sys_bytes, SR, _aec_only_cfg())
     assert rep.ran
     assert rep.frames_processed > 0
 
@@ -184,7 +195,7 @@ def test_no_echo_preserves_user_speech():
     mic_bytes = _f32_to_i16_bytes(mic_voice)
     sys_bytes = _f32_to_i16_bytes(sys_other)
 
-    out, rep = cancel_echo(mic_bytes, sys_bytes, SR, AecConfig(enabled=True))
+    out, rep = cancel_echo(mic_bytes, sys_bytes, SR, _aec_only_cfg())
     assert rep.ran
 
     out_f32 = _i16_bytes_to_f32(out)
@@ -216,7 +227,7 @@ def test_double_talk_preserves_user_attenuates_echo():
 
     out, rep = cancel_echo(
         _f32_to_i16_bytes(mic), _f32_to_i16_bytes(sys), SR,
-        AecConfig(enabled=True),
+        _aec_only_cfg(),
     )
     assert rep.ran
     out_f32 = _i16_bytes_to_f32(out)
@@ -261,7 +272,7 @@ def test_report_populated_with_timing_and_rms():
     """Smoke: AecReport fields make sense after a real run."""
     mic = _f32_to_i16_bytes(_voice_low(2.0, seed=40, amp=0.25))
     sys = _f32_to_i16_bytes(_noise_high(2.0, seed=41, amp=0.3))
-    out, rep = cancel_echo(mic, sys, SR, AecConfig(enabled=True))
+    out, rep = cancel_echo(mic, sys, SR, _aec_only_cfg())
     assert isinstance(rep, AecReport)
     assert rep.enabled
     assert rep.ran
@@ -286,7 +297,7 @@ def test_partial_tail_frame_passes_through_unchanged():
 
     out, rep = cancel_echo(
         _f32_to_i16_bytes(mic_arr), _f32_to_i16_bytes(sys_arr), SR,
-        AecConfig(enabled=True),
+        _aec_only_cfg(),
     )
     assert rep.ran
     assert rep.frames_processed == n_full // 160
@@ -297,6 +308,41 @@ def test_partial_tail_frame_passes_through_unchanged():
 # --------------------------------------------------------------------------
 # Lag estimation
 # --------------------------------------------------------------------------
+
+
+def test_noise_suppression_reduces_stationary_background():
+    """NS3 (enabled by default in v3.5.2+) should attenuate stationary
+    background noise on the mic when it's on, leaving the AEC-only path
+    untouched. Compares mic-out RMS with NS on vs NS off on identical
+    inputs — NS on must produce a lower RMS.
+    """
+    rng = np.random.default_rng(70)
+    n = SR * 3
+    mic_noise = (rng.normal(0, 0.05, n).astype(np.float32))
+    sys = _noise_high(3.0, seed=71, amp=0.3)
+    mic_bytes = _f32_to_i16_bytes(mic_noise)
+    sys_bytes = _f32_to_i16_bytes(sys)
+
+    _, rep_ns_off = cancel_echo(
+        mic_bytes, sys_bytes, SR,
+        AecConfig(enabled=True, noise_suppression=False, high_pass_filter=False),
+    )
+    _, rep_ns_on = cancel_echo(
+        mic_bytes, sys_bytes, SR,
+        AecConfig(enabled=True, noise_suppression=True, high_pass_filter=False),
+    )
+
+    assert rep_ns_off.ran
+    assert rep_ns_on.ran
+    attenuation_db = 20 * np.log10(
+        rep_ns_off.mic_rms_after / max(rep_ns_on.mic_rms_after, 1e-9)
+    )
+    # 3 dB floor: catches "flag wired to nothing" failures while leaving
+    # headroom for NS3 version drift across livekit releases. WebRTC NS3
+    # typically suppresses white noise by 6–12 dB.
+    assert attenuation_db >= 3.0, (
+        f"NS=on only attenuated by {attenuation_db:.1f} dB (expected >=3.0)"
+    )
 
 
 def test_lag_estimator_finds_non_zero_delay_on_speech_like_signal():
@@ -312,7 +358,7 @@ def test_lag_estimator_finds_non_zero_delay_on_speech_like_signal():
 
     out, rep = cancel_echo(
         _f32_to_i16_bytes(echo), _f32_to_i16_bytes(sys), SR,
-        AecConfig(enabled=True),
+        _aec_only_cfg(),
     )
     assert rep.ran
     assert abs(rep.lag_samples - true_delay) <= 4, (

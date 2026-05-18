@@ -552,11 +552,13 @@ class Agent:
                 buffers.mic_pcm = bytearray(cleaned_mic)
                 log.info(
                     "[aec] ran frames=%d dur=%.0fms lag=%+dsmp peak=%.2f "
-                    "mic_rms %.4f→%.4f sys_rms=%.4f",
+                    "ns=%s hpf=%s mic_rms %.4f→%.4f sys_rms=%.4f",
                     aec_report.frames_processed,
                     aec_report.duration_ms,
                     aec_report.lag_samples,
                     aec_report.lag_xcorr_peak,
+                    "on" if self.cfg.aec.noise_suppression else "off",
+                    "on" if self.cfg.aec.high_pass_filter else "off",
                     aec_report.mic_rms_before,
                     aec_report.mic_rms_after,
                     aec_report.sys_rms,
@@ -632,10 +634,28 @@ class Agent:
         # ~0 if it saw long stretches of synthetic zeros and effectively
         # disable itself; the per-channel windowing below removes echo /
         # dead-air regions from the encoded output instead.
+        #
+        # When AEC ran with NS=on this session, skip dsp.py's noisereduce
+        # — APM's NS3 has already shaped the mic spectrum, and stacking
+        # noisereduce on top re-estimates "noise" from an already-cleaned
+        # signal, threshold drifts low, and you get phasey/musical-noise
+        # artifacts (the same shape dsp.py:67-72 dialed prop_decrease
+        # down to 0.5 to avoid in the first place). Per-session derived
+        # config keeps the no-AEC path's denoise behavior intact.
+        mic_dsp_cfg = self.cfg.capture
+        if (
+            aec_report is not None
+            and aec_report.ran
+            and self.cfg.aec.noise_suppression
+        ):
+            mic_dsp_cfg = self.cfg.capture.model_copy(
+                update={"denoise_enabled": False}
+            )
+            log.info("[dsp] mic noisereduce skipped (APM NS3 already ran)")
         mic_dsp, sys_dsp = await asyncio.gather(
             loop.run_in_executor(
                 self._executor, apply_mic_dsp,
-                bytes(buffers.mic_pcm), sr, self.cfg.capture,
+                bytes(buffers.mic_pcm), sr, mic_dsp_cfg,
             ),
             loop.run_in_executor(
                 self._executor, apply_sys_dsp,

@@ -432,25 +432,24 @@ class ConversationDetector:
 
 
 def evaluate_user_turn_gate(buffers: SessionBuffers, cfg: ConversationConfig) -> GateResult:
-    """Cheap pre-upload gate: substantive user turn AND counterparty present."""
+    """Cheap pre-upload gate: substantive user speech AND counterparty present.
+
+    Single-threshold rule (v3.5.2+): cumulative mic voiced time across the
+    whole session must be ≥ ``cfg.min_user_total_secs``, however distributed.
+    One long turn, many short turns, doesn't matter.
+    """
     mic_total = buffers.mic_total_voiced()
     mic_max = buffers.mic_max_turn()
     mic_turns = buffers.mic_turn_count()
     sys_total = buffers.sys_total_voiced()
 
-    has_long_turn = mic_max >= cfg.min_user_turn_secs
-    has_cumulative = (
-        mic_total >= cfg.min_user_total_secs
-        and mic_turns >= cfg.min_user_turns_for_total
-    )
-    user_ok = has_long_turn or has_cumulative
+    user_ok = mic_total >= cfg.min_user_total_secs
     sys_ok = sys_total >= cfg.min_sys_voiced_secs
 
     if not user_ok:
         reason = (
-            f"FAIL substantive-user-turn (max_turn={mic_max:.1f}s < {cfg.min_user_turn_secs:.0f}s "
-            f"AND cumulative={mic_total:.1f}s/{mic_turns} turns < "
-            f"{cfg.min_user_total_secs:.0f}s/{cfg.min_user_turns_for_total})"
+            f"FAIL substantive-user-turn (mic_total={mic_total:.1f}s "
+            f"over {mic_turns} turns < {cfg.min_user_total_secs:.0f}s)"
         )
     elif not sys_ok:
         reason = (
@@ -458,13 +457,10 @@ def evaluate_user_turn_gate(buffers: SessionBuffers, cfg: ConversationConfig) ->
             f"no other side)"
         )
     else:
-        if has_long_turn:
-            reason = f"PASS substantive-user-turn (max_turn={mic_max:.1f}s ≥ {cfg.min_user_turn_secs:.0f}s)"
-        else:
-            reason = (
-                f"PASS substantive-user-turn (cumulative={mic_total:.1f}s "
-                f"over {mic_turns} turns)"
-            )
+        reason = (
+            f"PASS substantive-user-turn (mic_total={mic_total:.1f}s "
+            f"over {mic_turns} turns ≥ {cfg.min_user_total_secs:.0f}s)"
+        )
 
     return GateResult(
         passed=user_ok and sys_ok,

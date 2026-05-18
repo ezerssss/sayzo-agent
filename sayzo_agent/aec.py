@@ -166,10 +166,15 @@ def cancel_echo(
 
     sys_aligned = _align_reference(sys_int16, lag, len(mic_int16))
 
+    # AGC stays False — it dynamically pumps mic gain across the
+    # session, which is right for a phone call but wrong for our
+    # pipeline (would boost ambient noise to speech level during
+    # far-side monologue, confusing Deepgram diarize). dsp.py's
+    # one-shot peak-normalize handles overall level instead.
     apm = APM(
         echo_cancellation=True,
-        noise_suppression=False,
-        high_pass_filter=False,
+        noise_suppression=bool(cfg.noise_suppression),
+        high_pass_filter=bool(cfg.high_pass_filter),
         auto_gain_control=False,
     )
     apm.set_stream_delay_ms(0)

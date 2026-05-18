@@ -20,9 +20,7 @@ from sayzo_agent.models import SessionCloseReason, SpeechSegment
 def _cfg(**overrides) -> ConversationConfig:
     base = dict(
         joint_silence_close_secs=10.0,
-        min_user_turn_secs=8.0,
-        min_user_total_secs=15.0,
-        min_user_turns_for_total=2,
+        min_user_total_secs=8.0,
         min_sys_voiced_secs=1.0,
     )
     base.update(overrides)
@@ -295,6 +293,30 @@ def test_gate_passes_long_turn():
     d.tick(200.0)
     closed = d.take_closed_session()
     assert closed is not None
+    result = evaluate_user_turn_gate(closed, cfg)
+    assert result.passed
+    assert "PASS" in result.reason
+
+
+def test_gate_passes_many_short_turns_adding_up():
+    """User speaks in several short bursts (2.5s each) that add up to ≥ 8s
+    total — no single turn reaches 8s on its own. Pre-v3.5.2 this failed
+    because the cumulative path required 10s and the AND with ≥2 turns;
+    under the single-threshold rule (v3.5.2+), total time alone passes."""
+    cfg = _cfg()
+    d = ConversationDetector(cfg)
+    # 4 user bursts of 2.5s = 10s cumulative, none individually substantive.
+    for i in range(4):
+        d.on_segment(
+            SpeechSegment("mic", i * 5.0, i * 5.0 + 2.5),
+            now=i * 5.0 + 2.5,
+        )
+    d.on_segment(SpeechSegment("system", 21.0, 23.0), now=23.0)
+    d.tick(50.0)
+    closed = d.take_closed_session()
+    assert closed is not None
+    assert closed.mic_max_turn() < 8.0  # no single turn is long
+    assert closed.mic_total_voiced() >= 8.0  # but cumulative IS substantive
     result = evaluate_user_turn_gate(closed, cfg)
     assert result.passed
     assert "PASS" in result.reason

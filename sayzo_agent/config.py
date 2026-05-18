@@ -100,9 +100,16 @@ class VADConfig(BaseSettings):
 
 class ConversationConfig(BaseSettings):
     joint_silence_close_secs: float = 45.0
-    min_user_turn_secs: float = 8.0
-    min_user_total_secs: float = 10.0
-    min_user_turns_for_total: int = 2
+    # Single-threshold substantive-user-turn rule (v3.5.2+): a session passes
+    # iff the user's cumulative voiced time is at least this many seconds,
+    # however distributed — one long turn, many short turns, doesn't matter.
+    # The pre-v3.5.2 dual-path rule (8s single-turn OR 10s cumulative across
+    # ≥2 turns) used an AND inside the cumulative branch that surprised
+    # users into thinking a session with several 2-3s turns adding to 8s+
+    # should pass when it didn't. echo_guard handles "user accidentally let
+    # a podcast play into their mic" cases on a separate pass, so a single
+    # long VAD segment can't game this threshold.
+    min_user_total_secs: float = 8.0
     min_sys_voiced_secs: float = 1.0
     # Pad around each VAD segment (mic or system) when building the final
     # saved audio. Regions outside any padded segment are zero-filled so
@@ -209,14 +216,20 @@ class AecConfig(BaseSettings):
     # Reference-stream delay alignment.
     # Mic and sys arrive on independent device clocks (sounddevice mic
     # vs WASAPI loopback on Win / Process Tap helper on Mac); a global
-    # lag of tens of ms is normal. Echo_guard's own xcorr (see
-    # echo_guard.estimate_delay) is what we reuse here.
-    lag_search_ms: int = 200
+    # lag of hundreds of ms is normal — WASAPI loopback buffering alone
+    # can be 100-200 ms, plus sounddevice mic callback latency
+    # (~30-100 ms). 500 ms gives the xcorr enough headroom to find the
+    # real peak in most setups; 200 ms (v3.5.0 default) was clipping
+    # real-world lags at the search boundary on speaker-equipped
+    # laptops. Echo_guard's own xcorr (see echo_guard.estimate_delay)
+    # is what we reuse here.
+    lag_search_ms: int = 500
     # Cap the lag we pass to set_stream_delay_ms; xcorr lags larger
     # than this on a session-wide estimate usually indicate spurious
     # correlation (silence + silence aligns at random offsets), so
     # we fall back to 0 and let AEC3's internal delay tracker handle it.
-    lag_max_ms: int = 300
+    # Matched to lag_search_ms so the entire search range is trusted.
+    lag_max_ms: int = 500
     # Minimum xcorr peak (normalized) below which we don't trust the
     # estimated lag and fall back to 0. echo_guard uses 0.15; the AEC
     # global pass operates on much longer windows so we expect higher
@@ -227,6 +240,21 @@ class AecConfig(BaseSettings):
     # If either channel is essentially silent, AEC is a no-op; bail.
     min_mic_rms: float = 0.0005   # ~-66 dBFS in float32
     min_sys_rms: float = 0.0005
+
+    # Additional WebRTC AudioProcessingModule features beyond AEC3.
+    # NS3 (noise suppression) cleans the residual "musical noise"
+    # artifact that's typical after linear echo cancellation on
+    # speaker bleed — without it, you can hear a low-level static-like
+    # crackle in the cleaned mic. HPF (high-pass filter) kills DC and
+    # sub-80Hz rumble. Both run inside the same APM pass as AEC3 so
+    # they share the per-block state and don't add a separate sweep
+    # over the audio. AGC stays OFF on purpose — it pumps mic gain
+    # during far-side monologue and boosts ambient noise to speech
+    # level, which confuses Deepgram's diarization. Our peak-normalize
+    # in dsp.py is the one-shot loudness pass that handles overall
+    # level without AGC's per-frame mischief.
+    noise_suppression: bool = True
+    high_pass_filter: bool = True
 
 
 class DetectorSpec(BaseSettings):
