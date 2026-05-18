@@ -832,6 +832,21 @@ def load_config() -> Config:
                 **probe.capture.model_dump(), **user_capture
             }
 
+    if isinstance(user.get("aec"), dict):
+        env_aec_keys = {
+            k[len("SAYZO_AEC__"):].lower()
+            for k in os.environ
+            if k.upper().startswith("SAYZO_AEC__")
+        }
+        user_aec = {
+            k: v for k, v in user["aec"].items()
+            if k.lower() not in env_aec_keys
+        }
+        if user_aec:
+            init_kwargs["aec"] = {
+                **probe.aec.model_dump(), **user_aec
+            }
+
     cfg = Config(**init_kwargs) if init_kwargs else probe
     cfg.ensure_dirs()
     return cfg

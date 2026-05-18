@@ -91,10 +91,7 @@ export function RecordingPane() {
               </span>
             </div>
             <p className="mt-1 max-w-md text-xs leading-relaxed text-ink-muted">
-              If you use your laptop speakers (not headphones) during
-              meetings, the other person's voice can bleed into your
-              mic. Turn this on to subtract that bleed before Sayzo
-              uploads. Headphone users can leave it off.
+              Reduces echo in your meeting recordings.
             </p>
           </div>
           <Switch

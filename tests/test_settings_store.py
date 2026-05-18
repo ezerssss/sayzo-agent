@@ -106,3 +106,41 @@ def test_capture_system_scope_user_settings_overrides_default(
     from sayzo_agent.config import load_config
     cfg = load_config()
     assert cfg.capture.system_scope == "arm_app"
+
+
+def test_aec_enabled_default_is_false(tmp_path: Path, monkeypatch) -> None:
+    """Fresh install: AEC is opt-in until a later v3.5.x patch flips the default."""
+    monkeypatch.setenv("SAYZO_DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("SAYZO_AEC__ENABLED", raising=False)
+
+    from sayzo_agent.config import load_config
+    cfg = load_config()
+    assert cfg.aec.enabled is False
+
+
+def test_aec_enabled_user_settings_persists_across_restart(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """The bug that prompted v3.5.1: the Settings → Recording toggle wrote
+    {"aec": {"enabled": true}} to user_settings.json but load_config()'s
+    section allowlist didn't include "aec", so the value was silently
+    dropped on the next launch. Regression-test it via the same write→
+    load roundtrip the Settings UI performs."""
+    monkeypatch.setenv("SAYZO_DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("SAYZO_AEC__ENABLED", raising=False)
+    settings_store.save(tmp_path, {"aec": {"enabled": True}})
+
+    from sayzo_agent.config import load_config
+    cfg = load_config()
+    assert cfg.aec.enabled is True
+
+
+def test_aec_env_var_wins_over_user_settings(tmp_path: Path, monkeypatch) -> None:
+    """Standard precedence: SAYZO_AEC__ENABLED env var overrides user_settings.json."""
+    monkeypatch.setenv("SAYZO_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("SAYZO_AEC__ENABLED", "false")
+    settings_store.save(tmp_path, {"aec": {"enabled": True}})
+
+    from sayzo_agent.config import load_config
+    cfg = load_config()
+    assert cfg.aec.enabled is False
