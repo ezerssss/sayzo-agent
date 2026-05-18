@@ -12,7 +12,11 @@ import sys
 import tomllib
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_submodules, copy_metadata
+from PyInstaller.utils.hooks import (
+    collect_data_files,
+    collect_submodules,
+    copy_metadata,
+)
 
 block_cipher = None
 
@@ -98,6 +102,19 @@ tray_logo = Path("installer/assets/logo.png")
 if tray_logo.exists():
     datas.append((str(tray_logo), "installer/assets"))
 
+# livekit.rtc native FFI binary (WebRTC AEC3 — see sayzo_agent/aec.py).
+# The Python loader at livekit/rtc/_ffi_client.py calls
+# ``importlib.resources.files("livekit.rtc.resources") / "liblivekit_ffi.<ext>"``
+# at runtime to locate the dylib/dll/so. PyInstaller's static analysis
+# misses BOTH the resources sub-package (which holds the binary as
+# package data) and the binary itself — so a frozen build without
+# explicit bundling hits ``ImportError: failed to load liblivekit_ffi.*:
+# No module named 'livekit.rtc.resources'`` on first AEC use. The
+# ``sayzo-agent healthcheck`` CLI exercises ``cancel_echo`` against a
+# synthetic buffer specifically so this kind of break-on-package-graph
+# regression fails CI rather than the user.
+datas += collect_data_files("livekit", include_py_files=False)
+
 # ---------------------------------------------------------------------------
 # Hidden imports — modules loaded lazily or via importlib that PyInstaller
 # cannot detect through static analysis.
@@ -131,6 +148,15 @@ hiddenimports = [
     # First-run GUI window
     "webview",
 ]
+
+# livekit (WebRTC AEC3 wrapper, see sayzo_agent/aec.py). Lazy-imported
+# inside ``aec._get_apm()`` and the ``importlib.resources`` lookup of
+# the FFI binary references ``livekit.rtc.resources`` by name only —
+# PyInstaller's static scanner misses both. ``collect_submodules``
+# pulls the resources sub-package and every other module livekit
+# requires at runtime (the protobuf shims under ``livekit.rtc._proto``
+# are particularly easy to miss).
+hiddenimports += collect_submodules("livekit")
 
 # Windows-specific
 if sys.platform == "win32":
