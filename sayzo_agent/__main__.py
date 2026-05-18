@@ -374,6 +374,29 @@ def healthcheck() -> None:
         with torch.no_grad():
             _ = (x * 2).sum().item()
 
+    def _check_aec() -> None:
+        # WebRTC AEC3 via livekit.rtc.apm — ship a synthetic 1 s
+        # mic+sys buffer through cancel_echo. Catches the v3.0.0-style
+        # "lib imports but native FFI binary didn't make it into the
+        # bundle" failure mode for the new dep.
+        import numpy as np
+        from sayzo_agent.aec import cancel_echo
+        from sayzo_agent.config import AecConfig
+        sr = 16000
+        n = sr
+        rng = np.random.default_rng(0)
+        mic = (rng.normal(0, 3000, n).astype(np.int16)).tobytes()
+        sys_pcm = (rng.normal(0, 3000, n).astype(np.int16)).tobytes()
+        out, rep = cancel_echo(mic, sys_pcm, sr, AecConfig(enabled=True))
+        if not rep.ran:
+            raise RuntimeError(
+                f"AEC skipped: {rep.skip_reason} (livekit FFI binary may be missing)"
+            )
+        if len(out) != len(mic):
+            raise RuntimeError(
+                f"AEC output length mismatch: {len(out)} vs {len(mic)}"
+            )
+
     _try("numpy import", lambda: __import__("numpy"))
     _try("scipy.signal import", lambda: __import__("scipy.signal"))
     _try("sounddevice import", lambda: __import__("sounddevice"))
@@ -387,6 +410,8 @@ def healthcheck() -> None:
     _try("silero-vad load (torch JIT)", _check_silero)
     _try("av (PyAV) import", lambda: __import__("av"))
     _try("noisereduce import", lambda: __import__("noisereduce"))
+    _try("livekit.rtc.apm import", lambda: __import__("livekit.rtc.apm"))
+    _try("AEC end-to-end", _check_aec)
     _try("pydantic import", lambda: __import__("pydantic"))
     _try("httpx import", lambda: __import__("httpx"))
     _try("pystray import", lambda: __import__("pystray"))

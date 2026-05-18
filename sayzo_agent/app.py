@@ -25,7 +25,7 @@ from .conversation import (
     merge_close_segments,
 )
 from .dsp import apply_mic_dsp, apply_sys_dsp
-from . import echo_guard
+from . import aec, echo_guard
 from .models import SessionBuffers
 from .sink import CaptureSink
 from .notify import NoopNotifier, Notifier
@@ -530,12 +530,49 @@ class Agent:
         loop = asyncio.get_running_loop()
         sr = self.cfg.capture.sample_rate
 
-        # 0. Echo guard — classify mic VAD segments as user speech or
+        # 0a. AEC pre-pass — subtract speaker bleed from the mic at the
+        # sample level using WebRTC AEC3 (livekit.rtc.apm). Off by default
+        # in v3.4.0; flip on via SAYZO_AEC__ENABLED=1 for dogfooding.
+        # When enabled, the cleaned mic replaces buffers.mic_pcm so the
+        # downstream echo_guard + DSP + windowing all consume the post-AEC
+        # signal. echo_guard then acts as the non-linear residual safety
+        # net (cheap-laptop speaker compression, BT codec re-encoding) —
+        # see Critical design rule 5 in CLAUDE.md.
+        aec_report = None
+        if self.cfg.aec.enabled:
+            cleaned_mic, aec_report = await loop.run_in_executor(
+                self._executor,
+                aec.cancel_echo,
+                bytes(buffers.mic_pcm),
+                bytes(buffers.sys_pcm),
+                sr,
+                self.cfg.aec,
+            )
+            if aec_report.ran:
+                buffers.mic_pcm = bytearray(cleaned_mic)
+                log.info(
+                    "[aec] ran frames=%d dur=%.0fms lag=%+dsmp peak=%.2f "
+                    "mic_rms %.4f→%.4f sys_rms=%.4f",
+                    aec_report.frames_processed,
+                    aec_report.duration_ms,
+                    aec_report.lag_samples,
+                    aec_report.lag_xcorr_peak,
+                    aec_report.mic_rms_before,
+                    aec_report.mic_rms_after,
+                    aec_report.sys_rms,
+                )
+            else:
+                log.info("[aec] skipped (%s)", aec_report.skip_reason)
+
+        # 0b. Echo guard — classify mic VAD segments as user speech or
         # speaker-to-mic bleed, then strip echo entries from
         # `buffers.mic_segments` and record them on `buffers.mic_echo_segments`.
         # Runs BEFORE the gate so passive "user listens to a podcast" sessions
         # fail substantive-user-turn on real (non-echo-inflated) mic totals,
         # avoiding upload of sessions where the user never actually spoke.
+        # When AEC ran first (0a above), echo_guard operates on already-
+        # linearly-cleaned mic — it's still the non-linear residual safety
+        # net (cheap-speaker compression, BT codec re-encoding).
         eg_report = None
         if self.cfg.echo_guard.enabled:
             eg_report = await loop.run_in_executor(
@@ -671,6 +708,19 @@ class Agent:
                 "seconds_dropped": eg_report.seconds_dropped,
                 "dropped_spans": [[s, e] for s, e in eg_report.dropped_spans],
                 "thresholds": eg_report.thresholds,
+            }
+        if aec_report is not None:
+            metadata["aec"] = {
+                "enabled": aec_report.enabled,
+                "ran": aec_report.ran,
+                "skip_reason": aec_report.skip_reason,
+                "lag_samples": aec_report.lag_samples,
+                "lag_xcorr_peak": round(aec_report.lag_xcorr_peak, 4),
+                "frames_processed": aec_report.frames_processed,
+                "duration_ms": round(aec_report.duration_ms, 1),
+                "mic_rms_before": round(aec_report.mic_rms_before, 4),
+                "mic_rms_after": round(aec_report.mic_rms_after, 4),
+                "sys_rms": round(aec_report.sys_rms, 4),
             }
         record = await loop.run_in_executor(
             self._executor,

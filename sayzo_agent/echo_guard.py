@@ -466,7 +466,7 @@ def _classify_window(
     sys_wide = sys_pcm[sys_start:sys_end]
     pre_pad = t0_s - sys_start
 
-    lag, xcorr_peak = _estimate_delay(mic_slice, sys_wide, pre_pad, search)
+    lag, xcorr_peak = estimate_delay(mic_slice, sys_wide, pre_pad, search)
     if xcorr_peak < cfg.min_xcorr_peak:
         return _WindowResult(is_echo=False, reason="xcorr_low",
                              mic_rms=mic_rms, sys_rms=sys_rms,
@@ -502,7 +502,7 @@ def _classify_window(
     )
 
 
-def _estimate_delay(
+def estimate_delay(
     mic: np.ndarray, sys_wide: np.ndarray, pre_pad: int, search: int,
 ) -> tuple[int, float]:
     """Find best alignment of `mic` within `sys_wide` restricted to
@@ -512,6 +512,13 @@ def _estimate_delay(
         mic ≈ c · sys_wide[pre_pad + best_lag : pre_pad + best_lag + len(mic)]
     `normalized_peak` is the cosine of the angle between the two vectors at
     the best lag (Pearson-like, range [-1, 1] after mean-centering).
+
+    Public so the AEC pre-pass (sayzo_agent.aec) can reuse the same
+    cross-correlation logic for global mic↔sys lag estimation. The
+    captures arrive on independent device clocks (mic via sounddevice,
+    sys via WASAPI loopback / CoreAudio Process Tap), so AEC3's internal
+    delay estimator gets a much better starting point if we hand it the
+    bulk lag explicitly rather than letting it converge from zero.
     """
     from scipy.signal import correlate
 

@@ -183,6 +183,52 @@ class EchoGuardConfig(BaseSettings):
     debug: bool = False
 
 
+class AecConfig(BaseSettings):
+    """WebRTC AEC3 pre-pass over (mic_pcm, sys_pcm) before echo_guard.
+
+    The current echo_guard is a per-segment classifier — it can drop a
+    whole VAD segment if it looks like echo, but it can't subtract a
+    speaker-bleed *signal* from a mic segment that also contains real
+    user speech (double-talk). This AEC pass uses WebRTC's
+    AudioProcessingModule (AEC3) to predict the echo from the system
+    audio reference and subtract it from the mic at the sample level.
+
+    Runs in `app._process_session_inner` AFTER session close, BEFORE
+    `echo_guard.classify_buffers`, on the existing heavy-worker
+    ThreadPoolExecutor. echo_guard then sees an already-cleaned mic
+    and becomes the non-linear residual safety net (e.g. cheap-laptop
+    speaker driver compression, BT codec re-encoding artifacts).
+
+    v3.4.0 ships with ``enabled=False``; v3.4.1 flips the default ON
+    once speaker captures have been validated on both platforms.
+    """
+
+    # Master switch. SAYZO_AEC__ENABLED=1 to turn on.
+    enabled: bool = False
+
+    # Reference-stream delay alignment.
+    # Mic and sys arrive on independent device clocks (sounddevice mic
+    # vs WASAPI loopback on Win / Process Tap helper on Mac); a global
+    # lag of tens of ms is normal. Echo_guard's own xcorr (see
+    # echo_guard.estimate_delay) is what we reuse here.
+    lag_search_ms: int = 200
+    # Cap the lag we pass to set_stream_delay_ms; xcorr lags larger
+    # than this on a session-wide estimate usually indicate spurious
+    # correlation (silence + silence aligns at random offsets), so
+    # we fall back to 0 and let AEC3's internal delay tracker handle it.
+    lag_max_ms: int = 300
+    # Minimum xcorr peak (normalized) below which we don't trust the
+    # estimated lag and fall back to 0. echo_guard uses 0.15; the AEC
+    # global pass operates on much longer windows so we expect higher
+    # peaks when there's any real echo path.
+    min_xcorr_peak: float = 0.10
+
+    # Skip thresholds (cheap exits — no echo possible, don't waste CPU).
+    # If either channel is essentially silent, AEC is a no-op; bail.
+    min_mic_rms: float = 0.0005   # ~-66 dBFS in float32
+    min_sys_rms: float = 0.0005
+
+
 class DetectorSpec(BaseSettings):
     """Per-app detection rule for the whitelist auto-suggest path.
 
@@ -668,6 +714,7 @@ class Config(BaseSettings):
     vad: VADConfig = Field(default_factory=VADConfig)
     conversation: ConversationConfig = Field(default_factory=ConversationConfig)
     echo_guard: EchoGuardConfig = Field(default_factory=EchoGuardConfig)
+    aec: AecConfig = Field(default_factory=AecConfig)
     arm: ArmConfig = Field(default_factory=ArmConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)
     upload: UploadConfig = Field(default_factory=UploadConfig)
