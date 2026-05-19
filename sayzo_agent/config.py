@@ -242,18 +242,32 @@ class AecConfig(BaseSettings):
     min_sys_rms: float = 0.0005
 
     # Additional WebRTC AudioProcessingModule features beyond AEC3.
-    # NS3 (noise suppression) cleans the residual "musical noise"
-    # artifact that's typical after linear echo cancellation on
-    # speaker bleed — without it, you can hear a low-level static-like
-    # crackle in the cleaned mic. HPF (high-pass filter) kills DC and
-    # sub-80Hz rumble. Both run inside the same APM pass as AEC3 so
-    # they share the per-block state and don't add a separate sweep
-    # over the audio. AGC stays OFF on purpose — it pumps mic gain
-    # during far-side monologue and boosts ambient noise to speech
-    # level, which confuses Deepgram's diarization. Our peak-normalize
-    # in dsp.py is the one-shot loudness pass that handles overall
-    # level without AGC's per-frame mischief.
-    noise_suppression: bool = True
+    #
+    # NS3 (noise suppression) is exposed but OFF by default. It uses
+    # spectral subtraction tuned for VoIP human-listening and produces
+    # audible "musical noise" / comfort-noise artifacts on the
+    # already-clean signal coming out of AEC3 — a real user heard a
+    # static crackle on a headphones-only capture once NS3 was enabled
+    # in v3.5.2 dogfooding (env-var override capture confirmed NS3 was
+    # the culprit). Industry consensus for ASR/agent pipelines is to
+    # pick ONE noise suppressor; we already ship `noisereduce` in
+    # dsp.py tuned at prop_decrease=0.5 against this exact artifact
+    # shape. Keep the field so it can be turned back on via env var or
+    # Settings for experimentation, but the default is off. The
+    # `denoise_enabled = False` skip in app._process_session_inner is
+    # the guard rail for when someone explicitly flips this on — keeps
+    # NS3 + noisereduce from stacking and compounding the artifact.
+    #
+    # HPF (high-pass filter) stays ON by default — it's a fixed-cutoff
+    # high-pass that kills DC and sub-80Hz rumble; no known artifacts
+    # on clean input. Free win, no trade-off.
+    #
+    # AGC stays hardcoded OFF in aec.py — it pumps mic gain during
+    # far-side monologue and boosts ambient noise to speech level,
+    # confusing Deepgram's diarization. Our peak-normalize in dsp.py
+    # is the one-shot loudness pass that handles overall level without
+    # AGC's per-frame mischief.
+    noise_suppression: bool = False
     high_pass_filter: bool = True
 
 
