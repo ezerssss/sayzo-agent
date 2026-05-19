@@ -215,12 +215,18 @@ class AecConfig(BaseSettings):
     and becomes the non-linear residual safety net (e.g. cheap-laptop
     speaker driver compression, BT codec re-encoding artifacts).
 
-    v3.4.0 ships with ``enabled=False``; v3.4.1 flips the default ON
-    once speaker captures have been validated on both platforms.
+    v3.4.0 shipped with ``enabled=False`` (opt-in via env var or
+    Settings toggle) so we could dogfood the AEC integration without
+    risking regressions on the existing recording path. v3.6.1 flips
+    the default ON after the v3.6.0 mic↔sys alignment fix made AEC
+    actually effective in production: per-segment cancellation up to
+    25 dB when the user is silent, 4–10 dB during double-talk, and
+    audibly clearer recordings on every speaker setup the team
+    dogfooded.
     """
 
-    # Master switch. SAYZO_AEC__ENABLED=1 to turn on.
-    enabled: bool = False
+    # Master switch. SAYZO_AEC__ENABLED=0 to turn off.
+    enabled: bool = True
 
     # Reference-stream delay alignment.
     # Mic and sys arrive on independent device clocks (sounddevice mic

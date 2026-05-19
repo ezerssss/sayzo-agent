@@ -369,13 +369,13 @@ def _async_returning(value: Any):
 
 
 def test_get_recording_settings_reflects_endpoint_default(cfg: Config) -> None:
-    """Fresh config (post-v2.9.0 default flip): per_app_capture should be False
-    because system_scope defaults to 'endpoint'. aec_enabled defaults to False
-    in v3.5.0 until a later patch flips the default ON."""
+    """Fresh config: per_app_capture defaults to False (endpoint scope is
+    the default since v2.9.0); aec_enabled defaults to True (default flipped
+    in v3.6.1 after the alignment fix landed)."""
     b = Bridge(cfg)
     assert b.get_recording_settings() == {
         "per_app_capture": False,
-        "aec_enabled": False,
+        "aec_enabled": True,
     }
 
 
@@ -385,17 +385,17 @@ def test_get_recording_settings_reflects_arm_app_override(cfg: Config) -> None:
     b = Bridge(cfg)
     assert b.get_recording_settings() == {
         "per_app_capture": True,
-        "aec_enabled": False,
+        "aec_enabled": True,
     }
 
 
-def test_get_recording_settings_reflects_aec_enabled(cfg: Config) -> None:
-    """User has enabled AEC from the Settings UI (Beta toggle on)."""
-    cfg.aec.enabled = True
+def test_get_recording_settings_reflects_aec_disabled(cfg: Config) -> None:
+    """User has turned AEC off from the Settings UI (default is on in v3.6.1+)."""
+    cfg.aec.enabled = False
     b = Bridge(cfg)
     assert b.get_recording_settings() == {
         "per_app_capture": False,
-        "aec_enabled": True,
+        "aec_enabled": False,
     }
 
 

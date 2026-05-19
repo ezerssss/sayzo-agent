@@ -589,16 +589,35 @@ class Agent:
                 eg_report.seconds_dropped,
             )
             for r in eg_report.per_segment:
-                if not r.echo_spans:
-                    continue
                 lag_ms = int(round(r.lag_samples * 1000.0 / sr))
-                for es, ee in r.echo_spans:
+                if r.echo_spans:
+                    # Already-dropped segments — one log line per echo span.
+                    for es, ee in r.echo_spans:
+                        log.info(
+                            "[echo_guard]   drop %.2f-%.2fs coh=%.2f "
+                            "resid_speech_p=%.2f lag=%dms xcorr=%.2f "
+                            "rms_mic=%.3f rms_sys=%.3f reason=%s",
+                            es, ee, r.coherence, r.residual_speech_prob,
+                            lag_ms, r.xcorr_peak, r.mic_rms, r.sys_rms,
+                            r.reason,
+                        )
+                else:
+                    # Kept segments — log the scores too so we can see how
+                    # close each segment came to the drop threshold. Critical
+                    # observability for tuning thresholds AND for diagnosing
+                    # "AEC working but echo audible in transcript" reports:
+                    # with AEC decorrelating bleed from sys, echo_guard's
+                    # coherence check can stop firing even when bleed is
+                    # audible. We need to SEE the scores to know if a
+                    # threshold tweak is warranted.
                     log.info(
-                        "[echo_guard]   drop %.2f-%.2fs coh=%.2f "
+                        "[echo_guard]   keep %.2f-%.2fs coh=%.2f "
                         "resid_speech_p=%.2f lag=%dms xcorr=%.2f "
-                        "rms_mic=%.3f rms_sys=%.3f",
-                        es, ee, r.coherence, r.residual_speech_prob,
+                        "rms_mic=%.3f rms_sys=%.3f reason=%s",
+                        r.original.start_ts, r.original.end_ts,
+                        r.coherence, r.residual_speech_prob,
                         lag_ms, r.xcorr_peak, r.mic_rms, r.sys_rms,
+                        r.reason,
                     )
             self._echo_segments_dropped += eg_report.segments_dropped
             self._echo_secs_dropped += eg_report.seconds_dropped

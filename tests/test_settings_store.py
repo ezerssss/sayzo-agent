@@ -108,14 +108,17 @@ def test_capture_system_scope_user_settings_overrides_default(
     assert cfg.capture.system_scope == "arm_app"
 
 
-def test_aec_enabled_default_is_false(tmp_path: Path, monkeypatch) -> None:
-    """Fresh install: AEC is opt-in until a later v3.5.x patch flips the default."""
+def test_aec_enabled_default_is_true(tmp_path: Path, monkeypatch) -> None:
+    """Fresh install: AEC is on by default in v3.6.1+ (default flipped after
+    the v3.6.0 mic↔sys alignment fix made AEC actually effective). Older
+    builds shipped opt-in; this test guards against accidental regression
+    back to False."""
     monkeypatch.setenv("SAYZO_DATA_DIR", str(tmp_path))
     monkeypatch.delenv("SAYZO_AEC__ENABLED", raising=False)
 
     from sayzo_agent.config import load_config
     cfg = load_config()
-    assert cfg.aec.enabled is False
+    assert cfg.aec.enabled is True
 
 
 def test_aec_enabled_user_settings_persists_across_restart(

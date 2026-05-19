@@ -110,16 +110,22 @@ def _delay(x: np.ndarray, samples: int) -> np.ndarray:
 
 
 def test_aec_config_defaults():
-    """Lock in the v3.5.x default knob shape so a "helpful" flip in
-    review can't ship a regression.
+    """Lock in the default knob shape so a "helpful" flip in review
+    can't ship a regression.
 
-    NS3 stays OFF by default — see config.py for the reasoning (it
-    produces musical-noise artifacts on the already-clean AEC output
-    and noisereduce in dsp.py owns this concern). HPF stays ON because
-    it has no known artifacts on clean input. AGC is hardcoded off in
-    aec.py and isn't a config field.
+    ``enabled`` is ON by default since v3.6.1 — the v3.6.0 mic↔sys
+    alignment fix made AEC actually effective, and users with speakers
+    benefit immediately. NS3 stays OFF (musical-noise artifacts on the
+    already-clean AEC output, and noisereduce in dsp.py owns that
+    concern). HPF stays ON (fixed-cutoff high-pass with no known
+    artifacts on clean input). AGC is hardcoded off in aec.py and
+    isn't a config field.
     """
     cfg = AecConfig()
+    assert cfg.enabled is True, (
+        "AEC must default to ON — flipped in v3.6.1 after v3.6.0 made "
+        "AEC actually work in production."
+    )
     assert cfg.noise_suppression is False, (
         "NS3 must default to OFF — see config.py comment for the "
         "v3.5.2 dogfood report that established this."

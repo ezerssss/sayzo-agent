@@ -17,7 +17,7 @@ export function RecordingPane() {
         const s = await settingsBridge.getRecordingSettings();
         if (!cancelled) setSettings(s);
       } catch {
-        if (!cancelled) setSettings({ per_app_capture: false, aec_enabled: false });
+        if (!cancelled) setSettings({ per_app_capture: false, aec_enabled: true });
       }
     })();
     return () => {
@@ -86,18 +86,16 @@ export function RecordingPane() {
               <span className="text-sm font-medium text-ink">
                 Echo cancellation
               </span>
-              <span className="rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-amber-600">
-                Beta
-              </span>
             </div>
             <p className="mt-1 max-w-md text-xs leading-relaxed text-ink-muted">
-              Reduces echo in your meeting recordings.
+              Reduces echoed voices picked up from your speakers.
+              Recommended when not using headphones.
             </p>
           </div>
           <Switch
             checked={settings.aec_enabled}
             onChange={(v) => void handleToggle("aec_enabled", v)}
-            ariaLabel="Echo cancellation (beta)"
+            ariaLabel="Echo cancellation"
           />
         </label>
 
