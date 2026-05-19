@@ -72,7 +72,22 @@ class CaptureConfig(BaseSettings):
     denoise_strength: float = 0.5
     highpass_mic_hz: float = 80.0  # Butterworth HPF cutoff on mic, 0 = off
     highpass_sys_hz: float = 40.0  # lighter HPF on system (just kill DC/rumble)
-    peak_normalize_dbfs: float = -1.0  # post-DSP peak norm target
+    # Peak-normalize target. Lowered v3.6.4 from -1 dBFS to -3 dBFS after a
+    # user dogfood report: when AEC cancels strongly (mic RMS drops 3+ dB),
+    # peak-normalize compensates by applying extra gain to reach the target —
+    # which AMPLIFIES constant background (fan hum, room tone, electrical
+    # noise) along with the legitimate signal. Lower target = less baseline
+    # gain = less background lifted.
+    peak_normalize_dbfs: float = -3.0
+    # Hard ceiling on the gain peak-normalize is allowed to apply, in dB.
+    # 6 dB = 2x amplification max. Prevents pathological lift on quiet
+    # post-AEC captures (where the target/peak ratio could otherwise demand
+    # 15-20 dB of gain and turn background hum into audible static). Output
+    # peak may end up below ``peak_normalize_dbfs`` for very quiet inputs;
+    # that's the intended trade-off (quieter playback over amplified hum).
+    # Set 0 to disable amplification entirely; set a high value (e.g. 60)
+    # to restore pre-v3.6.4 unbounded behavior.
+    peak_normalize_max_gain_db: float = 6.0
 
     # Windows-only: opens a silent render stream on the same WASAPI endpoint
     # as the loopback capture, for the lifetime of an armed session. WASAPI

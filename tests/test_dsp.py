@@ -88,6 +88,44 @@ def test_peak_normalize_silent_is_passthrough():
     assert out is x  # no amplification of silence
 
 
+def test_peak_normalize_gain_cap_limits_amplification():
+    """v3.6.4 cap: a quiet signal that would otherwise need >max_gain_db to
+    reach target_dbfs is capped, so output peak is below target. Prevents
+    pathological lift of background hum when AEC reduces dominant RMS.
+    """
+    # Peak at -20 dBFS (0.1). Target -3 dBFS would normally demand ~17 dB
+    # of gain; the 6 dB cap should limit gain to 2x.
+    x = _sine(440, 0.1, amp=0.1)
+    out = _peak_normalize(x, target_dbfs=-3.0, max_gain_db=6.0)
+    expected_peak = 0.1 * (10.0 ** (6.0 / 20.0))  # 0.1 * ~1.995 = ~0.1995
+    actual_peak = float(np.max(np.abs(out)))
+    assert abs(actual_peak - expected_peak) < 0.005, (
+        f"expected peak ~{expected_peak:.3f} (capped at 6 dB), got {actual_peak:.3f}"
+    )
+
+
+def test_peak_normalize_gain_cap_inactive_when_signal_already_loud():
+    """When the signal's natural peak-to-target gain is below the cap, the
+    cap is a no-op and behavior matches uncapped peak-normalize."""
+    # Peak at -6 dBFS (0.5). Target -3 dBFS demands ~3 dB of gain — below
+    # the 6 dB cap, so the cap shouldn't engage.
+    x = _sine(440, 0.1, amp=0.5)
+    out = _peak_normalize(x, target_dbfs=-3.0, max_gain_db=6.0)
+    expected_peak = 10.0 ** (-3.0 / 20.0)  # ~0.708
+    actual_peak = float(np.max(np.abs(out)))
+    assert abs(actual_peak - expected_peak) < 0.005
+
+
+def test_peak_normalize_cap_none_restores_uncapped_behavior():
+    """``max_gain_db=None`` is the pre-v3.6.4 default — uncapped, so any
+    quiet input gets lifted all the way to ``target_dbfs``."""
+    x = _sine(440, 0.1, amp=0.05)  # peak -26 dBFS
+    out = _peak_normalize(x, target_dbfs=-1.0, max_gain_db=None)
+    expected_peak = 10.0 ** (-1.0 / 20.0)  # ~0.891
+    actual_peak = float(np.max(np.abs(out)))
+    assert abs(actual_peak - expected_peak) < 0.005
+
+
 # ---------- int16 <-> float32 round trip ----------
 
 

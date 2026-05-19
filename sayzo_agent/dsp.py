@@ -70,7 +70,19 @@ def _apply_highpass(x: np.ndarray, cutoff_hz: float, sr: int) -> np.ndarray:
     return sosfilt(sos, x).astype(np.float32, copy=False)
 
 
-def _peak_normalize(x: np.ndarray, target_dbfs: float) -> np.ndarray:
+def _peak_normalize(
+    x: np.ndarray, target_dbfs: float, max_gain_db: float | None = None,
+) -> np.ndarray:
+    """Scale ``x`` so its peak hits ``target_dbfs``, with optional gain cap.
+
+    ``max_gain_db`` (v3.6.4+) caps the amount of amplification applied. When
+    AEC has reduced the dominant signal RMS, an uncapped peak-normalize would
+    apply large gain to reach the target — amplifying constant background
+    (fan hum, room tone) into audibility along with the legitimate content.
+    With the cap, quiet captures emit below the target rather than getting
+    pathologically lifted. ``None`` (test default) restores the pre-v3.6.4
+    uncapped behavior.
+    """
     if x.size == 0:
         return x
     peak = float(np.max(np.abs(x)))
@@ -78,6 +90,9 @@ def _peak_normalize(x: np.ndarray, target_dbfs: float) -> np.ndarray:
         return x  # silent — don't amplify noise
     target = 10.0 ** (target_dbfs / 20.0)
     gain = target / peak
+    if max_gain_db is not None:
+        max_gain = 10.0 ** (max_gain_db / 20.0)
+        gain = min(gain, max_gain)
     # Don't pointlessly multiply if we're already there.
     if 0.99 <= gain <= 1.01:
         return x
@@ -126,7 +141,7 @@ def apply_mic_dsp(pcm16: bytes, sr: int, cfg: CaptureConfig) -> bytes:
     x = _apply_highpass(x, cfg.highpass_mic_hz, sr)
     if cfg.denoise_enabled:
         x = _denoise(x, sr, cfg.denoise_strength)
-    x = _peak_normalize(x, cfg.peak_normalize_dbfs)
+    x = _peak_normalize(x, cfg.peak_normalize_dbfs, cfg.peak_normalize_max_gain_db)
     return _f32_to_i16(x)
 
 
@@ -143,5 +158,5 @@ def apply_sys_dsp(pcm16: bytes, sr: int, cfg: CaptureConfig) -> bytes:
         return pcm16
     x = _i16_to_f32(pcm16)
     x = _apply_highpass(x, cfg.highpass_sys_hz, sr)
-    x = _peak_normalize(x, cfg.peak_normalize_dbfs)
+    x = _peak_normalize(x, cfg.peak_normalize_dbfs, cfg.peak_normalize_max_gain_db)
     return _f32_to_i16(x)

@@ -8,10 +8,22 @@ variants and writes the resulting mic-channel WAVs to a sibling
 Usage:
     python scripts/diagnose_aec.py <capture_id> [--data-dir DIR]
 
+Important: the mic + sys decoded from the Opus are NOT the raw captured
+audio — by the time they land in the Opus the live pipeline has already
+run AEC + DSP on the mic channel and light HPF on the sys channel. So
+the ``mic.wav`` written here is what Deepgram actually heard from the
+upload, and any further variant is AEC running ON TOP of an already-
+processed mic. Useful for residual analysis but DO NOT treat the
+variants as equivalent to "what would a different first-pass AEC have
+produced" — that comparison requires recording with the candidate config
+on the live agent.
+
 Variants written (mic only — sys is always the reference, unchanged):
-    raw_mic.wav         — pre-AEC mic, the input AEC sees
-    raw_sys.wav         — sys reference (the speaker output)
-    default.wav         — current AecConfig defaults (v3.5.2 state)
+    mic.wav             — mic channel decoded from the Opus (= what's
+                          actually in the uploaded file, post-live-AEC
+                          + post-DSP + post-Opus-roundtrip)
+    sys.wav             — sys channel decoded from the Opus
+    default.wav         — second AEC pass at current AecConfig defaults
     ns_off_hpf_off.wav  — pure AEC3 with NS/HPF disabled
     ns_off_hpf_on.wav   — explicit NS off, HPF on (same as the
                           v3.5.2 final default — sanity-check shape)
@@ -203,11 +215,13 @@ def main() -> int:
     print(f"  duration: {duration_s:.1f}s ({len(mic_pcm)//2} samples per channel)")
     print()
 
-    # Write raw inputs for A/B reference.
-    _write_wav(out_dir / "raw_mic.wav", mic_pcm)
-    _write_wav(out_dir / "raw_sys.wav", sys_pcm)
-    print(f"  raw mic RMS: {_rms_db(mic_pcm):.2f} dB")
-    print(f"  raw sys RMS: {_rms_db(sys_pcm):.2f} dB")
+    # Write the Opus-decoded channels as A/B reference. These are NOT raw
+    # capture — the live pipeline already ran AEC + DSP on the mic before
+    # encoding, so ``mic.wav`` is what Deepgram heard.
+    _write_wav(out_dir / "mic.wav", mic_pcm)
+    _write_wav(out_dir / "sys.wav", sys_pcm)
+    print(f"  mic RMS (decoded from Opus): {_rms_db(mic_pcm):.2f} dB")
+    print(f"  sys RMS (decoded from Opus): {_rms_db(sys_pcm):.2f} dB")
     print()
 
     print("Running variants...")
@@ -324,7 +338,7 @@ def main() -> int:
     print()
     print(f"Done. Listen to WAVs in:  {out_dir}")
     print(
-        "Suggested A/B in Audacity: import raw_mic.wav as one track, "
+        "Suggested A/B in Audacity: import mic.wav as one track, "
         "each variant on its own. Solo to compare."
     )
     return 0
