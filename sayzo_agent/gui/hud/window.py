@@ -223,6 +223,21 @@ class _HudHostWidget(QWidget):
             self.windowHandle() is not None,
             self.geometry().getRect(),
         )
+        # Deferred-show landing point. Chromium has loaded the React bundle
+        # and the page background is already painted transparent
+        # (QWebEngineView.page().setBackgroundColor(QColor(0,0,0,0)) above).
+        # Realizing the native window now means the user never sees an empty
+        # Qt backing buffer composited briefly before Chromium's first frame
+        # — that's the boot-flicker we used to ship. macOS WindowServer
+        # establishes its CGS connection here (same path as v3.3.1's at-boot
+        # realization, just delayed by load latency); orderFrontRegardless
+        # in _set_window_visible later handles the LSUIElement-parent case.
+        # MUST run before _set_click_through(True) below — that call's Win32
+        # branch uses self.winId(), which returns 0 until the native window
+        # is realized.
+        if not self.isVisible():
+            log.info("[hud] deferred-show: realizing window after loadFinished")
+            self.show()
         # Apply macOS-specific overlay tweaks (status-window-level,
         # collection behaviour, hides-on-deactivate=False) once Qt has
         # realised the native NSWindow. Probe lsappinfo first — that
@@ -918,7 +933,27 @@ class HudWindow:
         # tests).
         app = QApplication.instance() or QApplication(sys.argv)
         widget = _HudHostWidget(self._cfg, demo=self._demo)
-        widget.show()
+        # Defer widget.show() to _on_load_finished (in _HudHostWidget).
+        # Realizing the native window before Chromium has composited the
+        # transparent React content used to flash an empty 100x100 backing
+        # buffer at the top-right corner — see _on_load_finished for the
+        # full rationale. Geometry was set on-screen in __init__, so the
+        # deferred show still lands at the correct top-right anchor.
+        #
+        # Safety net: if loadFinished never arrives (corrupted dist,
+        # Chromium init hang, …), force-show after 8 s so the HUD is
+        # never permanently invisible. 8 s sits inside the launcher's
+        # 15 s wait_for_ready tolerance and covers slow cold-boot
+        # Chromium init.
+        def _fail_show_if_not_visible() -> None:
+            if not widget.isVisible():
+                log.warning(
+                    "[hud] fail-show timer fired: loadFinished never arrived; "
+                    "showing widget anyway so the HUD isn't permanently invisible",
+                )
+                widget.show()
+
+        QTimer.singleShot(8000, _fail_show_if_not_visible)
         widget.start_stdin_reader()
         _install_sigint_handler(app)
         # Wire Qt-level OS-shutdown hooks before app.exec() so they're

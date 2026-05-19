@@ -581,3 +581,186 @@ def test_close_pads_shorter_buffer_to_match():
     # session_end_mono must reflect the actual PCM duration.
     audio_dur = len(closed.mic_pcm) / 2 / sr
     assert abs((closed.session_end_mono - closed.session_t0_mono) - audio_dur) < 0.01
+
+
+# ---- v3.6 buffer-alignment regression tests ------------------------------
+#
+# Pre-v3.6 the re-anchor branch fired on cold-start delays > 2 s (the old
+# `max_gap_fill_secs` default), silently misaligning mic↔sys in the captured
+# Opus by the source's startup delay. AEC's ±500 ms search could never find
+# that lag and produced ~0 dB cancellation across every production capture.
+# These tests lock in the v3.6 behavior: legitimate cold-start gaps zero-fill,
+# genuinely stale frames are dropped explicitly, mic↔sys stay aligned at
+# session close regardless of which source delivered first.
+
+
+def test_first_sys_frame_after_startup_delay_zero_fills():
+    """Cold-start gap: sys capture thread takes 3.5 s to deliver its first
+    frame after arm. The detector must zero-fill the gap so sys_pcm sample N
+    corresponds to session_t0_mono + N/sr — not to the first-real-frame
+    time, which would offset sys vs mic by the startup delay.
+    """
+    sr = 16000
+    d = ConversationDetector(_cfg(), sample_rate=sr)
+    frame_secs = 0.02
+    arm_now = 100.0
+    d.open_session_on_arm(now=arm_now)
+    # Sys's first frame arrives 3.5 s after arm — typical WASAPI cold start.
+    startup_delay = 3.5
+    first_sys_ts = arm_now + startup_delay
+    d.on_frame("system", _frame(frame_secs, sr), first_sys_ts, first_sys_ts)
+    sys_samples = len(d._buffers.sys_pcm) // 2
+    expected_samples = int(round(startup_delay * sr)) + int(frame_secs * sr)
+    # Allow ±1 frame of rounding.
+    assert abs(sys_samples - expected_samples) <= int(frame_secs * sr), (
+        f"sys_pcm has {sys_samples} samples; expected ~{expected_samples} "
+        f"(3.5 s zero-fill + 20 ms frame)"
+    )
+    # And the leading 3.5 s must actually be zero (not whatever the frame's
+    # amplitude was).
+    fill_bytes = d._buffers.sys_pcm[: int(startup_delay * sr) * 2]
+    assert fill_bytes == bytes(len(fill_bytes)), "leading region is not zero-filled"
+
+
+def test_first_mic_frame_after_startup_delay_zero_fills():
+    """Symmetric to the sys test: same behavior must hold for mic when the
+    mic capture thread is the slow one (unusual but possible on a slow arm).
+    """
+    sr = 16000
+    d = ConversationDetector(_cfg(), sample_rate=sr)
+    frame_secs = 0.02
+    arm_now = 100.0
+    d.open_session_on_arm(now=arm_now)
+    startup_delay = 2.5
+    first_mic_ts = arm_now + startup_delay
+    d.on_frame("mic", _frame(frame_secs, sr), first_mic_ts, first_mic_ts)
+    mic_samples = len(d._buffers.mic_pcm) // 2
+    expected_samples = int(round(startup_delay * sr)) + int(frame_secs * sr)
+    assert abs(mic_samples - expected_samples) <= int(frame_secs * sr)
+    fill_bytes = d._buffers.mic_pcm[: int(startup_delay * sr) * 2]
+    assert fill_bytes == bytes(len(fill_bytes))
+
+
+def test_mic_and_sys_pcm_aligned_after_asymmetric_startup():
+    """The load-bearing invariant for AEC: after a session with asymmetric
+    startup delays (mic 100 ms, sys 3.5 s), mic_pcm[k] and sys_pcm[k] must
+    represent the same wall-clock time. Verified by checking that the
+    leading zero-fill on sys matches the startup-delay asymmetry exactly.
+    """
+    sr = 16000
+    d = ConversationDetector(_cfg(joint_silence_close_secs=5.0), sample_rate=sr)
+    frame_secs = 0.02
+    arm_now = 100.0
+    d.open_session_on_arm(now=arm_now)
+    # Mic starts almost immediately (100 ms cold start — typical fast path).
+    mic_start_delay = 0.1
+    sys_start_delay = 3.5
+    duration = 5.0  # 5 s of audio per source after each starts
+    n_frames = int(duration / frame_secs)
+    for i in range(n_frames):
+        t_mic = arm_now + mic_start_delay + i * frame_secs
+        t_sys = arm_now + sys_start_delay + i * frame_secs
+        d.on_frame("mic", _frame(frame_secs, sr), t_mic, t_mic)
+        d.on_frame("system", _frame(frame_secs, sr), t_sys, t_sys)
+    # Both buffers should have the same total length (each source = its
+    # startup zero-fill + 5 s of frames).
+    mic_dur = len(d._buffers.mic_pcm) / 2 / sr
+    sys_dur = len(d._buffers.sys_pcm) / 2 / sr
+    expected_mic = mic_start_delay + duration
+    expected_sys = sys_start_delay + duration
+    assert abs(mic_dur - expected_mic) < 2 * frame_secs, (
+        f"mic_dur={mic_dur:.3f}s, expected ~{expected_mic:.3f}s"
+    )
+    assert abs(sys_dur - expected_sys) < 2 * frame_secs, (
+        f"sys_dur={sys_dur:.3f}s, expected ~{expected_sys:.3f}s"
+    )
+    # Leading region of sys is the startup-delay zero-fill; mic at that same
+    # offset already contains real frame audio. THIS is the alignment proof:
+    # at session-relative time t = 0.5 s (well inside sys's zero-fill), mic
+    # has audio and sys is zero — exactly as wall-clock requires.
+    probe_offset_secs = 0.5
+    probe_byte = int(probe_offset_secs * sr) * 2
+    mic_byte = d._buffers.mic_pcm[probe_byte:probe_byte + 2]
+    sys_byte = d._buffers.sys_pcm[probe_byte:probe_byte + 2]
+    assert mic_byte != b"\x00\x00", "mic should have real audio at +0.5s"
+    assert sys_byte == b"\x00\x00", "sys should still be in zero-fill at +0.5s"
+
+
+def test_stale_frame_before_session_t0_dropped():
+    """A frame whose ``capture_mono_ts`` predates ``session_t0_mono`` by
+    more than the jitter tolerance is a leak from a previous arm cycle.
+    Drop it explicitly — appending its audio would inject pre-arm content
+    at the start of the session.
+    """
+    sr = 16000
+    d = ConversationDetector(_cfg(), sample_rate=sr)
+    frame_secs = 0.02
+    arm_now = 300.0
+    d.open_session_on_arm(now=arm_now)
+    # Stale frame from before arm (5 s in the past — well beyond the 0.5 s
+    # arm-boundary jitter tolerance).
+    stale_ts = arm_now - 5.0
+    d.on_frame("system", _frame(frame_secs, sr), stale_ts, arm_now)
+    assert len(d._buffers.sys_pcm) == 0, (
+        f"stale frame was appended; sys_pcm len={len(d._buffers.sys_pcm)}"
+    )
+    # A frame at the jitter boundary (0.3 s before arm) is treated as a
+    # normal first-frame arrival, not stale.
+    boundary_ts = arm_now - 0.3
+    d.on_frame("system", _frame(frame_secs, sr), boundary_ts, arm_now)
+    assert len(d._buffers.sys_pcm) > 0, "near-boundary frame must not be dropped"
+
+
+def test_pathological_gap_above_max_fill_reanchors_with_warning(caplog):
+    """A gap larger than ``max_gap_fill_secs`` (default 30 s) is pathological
+    — system suspend, USB reconnect, etc. Inject the small audible
+    discontinuity rather than zero-filling minutes of silence into the
+    buffer.
+    """
+    sr = 16000
+    cfg = _cfg(max_gap_fill_secs=30.0)
+    d = ConversationDetector(cfg, sample_rate=sr)
+    frame_secs = 0.02
+    arm_now = 100.0
+    d.open_session_on_arm(now=arm_now)
+    # Normal first second of frames.
+    for i in range(int(1.0 / frame_secs)):
+        t = arm_now + i * frame_secs
+        d.on_frame("mic", _frame(frame_secs, sr), t, t)
+    len_before = len(d._buffers.mic_pcm)
+    # Now a 60 s gap (a real system suspend).
+    runaway_ts = arm_now + 1.0 + 60.0
+    with caplog.at_level("WARNING"):
+        d.on_frame("mic", _frame(frame_secs, sr), runaway_ts, runaway_ts)
+    growth_samples = (len(d._buffers.mic_pcm) - len_before) // 2
+    assert growth_samples <= int(frame_secs * sr) + 1, (
+        f"buffer grew by {growth_samples} samples; expected ~{int(frame_secs * sr)} "
+        "(one frame, no fill)"
+    )
+    assert any("re-anchoring" in rec.message for rec in caplog.records), (
+        "expected a re-anchor warning for the 60 s gap"
+    )
+
+
+def test_cold_start_zero_fill_under_new_default_cap():
+    """The v3.6 default ``max_gap_fill_secs=30.0`` lets a 5 s sys cold start
+    zero-fill correctly (previously the 2.0 s default re-anchored and
+    misaligned mic vs sys). Belt-and-braces regression guard for the
+    default itself, separate from the explicit-config tests above.
+    """
+    sr = 16000
+    # No max_gap_fill_secs override — exercises the default.
+    d = ConversationDetector(_cfg(), sample_rate=sr)
+    frame_secs = 0.02
+    arm_now = 100.0
+    d.open_session_on_arm(now=arm_now)
+    cold_start = 5.0
+    first_sys_ts = arm_now + cold_start
+    d.on_frame("system", _frame(frame_secs, sr), first_sys_ts, first_sys_ts)
+    sys_samples = len(d._buffers.sys_pcm) // 2
+    expected_samples = int(round(cold_start * sr)) + int(frame_secs * sr)
+    assert abs(sys_samples - expected_samples) <= int(frame_secs * sr), (
+        f"5 s cold-start did not zero-fill under the new default cap "
+        f"(got {sys_samples} samples, expected ~{expected_samples}). "
+        "max_gap_fill_secs default may have regressed below 5 s."
+    )

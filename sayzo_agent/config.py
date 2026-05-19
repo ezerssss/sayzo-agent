@@ -134,12 +134,21 @@ class ConversationConfig(BaseSettings):
     # one scheduler hiccup on either end of a batch.
     gap_tolerance_secs_mic: float = 0.060
     gap_tolerance_secs_system: float = 0.150
-    # Hard upper bound on a single zero-fill gap. Real audio dropouts from
-    # scheduler / driver / USB hiccups don't exceed a few hundred ms; any
-    # bigger "gap" is stale state (stale frame from a previous arm cycle,
-    # system suspend resume, mono clock skip). Re-anchor instead of filling
-    # so the session can't end up minutes longer than the wall-clock event.
-    max_gap_fill_secs: float = 2.0
+    # Hard upper bound on a single zero-fill gap. Below the cap, gaps are
+    # zero-filled to preserve the sample-to-mono-time invariant required for
+    # mic↔sys alignment in the AEC pre-pass. Above it, the detector
+    # re-anchors as a safety valve so a literal system-suspend (minutes long)
+    # doesn't inject minutes of silence into the session.
+    #
+    # 30 s tolerates realistic sys-capture startup delays: WASAPI pa.open +
+    # silence-pump open + first 500 ms batch read takes 1–5 s typical and up
+    # to ~10 s on cold-cache COM init. The pre-v3.6 default of 2 s was too
+    # tight, so cold starts hit the re-anchor branch and misaligned mic vs
+    # sys by the startup delay — silently breaking AEC for every session.
+    # Stale frames (capture_mono_ts < session_t0_mono) are now detected
+    # separately in `on_frame` and dropped explicitly, so this cap no longer
+    # has to do double duty as the stale-frame guard.
+    max_gap_fill_secs: float = 30.0
 
 
 class EchoGuardConfig(BaseSettings):

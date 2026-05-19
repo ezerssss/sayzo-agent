@@ -19,12 +19,28 @@ Mono-clock invariant
 Every frame passed to ``on_frame`` carries a ``capture_mono_ts`` — the
 ``time.monotonic()`` value of the first sample in the frame. While a session
 is OPEN, sample ``N`` of ``mic_pcm`` / ``sys_pcm`` corresponds to monotonic
-time ``session_t0_mono + N/sample_rate``. Modest dropped / late frames
-(scheduler hiccups, USB jitter) are zero-filled to preserve that invariant.
-Implausibly large gaps (capped by ``ConversationConfig.max_gap_fill_secs``)
-re-anchor instead of filling — a 200 s "gap" is never a real audio dropout,
-it's stale state, and zero-filling it would inject 200 s of silence into the
-session.
+time ``session_t0_mono + N/sample_rate``. The invariant is load-bearing for
+the AEC pre-pass: mic[k] and sys[k] must represent the same wall-clock
+moment, otherwise AEC3's ±500 ms search window can't find the alignment.
+
+To preserve the invariant:
+  * Modest dropped / late frames (scheduler jitter) are zero-filled.
+  * **Cold-start gaps** between arm time and the first frame on a source
+    are also zero-filled, even if they're several seconds long. The
+    system-capture thread typically takes 1–5 s to open WASAPI, prime the
+    silence pump, and deliver its first 500 ms batch; mic usually arrives
+    in well under a second. Without zero-fill bridging the asymmetry, the
+    two sources end up offset by exactly the difference in their startup
+    delays. ``ConversationConfig.max_gap_fill_secs`` (default 30 s in
+    v3.6+) is the upper bound; above it the detector re-anchors so a
+    literal system-suspend can't inject minutes of silence.
+  * **Stale frames** (``capture_mono_ts < session_t0_mono``) — frames left
+    in the producer queue from a previous arm cycle that leak through
+    after re-arm — are detected explicitly and dropped. Before v3.6 the
+    re-anchor branch did double duty as the stale-frame guard, and the
+    2 s cap was tuned for that role; the result was that legitimate
+    cold-start gaps above 2 s also hit the re-anchor path without
+    zero-fill, silently breaking AEC.
 
 VAD segment contract: ``on_segment(seg, now)`` expects ``seg.start_ts``
 and ``seg.end_ts`` in **monotonic seconds** (the values
@@ -50,6 +66,15 @@ from .config import ConversationConfig
 from .models import SessionBuffers, SessionCloseReason, SpeechSegment, Source
 
 log = logging.getLogger(__name__)
+
+
+# Tolerance for the stale-frame check in ``on_frame``: a frame whose
+# ``capture_mono_ts`` falls within this many seconds before ``session_t0_mono``
+# is treated as a normal first-frame arrival (the arm boundary is fuzzy at
+# the millisecond level — capture threads stamp the first sample slightly
+# before ArmController records ``now`` for the open call). Anything earlier
+# than that is a genuine leak from a previous arm cycle and dropped.
+_STALE_FRAME_JITTER_SECS = 0.5
 
 
 class SessionState(str, Enum):
@@ -252,17 +277,37 @@ class ConversationDetector:
         bleed-through. Either way it must not pollute the next session.
 
         ``capture_mono_ts`` is the monotonic time of the frame's first
-        sample. Modest gaps between successive frames are zero-filled to
-        preserve the sample-to-mono-time invariant. Implausibly large
-        gaps (capped by ``ConversationConfig.max_gap_fill_secs``) re-
-        anchor the stream rather than filling — a multi-second "gap" is
-        never a real audio dropout, it's stale state, and zero-filling
-        it would corrupt the session timeline.
+        sample. Three regimes:
+
+        * ``capture_mono_ts < session_t0_mono - jitter`` — stale frame from
+          a previous arm cycle that leaked through the producer queue.
+          Dropped entirely; appending it would inject pre-arm audio.
+        * ``0 ≤ gap ≤ max_gap_fill_secs`` — legitimate latency (cold-start
+          delay before the capture thread delivers its first frame, USB
+          jitter, scheduler hiccup, etc.). Zero-filled so sample N of the
+          buffer maps to ``session_t0_mono + N/sample_rate`` regardless of
+          which source delivered first.
+        * ``gap > max_gap_fill_secs`` — pathological (system suspend, USB
+          reconnect after minutes). Re-anchored with a small audible
+          discontinuity rather than injecting minutes of silence.
         """
         if (
             self.state not in (SessionState.OPEN, SessionState.PENDING_CLOSE)
             or self._buffers is None
         ):
+            return
+
+        # Drop stale frames left over from a previous arm cycle: anything
+        # whose timestamp predates the current session_t0 (beyond the
+        # arm-boundary jitter tolerance) is from before we opened. Without
+        # this guard, a frame with `capture_mono_ts < session_t0_mono` would
+        # produce a NEGATIVE gap (no zero-fill triggered) and silently
+        # append pre-arm audio at the start of the session.
+        if capture_mono_ts < self._session_t0_mono - _STALE_FRAME_JITTER_SECS:
+            log.debug(
+                "[session] %s: dropping stale frame (ts=%.2f < t0=%.2f)",
+                source, capture_mono_ts, self._session_t0_mono,
+            )
             return
 
         # int16 little-endian for compact buffering
@@ -273,20 +318,24 @@ class ConversationDetector:
         dst = self._buffers.mic_pcm if source == "mic" else self._buffers.sys_pcm
         stream_end = self._stream_end_mono[source]
         if stream_end is None:
+            # Legacy test path (open_session_on_arm not called). Anchor to
+            # capture_mono_ts so the first frame appends with gap=0; this
+            # is the pre-v3.6 behavior for tests that drive on_frame without
+            # going through open_session_on_arm.
             stream_end = capture_mono_ts
 
         gap_secs = capture_mono_ts - stream_end
         gap_tolerance = self._gap_tolerance(source)
         max_fill = self.cfg.max_gap_fill_secs
         if gap_secs > max_fill:
-            # Implausibly large gap — likely a stale frame from before this
-            # arm cycle, or the wall clock skipped (system suspend, USB
-            # reconnect). Re-anchor instead of filling: the new sample 0 of
-            # what's appended below corresponds to capture_mono_ts, with no
-            # zero-fill bridge. Leaves a small audible discontinuity, which
-            # is far better than injecting minutes of silence.
+            # Pathological gap (> max_gap_fill_secs, default 30 s) — system
+            # suspend, USB reconnect after a long stall, mono clock skip.
+            # Re-anchor instead of zero-filling minutes of silence. Will
+            # produce a small audible discontinuity and a one-time mic↔sys
+            # misalignment up to the gap size, both of which are strictly
+            # better than injecting tens of seconds of zeros.
             log.warning(
-                "[session] %s: dropping %.1fs gap-fill (cap=%.1fs) — re-anchoring",
+                "[session] %s: gap %.1fs exceeds cap %.1fs — re-anchoring",
                 source, gap_secs, max_fill,
             )
             stream_end = capture_mono_ts
