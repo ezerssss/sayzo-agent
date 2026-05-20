@@ -531,40 +531,60 @@ class Agent:
         sr = self.cfg.capture.sample_rate
 
         # 0a. AEC pre-pass — subtract speaker bleed from the mic at the
-        # sample level using WebRTC AEC3 (livekit.rtc.apm). Off by default
-        # in v3.4.0; flip on via SAYZO_AEC__ENABLED=1 for dogfooding.
-        # When enabled, the cleaned mic replaces buffers.mic_pcm so the
-        # downstream echo_guard + DSP + windowing all consume the post-AEC
-        # signal. echo_guard then acts as the non-linear residual safety
-        # net (cheap-laptop speaker compression, BT codec re-encoding) —
-        # see Critical design rule 5 in CLAUDE.md.
+        # sample level using WebRTC AEC3 (livekit.rtc.apm). Default ON
+        # since v3.6.1; SAYZO_AEC__ENABLED=0 to disable.
+        #
+        # v3.6.6: runs THREE sequential passes (the D-recipe from the
+        # scripts/synth_double_talk_test.py prototype). Each pass feeds
+        # the previous pass's cleaned mic back into AEC3 against the
+        # ORIGINAL sys reference. The reference does NOT get re-cleaned
+        # between passes — sys is the ground truth of what the speaker
+        # played, and cleaning it would corrupt the echo model AEC3 is
+        # trying to learn. Each pass uses a fresh APM instance, so the
+        # adaptive filter re-converges on residual that survived the
+        # previous pass; passes 2 and 3 attack the long-tail reverb that
+        # pass 1's impulse-response window couldn't fully model.
+        #
+        # When AEC runs, the cleaned mic replaces buffers.mic_pcm so the
+        # downstream echo_guard + DSP + windowing all consume the post-
+        # AEC signal. echo_guard then acts as the non-linear residual
+        # safety net (cheap-laptop speaker compression, BT codec re-
+        # encoding) — see Critical design rule 5 in CLAUDE.md.
+        aec_passes: list[aec.AecReport] = []
         aec_report = None
         if self.cfg.aec.enabled:
-            cleaned_mic, aec_report = await loop.run_in_executor(
-                self._executor,
-                aec.cancel_echo,
-                bytes(buffers.mic_pcm),
-                bytes(buffers.sys_pcm),
-                sr,
-                self.cfg.aec,
-            )
+            cleaned_mic = bytes(buffers.mic_pcm)
+            sys_pcm_bytes = bytes(buffers.sys_pcm)
+            for i in range(3):
+                cleaned_mic, rep = await loop.run_in_executor(
+                    self._executor,
+                    aec.cancel_echo,
+                    cleaned_mic,
+                    sys_pcm_bytes,
+                    sr,
+                    self.cfg.aec,
+                )
+                aec_passes.append(rep)
+                if rep.ran:
+                    log.info(
+                        "[aec] pass %d/3 frames=%d dur=%.0fms lag=%+dsmp "
+                        "peak=%.2f ns=%s hpf=%s mic_rms %.4f→%.4f sys_rms=%.4f",
+                        i + 1,
+                        rep.frames_processed, rep.duration_ms,
+                        rep.lag_samples, rep.lag_xcorr_peak,
+                        "on" if self.cfg.aec.noise_suppression else "off",
+                        "on" if self.cfg.aec.high_pass_filter else "off",
+                        rep.mic_rms_before, rep.mic_rms_after, rep.sys_rms,
+                    )
+                else:
+                    # Silent buffers / livekit unavailable / APM error —
+                    # cancel_echo returned input unchanged, so passes 2-3
+                    # would do the same. Skip them.
+                    log.info("[aec] pass %d/3 skipped (%s)", i + 1, rep.skip_reason)
+                    break
+            aec_report = aec_passes[-1]
             if aec_report.ran:
                 buffers.mic_pcm = bytearray(cleaned_mic)
-                log.info(
-                    "[aec] ran frames=%d dur=%.0fms lag=%+dsmp peak=%.2f "
-                    "ns=%s hpf=%s mic_rms %.4f→%.4f sys_rms=%.4f",
-                    aec_report.frames_processed,
-                    aec_report.duration_ms,
-                    aec_report.lag_samples,
-                    aec_report.lag_xcorr_peak,
-                    "on" if self.cfg.aec.noise_suppression else "off",
-                    "on" if self.cfg.aec.high_pass_filter else "off",
-                    aec_report.mic_rms_before,
-                    aec_report.mic_rms_after,
-                    aec_report.sys_rms,
-                )
-            else:
-                log.info("[aec] skipped (%s)", aec_report.skip_reason)
 
         # 0b. Echo guard — classify mic VAD segments as user speech or
         # speaker-to-mic bleed, then strip echo entries from
@@ -748,18 +768,34 @@ class Agent:
                 "dropped_spans": [[s, e] for s, e in eg_report.dropped_spans],
                 "thresholds": eg_report.thresholds,
             }
-        if aec_report is not None:
+        if aec_passes:
+            # Per-pass telemetry (v3.6.6). Most fields anchor to pass 1 so
+            # mic_rms_before / sys_rms / lag still describe the ORIGINAL
+            # signal, not pass N-1's output. mic_rms_after + frames_processed
+            # come from the last pass — the final cleaned mic — and
+            # duration_ms is the total CPU spent across all passes that ran.
+            # mic_rms_after_per_pass lets us verify in the field that passes
+            # 2 and 3 actually contributed (vs. AEC3 plateauing after pass 1).
+            first = aec_passes[0]
+            last = aec_passes[-1]
+            ran_passes = [r for r in aec_passes if r.ran]
             metadata["aec"] = {
-                "enabled": aec_report.enabled,
-                "ran": aec_report.ran,
-                "skip_reason": aec_report.skip_reason,
-                "lag_samples": aec_report.lag_samples,
-                "lag_xcorr_peak": round(aec_report.lag_xcorr_peak, 4),
-                "frames_processed": aec_report.frames_processed,
-                "duration_ms": round(aec_report.duration_ms, 1),
-                "mic_rms_before": round(aec_report.mic_rms_before, 4),
-                "mic_rms_after": round(aec_report.mic_rms_after, 4),
-                "sys_rms": round(aec_report.sys_rms, 4),
+                "enabled": first.enabled,
+                "ran": last.ran,
+                "skip_reason": last.skip_reason,
+                "lag_samples": first.lag_samples,
+                "lag_xcorr_peak": round(first.lag_xcorr_peak, 4),
+                "frames_processed": last.frames_processed,
+                "duration_ms": round(
+                    sum(r.duration_ms for r in aec_passes), 1
+                ),
+                "mic_rms_before": round(first.mic_rms_before, 4),
+                "mic_rms_after": round(last.mic_rms_after, 4),
+                "sys_rms": round(first.sys_rms, 4),
+                "passes_run": len(ran_passes),
+                "mic_rms_after_per_pass": [
+                    round(r.mic_rms_after, 4) for r in ran_passes
+                ],
             }
         record = await loop.run_in_executor(
             self._executor,

@@ -188,7 +188,16 @@ class EchoGuardConfig(BaseSettings):
     # at low amplitude, so we bias more aggressively toward dropping. Real
     # meeting users speak at -20 to -10 dBFS, producing residual-speech
     # probabilities near 1.0, well above the keep threshold.
-    coh_high_threshold: float = 0.50  # mean weighted speech-band coherence
+    #
+    # v3.6.6: tightened from 0.50 → 0.30 to match the D-recipe prototype
+    # (scripts/synth_double_talk_test.py). With triple-AEC running upstream,
+    # the linear filter has already taken three swings at the bleed; what
+    # survives onto the mic in the speech band tends to be the harder cases
+    # (cheap-speaker compression artifacts, BT codec re-encoding) where the
+    # remaining coherence is lower but still attributable to sys content. A
+    # 0.30 threshold catches those without dropping legitimate user turns,
+    # since residual-speech-prob (the AND-partner gate) keeps real speech.
+    coh_high_threshold: float = 0.30  # mean weighted speech-band coherence
     residual_speech_keep_prob: float = 0.25  # Silero max chunk prob → keep
 
     # Delay / FFT sizing
@@ -201,9 +210,18 @@ class EchoGuardConfig(BaseSettings):
     # segment (and reiteration cases where user echoes a phrase after a short
     # pause). Fine hop catches short echo fragments inside longer merged
     # segments — the "in today a" / "few seconds" class of leaks.
-    subdivide_long_segments_secs: float = 4.0  # 0 disables
-    subdivide_window_secs: float = 1.0
-    subdivide_hop_secs: float = 0.25
+    #
+    # v3.6.6: tightened the whole subdivide tuple (4.0/1.0/0.25 → 0.3/0.3/0.1)
+    # to match the D-recipe prototype. The 4.0 s minimum was too coarse — a
+    # 3 s "you. okay so back to" merged segment (user "okay so back to" +
+    # other-side "you." bleeding through) would never get subdivided and
+    # would ride through as one whole-segment classification. With the 0.3 s
+    # minimum + 0.3 s window + 0.1 s hop, the same segment splits into ten
+    # 0.3 s sub-windows each scored independently; only the actual bleed
+    # span gets zeroed.
+    subdivide_long_segments_secs: float = 0.3  # 0 disables
+    subdivide_window_secs: float = 0.3
+    subdivide_hop_secs: float = 0.1
 
     # Cosine fade at zero'd-region boundaries so the encoder doesn't see a
     # spectral cliff at echo → user transitions on the mic channel.
