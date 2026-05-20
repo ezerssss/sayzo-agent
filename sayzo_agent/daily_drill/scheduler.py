@@ -48,6 +48,13 @@ log = logging.getLogger(__name__)
 
 
 # Status codes returned from fire_now for the test-trigger CLI.
+# v3.6.5: `skipped_weekend_no_history` and `skipped_over_credit` are
+# retained as literal values to preserve forward/back-compat with any
+# log-scraping or test helpers that pattern-match against them, but
+# the scheduler no longer emits either: the weekend cold-start gate
+# was removed (was silencing new users entirely on Sat/Sun) and the
+# platform's `/sessions/today` endpoint never returns 402 (credit
+# charge moved to `/sessions/complete`).
 FireResultStatus = Literal[
     "fired",
     "skipped_master_disabled",
@@ -66,6 +73,7 @@ FireResultStatus = Literal[
     "skipped_model_wants_later",
     "skipped_in_progress",
     "skipped_over_credit",
+    "skipped_no_deep_link",
     "skipped_auth_error",
     "skipped_transient_error",
     "skipped_dispatch_failed",
@@ -156,6 +164,15 @@ class DailyDrillScheduler:
         self._current_today: Optional[TodaySessionResponse] = None
         self._fetch_in_flight: bool = False
         self._last_seen_day: Optional[str] = None
+        # Tracks the previous tick's skip-reason so we can log INFO only on
+        # transitions instead of every 60s — DEBUG is fine for the steady
+        # state, but the first time a gate flips silently we want a single
+        # INFO line so future "I never see notifications" reports are
+        # diagnosable from agent.log without flipping log level.
+        self._last_skip_status: Optional[FireResultStatus] = None
+        # One-shot first-fire task (see _maybe_first_fire). Held so stop()
+        # can cancel it cleanly during shutdown.
+        self._first_fire_task: Optional[asyncio.Task] = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -173,9 +190,24 @@ class DailyDrillScheduler:
         self._started_at_mono = time.monotonic()
         self._stop.clear()
         self._task = asyncio.create_task(self._tick_loop(), name="daily_drill")
+        # v3.6.5: guaranteed first-fire after boot warmup so a user who
+        # launches the agent at noon and quits at 5pm always sees one
+        # toast that day, even if Thompson sampling would otherwise pick
+        # a later hour. The tick loop still runs all day for additional
+        # learning fires when the user keeps the agent open.
+        self._first_fire_task = asyncio.create_task(
+            self._maybe_first_fire(), name="daily_drill_first_fire",
+        )
 
     async def stop(self) -> None:
         self._stop.set()
+        if self._first_fire_task is not None:
+            self._first_fire_task.cancel()
+            try:
+                await self._first_fire_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._first_fire_task = None
         if self._task is not None:
             self._task.cancel()
             try:
@@ -184,6 +216,74 @@ class DailyDrillScheduler:
                 pass
             self._task = None
         log.info("[daily_drill] stopped")
+
+    async def _maybe_first_fire(self) -> None:
+        """One-shot guaranteed fire after boot warmup.
+
+        Smart timing is great when the agent runs all day — but a user
+        who launches Sayzo at noon and quits at 5pm shouldn't depend on
+        Thompson sampling lining up with their actual window. Sleep
+        through boot warmup, then fire if we haven't already.
+
+        Gates honored: auth (via _evaluate's token check), armed, and
+        mic-active. Timing gates (idle, time-of-day window, Thompson)
+        are bypassed via ignore_gates=True so a noon launch still fires.
+
+        The armed/mic checks must happen BEFORE the ignore_gates=True
+        call because that flag bypasses the inside-the-gate-chain armed/
+        mic checks too. We never want a daily-drill toast to fire mid-
+        meeting — that's a "ringing in your boss's Zoom" UX disaster.
+
+        Cancellable mid-warmup via stop(): wait_for-stop pattern wakes
+        the task on shutdown so we don't fire a stray toast at the
+        exact moment the agent is exiting.
+        """
+        try:
+            await asyncio.wait_for(
+                self._stop.wait(),
+                timeout=self._cfg.boot_warmup_secs + 5.0,
+            )
+            return  # stop() was called during warmup
+        except asyncio.TimeoutError:
+            pass
+
+        today = self._now_fn().date().isoformat()
+        if self._stats.last_fired_on_day == today:
+            log.info(
+                "[daily_drill] first-fire on start: already fired today; skipping"
+            )
+            return
+
+        # Defend against firing during an active meeting. ignore_gates=True
+        # below would otherwise bypass these checks (they live inside
+        # the if-not-ignore_gates block in _evaluate_and_maybe_fire).
+        try:
+            from ..arm.controller import ArmState
+            if self._arm_state_fn() == ArmState.ARMED:
+                log.info("[daily_drill] first-fire skipped: agent armed")
+                return
+        except Exception:
+            log.debug(
+                "[daily_drill] first-fire arm-state probe failed", exc_info=True,
+            )
+        try:
+            if self._is_mic_active_fn():
+                log.info("[daily_drill] first-fire skipped: mic active")
+                return
+        except Exception:
+            log.debug(
+                "[daily_drill] first-fire mic-active probe failed", exc_info=True,
+            )
+
+        log.info("[daily_drill] first-fire on start: attempting")
+        try:
+            result = await self._evaluate_and_maybe_fire(ignore_gates=True)
+        except Exception:
+            log.warning(
+                "[daily_drill] first-fire raised", exc_info=True
+            )
+            return
+        log.info("[daily_drill] first-fire result: %s", result.status)
 
     def reload_config(
         self, cfg: "NotificationConfig", master_enabled: bool,
@@ -228,6 +328,13 @@ class DailyDrillScheduler:
         """Re-evaluate gates and maybe fire."""
         result = await self._evaluate_and_maybe_fire(ignore_gates=False)
         log.debug("[daily_drill] tick result: %s", result.status)
+        if result.status != self._last_skip_status and result.status != "fired":
+            log.info(
+                "[daily_drill] skip-reason changed: %s → %s",
+                self._last_skip_status,
+                result.status,
+            )
+        self._last_skip_status = result.status
 
     # ------------------------------------------------------------------
     # Gate composition + fire
@@ -269,9 +376,10 @@ class DailyDrillScheduler:
         # compat with on-disk stats from older versions.
 
         if not ignore_gates:
-            # Weekend cold-start gate
-            if now.weekday() >= 5 and not self._model.has_any_weekend_engagement():
-                return FireResult(status="skipped_weekend_no_history")
+            # v3.6.5: weekend cold-start gate removed. It was silencing new
+            # users entirely on Sat/Sun (no way to earn weekend engagement
+            # signal without first getting a weekend toast). The 9-5 window
+            # already biases away from weekend-non-workers via the model.
 
             # Time-window gates
             if now.hour < self._cfg.min_hour:
@@ -282,13 +390,15 @@ class DailyDrillScheduler:
                 < self._cfg.lunch_end_hour
             ):
                 return FireResult(status="skipped_lunch")
-            if now.hour >= self._cfg.eod_fallback_hour:
+            if now.hour >= self._cfg.max_hour:
+                # Outside the firing window for the day. Surface the EOD
+                # fallback (now a real toast in v3.6.5, see _maybe_surface_eod_fallback).
                 await self._maybe_surface_eod_fallback(now, today)
                 return FireResult(status="skipped_outside_window")
 
             # Boot warmup
             elapsed_since_start = time.monotonic() - self._started_at_mono
-            if elapsed_since_start < self._cfg.min_idle_secs:
+            if elapsed_since_start < self._cfg.boot_warmup_secs:
                 return FireResult(status="skipped_boot_warmup")
 
             # Idle gate
@@ -333,15 +443,36 @@ class DailyDrillScheduler:
 
         if resp.status == "auth_required":
             return FireResult(status="skipped_auth_error", response=resp)
-        if resp.status == "over_credit":
-            # Mark "decided not to fire" so we don't keep hitting /today
-            # all day when the user's credits are exhausted.
-            self._stats.last_fired_on_day = today
-            self._save_stats()
-            return FireResult(status="skipped_over_credit", response=resp)
+        # NOTE: `over_credit` (402) is no longer reachable — confirmed with
+        # the platform team 2026-05-20 that `/sessions/today` never returns
+        # 402; the credit charge moved to `/sessions/complete`. The branch
+        # was deleted in v3.6.5; the api.py mapping no longer emits it.
         if resp.status in ("transient_error", "unknown_error"):
             return FireResult(status="skipped_transient_error", response=resp)
+        if not resp.fireable:
+            # Defensive: any future non-fireable status (or a defensive
+            # over_credit slipping through) must NOT dispatch. Treat as
+            # transient so the next tick re-fetches rather than locking
+            # the day.
+            log.warning(
+                "[daily_drill] unexpected non-fireable status: %s; skipping",
+                resp.status,
+            )
+            return FireResult(status="skipped_transient_error", response=resp)
         # ok / still_processing / retry_required → fire
+
+        # 409 DRILL_STILL_PROCESSING is `fireable` but the platform omits
+        # `deepLinkUrl` on that branch (server route.ts:66-76). Firing a
+        # toast that can't be clicked is worse than skipping — the user
+        # presses "Open drill" and nothing happens, then concludes the
+        # whole feature is broken. Wait one tick; by then the server has
+        # finished processing and the next response will carry a link.
+        if not resp.deep_link_url:
+            log.info(
+                "[daily_drill] response is fireable but deep_link_url is None "
+                "(likely 409 DRILL_STILL_PROCESSING); skipping until next tick"
+            )
+            return FireResult(status="skipped_no_deep_link", response=resp)
 
         self._current_today = resp
         title, body = compose_copy(resp)
@@ -367,12 +498,15 @@ class DailyDrillScheduler:
         if not dispatched:
             # Backend can't render — fall back to the tray surface for
             # the day. Mark the day so we don't keep retrying.
+            # v3.6.5: go straight to tray instead of re-entering the EOD
+            # path; that path would just try notify_actionable again and
+            # fail again. The tray label is the genuine last-resort.
             log.warning(
                 "[daily_drill] notify_actionable returned False; "
                 "falling back to EOD tray surface"
             )
             self._stats.last_fired_on_day = today
-            await self._maybe_surface_eod_fallback(now, today)
+            self._set_tray_eod_label_if_needed(today)
             self._save_stats()
             return FireResult(
                 status="skipped_dispatch_failed", response=resp, title=title, body=body,
@@ -450,22 +584,26 @@ class DailyDrillScheduler:
         )
 
     # ------------------------------------------------------------------
-    # End-of-day tray fallback
+    # End-of-day fallback (v3.6.5: real toast, tray as last-resort)
     # ------------------------------------------------------------------
 
     async def _maybe_surface_eod_fallback(
         self, now: datetime, today: str
     ) -> None:
-        """Surface a tray item if past EOD cutoff and not already shown."""
+        """Surface the EOD fallback after max_hour.
+
+        Pre-v3.6.5 this was tray-only and effectively invisible (users
+        don't watch the system tray). Now it tries to fire a real
+        actionable toast first, falling back to the tray label only
+        when the toast dispatch itself fails.
+        """
         if self._stats.eod_fallback_shown_on == today:
             return
-        if self._stats.last_fired_on_day == today and self._current_today is None:
-            # We already fired (real toast or marked decided); nothing to
-            # surface unless the toast itself failed and set
-            # _current_today separately.
+        if self._stats.last_fired_on_day == today:
+            # Regular path already fired today — don't double-notify.
             return
 
-        # Best-effort fetch — if it fails, leave the tray quiet.
+        # Fetch the day's session if we haven't already.
         if self._current_today is None:
             client = self._auth_client_factory()
             if client is None:
@@ -479,8 +617,60 @@ class DailyDrillScheduler:
                 return
             if not resp.fireable:
                 return
+            if not resp.deep_link_url:
+                # Same broken-click guard as _fire_drill: don't surface
+                # an EOD toast that can't be clicked through.
+                log.info(
+                    "[daily_drill] EOD: fireable but no deep_link_url; skipping"
+                )
+                return
             self._current_today = resp
 
+        resp = self._current_today
+        title, body = compose_copy(resp)
+        fired_at = self._now_fn()
+        pending = _PendingFire(
+            fired_at_dt=fired_at,
+            fired_at_mono=time.monotonic(),
+            session_id=resp.session_id,
+            deep_link_url=resp.deep_link_url,
+        )
+        with self._lock:
+            self._pending = pending
+
+        dispatched = self._notifier.notify_actionable(
+            title=title,
+            body=body,
+            button_label="Open drill",
+            on_pressed=lambda: self._on_pressed_callback(pending),
+            expire_after_secs=self._cfg.dismiss_window_secs,
+            on_expire=lambda: self._on_expire_callback(pending),
+        )
+
+        if dispatched:
+            self._stats.last_fired_on_day = today
+            self._stats.eod_fallback_shown_on = today
+            self._model.record_fire(fired_at)
+            self._save_stats()
+            log.info(
+                "[daily_drill] EOD fired: title=%r session=%s",
+                title,
+                resp.session_id,
+            )
+            return
+
+        # Dispatch failed — fall back to the tray label as last resort.
+        self._set_tray_eod_label_if_needed(today)
+
+    def _set_tray_eod_label_if_needed(self, today: str) -> None:
+        """Set the EOD tray label, marking the day to avoid re-surfacing.
+
+        Last-resort fallback used by both the EOD path (when toast
+        dispatch failed) and the in-hours dispatch-failure path in
+        _fire_drill. Kept synchronous because it doesn't await anything.
+        """
+        if self._stats.eod_fallback_shown_on == today:
+            return
         if self._tray_state is not None:
             try:
                 self._tray_state.set_eod_drill_label(_EOD_LABEL)
@@ -490,7 +680,9 @@ class DailyDrillScheduler:
                 )
         self._stats.eod_fallback_shown_on = today
         self._save_stats()
-        log.info("[daily_drill] EOD tray fallback surfaced for %s", today)
+        log.warning(
+            "[daily_drill] EOD toast dispatch failed; fell back to tray label"
+        )
 
     def on_eod_tray_click(self) -> None:
         """User clicked the EOD tray item — open drill, record soft_tap."""

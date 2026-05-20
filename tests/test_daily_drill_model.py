@@ -281,45 +281,13 @@ def test_history_capped_drops_oldest() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Weekend gate helper
-# ---------------------------------------------------------------------------
-
-
-def test_has_any_weekend_engagement_false_for_weekday_only() -> None:
-    m = _model()
-    fired_at = _dt(hour=10)  # Monday
-    m.record_fire(fired_at)
-    m.record_outcome(fired_at, "tap", latency_ms=1_000, session_id=None)
-    assert not m.has_any_weekend_engagement()
-
-
-def test_has_any_weekend_engagement_true_after_saturday_tap() -> None:
-    m = _model()
-    sat = _dt(year=2026, month=5, day=9, hour=10)  # Saturday
-    m.record_fire(sat)
-    m.record_outcome(sat, "tap", latency_ms=1_000, session_id=None)
-    assert m.has_any_weekend_engagement()
-
-
-def test_has_any_weekend_engagement_false_for_weekend_expire_only() -> None:
-    m = _model()
-    sun = _dt(year=2026, month=5, day=10, hour=10)  # Sunday
-    m.record_fire(sun)
-    m.record_outcome(sun, "expire", latency_ms=None, session_id=None)
-    assert not m.has_any_weekend_engagement()
-
-
-def test_has_any_weekend_engagement_true_after_sunday_soft_tap() -> None:
-    m = _model()
-    sun = _dt(year=2026, month=5, day=10, hour=10)
-    m.record_fire(sun)
-    m.record_outcome(sun, "soft_tap", latency_ms=600_000, session_id=None)
-    assert m.has_any_weekend_engagement()
-
-
-# ---------------------------------------------------------------------------
 # Load / save round-trip
 # ---------------------------------------------------------------------------
+#
+# NOTE: pre-v3.6.5 there was a `has_any_weekend_engagement` helper that
+# backed the scheduler's weekend cold-start gate. The gate was deleted
+# in v3.6.5 (new users were getting zero toasts on Sat/Sun forever),
+# and the helper and its four tests were removed with it.
 
 
 def test_load_missing_returns_fresh_model(tmp_path: Path) -> None:

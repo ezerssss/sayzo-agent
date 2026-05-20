@@ -241,24 +241,6 @@ class BucketModel:
     def total_fires(self) -> int:
         return sum(b.fires for b in self.stats.buckets.values())
 
-    def has_any_weekend_engagement(self) -> bool:
-        """True if any Sat/Sun bucket has a tap or soft_tap on record.
-
-        Used by the scheduler's weekend-cold-start gate: skip weekend
-        firing entirely until the user proves they're sometimes around
-        on weekends.
-        """
-        for key, b in self.stats.buckets.items():
-            if not key:
-                continue
-            try:
-                dow = int(key.split("-", 1)[0])
-            except ValueError:
-                continue
-            if dow >= 5 and (b.taps + b.soft_taps) > 0:
-                return True
-        return False
-
     # ------------------------------------------------------------------
     # Scoring
     # ------------------------------------------------------------------

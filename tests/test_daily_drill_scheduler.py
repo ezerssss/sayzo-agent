@@ -144,12 +144,13 @@ def stats_path(tmp_path: Path) -> Path:
 def _cfg(**overrides) -> NotificationConfig:
     base = dict(
         daily_drill_enabled=True,
-        min_idle_secs=180.0,
+        min_idle_secs=30.0,
+        boot_warmup_secs=30.0,
         cold_start_hour=11,
         min_hour=9,
         lunch_start_hour=12,
         lunch_end_hour=13,
-        max_hour=17,
+        max_hour=20,
         eod_fallback_hour=17,
         dismiss_window_secs=300.0,
         soft_tap_window_secs=14400.0,
@@ -216,7 +217,7 @@ def _make_scheduler(
         rng=rng or random.Random(0),
         tick_secs=60.0,
     )
-    sched._started_at_mono = time.monotonic() - cfg.min_idle_secs - 60.0
+    sched._started_at_mono = time.monotonic() - cfg.boot_warmup_secs - 60.0
     sched._has_auth_cached = notifier.has_authorisation
     return sched, notifier, opened_urls
 
@@ -348,25 +349,17 @@ async def test_skips_within_boot_warmup(stats_path, monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_skips_on_weekend_with_no_history(stats_path, monkeypatch) -> None:
-    _patch_fetch(monkeypatch, _ok_response())
-    sched, _, _ = _make_scheduler(
-        stats_path=stats_path, now=datetime(2026, 5, 9, 11, 5)  # Saturday
-    )
-    res = await sched._evaluate_and_maybe_fire(ignore_gates=False)
-    assert res.status == "skipped_weekend_no_history"
+async def test_fires_on_weekend_with_no_history(stats_path, monkeypatch) -> None:
+    """v3.6.5: weekend cold-start gate dropped.
 
-
-@pytest.mark.asyncio
-async def test_fires_on_weekend_after_engagement(stats_path, monkeypatch) -> None:
+    Pre-v3.6.5 a new user got zero toasts on Sat/Sun until they engaged
+    with one — which they couldn't, because they never got one. The gate
+    was deleted; weekends now behave the same as weekdays.
+    """
     _patch_fetch(monkeypatch, _ok_response())
     sched, notifier, _ = _make_scheduler(
-        stats_path=stats_path, now=datetime(2026, 5, 9, 11, 5)
+        stats_path=stats_path, now=datetime(2026, 5, 9, 11, 5),  # Saturday
     )
-    # Seed a past Saturday tap so the weekend gate opens.
-    past_sat = datetime(2026, 5, 2, 11, 0)
-    sched._model.record_fire(past_sat)
-    sched._model.record_outcome(past_sat, "tap", latency_ms=10000, session_id="x")
     res = await sched._evaluate_and_maybe_fire(ignore_gates=False)
     assert res.status == "fired"
     assert len(notifier.actionable_calls) == 1
@@ -401,16 +394,75 @@ async def test_fires_only_once_per_day(stats_path, monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_402_marks_day_done_no_tray_fallback(stats_path, monkeypatch) -> None:
+async def test_over_credit_defensively_skipped_as_transient(
+    stats_path, monkeypatch,
+) -> None:
+    """v3.6.5: platform confirmed `/sessions/today` never returns 402.
+
+    The `over_credit` status is dead in api.py. If a future regression
+    somehow surfaced one, the defensive non-fireable branch in _fire_drill
+    treats it as transient (re-fetch next tick) rather than locking the
+    day. This test pins that behavior so a regression makes a loud noise.
+    """
     _patch_fetch(
         monkeypatch, TodaySessionResponse(status="over_credit")
     )
     sched, notifier, _ = _make_scheduler(stats_path=stats_path)
     res = await sched._evaluate_and_maybe_fire(ignore_gates=False)
-    assert res.status == "skipped_over_credit"
-    assert sched._stats.last_fired_on_day == "2026-05-04"
-    assert sched._stats.eod_fallback_shown_on is None
+    assert res.status == "skipped_transient_error"
+    # Day NOT marked — would retry next tick.
+    assert sched._stats.last_fired_on_day is None
     assert notifier.actionable_calls == []
+
+
+@pytest.mark.asyncio
+async def test_still_processing_with_no_deeplink_does_not_fire(
+    stats_path, monkeypatch,
+) -> None:
+    """409 DRILL_STILL_PROCESSING omits deepLinkUrl per server contract.
+
+    Pre-v3.6.5 we still fired a toast that did nothing on click. The
+    new guard returns skipped_no_deep_link so the user doesn't see a
+    broken-feeling notification; the next tick re-fetches and the
+    server will have finished processing by then.
+    """
+    _patch_fetch(
+        monkeypatch,
+        TodaySessionResponse(
+            status="still_processing",
+            session_id="sess_pending",
+            deep_link_url=None,
+        ),
+    )
+    sched, notifier, _ = _make_scheduler(stats_path=stats_path)
+    res = await sched._evaluate_and_maybe_fire(ignore_gates=False)
+    assert res.status == "skipped_no_deep_link"
+    assert sched._stats.last_fired_on_day is None
+    assert notifier.actionable_calls == []
+
+
+@pytest.mark.asyncio
+async def test_retry_required_with_deeplink_still_fires(
+    stats_path, monkeypatch,
+) -> None:
+    """409 DRILL_RETRY_REQUIRED includes deepLinkUrl and should fire.
+
+    The user's last drill needs a redo; the toast click takes them to
+    the redo page. Companion to the still_processing test above.
+    """
+    _patch_fetch(
+        monkeypatch,
+        TodaySessionResponse(
+            status="retry_required",
+            session_id="sess_redo",
+            deep_link_url="https://sayzo.app/drills/sess_redo",
+            scenario_title="Wednesday standup",
+        ),
+    )
+    sched, notifier, _ = _make_scheduler(stats_path=stats_path)
+    res = await sched._evaluate_and_maybe_fire(ignore_gates=False)
+    assert res.status == "fired"
+    assert len(notifier.actionable_calls) == 1
 
 
 @pytest.mark.asyncio
@@ -456,19 +508,8 @@ async def test_expire_records_expire_outcome(stats_path, monkeypatch) -> None:
     assert opened == []
 
 
-@pytest.mark.asyncio
-async def test_dispatch_failed_falls_back_to_eod(stats_path, monkeypatch) -> None:
-    """Notifier returns False → mark day done + try EOD fallback."""
-    _patch_fetch(monkeypatch, _ok_response())
-    fn = FakeNotifier(dispatch_returns=False)
-    sched, _, _ = _make_scheduler(stats_path=stats_path, fake_notifier=fn)
-    res = await sched._evaluate_and_maybe_fire(ignore_gates=False)
-    assert res.status == "skipped_dispatch_failed"
-    assert sched._stats.last_fired_on_day == "2026-05-04"
-
-
 # ---------------------------------------------------------------------------
-# EOD tray fallback
+# EOD fallback (v3.6.5: real toast, tray as last-resort)
 # ---------------------------------------------------------------------------
 
 
@@ -484,64 +525,108 @@ class FakeTrayState:
 
 
 @pytest.mark.asyncio
-async def test_eod_fallback_surfaces_when_window_passed_unfired(
-    stats_path, monkeypatch
+async def test_dispatch_failed_in_hours_sets_tray_label_directly(
+    stats_path, monkeypatch,
 ) -> None:
+    """In-hours dispatch failure: skip the EOD re-entry, just set tray.
+
+    Pre-v3.6.5 the dispatch-failure path called _maybe_surface_eod_fallback
+    which (now that EOD also tries a toast) would just retry the same
+    failing dispatch. v3.6.5 sets the tray label directly via the helper.
+    """
     _patch_fetch(monkeypatch, _ok_response())
-    cfg = _cfg(eod_fallback_hour=17)
+    fn = FakeNotifier(dispatch_returns=False)
     tray = FakeTrayState()
-    sched, _, _ = _make_scheduler(
+    sched, _, _ = _make_scheduler(stats_path=stats_path, fake_notifier=fn)
+    sched._tray_state = tray  # type: ignore[assignment]
+    res = await sched._evaluate_and_maybe_fire(ignore_gates=False)
+    assert res.status == "skipped_dispatch_failed"
+    assert sched._stats.last_fired_on_day == "2026-05-04"
+    assert tray.label == "Today's drill — 60s"
+
+
+@pytest.mark.asyncio
+async def test_eod_path_fires_real_toast_not_tray(
+    stats_path, monkeypatch,
+) -> None:
+    """After max_hour the EOD path fires a real actionable toast.
+
+    Pre-v3.6.5 this was tray-only; users don't watch the tray so the
+    feature was effectively invisible after work hours.
+    """
+    _patch_fetch(monkeypatch, _ok_response())
+    tray = FakeTrayState()
+    sched, notifier, _ = _make_scheduler(
         stats_path=stats_path,
-        cfg=cfg,
-        now=datetime(2026, 5, 4, 18, 0),
+        now=datetime(2026, 5, 4, 20, 30),  # past max_hour=20
     )
     sched._tray_state = tray  # type: ignore[assignment]
     res = await sched._evaluate_and_maybe_fire(ignore_gates=False)
     assert res.status == "skipped_outside_window"
+    # Real toast fired (NOT a silent tray-only update).
+    assert len(notifier.actionable_calls) == 1
+    assert sched._stats.last_fired_on_day == "2026-05-04"
+    assert sched._stats.eod_fallback_shown_on == "2026-05-04"
+    # Tray label remains None — toast dispatch succeeded so the
+    # last-resort tray path was never reached.
+    assert tray.label is None
+
+
+@pytest.mark.asyncio
+async def test_eod_path_falls_back_to_tray_when_dispatch_fails(
+    stats_path, monkeypatch,
+) -> None:
+    """If notify_actionable returns False (HUD unavailable), the EOD
+    path falls back to the tray label as a genuine last-resort."""
+    _patch_fetch(monkeypatch, _ok_response())
+    fn = FakeNotifier(dispatch_returns=False)
+    tray = FakeTrayState()
+    sched, _, _ = _make_scheduler(
+        stats_path=stats_path,
+        fake_notifier=fn,
+        now=datetime(2026, 5, 4, 20, 30),
+    )
+    sched._tray_state = tray  # type: ignore[assignment]
+    await sched._evaluate_and_maybe_fire(ignore_gates=False)
     assert tray.label == "Today's drill — 60s"
     assert sched._stats.eod_fallback_shown_on == "2026-05-04"
 
 
 @pytest.mark.asyncio
-async def test_eod_fallback_persisted_no_repeat(
-    stats_path, monkeypatch
+async def test_eod_does_not_fire_twice_in_one_day(
+    stats_path, monkeypatch,
 ) -> None:
     _patch_fetch(monkeypatch, _ok_response())
-    cfg = _cfg(eod_fallback_hour=17)
-    tray = FakeTrayState()
-    sched, _, _ = _make_scheduler(
-        stats_path=stats_path,
-        cfg=cfg,
-        now=datetime(2026, 5, 4, 18, 0),
+    sched, notifier, _ = _make_scheduler(
+        stats_path=stats_path, now=datetime(2026, 5, 4, 20, 30),
     )
-    sched._tray_state = tray  # type: ignore[assignment]
     await sched._evaluate_and_maybe_fire(ignore_gates=False)
-    assert tray.label == "Today's drill — 60s"
-    # Clear the tray label as if the user closed it; the scheduler must
-    # NOT re-set it the same day.
-    tray.label = None
+    assert len(notifier.actionable_calls) == 1
+    # Second tick same day must NOT fire a second toast.
     await sched._evaluate_and_maybe_fire(ignore_gates=False)
-    assert tray.label is None
+    assert len(notifier.actionable_calls) == 1
 
 
 @pytest.mark.asyncio
 async def test_eod_tray_click_opens_link_and_records_soft_tap(
-    stats_path, monkeypatch
+    stats_path, monkeypatch,
 ) -> None:
+    """When the toast dispatch fails and falls back to the tray, the
+    tray-click path still opens the drill + records soft_tap."""
     _patch_fetch(monkeypatch, _ok_response())
     opened = _patch_open(monkeypatch)
-    cfg = _cfg(eod_fallback_hour=17)
+    fn = FakeNotifier(dispatch_returns=False)
     tray = FakeTrayState()
     sched, _, _ = _make_scheduler(
         stats_path=stats_path,
-        cfg=cfg,
-        now=datetime(2026, 5, 4, 18, 0),
+        fake_notifier=fn,
+        now=datetime(2026, 5, 4, 20, 30),
     )
     sched._tray_state = tray  # type: ignore[assignment]
     await sched._evaluate_and_maybe_fire(ignore_gates=False)
     sched.on_eod_tray_click()
     assert opened == ["https://sayzo.app/drills/sess_test"]
-    bucket = sched._model.stats.buckets["0-18"]
+    bucket = sched._model.stats.buckets["0-20"]
     assert bucket.soft_taps == 1
     assert tray.label is None
 
@@ -634,3 +719,106 @@ async def test_cross_midnight_reset_allows_next_day_fire(
     res2 = await sched._evaluate_and_maybe_fire(ignore_gates=False)
     assert res2.status == "fired"
     assert len(notifier.actionable_calls) == 2
+
+
+# ---------------------------------------------------------------------------
+# First-fire on agent start (v3.6.5)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_first_fire_on_start_fires_after_warmup(
+    stats_path, monkeypatch,
+) -> None:
+    """v3.6.5: a one-shot first-fire runs after boot_warmup_secs + 5s
+    so a user launching the agent at noon and quitting at 5pm always
+    sees a toast that day, even if Thompson sampling would defer."""
+    _patch_fetch(monkeypatch, _ok_response())
+    # Short warmup so the test doesn't wait 30 seconds.
+    cfg = _cfg(boot_warmup_secs=0.05)
+    sched, notifier, _ = _make_scheduler(stats_path=stats_path, cfg=cfg)
+    # Reset _started_at_mono so the boot_warmup branch in _evaluate
+    # (which runs inside ignore_gates=True path) doesn't pre-fire.
+    sched._started_at_mono = time.monotonic()
+    # Manually trigger the first-fire task body.
+    await sched._maybe_first_fire()
+    assert len(notifier.actionable_calls) == 1
+    assert sched._stats.last_fired_on_day == "2026-05-04"
+
+
+@pytest.mark.asyncio
+async def test_first_fire_on_start_skipped_if_already_fired_today(
+    stats_path, monkeypatch,
+) -> None:
+    _patch_fetch(monkeypatch, _ok_response())
+    cfg = _cfg(boot_warmup_secs=0.05)
+    sched, notifier, _ = _make_scheduler(stats_path=stats_path, cfg=cfg)
+    # Pretend the tick loop already fired earlier.
+    sched._stats.last_fired_on_day = "2026-05-04"
+    await sched._maybe_first_fire()
+    assert notifier.actionable_calls == []
+
+
+@pytest.mark.asyncio
+async def test_first_fire_on_start_skipped_if_unauthenticated(
+    stats_path, monkeypatch,
+) -> None:
+    _patch_fetch(monkeypatch, _ok_response())
+    cfg = _cfg(boot_warmup_secs=0.05)
+    sched, notifier, _ = _make_scheduler(
+        stats_path=stats_path, cfg=cfg, has_tokens=False,
+    )
+    await sched._maybe_first_fire()
+    # Even with ignore_gates=True the auth gate is honored.
+    assert notifier.actionable_calls == []
+
+
+@pytest.mark.asyncio
+async def test_first_fire_on_start_cancelled_during_warmup(
+    stats_path, monkeypatch,
+) -> None:
+    """Calling stop() during warmup must not produce a stray toast."""
+    _patch_fetch(monkeypatch, _ok_response())
+    cfg = _cfg(boot_warmup_secs=60.0)  # long enough that we never reach it
+    sched, notifier, _ = _make_scheduler(stats_path=stats_path, cfg=cfg)
+    # Set the stop event to simulate shutdown mid-warmup.
+    sched._stop.set()
+    await sched._maybe_first_fire()
+    assert notifier.actionable_calls == []
+
+
+@pytest.mark.asyncio
+async def test_first_fire_on_start_skipped_if_armed(
+    stats_path, monkeypatch,
+) -> None:
+    """First-fire must NOT dispatch while the agent is capturing a call.
+
+    Regression guard: ignore_gates=True inside _evaluate_and_maybe_fire
+    bypasses the in-chain armed/mic checks, so _maybe_first_fire has to
+    pre-check them explicitly. Without this guard, launching Sayzo right
+    before a Zoom call produces a toast mid-meeting.
+    """
+    _patch_fetch(monkeypatch, _ok_response())
+    cfg = _cfg(boot_warmup_secs=0.05)
+    sched, notifier, _ = _make_scheduler(
+        stats_path=stats_path, cfg=cfg, arm_state=_ARMED,
+    )
+    await sched._maybe_first_fire()
+    assert notifier.actionable_calls == []
+    assert sched._stats.last_fired_on_day is None
+
+
+@pytest.mark.asyncio
+async def test_first_fire_on_start_skipped_if_mic_active(
+    stats_path, monkeypatch,
+) -> None:
+    """Companion to the armed-skip test: mic-held by any process also
+    blocks first-fire (e.g., user in a web meeting Sayzo isn't tracking)."""
+    _patch_fetch(monkeypatch, _ok_response())
+    cfg = _cfg(boot_warmup_secs=0.05)
+    sched, notifier, _ = _make_scheduler(
+        stats_path=stats_path, cfg=cfg, mic_active=True,
+    )
+    await sched._maybe_first_fire()
+    assert notifier.actionable_calls == []
+    assert sched._stats.last_fired_on_day is None

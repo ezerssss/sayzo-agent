@@ -8,10 +8,10 @@ Wraps the platform's already-shipped endpoint:
     Authorization: Bearer <user token>
 
     200 → { sessionId, deepLinkUrl, isReplay, scenarioTitle, question }
-    402 → user is over credit limit; do not fire today
-    409 → DRILL_RETRY_REQUIRED or DRILL_STILL_PROCESSING; can fire but
-          link points at the existing drill (the platform will recover)
+    409 → DRILL_RETRY_REQUIRED (carries deepLinkUrl, fires + clickable)
+          DRILL_STILL_PROCESSING (no deepLinkUrl, scheduler skips one tick)
     401 → token invalid (transient; the next reauth refreshes)
+    404 → user profile missing (rare; admin-cascade-deletes only)
     5xx / network → retry with exponential backoff (caller-defined max)
 
 The function never raises — every branch maps to a ``status`` field on
@@ -21,6 +21,14 @@ the single place where "fire / skip / mark-done" decisions live.
 Authentication uses the existing ``AuthenticatedClient`` (auth/client.py)
 which auto-refreshes on 401. ``AuthenticationRequired`` from the auth
 layer surfaces here as ``status="auth_required"``.
+
+v3.6.5: The platform's ``/sessions/today`` endpoint runs synchronous LLM
+generation inside the request (no async queue), so a slow LLM day can
+push request latency above httpx's 5 s default timeout. We pass an
+explicit 45 s read timeout to survive those days. Also: the pre-v3.6.5
+``402 over_credit`` branch documented above is gone — confirmed with the
+platform team that ``/sessions/today`` never returns 402; the credit
+charge moved to ``/sessions/complete``.
 """
 from __future__ import annotations
 
@@ -42,7 +50,19 @@ log = logging.getLogger(__name__)
 
 _API_PATH = "/api/sessions/today"
 
+# Per-call timeout for /sessions/today. httpx's default is 5 s total,
+# which is too tight for this endpoint — the platform runs synchronous
+# LLM generation inside the request (see services/drill-pre-generator),
+# and on a slow LLM day every attempt would time out and the agent
+# would never fire. 45 s read covers the slow-LLM case; connect/write/
+# pool stay snappy so we fail fast on real network breakage.
+_TODAY_TIMEOUT = httpx.Timeout(connect=10.0, read=45.0, write=10.0, pool=10.0)
 
+
+# ``over_credit`` is retained as a literal here purely so legacy tests /
+# log scrapers that pattern-match against the string don't break on
+# upgrade. The 402 branch was removed from ``fetch_today_session`` in
+# v3.6.5; the platform never returns 402 on this endpoint.
 ResponseStatus = Literal[
     "ok",
     "over_credit",
@@ -102,7 +122,7 @@ async def fetch_today_session(
 
     for attempt in range(max_retries):
         try:
-            resp = await client.get(_API_PATH)
+            resp = await client.get(_API_PATH, timeout=_TODAY_TIMEOUT)
         except AuthenticationRequired:
             log.info(
                 "[daily_drill.api] /sessions/today: not authenticated (attempt %d)",
@@ -159,9 +179,10 @@ async def fetch_today_session(
             log.info("[daily_drill.api] /sessions/today returned 401")
             return TodaySessionResponse(status="auth_required")
 
-        if sc == 402:
-            log.info("[daily_drill.api] /sessions/today returned 402 (over credit)")
-            return TodaySessionResponse(status="over_credit")
+        # v3.6.5: 402 over_credit branch deleted — platform never returns
+        # 402 on this endpoint (charge moved to /sessions/complete). Log
+        # via the `unexpected status` path below if the platform ever
+        # regresses, so we'd see it in the wild.
 
         if sc == 409:
             # Spec: 409 may carry DRILL_STILL_PROCESSING or DRILL_RETRY_REQUIRED;

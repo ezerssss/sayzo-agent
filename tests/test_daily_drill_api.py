@@ -144,15 +144,22 @@ async def test_200_with_non_json_body_returns_unknown_error(patch_async_client) 
 
 
 # ---------------------------------------------------------------------------
-# 402 over credit
+# 402 (regression guard — should NOT reach the dead over_credit branch)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_402_returns_over_credit(patch_async_client) -> None:
+async def test_402_falls_through_to_unknown_error(patch_async_client) -> None:
+    """v3.6.5: 402 branch deleted (platform never returns 402 on /today).
+
+    If a future regression causes the platform to return 402 here, the
+    Other-4xx fallthrough maps it to unknown_error — the scheduler then
+    treats that as transient and retries next tick, instead of silently
+    locking the day under the old over_credit semantics.
+    """
     patch_async_client(lambda req: httpx.Response(402, json={"code": "CREDIT_LIMIT"}))
     resp = await fetch_today_session(_make_real_client())
-    assert resp.status == "over_credit"
+    assert resp.status == "unknown_error"
     assert resp.fireable is False
 
 
@@ -321,6 +328,47 @@ async def test_timeout_retries_then_gives_up(patch_async_client) -> None:
         _make_real_client(), max_retries=2, base_backoff_secs=0.0
     )
     assert resp.status == "transient_error"
+
+
+# ---------------------------------------------------------------------------
+# Extended read timeout (v3.6.5)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_today_call_passes_extended_timeout(monkeypatch) -> None:
+    """v3.6.5: /sessions/today must be called with an extended read
+    timeout because the platform runs synchronous LLM generation inside
+    the request. httpx's 5s default would silently fail on slow LLM
+    days and the agent would never fire."""
+    from sayzo_agent.daily_drill import api as api_mod
+
+    captured: dict = {}
+
+    async def fake_request(self, method, path, **kwargs):
+        captured["method"] = method
+        captured["path"] = path
+        captured["timeout"] = kwargs.get("timeout")
+        return httpx.Response(
+            200,
+            json={
+                "sessionId": "s",
+                "deepLinkUrl": "u",
+                "isReplay": False,
+                "scenarioTitle": "t",
+                "question": "q",
+            },
+        )
+
+    monkeypatch.setattr(AuthenticatedClient, "request", fake_request)
+    resp = await fetch_today_session(_make_real_client())
+
+    assert captured["method"] == "GET"
+    assert captured["path"] == "/api/sessions/today"
+    # The exact Timeout object is passed through — read deadline 45s.
+    assert captured["timeout"] is api_mod._TODAY_TIMEOUT
+    assert captured["timeout"].read == 45.0
+    assert resp.status == "ok"
 
 
 # ---------------------------------------------------------------------------

@@ -706,9 +706,19 @@ class NotificationConfig(BaseSettings):
     # regardless). Toggle in Settings → Notifications.
     daily_drill_enabled: bool = True
 
-    # User must be idle (no kbd/mouse) at least this long before we fire,
-    # to avoid interrupting an active meeting or a user mid-rush.
-    min_idle_secs: float = 180.0
+    # "Don't fire mid-keystroke" guard — not a "wait until user steps
+    # away" gate. The HUD is non-focus-stealing (Win32 SW_SHOWNOACTIVATE,
+    # Cocoa orderFront_(None)), so a calm toast in the corner is not an
+    # interruption the way a modal would be. v3.6.5 dropped this from
+    # 180s to 30s; the conservative threshold was preventing real-world
+    # fires almost entirely (active workers rarely hit 3+ minutes idle
+    # during the 9-5 window).
+    min_idle_secs: float = 30.0
+
+    # Minimum agent uptime before the scheduler is allowed to fire. Split
+    # out from min_idle_secs in v3.6.5 — those are different concepts and
+    # tying them together meant tuning one re-tuned the other.
+    boot_warmup_secs: float = 30.0
 
     # Cold-start hour (no engagement history yet). 11am local — outside
     # morning rush, before lunch, after standups.
@@ -718,10 +728,15 @@ class NotificationConfig(BaseSettings):
     min_hour: int = 9
     lunch_start_hour: int = 12
     lunch_end_hour: int = 13     # exclusive — lunch covers 12 only
-    max_hour: int = 17           # exclusive — last firing hour is 16
+    max_hour: int = 20           # exclusive — last firing hour is 19
 
-    # At/after this hour, if we never fired today, surface the EOD tray
-    # fallback instead of firing late-evening "make-up" notifications.
+    # Pre-v3.6.5 gate boundary: after this hour the scheduler short-
+    # circuited to the EOD tray label instead of trying to fire a toast.
+    # v3.6.5 dropped that early-return so the normal fire path runs all
+    # the way to max_hour, and the EOD fallback (now a real toast) only
+    # triggers after max_hour. This field is retained for forward/back-
+    # compat with persisted user_settings.json — it is currently unused
+    # as a gate.
     eod_fallback_hour: int = 17
 
     # Window for distinguishing tap (engaged) from soft_tap (late tap).
