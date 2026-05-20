@@ -108,7 +108,13 @@ class NotificationStats:
     version: int = _SCHEMA_VERSION
     buckets: dict[str, BucketStats] = field(default_factory=dict)
     history: list[HistoryEntry] = field(default_factory=list)
-    last_fired_on_day: Optional[str] = None  # YYYY-MM-DD local
+    # v3.6.7: primary cooldown gate. ISO 8601 local datetime of the last
+    # successful fire (or dispatch failure). The scheduler compares
+    # ``now - last_fire_at < cooldown_secs`` instead of the legacy
+    # ``last_fired_on_day == today`` calendar check, so the cooldown
+    # works across any schedule / timezone with no calendar logic.
+    last_fire_at: Optional[str] = None
+    last_fired_on_day: Optional[str] = None  # YYYY-MM-DD local (legacy, kept for telemetry)
     eod_fallback_shown_on: Optional[str] = None
     os_disabled_prompt_shown: bool = False
 
@@ -117,6 +123,7 @@ class NotificationStats:
             "version": self.version,
             "buckets": {k: v.as_dict() for k, v in self.buckets.items()},
             "history": [h.as_dict() for h in self.history],
+            "last_fire_at": self.last_fire_at,
             "last_fired_on_day": self.last_fired_on_day,
             "eod_fallback_shown_on": self.eod_fallback_shown_on,
             "os_disabled_prompt_shown": self.os_disabled_prompt_shown,
@@ -164,6 +171,7 @@ class NotificationStats:
             version=version,
             buckets=buckets,
             history=history,
+            last_fire_at=d.get("last_fire_at") or None,
             last_fired_on_day=d.get("last_fired_on_day") or None,
             eod_fallback_shown_on=d.get("eod_fallback_shown_on") or None,
             os_disabled_prompt_shown=bool(d.get("os_disabled_prompt_shown", False)),

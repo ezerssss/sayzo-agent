@@ -145,6 +145,8 @@ def _cfg(**overrides) -> NotificationConfig:
     base = dict(
         daily_drill_enabled=True,
         min_idle_secs=30.0,
+        max_idle_secs=600.0,
+        cooldown_secs=18 * 3600.0,
         boot_warmup_secs=30.0,
         cold_start_hour=11,
         min_hour=9,
@@ -320,23 +322,87 @@ async def test_skips_when_idle_below_threshold(stats_path, monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_skips_during_lunch(stats_path, monkeypatch) -> None:
+async def test_lunch_hour_no_longer_blocks(stats_path, monkeypatch) -> None:
+    """v3.6.7: time-of-day gates removed. Lunch hour was a heuristic for
+    'user is probably away'; the activity gate (max_idle_secs) handles
+    that directly now. At 12:30 with idle within the activity window,
+    fires normally."""
     _patch_fetch(monkeypatch, _ok_response())
-    sched, _, _ = _make_scheduler(
-        stats_path=stats_path, now=datetime(2026, 5, 4, 12, 30)
+    sched, notifier, _ = _make_scheduler(
+        stats_path=stats_path, now=datetime(2026, 5, 4, 12, 30),
     )
     res = await sched._evaluate_and_maybe_fire(ignore_gates=False)
-    assert res.status == "skipped_lunch"
+    assert res.status == "fired"
+    assert len(notifier.actionable_calls) == 1
 
 
 @pytest.mark.asyncio
-async def test_skips_before_min_hour(stats_path, monkeypatch) -> None:
+async def test_before_min_hour_no_longer_blocks(stats_path, monkeypatch) -> None:
+    """v3.6.7: 7 AM (pre-9 AM in the old workday window) fires normally
+    if the user is actively present. The activity gate replaces the
+    time-of-day window — schedule-agnostic by design."""
     _patch_fetch(monkeypatch, _ok_response())
-    sched, _, _ = _make_scheduler(
-        stats_path=stats_path, now=datetime(2026, 5, 4, 7, 0)
+    sched, notifier, _ = _make_scheduler(
+        stats_path=stats_path, now=datetime(2026, 5, 4, 7, 0),
     )
     res = await sched._evaluate_and_maybe_fire(ignore_gates=False)
-    assert res.status == "skipped_outside_window"
+    assert res.status == "fired"
+    assert len(notifier.actionable_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_night_shift_hour_fires_normally(stats_path, monkeypatch) -> None:
+    """v3.6.7 the headline use case: a PH BPO worker at 23:00 PHT (night
+    shift) sees a toast just like a daytime worker at 11:00 — same gates,
+    same outcome. No SAYZO_NOTIFICATIONS__* configuration required."""
+    _patch_fetch(monkeypatch, _ok_response())
+    sched, notifier, _ = _make_scheduler(
+        stats_path=stats_path, now=datetime(2026, 5, 4, 23, 0),
+    )
+    res = await sched._evaluate_and_maybe_fire(ignore_gates=False)
+    assert res.status == "fired"
+    assert len(notifier.actionable_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_skips_when_idle_above_max(stats_path, monkeypatch) -> None:
+    """The night-shift gate: a sleeping user is idle for many hours,
+    far above max_idle_secs (default 600s). Toast skipped — this is what
+    makes the activity gate work for any schedule without time-of-day
+    knowledge."""
+    _patch_fetch(monkeypatch, _ok_response())
+    sched, notifier, _ = _make_scheduler(stats_path=stats_path, idle_secs=3600.0)
+    res = await sched._evaluate_and_maybe_fire(ignore_gates=False)
+    assert res.status == "skipped_idle"
+    assert notifier.actionable_calls == []
+
+
+@pytest.mark.asyncio
+async def test_skips_when_in_cooldown(stats_path, monkeypatch) -> None:
+    """v3.6.7: cooldown replaces last_fired_on_day == today. A fire 1 hour
+    ago should still block any new fire (default cooldown=18h)."""
+    _patch_fetch(monkeypatch, _ok_response())
+    sched, notifier, _ = _make_scheduler(
+        stats_path=stats_path, now=datetime(2026, 5, 4, 14, 0),
+    )
+    # Pretend we fired one hour ago.
+    sched._stats.last_fire_at = datetime(2026, 5, 4, 13, 0).isoformat()
+    res = await sched._evaluate_and_maybe_fire(ignore_gates=False)
+    assert res.status == "skipped_already_fired"
+    assert notifier.actionable_calls == []
+
+
+@pytest.mark.asyncio
+async def test_fires_when_cooldown_expired(stats_path, monkeypatch) -> None:
+    """20 hours after the last fire (cooldown=18h), eligible to fire again."""
+    _patch_fetch(monkeypatch, _ok_response())
+    sched, notifier, _ = _make_scheduler(
+        stats_path=stats_path, now=datetime(2026, 5, 4, 14, 0),
+    )
+    sched._stats.last_fire_at = datetime(2026, 5, 3, 18, 0).isoformat()  # 20h ago
+    res = await sched._evaluate_and_maybe_fire(ignore_gates=False)
+    assert res.status == "fired"
+    assert len(notifier.actionable_calls) == 1
 
 
 @pytest.mark.asyncio
@@ -546,87 +612,55 @@ async def test_dispatch_failed_in_hours_sets_tray_label_directly(
 
 
 @pytest.mark.asyncio
-async def test_eod_path_fires_real_toast_not_tray(
+async def test_dispatch_failure_falls_back_to_tray(
     stats_path, monkeypatch,
 ) -> None:
-    """After max_hour the EOD path fires a real actionable toast.
-
-    Pre-v3.6.5 this was tray-only; users don't watch the tray so the
-    feature was effectively invisible after work hours.
-    """
-    _patch_fetch(monkeypatch, _ok_response())
-    tray = FakeTrayState()
-    sched, notifier, _ = _make_scheduler(
-        stats_path=stats_path,
-        now=datetime(2026, 5, 4, 20, 30),  # past max_hour=20
-    )
-    sched._tray_state = tray  # type: ignore[assignment]
-    res = await sched._evaluate_and_maybe_fire(ignore_gates=False)
-    assert res.status == "skipped_outside_window"
-    # Real toast fired (NOT a silent tray-only update).
-    assert len(notifier.actionable_calls) == 1
-    assert sched._stats.last_fired_on_day == "2026-05-04"
-    assert sched._stats.eod_fallback_shown_on == "2026-05-04"
-    # Tray label remains None — toast dispatch succeeded so the
-    # last-resort tray path was never reached.
-    assert tray.label is None
-
-
-@pytest.mark.asyncio
-async def test_eod_path_falls_back_to_tray_when_dispatch_fails(
-    stats_path, monkeypatch,
-) -> None:
-    """If notify_actionable returns False (HUD unavailable), the EOD
-    path falls back to the tray label as a genuine last-resort."""
+    """v3.6.7: the EOD path (which used to fire from now.hour >= max_hour)
+    is gone. The tray fallback only triggers when notify_actionable
+    returns False (HUD subprocess crashed, etc.)."""
     _patch_fetch(monkeypatch, _ok_response())
     fn = FakeNotifier(dispatch_returns=False)
     tray = FakeTrayState()
-    sched, _, _ = _make_scheduler(
-        stats_path=stats_path,
-        fake_notifier=fn,
-        now=datetime(2026, 5, 4, 20, 30),
-    )
+    sched, _, _ = _make_scheduler(stats_path=stats_path, fake_notifier=fn)
     sched._tray_state = tray  # type: ignore[assignment]
-    await sched._evaluate_and_maybe_fire(ignore_gates=False)
+    res = await sched._evaluate_and_maybe_fire(ignore_gates=False)
+    assert res.status == "skipped_dispatch_failed"
     assert tray.label == "Today's drill — 60s"
     assert sched._stats.eod_fallback_shown_on == "2026-05-04"
+    # Cooldown is also marked so we don't keep retrying every tick.
+    assert sched._stats.last_fire_at is not None
 
 
 @pytest.mark.asyncio
-async def test_eod_does_not_fire_twice_in_one_day(
+async def test_does_not_fire_twice_within_cooldown(
     stats_path, monkeypatch,
 ) -> None:
+    """Cooldown gate: second tick same day must NOT fire a second toast."""
     _patch_fetch(monkeypatch, _ok_response())
-    sched, notifier, _ = _make_scheduler(
-        stats_path=stats_path, now=datetime(2026, 5, 4, 20, 30),
-    )
+    sched, notifier, _ = _make_scheduler(stats_path=stats_path)
     await sched._evaluate_and_maybe_fire(ignore_gates=False)
     assert len(notifier.actionable_calls) == 1
-    # Second tick same day must NOT fire a second toast.
     await sched._evaluate_and_maybe_fire(ignore_gates=False)
     assert len(notifier.actionable_calls) == 1
 
 
 @pytest.mark.asyncio
-async def test_eod_tray_click_opens_link_and_records_soft_tap(
+async def test_tray_click_opens_link_and_records_soft_tap(
     stats_path, monkeypatch,
 ) -> None:
-    """When the toast dispatch fails and falls back to the tray, the
-    tray-click path still opens the drill + records soft_tap."""
+    """When dispatch fails and falls back to the tray, the user's
+    tray-click still opens the drill + records soft_tap (preserved from
+    v3.6.5 — it's the user's escape hatch from a broken HUD)."""
     _patch_fetch(monkeypatch, _ok_response())
     opened = _patch_open(monkeypatch)
     fn = FakeNotifier(dispatch_returns=False)
     tray = FakeTrayState()
-    sched, _, _ = _make_scheduler(
-        stats_path=stats_path,
-        fake_notifier=fn,
-        now=datetime(2026, 5, 4, 20, 30),
-    )
+    sched, _, _ = _make_scheduler(stats_path=stats_path, fake_notifier=fn)
     sched._tray_state = tray  # type: ignore[assignment]
     await sched._evaluate_and_maybe_fire(ignore_gates=False)
     sched.on_eod_tray_click()
     assert opened == ["https://sayzo.app/drills/sess_test"]
-    bucket = sched._model.stats.buckets["0-20"]
+    bucket = sched._model.stats.buckets["0-11"]  # Mon 11 — the default test now
     assert bucket.soft_taps == 1
     assert tray.label is None
 
@@ -676,9 +710,11 @@ async def test_reload_config_disables_takes_effect_next_tick(
     # First call fires.
     res1 = await sched._evaluate_and_maybe_fire(ignore_gates=False)
     assert res1.status == "fired"
-    # Reload with daily disabled; subsequent call (different day) skips.
+    # Reload with daily disabled; subsequent call (after cooldown
+    # cleared) skips.
     sched.reload_config(_cfg(daily_drill_enabled=False), master_enabled=True)
-    sched._stats.last_fired_on_day = None  # simulate next-day reset
+    sched._stats.last_fire_at = None  # simulate cooldown expiry
+    sched._stats.last_fired_on_day = None
     sched._last_seen_day = None
     res2 = await sched._evaluate_and_maybe_fire(ignore_gates=False)
     assert res2.status == "skipped_daily_disabled"
@@ -747,14 +783,17 @@ async def test_first_fire_on_start_fires_after_warmup(
 
 
 @pytest.mark.asyncio
-async def test_first_fire_on_start_skipped_if_already_fired_today(
+async def test_first_fire_on_start_skipped_if_in_cooldown(
     stats_path, monkeypatch,
 ) -> None:
+    """First-fire honors cooldown even though it ignores other gates.
+    Pretend a tick fired 2 hours ago — cooldown is still active (18h)."""
     _patch_fetch(monkeypatch, _ok_response())
     cfg = _cfg(boot_warmup_secs=0.05)
-    sched, notifier, _ = _make_scheduler(stats_path=stats_path, cfg=cfg)
-    # Pretend the tick loop already fired earlier.
-    sched._stats.last_fired_on_day = "2026-05-04"
+    sched, notifier, _ = _make_scheduler(
+        stats_path=stats_path, cfg=cfg, now=datetime(2026, 5, 4, 13, 0),
+    )
+    sched._stats.last_fire_at = datetime(2026, 5, 4, 11, 0).isoformat()
     await sched._maybe_first_fire()
     assert notifier.actionable_calls == []
 

@@ -1,10 +1,25 @@
-"""DailyDrillScheduler — orchestrates the per-workday notification.
+"""DailyDrillScheduler — orchestrates the daily notification.
 
 Lives as a single asyncio task spawned from ``Agent.run()`` next to the
 arm controller. Ticks every ``tick_secs`` (default 60s) and runs a chain
-of gates; if all pass and the bucket model wants to fire today, it calls
-``/api/sessions/today`` and dispatches an actionable toast via
-``notifier.notify_actionable``.
+of gates; if all pass it calls ``/api/sessions/today`` and dispatches an
+actionable toast via ``notifier.notify_actionable``.
+
+v3.6.7: timing is driven by **activity + cooldown**, not time-of-day:
+
+* **Activity gate** — user must be idle ≥ ``min_idle_secs`` (don't
+  interrupt mid-keystroke) AND ≤ ``max_idle_secs`` (proves the user is
+  actually present, not asleep / away). One gate covers daytime workers,
+  night-shift workers, evening workers, irregular schedules — no
+  configuration needed.
+* **Cooldown gate** — fires no more than once per ``cooldown_secs``
+  (default 18h). A simple timestamp comparison; no calendar / shift /
+  timezone logic. Replaces the v3.6.5 ``last_fired_on_day == today``
+  check.
+
+The bucket model still records outcomes (tap / soft_tap / expire per
+hour-of-day) as telemetry but no longer gates firing — Thompson
+sampling is dead weight in the activity+cooldown world.
 
 Outcome flow:
 
@@ -12,8 +27,8 @@ Outcome flow:
   browser, records ``tap`` (within ``dismiss_window_secs``) or
   ``soft_tap`` (within ``soft_tap_window_secs``); ignores anything later.
 * ``on_expire`` (notifier watchdog) → records ``expire`` and saves stats.
-* ``on_eod_tray_click`` → records a ``soft_tap`` for the EOD-fallback
-  surface and opens the deep link.
+* ``on_eod_tray_click`` → records a ``soft_tap`` and opens the deep link
+  (kept for any tray label leftover from a dispatch-failure case).
 
 The scheduler holds a single in-memory ``_pending_fire`` representing
 the in-flight notification. The notifier's single-fire latch guarantees
@@ -247,10 +262,10 @@ class DailyDrillScheduler:
         except asyncio.TimeoutError:
             pass
 
-        today = self._now_fn().date().isoformat()
-        if self._stats.last_fired_on_day == today:
+        now = self._now_fn()
+        if self._is_in_cooldown(now):
             log.info(
-                "[daily_drill] first-fire on start: already fired today; skipping"
+                "[daily_drill] first-fire on start: within cooldown; skipping"
             )
             return
 
@@ -344,13 +359,19 @@ class DailyDrillScheduler:
         now = self._now_fn()
         today = now.date().isoformat()
 
-        # Cross-midnight reset BEFORE the already-fired check so a new
-        # day clears yesterday's state.
+        # Calendar-day reset for `eod_fallback_shown_on` and pending state
+        # only — the once-per-day fire gate was replaced by the timestamp
+        # cooldown (see _is_in_cooldown) in v3.6.7.
         if self._last_seen_day != today:
             self._reset_daily_state(today)
             self._last_seen_day = today
 
-        if self._stats.last_fired_on_day == today and not ignore_gates:
+        # v3.6.7: cooldown replaces `last_fired_on_day == today`. A single
+        # timestamp comparison handles every schedule (daytime, night
+        # shift, irregular) without time-of-day knowledge. ignore_gates
+        # bypasses this for the test-trigger CLI; first-fire-on-start
+        # honors it via its own _is_in_cooldown call.
+        if not ignore_gates and self._is_in_cooldown(now):
             return FireResult(status="skipped_already_fired")
 
         if not self._master_enabled and not ignore_gates:
@@ -376,33 +397,27 @@ class DailyDrillScheduler:
         # compat with on-disk stats from older versions.
 
         if not ignore_gates:
-            # v3.6.5: weekend cold-start gate removed. It was silencing new
-            # users entirely on Sat/Sun (no way to earn weekend engagement
-            # signal without first getting a weekend toast). The 9-5 window
-            # already biases away from weekend-non-workers via the model.
-
-            # Time-window gates
-            if now.hour < self._cfg.min_hour:
-                return FireResult(status="skipped_outside_window")
-            if (
-                self._cfg.lunch_start_hour
-                <= now.hour
-                < self._cfg.lunch_end_hour
-            ):
-                return FireResult(status="skipped_lunch")
-            if now.hour >= self._cfg.max_hour:
-                # Outside the firing window for the day. Surface the EOD
-                # fallback (now a real toast in v3.6.5, see _maybe_surface_eod_fallback).
-                await self._maybe_surface_eod_fallback(now, today)
-                return FireResult(status="skipped_outside_window")
-
-            # Boot warmup
+            # Boot warmup — agent must have been alive for boot_warmup_secs
+            # before we'll fire. Catches the "agent just launched, give it
+            # a moment to settle" case.
             elapsed_since_start = time.monotonic() - self._started_at_mono
             if elapsed_since_start < self._cfg.boot_warmup_secs:
                 return FireResult(status="skipped_boot_warmup")
 
-            # Idle gate
-            if self._get_idle_secs_fn() < self._cfg.min_idle_secs:
+            # Activity gate (v3.6.7): recency CAP, not a minimum. The user
+            # must have touched the keyboard/mouse within max_idle_secs
+            # (default 10min) AND not be actively typing right now
+            # (min_idle_secs, default 30s). This single gate replaces the
+            # entire time-of-day window: a sleeping user is idle for hours
+            # (far above the cap → skipped), a working user is idle
+            # 30s-few-minutes between keystrokes (in the window → fires).
+            # Works identically for daytime workers, night-shift workers,
+            # evening workers, weekend warriors — no schedule
+            # configuration needed.
+            idle_secs = self._get_idle_secs_fn()
+            if idle_secs < self._cfg.min_idle_secs:
+                return FireResult(status="skipped_idle")
+            if idle_secs > self._cfg.max_idle_secs:
                 return FireResult(status="skipped_idle")
 
             # Meeting gate — armed agent OR raw mic-in-use
@@ -418,14 +433,33 @@ class DailyDrillScheduler:
             except Exception:
                 log.debug("[daily_drill] mic active probe failed", exc_info=True)
 
-            # Model picks the hour
-            chosen_hour = self._model.pick_hour_today(as_of=now, rng=self._rng)
-            if chosen_hour is None:
-                return FireResult(status="skipped_model_no_pick")
-            if now.hour < chosen_hour:
-                return FireResult(status="skipped_model_wants_later")
+            # Thompson sampling is now telemetry-only (v3.6.7). With
+            # activity + cooldown driving timing, "pick the best hour"
+            # is meaningless — the answer is always "the next moment the
+            # user is present post-cooldown." We still record outcomes
+            # so a future UI could surface "your peak engagement hours"
+            # without re-instrumenting.
 
         return await self._fire_drill(now, today)
+
+    def _is_in_cooldown(self, now: datetime) -> bool:
+        """True if a fire happened within the last cooldown_secs.
+
+        Replaces the v3.6.5 `last_fired_on_day == today` calendar check
+        with a simple timestamp comparison. Works in any timezone, across
+        any schedule, no shift_today / date arithmetic.
+        """
+        if not self._stats.last_fire_at:
+            return False
+        try:
+            last = datetime.fromisoformat(self._stats.last_fire_at)
+        except ValueError:
+            # Corrupt or pre-v3.6.7 stats file with no last_fire_at.
+            # Treat as never-fired so we don't lock out the user forever
+            # on a one-off parse error.
+            return False
+        secs_since = (now - last).total_seconds()
+        return secs_since < self._cfg.cooldown_secs
 
     async def _fire_drill(self, now: datetime, today: str) -> FireResult:
         with self._lock:
@@ -497,22 +531,24 @@ class DailyDrillScheduler:
         )
         if not dispatched:
             # Backend can't render — fall back to the tray surface for
-            # the day. Mark the day so we don't keep retrying.
-            # v3.6.5: go straight to tray instead of re-entering the EOD
-            # path; that path would just try notify_actionable again and
-            # fail again. The tray label is the genuine last-resort.
+            # the day. Mark cooldown so we don't keep retrying every tick.
+            # v3.6.7: timestamp cooldown replaces last_fired_on_day; the
+            # tray label still dedupes by calendar day to prevent spam if
+            # dispatch keeps failing.
             log.warning(
                 "[daily_drill] notify_actionable returned False; "
                 "falling back to EOD tray surface"
             )
-            self._stats.last_fired_on_day = today
+            self._stats.last_fire_at = fired_at.isoformat()
+            self._stats.last_fired_on_day = today  # legacy field, still set for telemetry
             self._set_tray_eod_label_if_needed(today)
             self._save_stats()
             return FireResult(
                 status="skipped_dispatch_failed", response=resp, title=title, body=body,
             )
 
-        self._stats.last_fired_on_day = today
+        self._stats.last_fire_at = fired_at.isoformat()
+        self._stats.last_fired_on_day = today  # legacy field, still set for telemetry
         self._model.record_fire(fired_at)
         self._save_stats()
         log.info(
@@ -584,83 +620,13 @@ class DailyDrillScheduler:
         )
 
     # ------------------------------------------------------------------
-    # End-of-day fallback (v3.6.5: real toast, tray as last-resort)
+    # Tray fallback (last resort when notify_actionable returns False)
     # ------------------------------------------------------------------
-
-    async def _maybe_surface_eod_fallback(
-        self, now: datetime, today: str
-    ) -> None:
-        """Surface the EOD fallback after max_hour.
-
-        Pre-v3.6.5 this was tray-only and effectively invisible (users
-        don't watch the system tray). Now it tries to fire a real
-        actionable toast first, falling back to the tray label only
-        when the toast dispatch itself fails.
-        """
-        if self._stats.eod_fallback_shown_on == today:
-            return
-        if self._stats.last_fired_on_day == today:
-            # Regular path already fired today — don't double-notify.
-            return
-
-        # Fetch the day's session if we haven't already.
-        if self._current_today is None:
-            client = self._auth_client_factory()
-            if client is None:
-                return
-            try:
-                resp = await fetch_today_session(client)
-            except Exception:
-                log.debug(
-                    "[daily_drill] EOD fetch failed", exc_info=True
-                )
-                return
-            if not resp.fireable:
-                return
-            if not resp.deep_link_url:
-                # Same broken-click guard as _fire_drill: don't surface
-                # an EOD toast that can't be clicked through.
-                log.info(
-                    "[daily_drill] EOD: fireable but no deep_link_url; skipping"
-                )
-                return
-            self._current_today = resp
-
-        resp = self._current_today
-        title, body = compose_copy(resp)
-        fired_at = self._now_fn()
-        pending = _PendingFire(
-            fired_at_dt=fired_at,
-            fired_at_mono=time.monotonic(),
-            session_id=resp.session_id,
-            deep_link_url=resp.deep_link_url,
-        )
-        with self._lock:
-            self._pending = pending
-
-        dispatched = self._notifier.notify_actionable(
-            title=title,
-            body=body,
-            button_label="Open drill",
-            on_pressed=lambda: self._on_pressed_callback(pending),
-            expire_after_secs=self._cfg.dismiss_window_secs,
-            on_expire=lambda: self._on_expire_callback(pending),
-        )
-
-        if dispatched:
-            self._stats.last_fired_on_day = today
-            self._stats.eod_fallback_shown_on = today
-            self._model.record_fire(fired_at)
-            self._save_stats()
-            log.info(
-                "[daily_drill] EOD fired: title=%r session=%s",
-                title,
-                resp.session_id,
-            )
-            return
-
-        # Dispatch failed — fall back to the tray label as last resort.
-        self._set_tray_eod_label_if_needed(today)
+    #
+    # v3.6.7 removed the time-of-day EOD trigger. The tray label only
+    # surfaces now when the HUD's notify_actionable fails outright (HUD
+    # subprocess crashed, etc.). on_eod_tray_click below handles the
+    # user's click on that fallback label.
 
     def _set_tray_eod_label_if_needed(self, today: str) -> None:
         """Set the EOD tray label, marking the day to avoid re-surfacing.

@@ -724,29 +724,53 @@ class NotificationConfig(BaseSettings):
     # regardless). Toggle in Settings → Notifications.
     daily_drill_enabled: bool = True
 
-    # "Don't fire mid-keystroke" guard — not a "wait until user steps
-    # away" gate. The HUD is non-focus-stealing (Win32 SW_SHOWNOACTIVATE,
-    # Cocoa orderFront_(None)), so a calm toast in the corner is not an
-    # interruption the way a modal would be. v3.6.5 dropped this from
-    # 180s to 30s; the conservative threshold was preventing real-world
-    # fires almost entirely (active workers rarely hit 3+ minutes idle
-    # during the 9-5 window).
+    # Activity gate (v3.6.7): the user is "present and free to look at a
+    # toast" iff ``min_idle_secs <= idle_secs <= max_idle_secs``. The
+    # LOWER bound ("don't fire mid-keystroke") prevents interrupting an
+    # active typing burst — wait for a brief pause. The UPPER bound
+    # ("they've touched the computer recently") is the night-shift fix:
+    # a sleeping user is idle for many hours, far above the cap, so the
+    # gate skips. Works for every schedule (daytime, night, evening,
+    # irregular) without time-of-day configuration.
     min_idle_secs: float = 30.0
+    max_idle_secs: float = 600.0   # 10 min
+
+    # Cooldown between fires (v3.6.7). Replaces the v3.6.5 once-per-
+    # calendar-day gate with a simple timestamp comparison so timezone /
+    # calendar / shift boundaries don't matter. 18h means: fire at 23:00
+    # Mon, next eligible fire window opens at 17:00 Tue. ``ignore_gates``
+    # (test-trigger CLI) bypasses this; first-fire-on-start honors it.
+    cooldown_secs: float = 18 * 3600  # 64800.0 = 18 hours
 
     # Minimum agent uptime before the scheduler is allowed to fire. Split
     # out from min_idle_secs in v3.6.5 — those are different concepts and
     # tying them together meant tuning one re-tuned the other.
     boot_warmup_secs: float = 30.0
 
-    # Cold-start hour (no engagement history yet). 11am local — outside
-    # morning rush, before lunch, after standups.
+    # Cold-start hour (no engagement history yet). Used by the bucket
+    # model's _cold_start_pick for telemetry purposes only — v3.6.7
+    # decoupled gating from time-of-day, so this is no longer used to
+    # block fires. Kept for back-compat with on-disk stats and any future
+    # UI that wants to display "your typical engagement hour."
     cold_start_hour: int = 11
 
-    # Workday window (local time, 24-hour). max_hour exclusive.
+    # Legacy time-of-day fields (v3.6.7: NO LONGER USED FOR GATING).
+    #
+    # Pre-v3.6.7 the scheduler enforced a 9-AM-to-8-PM "workday window"
+    # to bound when notifications could fire, with a lunch-hour skip.
+    # That model was fundamentally wrong for non-daytime workers (PH BPO
+    # workers on US shifts, evening / night-shift workers, irregular
+    # schedules). v3.6.7 replaced the time window with an activity gate
+    # (min_idle_secs ≤ idle_secs ≤ max_idle_secs) — "is the user at
+    # their computer right now?" — which is schedule-agnostic.
+    #
+    # The fields are preserved for back-compat with persisted user_settings
+    # and for the bucket model's per-(dow,hour) telemetry. They are not
+    # consulted by ``_evaluate_and_maybe_fire``.
     min_hour: int = 9
     lunch_start_hour: int = 12
     lunch_end_hour: int = 13     # exclusive — lunch covers 12 only
-    max_hour: int = 20           # exclusive — last firing hour is 19
+    max_hour: int = 20           # exclusive
 
     # Pre-v3.6.5 gate boundary: after this hour the scheduler short-
     # circuited to the EOD tray label instead of trying to fire a toast.
