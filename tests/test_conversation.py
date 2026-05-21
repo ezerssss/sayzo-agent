@@ -10,9 +10,7 @@ from sayzo_agent.config import ConversationConfig
 from sayzo_agent.conversation import (
     ConversationDetector,
     SessionState,
-    build_windowed_pcm,
     evaluate_user_turn_gate,
-    merge_close_segments,
 )
 from sayzo_agent.models import SessionCloseReason, SpeechSegment
 
@@ -25,68 +23,6 @@ def _cfg(**overrides) -> ConversationConfig:
     )
     base.update(overrides)
     return ConversationConfig(**base)
-
-
-def test_merge_close_segments_preserves_short_gaps():
-    """Two segments within the gap threshold are merged into one range."""
-    segs = [
-        SpeechSegment("mic", 0.0, 3.0),
-        SpeechSegment("mic", 5.0, 8.0),  # 2s gap
-    ]
-    merged = merge_close_segments(segs, gap_secs=5.0)
-    assert len(merged) == 1
-    assert merged[0].start_ts == 0.0
-    assert merged[0].end_ts == 8.0
-
-
-def test_merge_close_segments_respects_long_gaps():
-    """Segments further apart than the threshold are kept separate."""
-    segs = [
-        SpeechSegment("mic", 0.0, 3.0),
-        SpeechSegment("mic", 15.0, 18.0),  # 12s gap
-    ]
-    merged = merge_close_segments(segs, gap_secs=5.0)
-    assert len(merged) == 2
-
-
-def test_merge_close_segments_ignores_source():
-    """A mic segment followed by a nearby sys segment should merge — the
-    helper is purely timestamp-based because build_windowed_pcm is too."""
-    segs = [
-        SpeechSegment("mic", 0.0, 3.0),
-        SpeechSegment("system", 5.0, 8.0),  # 2s gap, different source
-    ]
-    merged = merge_close_segments(segs, gap_secs=5.0)
-    assert len(merged) == 1
-    assert merged[0].start_ts == 0.0
-    assert merged[0].end_ts == 8.0
-
-
-def test_merge_close_segments_disabled_when_gap_zero():
-    """gap_secs <= 0 should just return the input sorted, no merging."""
-    segs = [
-        SpeechSegment("mic", 5.0, 8.0),
-        SpeechSegment("mic", 0.0, 3.0),
-    ]
-    merged = merge_close_segments(segs, gap_secs=0.0)
-    assert len(merged) == 2
-    assert merged[0].start_ts == 0.0
-    assert merged[1].start_ts == 5.0
-
-
-def test_merge_close_segments_chains_multiple():
-    """A, B, C each within gap of the previous all merge into one range."""
-    segs = [
-        SpeechSegment("mic", 0.0, 2.0),
-        SpeechSegment("system", 3.0, 5.0),
-        SpeechSegment("mic", 6.0, 9.0),
-        SpeechSegment("mic", 20.0, 22.0),  # far away
-    ]
-    merged = merge_close_segments(segs, gap_secs=2.0)
-    assert len(merged) == 2
-    assert merged[0].start_ts == 0.0
-    assert merged[0].end_ts == 9.0
-    assert merged[1].start_ts == 20.0
 
 
 def _frame(seconds: float, sr: int = 16000, amplitude: float = 0.1) -> np.ndarray:
@@ -356,42 +292,6 @@ def test_gate_passes_late_substantive_user_turn():
     assert result.mic_max_turn >= 8.0
     # Whole session preserved (we can see both early and late mic content)
     assert closed.mic_turn_count() == 2
-
-
-def _make_pcm(seconds: float, sr: int = 16000, value: int = 1000) -> bytes:
-    return (np.full(int(seconds * sr), value, dtype=np.int16)).tobytes()
-
-
-def test_build_windowed_pcm_zeroes_outside_windows():
-    sr = 16000
-    pcm = _make_pcm(10.0, sr=sr, value=1000)  # 10s of constant non-zero
-    seg = SpeechSegment("mic", 4.0, 5.0)  # one 1s segment
-    out = build_windowed_pcm(pcm, [seg], pad_secs=0.5, sample_rate=sr)
-    assert len(out) == len(pcm)
-    arr = np.frombuffer(out, dtype=np.int16)
-    # Window: [3.5s, 5.5s] → samples [56000, 88000]
-    assert np.all(arr[: int(3.5 * sr)] == 0)
-    assert np.all(arr[int(3.5 * sr) : int(5.5 * sr)] == 1000)
-    assert np.all(arr[int(5.5 * sr) :] == 0)
-
-
-def test_build_windowed_pcm_merges_overlapping_windows():
-    sr = 16000
-    pcm = _make_pcm(10.0, sr=sr, value=1000)
-    segs = [SpeechSegment("mic", 3.0, 3.2), SpeechSegment("mic", 3.5, 3.7)]
-    out = build_windowed_pcm(pcm, segs, pad_secs=1.0, sample_rate=sr)
-    arr = np.frombuffer(out, dtype=np.int16)
-    # Merged window: [2.0s, 4.7s]
-    assert np.all(arr[: int(2.0 * sr)] == 0)
-    assert np.all(arr[int(2.0 * sr) : int(4.7 * sr)] == 1000)
-    assert np.all(arr[int(4.7 * sr) :] == 0)
-
-
-def test_build_windowed_pcm_no_segments_returns_zeros():
-    pcm = _make_pcm(2.0)
-    out = build_windowed_pcm(pcm, [], pad_secs=1.0, sample_rate=16000)
-    assert len(out) == len(pcm)
-    assert np.all(np.frombuffer(out, dtype=np.int16) == 0)
 
 
 def test_gate_fails_no_counterparty():

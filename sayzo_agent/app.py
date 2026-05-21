@@ -20,13 +20,12 @@ from .config import Config
 from .conversation import (
     ConversationDetector,
     SessionState,
-    build_windowed_pcm,
     evaluate_user_turn_gate,
-    merge_close_segments,
 )
 from .dsp import apply_mic_dsp, apply_sys_dsp
 from . import aec, echo_guard
 from .models import SessionBuffers
+from .session_trim import apply_session_trim
 from .sink import CaptureSink
 from .notify import NoopNotifier, Notifier
 from .retry import empty_upload_state
@@ -702,62 +701,50 @@ class Agent:
             ),
         )
 
-        # 3. Trim dead air from the final audio. Per-channel: each track
-        # trims against its OWN VAD segments. Mic uses mic_segments (already
-        # echo-cleaned at step 0), so echo-only periods are silent on the
-        # saved mic track; sys uses sys_segments and carries the far-side
-        # audio as usual.
-        #
-        # Before zeroing, merge any two segments on a channel whose gap is
-        # shorter than `final_audio_merge_gap_secs`. This preserves
-        # conversational pauses (response latency, thinking beats, intra-
-        # turn hesitation) as real audio — those pauses are coachable
-        # signal for the server-side analysis. True dead air longer than
-        # the merge gap still gets removed.
-        gap = self.cfg.conversation.final_audio_merge_gap_secs
+        # 3. Slice the final audio at [first_speech - pad, last_speech + pad]
+        # across both channels using identical sample indices. Mid-conversation
+        # silences are preserved as recorded audio (thinking pauses, response
+        # latency). Mic-only zeroing is then applied for any `mic_echo_segments`
+        # spans inside the kept range — CLAUDE.md design rule 5 layered echo
+        # defense. Identical indices on mic/sys are load-bearing for AEC
+        # alignment (see memory `project_aec_misalignment_v3_6_0`).
         pad = self.cfg.conversation.final_audio_speech_pad_secs
-        mic_trim_segs = merge_close_segments(list(buffers.mic_segments), gap_secs=gap)
-        sys_trim_segs = merge_close_segments(list(buffers.sys_segments), gap_secs=gap)
-        mic_final = build_windowed_pcm(mic_dsp, mic_trim_segs, pad_secs=pad, sample_rate=sr)
-        sys_final = build_windowed_pcm(sys_dsp, sys_trim_segs, pad_secs=pad, sample_rate=sr)
-
-        # Truncate trailing silence: cut both channels at the end of the
-        # last speech segment on EITHER channel + pad. The session buffer
-        # includes up to joint_silence_close_secs of dead air at the tail —
-        # no reason to keep it on disk.
-        full_secs = len(buffers.mic_pcm) / 2 / sr
-        all_segs = list(buffers.mic_segments) + list(buffers.sys_segments)
-        if all_segs:
-            last_end = max(s.end_ts for s in all_segs)
-            cut_sample = min(
-                int((last_end + pad) * sr),
-                len(mic_final) // 2,
-                len(sys_final) // 2,
-            )
-            cut_byte = cut_sample * 2
-            mic_final = mic_final[:cut_byte]
-            sys_final = sys_final[:cut_byte]
-
-        kept_secs = len(mic_final) / 2 / sr
+        mic_final, sys_final, trim_report = apply_session_trim(
+            mic_dsp,
+            sys_dsp,
+            buffers.mic_segments,
+            buffers.sys_segments,
+            buffers.mic_echo_segments,
+            pad_secs=pad,
+            sample_rate=sr,
+        )
         log.info(
             "[sink] trimmed: %.1fs kept out of %.1fs total",
-            kept_secs,
-            full_secs,
+            trim_report.kept_secs,
+            trim_report.original_secs,
         )
 
         # 4. Sink + upload
-        # Derive wall-clock started_at / ended_at from the PCM timeline so
-        # record.json lines up with the saved Opus file. `session_t0_mono`
-        # may be earlier than `started_monotonic` (backfill extends the
-        # audio earlier than the _open_session moment); `session_end_mono`
-        # may be slightly later (tail pad equalizes channel lengths).
+        # Derive wall-clock started_at / ended_at from the sliced PCM. Two
+        # offsets shift `buffers.started_at`:
+        #   - `backfill_secs`: session_t0_mono is earlier than started_monotonic
+        #     when backfill extends the audio before _open_session was called.
+        #   - `trim_report.start_offset_secs`: the post-DSP slice cut leading
+        #     silence, so `mic_final[0]` is later than session_t0_mono.
+        # `pcm_duration` comes from the sliced length, not `buffers.pcm_duration`
+        # (which still reflects the un-sliced session buffer).
         backfill_secs = max(0.0, buffers.started_monotonic - buffers.session_t0_mono)
-        true_started_at = buffers.started_at - timedelta(seconds=backfill_secs)
-        pcm_duration = buffers.pcm_duration(sr)
+        true_started_at = (
+            buffers.started_at
+            - timedelta(seconds=backfill_secs)
+            + timedelta(seconds=trim_report.start_offset_secs)
+        )
+        pcm_duration = len(mic_final) / 2 / sr
         ended_at = true_started_at + timedelta(seconds=pcm_duration)
         metadata = {
             "close_reason": buffers.close_reason.value if buffers.close_reason else None,
             "upload": empty_upload_state(),
+            "trim": trim_report.as_metadata(),
         }
         if eg_report is not None:
             metadata["echo_guard"] = {

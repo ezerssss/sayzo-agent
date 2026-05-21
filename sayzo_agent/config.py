@@ -131,12 +131,13 @@ class ConversationConfig(BaseSettings):
     # dead air + static artifacts don't end up in the on-disk capture. Small
     # pad keeps speech starts/ends from being clipped.
     final_audio_speech_pad_secs: float = 0.5
-    # Before zero-filling dead air, merge any two VAD segments whose gap is
-    # shorter than this. Preserves conversational pauses (response latency,
-    # thinking beats, intra-turn hesitation) as real audio — those pauses
-    # are coachable signal for speech analysis. True dead air longer than
-    # this threshold still gets zeroed. Set to 0 to disable merging and fall
-    # back to strict per-segment trimming.
+    # DEPRECATED v3.7.0 — unused. The pre-v3.7 trim pipeline used this to
+    # decide which mid-conversation VAD gaps to zero-fill on disk; v3.7.0
+    # replaced that with `apply_session_trim` (sayzo_agent/session_trim.py),
+    # which slices to [first_speech-pad, last_speech+pad] and preserves all
+    # mid-region audio. Kept here so existing user_settings.json files don't
+    # fail pydantic validation if the per-class `extra` policy isn't 'ignore'.
+    # Remove in v3.8.
     final_audio_merge_gap_secs: float = 5.0
     # Gap-fill thresholds for the mono-clock invariant. When a frame arrives
     # with capture_mono_ts more than this far past "expected next sample

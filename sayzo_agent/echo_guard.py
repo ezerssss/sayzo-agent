@@ -151,11 +151,14 @@ def classify_buffers(
       - `buffers.mic_segments` contains only user segments (echo spans
         removed, partial segments split around interior echo spans).
       - `buffers.mic_echo_segments` is populated with every dropped span.
-      - The raw `buffers.mic_pcm` / `buffers.sys_pcm` are NOT modified. The
-        downstream pipeline removes echo regions from the encoded audio
-        via per-channel VAD windowing (the merged mic_segments no longer
-        include them); ``zero_out_echo_regions`` remains available for
-        callers that want a pre-zeroed mic PCM directly.
+      - The raw `buffers.mic_pcm` / `buffers.sys_pcm` are NOT modified.
+        Downstream `apply_session_trim` (sayzo_agent/session_trim.py) zeros
+        the mic PCM directly over each `mic_echo_segments` span inside the
+        final slice — CLAUDE.md design rule 5 layered echo defense:
+        AEC linear → echo_guard residual classifier → direct mic zeroing
+        → server-side ``isEchoLeakUtterance``.
+        ``zero_out_echo_regions`` remains available for callers that want
+        a pre-zeroed mic PCM directly.
 
     Returns an `EchoGuardReport` for logging and record.json metadata.
     """
