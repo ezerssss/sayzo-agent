@@ -304,9 +304,32 @@ class _HudHostWidget(QWidget):
             # stale, …), clamp to a primary-screen position the user
             # can definitely see.
             x, y = self._clamp_to_visible_screen(x, y)
+            # Force a real Qt geometry change to drive a paintEvent →
+            # UpdateLayeredWindow refresh of the OS layered surface.
+            # WA_TranslucentBackground + WS_EX_LAYERED on Windows means
+            # the on-screen pixels come from UpdateLayeredWindow, which
+            # is itself driven by a top-level paintEvent. self.move()
+            # at unchanged position is a no-op, and setGeometry with
+            # identical values is skipped by most platform plugins.
+            # Without a real change, every upstream cache short-circuits
+            # (React lastW/lastH in HudApp.tsx, Python _current_* in
+            # _set_window_size below, Qt move-to-same-position here)
+            # and consecutive same-size toasts silently fail to paint:
+            # the OS layered surface stays stuck on the previous
+            # (alpha=0 empty) frame and the user sees nothing.
+            #
+            # 1-px width shrink-then-restore forces a real resize event
+            # → paintEvent → UpdateLayeredWindow → fresh composite of
+            # whatever QWebEngineView's GPU surface holds (the
+            # just-mounted card content). The 1-px change lives for one
+            # event-loop tick and is sub-perceptible at typical card
+            # widths (>300 px).
+            w = self._current_width
+            h = self._current_height
             self._suppress_anchor_update = True
             try:
-                self.move(int(x), int(y))
+                self.setGeometry(int(x), int(y), max(1, w - 1), h)
+                self.setGeometry(int(x), int(y), w, h)
             finally:
                 self._suppress_anchor_update = False
             log.info(
