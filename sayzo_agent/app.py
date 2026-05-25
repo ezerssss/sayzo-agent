@@ -168,6 +168,7 @@ class Agent:
             notifier=self.notifier,
             data_dir=self.cfg.data_dir,
             system_scope_fn=lambda: self.cfg.capture.system_scope,
+            show_recording_indicator_fn=lambda: self.cfg.hud.show_recording_indicator,
         )
 
         # Optional daily-drill scheduler. Constructed by the service entry

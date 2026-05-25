@@ -27,12 +27,14 @@ export type SetupStatus = {
   account_state: AccountState;
   is_complete: boolean;
   // One-shot resume hint set by Bridge.restart_app() before it hard-exits
-  // (currently only "accessibility"). App.tsx's initialScreen() reads this
-  // on the first get_status() call after a Restart-Sayzo round-trip and
-  // jumps straight back to the Accessibility screen instead of dropping
-  // the user to the default sequence[2] (Microphone). Cleared by the
-  // backend on read.
-  resume_at: "accessibility" | null;
+  // (currently only "accessibility" in production; "indicator" is set
+  // exclusively by the dev mock bridge for the `#preview=indicator`
+  // preview route — see `lib/mock-bridge-init.ts`). App.tsx's
+  // initialScreen() reads this on the first get_status() call after a
+  // Restart-Sayzo round-trip and jumps straight back to the named screen
+  // instead of dropping the user to the default sequence[2] (Microphone).
+  // Cleared by the backend on read.
+  resume_at: "accessibility" | "indicator" | null;
 };
 
 export type AccountStatusPayload = {
@@ -138,6 +140,14 @@ declare global {
     get_hotkey(): Promise<HotkeyState>;
     validate_hotkey(binding: string): Promise<HotkeyValidation>;
     save_hotkey(binding: string): Promise<HotkeySaveResult>;
+
+    // Recording indicator (HUD pill visibility). Picked during onboarding,
+    // mirrored in Settings → Recording. `visible: true` means the floating
+    // capture pill appears on arm; `false` suppresses it (tray icon stays).
+    get_recording_indicator(): Promise<{ visible: boolean }>;
+    set_recording_indicator(
+      visible: boolean,
+    ): Promise<{ saved: boolean; error?: string }>;
 
     mark_permissions_onboarded(): Promise<null>;
     finish(): Promise<null>;
@@ -290,6 +300,16 @@ export const bridge = {
   async saveHotkey(binding: string) {
     await whenReady();
     return window.pywebview.api.save_hotkey(binding);
+  },
+
+  // Recording indicator.
+  async getRecordingIndicator() {
+    await whenReady();
+    return window.pywebview.api.get_recording_indicator();
+  },
+  async setRecordingIndicator(visible: boolean) {
+    await whenReady();
+    return window.pywebview.api.set_recording_indicator(visible);
   },
 
   async markPermissionsOnboarded() {

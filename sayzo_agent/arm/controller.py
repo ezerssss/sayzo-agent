@@ -202,6 +202,13 @@ class ArmController:
         # fresh value. Default returns "endpoint" so tests + the
         # smoke-test harness don't have to pass it explicitly.
         system_scope_fn: Callable[[], str] = lambda: "endpoint",
+        # Reads current ``cfg.hud.show_recording_indicator``. Same callable
+        # pattern as ``system_scope_fn`` so the gate picks up Settings
+        # mutations on the next arm without a service restart. Default
+        # True so unit tests and any caller that constructs the controller
+        # without wiring this up preserves the legacy "show pill on every
+        # arm" behaviour.
+        show_recording_indicator_fn: Callable[[], bool] = lambda: True,
     ) -> None:
         self.cfg = cfg
         self.detector = detector
@@ -277,6 +284,7 @@ class ArmController:
         # Web-onboarding gate (see _arm_internal + _run_whitelist_watcher).
         self.account_gate_fn: Optional[AccountGateFn] = account_gate_fn
         self._system_scope_fn = system_scope_fn
+        self._show_recording_indicator_fn = show_recording_indicator_fn
         # Per-app_key dedup for the watcher's "skipped because gated" log,
         # so a long meeting in a blocked-account state doesn't spam at the
         # 2 s poll cadence.
@@ -677,7 +685,20 @@ class ArmController:
         # ``ask_consent_pausing_pill`` can restore the same pill
         # verbatim (with the original ``start_ts``) after an "are you
         # still here?" consent if the user opts to keep going.
-        if self._hud_launcher is not None:
+        #
+        # Gated by ``cfg.hud.show_recording_indicator`` (read via the
+        # ``show_recording_indicator_fn`` callable so a live Settings
+        # toggle takes effect on the next arm) — users who picked "Stay
+        # out of the way" during onboarding get no pill on arm. The tray
+        # menu label still flips to "Stop recording" so they have a
+        # non-floating confirmation that Sayzo is armed; consent cards /
+        # toasts are unaffected (they fire on demand, not as a persistent
+        # presence). ``hide_pill`` on disarm stays unconditional —
+        # ``launcher.hide_pill`` is a no-op when no pill is showing.
+        if (
+            self._hud_launcher is not None
+            and self._show_recording_indicator_fn()
+        ):
             self._hud_launcher.show_pill(
                 reason=reason.source,
                 reason_label=(reason.display_name or reason.source.capitalize()),

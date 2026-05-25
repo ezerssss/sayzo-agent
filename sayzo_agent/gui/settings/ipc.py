@@ -64,6 +64,13 @@ class Methods:
     SNAPSHOT_MIC_STATE = "snapshot_mic_state"
     SNAPSHOT_FOREGROUND = "snapshot_foreground"
     RELOAD_DETECTORS = "reload_detectors"
+    # Recording pane — re-read ``hud.show_recording_indicator`` from disk so
+    # toggling the floating indicator on/off (Settings → Recording, or the
+    # first-run onboarding picker) takes effect on the next arm without a
+    # service restart. The gate in ``arm/controller.py::_arm_internal`` reads
+    # the live agent's cfg each arm, but the Settings / setup windows run in
+    # their own subprocesses and can't mutate the agent's cfg directly.
+    RELOAD_HUD_CONFIG = "reload_hud_config"
     # Captures pane — surfaces in-flight sessions and lets the Settings
     # subprocess kick the upload retry sweep when the user hits "Try again".
     SNAPSHOT_PROCESSING_CAPTURES = "snapshot_processing_captures"

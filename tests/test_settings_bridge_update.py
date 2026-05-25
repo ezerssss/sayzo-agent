@@ -371,11 +371,13 @@ def _async_returning(value: Any):
 def test_get_recording_settings_reflects_endpoint_default(cfg: Config) -> None:
     """Fresh config: per_app_capture defaults to False (endpoint scope is
     the default since v2.9.0); aec_enabled defaults to True (default flipped
-    in v3.6.1 after the alignment fix landed)."""
+    in v3.6.1 after the alignment fix landed); show_recording_indicator
+    defaults to True (preserves pre-feature behaviour for upgraders)."""
     b = Bridge(cfg)
     assert b.get_recording_settings() == {
         "per_app_capture": False,
         "aec_enabled": True,
+        "show_recording_indicator": True,
     }
 
 
@@ -386,6 +388,7 @@ def test_get_recording_settings_reflects_arm_app_override(cfg: Config) -> None:
     assert b.get_recording_settings() == {
         "per_app_capture": True,
         "aec_enabled": True,
+        "show_recording_indicator": True,
     }
 
 
@@ -396,7 +399,50 @@ def test_get_recording_settings_reflects_aec_disabled(cfg: Config) -> None:
     assert b.get_recording_settings() == {
         "per_app_capture": False,
         "aec_enabled": False,
+        "show_recording_indicator": True,
     }
+
+
+def test_get_recording_settings_reflects_indicator_hidden(cfg: Config) -> None:
+    """User picked "Stay out of the way" during onboarding (or toggled the
+    Settings → Recording entry off): show_recording_indicator is False."""
+    cfg.hud.show_recording_indicator = False
+    b = Bridge(cfg)
+    assert b.get_recording_settings() == {
+        "per_app_capture": False,
+        "aec_enabled": True,
+        "show_recording_indicator": False,
+    }
+
+
+def test_set_recording_setting_hides_indicator(cfg: Config) -> None:
+    """Toggle off: cfg.hud.show_recording_indicator mutates, user_settings.json
+    gets the new value, requires_restart=False is returned (the gate in
+    arm/controller.py reads cfg on every arm)."""
+    from sayzo_agent import settings_store as ss
+
+    b = Bridge(cfg)
+    result = b.set_recording_setting("show_recording_indicator", False)
+
+    assert result == {"saved": True, "requires_restart": False}
+    assert cfg.hud.show_recording_indicator is False
+    persisted = ss.load(cfg.data_dir)
+    assert persisted == {"hud": {"show_recording_indicator": False}}
+
+
+def test_set_recording_setting_shows_indicator(cfg: Config) -> None:
+    """Toggle on: persists True explicitly so the user's choice survives
+    even if the default flips later."""
+    from sayzo_agent import settings_store as ss
+
+    cfg.hud.show_recording_indicator = False
+    b = Bridge(cfg)
+    result = b.set_recording_setting("show_recording_indicator", True)
+
+    assert result == {"saved": True, "requires_restart": False}
+    assert cfg.hud.show_recording_indicator is True
+    persisted = ss.load(cfg.data_dir)
+    assert persisted == {"hud": {"show_recording_indicator": True}}
 
 
 def test_set_recording_setting_enables_aec(cfg: Config) -> None:

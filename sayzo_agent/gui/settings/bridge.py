@@ -678,22 +678,43 @@ class Bridge:
 
         ``aec_enabled`` mirrors ``cfg.aec.enabled`` directly (WebRTC AEC3
         pre-pass, see sayzo_agent/aec.py).
+
+        ``show_recording_indicator`` mirrors
+        ``cfg.hud.show_recording_indicator`` — when False, the floating
+        capture pill is suppressed on arm (see
+        ``arm/controller.py::_arm_internal``).
         """
         return {
             "per_app_capture": self._cfg.capture.system_scope == "arm_app",
             "aec_enabled": bool(self._cfg.aec.enabled),
+            "show_recording_indicator": bool(
+                self._cfg.hud.show_recording_indicator
+            ),
         }
 
     def set_recording_setting(self, key: str, value: bool) -> dict[str, Any]:
         """Persist a single recording-pane toggle.
 
-        Returns ``requires_restart=True`` for every recording key because
-        both the capture pipeline (``SystemCapture``) and the AEC pre-pass
-        (``aec`` module's lazy-loaded APM) bind their config at agent
-        startup and aren't reconstructed between arms. Live reload would
-        require restructuring the Agent lifecycle and is out of scope.
+        ``per_app_capture`` + ``aec_enabled`` return ``requires_restart=True``
+        because both the capture pipeline (``SystemCapture``) and the AEC
+        pre-pass bind their config at agent startup and aren't reconstructed
+        between arms.
+
+        ``show_recording_indicator`` returns ``requires_restart=False`` — the
+        gate in ``arm/controller.py::_arm_internal`` reads
+        ``cfg.hud.show_recording_indicator`` on every arm. But this Settings
+        window runs in its own subprocess (see the module docstring), so
+        mutating ``self._cfg`` here only updates *our* copy — the live
+        agent's cfg is untouched and it would keep showing/hiding the pill on
+        the stale boot value until a restart. After the disk write we
+        therefore nudge the running agent over IPC (``RELOAD_HUD_CONFIG``),
+        which re-reads the value and applies it so the change lands on the
+        next arm. Best-effort: when the agent isn't running, ``call_quiet``
+        is silent and the value is picked up on the agent's next boot.
+        (Mid-arm live show/hide is still deferred; the pane's hint says so.)
         """
         coerced = bool(value)
+        requires_restart = True
 
         if key == "per_app_capture":
             new_scope = "arm_app" if coerced else "endpoint"
@@ -714,6 +735,16 @@ class Bridge:
                     exc_info=True,
                 )
             patch = {"aec": {"enabled": coerced}}
+        elif key == "show_recording_indicator":
+            try:
+                self._cfg.hud.show_recording_indicator = coerced
+            except Exception:
+                log.debug(
+                    "[settings.bridge] cfg.hud.show_recording_indicator mutation failed",
+                    exc_info=True,
+                )
+            patch = {"hud": {"show_recording_indicator": coerced}}
+            requires_restart = False
         else:
             return {"saved": False, "error": f"unknown recording key: {key}"}
 
@@ -726,7 +757,14 @@ class Bridge:
             )
             return {"saved": False, "error": "couldn't write user_settings.json"}
 
-        return {"saved": True, "requires_restart": True}
+        # The recording indicator is the one recording-pane toggle that takes
+        # effect without a restart — nudge the live agent to re-read it so the
+        # change lands on the next arm. per_app_capture / aec_enabled bind at
+        # startup (requires_restart=True) and have nothing to reload mid-run.
+        if key == "show_recording_indicator":
+            self._ipc.call_quiet(Methods.RELOAD_HUD_CONFIG)
+
+        return {"saved": True, "requires_restart": requires_restart}
 
     # ------------------------------------------------------------------
     # JS-callable methods — Permissions

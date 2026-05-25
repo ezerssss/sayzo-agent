@@ -1995,6 +1995,36 @@ def service(force_setup: bool, from_autostart: bool, open_settings: bool) -> Non
                     )
             return {"reloaded": True}
 
+        def _ipc_reload_hud_config() -> dict:
+            # Settings → Recording "Show recording indicator" toggle (and the
+            # first-run onboarding picker) write the new value to
+            # user_settings.json from their own subprocess, then nudge here.
+            # Re-read the full config from disk and copy just the HUD field
+            # onto the live agent's cfg so the next _arm_internal sees it.
+            # Re-reading (vs. taking the value as a param) preserves env-var
+            # precedence: SAYZO_HUD__SHOW_RECORDING_INDICATOR still wins.
+            try:
+                fresh = load_config()
+            except Exception:
+                log.warning(
+                    "[ipc] reload_hud_config: load_config failed", exc_info=True
+                )
+                return {"reloaded": False}
+            try:
+                agent.cfg.hud.show_recording_indicator = (
+                    fresh.hud.show_recording_indicator
+                )
+            except Exception:
+                log.warning(
+                    "[ipc] reload_hud_config: apply raised", exc_info=True
+                )
+                return {"reloaded": False}
+            log.info(
+                "[ipc] reload_hud_config: show_recording_indicator=%s",
+                agent.cfg.hud.show_recording_indicator,
+            )
+            return {"reloaded": True}
+
         def _ipc_test_drill_notification() -> dict:
             if agent.daily_drill is None:
                 return {"ok": False, "reason": "daily_drill_not_constructed"}
@@ -2027,6 +2057,7 @@ def service(force_setup: bool, from_autostart: bool, open_settings: bool) -> Non
         ipc_server.register(
             Methods.RELOAD_NOTIFICATION_CONFIG, _ipc_reload_notification_config
         )
+        ipc_server.register(Methods.RELOAD_HUD_CONFIG, _ipc_reload_hud_config)
         ipc_server.register(
             Methods.TEST_DRILL_NOTIFICATION, _ipc_test_drill_notification
         )

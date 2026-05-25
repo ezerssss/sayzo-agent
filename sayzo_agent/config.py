@@ -637,6 +637,24 @@ class ArmConfig(BaseSettings):
     notify_session_wrapped: bool = True
 
 
+class HudConfig(BaseSettings):
+    """Visual settings for the on-screen HUD (the floating capture pill,
+    consent cards, toasts).
+
+    Top-level rather than nested under ``ArmConfig`` because visibility is
+    about the UI surface, not the arming logic — keeps room for additional
+    HUD prefs (animation intensity, position, etc.) without re-organising.
+    """
+
+    # When False, the floating "recording indicator" (StatePill) doesn't
+    # appear while a session is armed — the user still arms / disarms via
+    # hotkey or tray menu, and consent cards / toasts still fire. Chosen
+    # during first-run onboarding and changeable via Settings → Recording.
+    # Default True preserves current behaviour for upgrading users and
+    # gives new users the live trust signal during their first arm.
+    show_recording_indicator: bool = True
+
+
 class AuthConfig(BaseSettings):
     auth_url: str = "https://sayzo.app/api/auth"
     client_id: str = "sayzo-desktop"  # Public OAuth client ID (no secret — PKCE)
@@ -846,6 +864,7 @@ class Config(BaseSettings):
     echo_guard: EchoGuardConfig = Field(default_factory=EchoGuardConfig)
     aec: AecConfig = Field(default_factory=AecConfig)
     arm: ArmConfig = Field(default_factory=ArmConfig)
+    hud: HudConfig = Field(default_factory=HudConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)
     upload: UploadConfig = Field(default_factory=UploadConfig)
     notifications: NotificationConfig = Field(default_factory=NotificationConfig)
@@ -975,6 +994,21 @@ def load_config() -> Config:
         if user_aec:
             init_kwargs["aec"] = {
                 **probe.aec.model_dump(), **user_aec
+            }
+
+    if isinstance(user.get("hud"), dict):
+        env_hud_keys = {
+            k[len("SAYZO_HUD__"):].lower()
+            for k in os.environ
+            if k.upper().startswith("SAYZO_HUD__")
+        }
+        user_hud = {
+            k: v for k, v in user["hud"].items()
+            if k.lower() not in env_hud_keys
+        }
+        if user_hud:
+            init_kwargs["hud"] = {
+                **probe.hud.model_dump(), **user_hud
             }
 
     cfg = Config(**init_kwargs) if init_kwargs else probe

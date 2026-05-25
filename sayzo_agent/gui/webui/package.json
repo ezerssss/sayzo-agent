@@ -10,6 +10,8 @@
     "dev:mock": "vite --mode mock",
     "predev:finish-signup": "python ../../../scripts/sync_brand_assets.py",
     "dev:finish-signup": "vite --mode mock --open /#preview=finish-signup",
+    "predev:indicator": "python ../../../scripts/sync_brand_assets.py",
+    "dev:indicator": "vite --mode mock --open /#preview=indicator",
     "predev:hud": "python ../../../scripts/sync_brand_assets.py",
     "dev:hud": "vite --mode mock --open /#route=hud&demo=1",
     "predev:hud-pill": "python ../../../scripts/sync_brand_assets.py",

@@ -25,7 +25,13 @@ from sayzo_agent.gui.setup.bridge import Bridge, SetupResult
 log = logging.getLogger(__name__)
 
 WINDOW_TITLE = "Sayzo — Setup"
-WINDOW_SIZE = (720, 560)
+# Height sized for the tallest step — the recording-indicator picker, whose
+# full-width 16:9 hero preview + selectors + caption need ~340px of content
+# room below the header/title. 680 keeps that step scroll-free while still
+# fitting comfortably on a 768px-tall display (680 + title bar + taskbar
+# ≈ 750). The other (text-light) steps just gain breathing room. Resizable,
+# so a user on a short screen can shrink it; the picker scrolls if they do.
+WINDOW_SIZE = (720, 680)
 WINDOW_MIN_SIZE = (640, 480)
 
 

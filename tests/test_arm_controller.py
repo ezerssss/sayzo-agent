@@ -201,6 +201,123 @@ async def test_hotkey_arm_confirmation_yes_opens_streams():
     await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
 
 
+class _FakeHudLauncher:
+    """Minimal HudLauncher stub. Records show_pill / hide_pill calls and
+    delegates the consent path to the notifier so the controller's
+    ``ask_consent_pausing_pill`` branch works against a FakeNotifier.
+
+    Only the methods the controller actually invokes are stubbed; the rest
+    of HudLauncher's surface (set_audio_levels, etc) is unused by the arm
+    code paths we exercise here.
+    """
+
+    def __init__(self, notifier: "FakeNotifier") -> None:
+        self._notifier = notifier
+        self.show_pill_calls: list[dict[str, Any]] = []
+        self.hide_pill_calls: int = 0
+
+    def show_pill(self, **kwargs: Any) -> bool:
+        self.show_pill_calls.append(kwargs)
+        return True
+
+    def hide_pill(self) -> bool:
+        self.hide_pill_calls += 1
+        return True
+
+    def set_pill_stop_callback(self, _cb: Any) -> None:
+        pass
+
+    def ask_consent_pausing_pill(
+        self,
+        title: str,
+        body: str,
+        yes_label: str,
+        no_label: str,
+        timeout_secs: float,
+        default_on_timeout: str = "no",
+    ) -> str:
+        # Delegate to the notifier so the existing FakeNotifier
+        # ``consent_script`` mechanism drives this path too.
+        return self._notifier.ask_consent(
+            title, body, yes_label, no_label, timeout_secs, default_on_timeout,
+        )
+
+
+def _build_controller_with_indicator(
+    *, indicator_visible: bool,
+) -> tuple[ArmController, "FakeNotifier", "_FakeHudLauncher"]:
+    """Construct an ArmController wired with a fake HUD launcher and the
+    given show_recording_indicator preference."""
+    notifier = FakeNotifier()
+    notifier.consent_script = ["yes"]
+    launcher = _FakeHudLauncher(notifier)
+    notifier.launcher = launcher  # type: ignore[attr-defined]
+
+    arm_cfg = ArmConfig(
+        hotkey="ctrl+alt+s",
+        poll_interval_secs=0.01,
+        hotkey_confirm_timeout_secs=0.1,
+        consent_toast_timeout_secs=0.1,
+        end_toast_timeout_secs=0.1,
+        checkin_toast_timeout_secs=0.1,
+        meeting_ended_toast_timeout_secs=0.1,
+        whitelist_arm_release_grace_secs=0.03,
+        force_close_after_keep_going_secs=0.05,
+        decline_release_grace_secs=0.05,
+        long_meeting_checkin_marks_secs=[3600.0],
+        detectors=default_detector_specs(),
+    )
+    conv_cfg = ConversationConfig(joint_silence_close_secs=1.0)
+    detector = ConversationDetector(conv_cfg)
+    mic = FakeCapture()
+    sys_cap = FakeCapture()
+    vad_m = FakeVAD(source="mic")
+    vad_s = FakeVAD(source="system")
+    ctrl = ArmController(
+        arm_cfg, detector,
+        mic_capture=mic, sys_capture=sys_cap,
+        vad_mic=vad_m, vad_sys=vad_s,
+        notifier=notifier,
+        get_mic_holders=lambda: [],
+        is_mic_active=lambda: False,
+        get_running_processes=lambda: frozenset(),
+        get_foreground_info=lambda: ForegroundInfo(),
+        system_scope_fn=lambda: "endpoint",
+        show_recording_indicator_fn=lambda: indicator_visible,
+    )
+    return ctrl, notifier, launcher
+
+
+async def test_hotkey_arm_with_indicator_visible_shows_pill():
+    """show_recording_indicator_fn returns True (default for new users +
+    upgraders) → show_pill is called on arm."""
+    ctrl, _, launcher = _build_controller_with_indicator(indicator_visible=True)
+
+    await ctrl._on_hotkey_pressed()
+    assert ctrl.state == ArmState.ARMED
+    assert len(launcher.show_pill_calls) == 1
+    assert launcher.show_pill_calls[0]["reason"] == "hotkey"
+
+    await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
+    # hide_pill always fires on disarm, even when no pill was ever shown.
+    assert launcher.hide_pill_calls == 1
+
+
+async def test_hotkey_arm_with_indicator_hidden_skips_pill():
+    """show_recording_indicator_fn returns False ("Stay out of the way"
+    chosen during onboarding) → show_pill is NOT called on arm. Capture
+    still proceeds; hide_pill on disarm still fires (no-op against an
+    already-absent pill on the React side)."""
+    ctrl, _, launcher = _build_controller_with_indicator(indicator_visible=False)
+
+    await ctrl._on_hotkey_pressed()
+    assert ctrl.state == ArmState.ARMED
+    assert launcher.show_pill_calls == []
+
+    await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
+    assert launcher.hide_pill_calls == 1
+
+
 async def test_hotkey_arm_confirmation_no_keeps_disarmed():
     notifier = FakeNotifier()
     notifier.consent_script = ["no"]

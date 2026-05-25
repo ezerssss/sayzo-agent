@@ -58,6 +58,11 @@ export type NotificationKey = keyof NotificationFlags;
 export type RecordingSettings = {
   per_app_capture: boolean;
   aec_enabled: boolean;
+  // When false, the floating recording indicator (HUD pill) does NOT
+  // appear while armed. Toggled via Settings → Recording (the
+  // setRecordingSetting call) and chosen during onboarding (via the
+  // setup bridge's setRecordingIndicator method).
+  show_recording_indicator: boolean;
 };
 
 export type RecordingSettingKey = keyof RecordingSettings;

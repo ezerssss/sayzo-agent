@@ -17,7 +17,12 @@ export function RecordingPane() {
         const s = await settingsBridge.getRecordingSettings();
         if (!cancelled) setSettings(s);
       } catch {
-        if (!cancelled) setSettings({ per_app_capture: false, aec_enabled: true });
+        if (!cancelled)
+          setSettings({
+            per_app_capture: false,
+            aec_enabled: true,
+            show_recording_indicator: true,
+          });
       }
     })();
     return () => {
@@ -55,6 +60,29 @@ export function RecordingPane() {
       </p>
 
       <div className="mt-8 space-y-2">
+        <label className="flex cursor-pointer items-start justify-between gap-4 rounded-md py-2">
+          <div className="flex-1">
+            <div className="flex items-center gap-2">
+              <span className="text-sm font-medium text-ink">
+                Show recording indicator
+              </span>
+            </div>
+            <p className="mt-1 max-w-md text-xs leading-relaxed text-ink-muted">
+              A small reminder appears in the corner of your screen while
+              Sayzo records. Turn off to stay out of the way — Sayzo still
+              records, and the tray icon's menu shows it's running. Takes
+              effect the next time Sayzo starts recording.
+            </p>
+          </div>
+          <Switch
+            checked={settings.show_recording_indicator}
+            onChange={(v) =>
+              void handleToggle("show_recording_indicator", v)
+            }
+            ariaLabel="Show recording indicator"
+          />
+        </label>
+
         <label className="flex cursor-pointer items-start justify-between gap-4 rounded-md py-2">
           <div className="flex-1">
             <div className="flex items-center gap-2">

@@ -7,6 +7,7 @@ import { Microphone } from "./screens/Microphone";
 import { AudioCapture } from "./screens/AudioCapture";
 import { Accessibility } from "./screens/Accessibility";
 import { Shortcut } from "./screens/Shortcut";
+import { Indicator } from "./screens/Indicator";
 import { Done } from "./screens/Done";
 import { Alert } from "./components/ui/Alert";
 
@@ -38,6 +39,7 @@ type Screen =
   | "audio-capture"
   | "accessibility"
   | "shortcut"
+  | "indicator"
   | "done";
 
 const ACCOUNT_BLOCKED_STATES: ReadonlyArray<AccountState> = [
@@ -58,10 +60,11 @@ function sequenceFor(platform: string): Screen[] {
       "audio-capture",
       "accessibility",
       "shortcut",
+      "indicator",
       "done",
     ];
   }
-  return ["welcome", "shortcut", "done"];
+  return ["welcome", "shortcut", "indicator", "done"];
 }
 
 function initialScreen(
@@ -78,8 +81,9 @@ function initialScreen(
   }
   // Upgrade re-install over a complete setup: skip walkthrough, land on Done.
   if (status.is_complete) return "done";
-  // One-shot resume after Restart-Sayzo from the Accessibility screen.
-  // The backend writes a marker before exit and clears it on this read,
+  // One-shot resume after Restart-Sayzo from the Accessibility screen, or
+  // from the `dev:indicator` preview route. The backend writes a marker
+  // before exit (or the mock bridge sets it) and clears it on this read,
   // so we only honor it when the target screen is actually in this
   // platform's sequence (defensive — if a future build changes the
   // sequence, a stale marker shouldn't crash us).
@@ -88,6 +92,12 @@ function initialScreen(
     (sequence as string[]).includes("accessibility")
   ) {
     return "accessibility";
+  }
+  if (
+    status.resume_at === "indicator" &&
+    (sequence as string[]).includes("indicator")
+  ) {
+    return "indicator";
   }
   return sequence[1] ?? "done";
 }
@@ -276,8 +286,16 @@ export function App() {
                 .map((p) => (p.length === 1 ? p.toUpperCase() : titleCase(p)))
                 .join("+"),
             );
-            setScreen("done");
+            advance();
           }}
+          onCancel={handleCancel}
+        />
+      );
+    case "indicator":
+      return (
+        <Indicator
+          step={step!}
+          onNext={advance}
           onCancel={handleCancel}
         />
       );

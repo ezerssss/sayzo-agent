@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 from sayzo_agent.config import Config
 from sayzo_agent.gui.common import hotkey as hotkey_helpers
 from sayzo_agent.gui.common.login import LoginCoordinator
+from sayzo_agent.gui.settings.ipc import IPCClient, Methods
 from sayzo_agent.gui.setup.detect import detect_setup
 
 if TYPE_CHECKING:
@@ -62,6 +63,12 @@ class Bridge:
         self._login = LoginCoordinator(
             cfg, self._push_event, thread_name="setup-login",
         )
+        # Lazy connection to the live agent. The setup window runs in its own
+        # subprocess, so ``set_recording_indicator`` can't reach the running
+        # agent's cfg by mutating ours — it nudges over IPC instead. Best-
+        # effort: during first-run the service is often not up yet, in which
+        # case the disk write alone suffices (picked up on the next boot).
+        self._ipc = IPCClient(cfg.data_dir)
 
     # ------------------------------------------------------------------
     # Lifecycle (called from SetupWindow, not from JS). The setter is
@@ -404,6 +411,56 @@ class Bridge:
 
     def save_hotkey(self, binding: str) -> dict[str, Any]:
         return hotkey_helpers.save_hotkey(self._cfg, binding)
+
+    # ---- Recording indicator (HUD pill visibility) ------------------
+
+    def get_recording_indicator(self) -> dict[str, Any]:
+        """Read the current "show recording indicator" preference.
+
+        The onboarding picker reads this on mount so a user who quits +
+        re-opens setup after the first time lands on their previous pick
+        instead of the default. Returns the live ``Config`` value so a
+        ``set_recording_indicator`` earlier in the same session is
+        reflected.
+        """
+        return {"visible": bool(self._cfg.hud.show_recording_indicator)}
+
+    def set_recording_indicator(self, visible: bool) -> dict[str, Any]:
+        """Persist the onboarding picker's choice + nudge the live agent.
+
+        Writes the boolean to ``user_settings.json`` under ``hud`` and updates
+        ``self._cfg.hud.show_recording_indicator`` so a later read in this
+        same setup session is consistent. The setup window runs in its own
+        subprocess, though, so mutating our cfg does NOT reach a concurrently
+        running agent — we nudge it over IPC (``RELOAD_HUD_CONFIG``) so a
+        "Stay out of the way" pick applies on the next arm rather than waiting
+        for a restart. Best-effort: during first-run the service is usually
+        not up yet, in which case ``call_quiet`` is silent and the on-disk
+        value is read on the agent's next boot.
+        """
+        from sayzo_agent import settings_store
+
+        coerced = bool(visible)
+        try:
+            settings_store.save(
+                self._cfg.data_dir,
+                {"hud": {"show_recording_indicator": coerced}},
+            )
+        except Exception:
+            log.warning(
+                "[bridge] persist hud.show_recording_indicator failed",
+                exc_info=True,
+            )
+            return {"saved": False, "error": "couldn't write user_settings.json"}
+        try:
+            self._cfg.hud.show_recording_indicator = coerced
+        except Exception:
+            log.debug(
+                "[bridge] cfg.hud.show_recording_indicator mutation failed",
+                exc_info=True,
+            )
+        self._ipc.call_quiet(Methods.RELOAD_HUD_CONFIG)
+        return {"saved": True}
 
     # ---- Web-onboarding gate ----------------------------------------
 

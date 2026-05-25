@@ -71,6 +71,54 @@ function makeStubApi(
   });
 }
 
+function installIndicatorPreviewBridge(): void {
+  // Land directly on the Indicator step (between Shortcut and Done).
+  // ``resume_at: "indicator"`` is honored by App.tsx's initialScreen()
+  // on the first status read.
+  console.info("[mock-bridge] Indicator preview");
+  let currentVisible = true;
+  const status = {
+    has_token: true,
+    has_mic_permission: true,
+    has_permissions_onboarded: false,
+    account_state: "ok" as const,
+    is_complete: false,
+    resume_at: "indicator" as const,
+  };
+
+  const overrides: Record<string, (...args: unknown[]) => Promise<unknown>> = {
+    get_status: async () => status,
+    get_config_snapshot: async () => ({
+      platform: platformGuess(),
+      auth_url: "https://sayzo.app",
+    }),
+    get_hotkey: async () => ({ binding: "ctrl+alt+s", display: "Ctrl+Alt+S" }),
+    get_recording_indicator: async () => ({ visible: currentVisible }),
+    set_recording_indicator: async (visible: unknown) => {
+      currentVisible = Boolean(visible);
+      console.info(
+        `[mock-bridge] set_recording_indicator(${currentVisible})`,
+      );
+      return { saved: true };
+    },
+    mark_permissions_onboarded: async () => {
+      console.info("[mock-bridge] mark_permissions_onboarded (no-op)");
+      return null;
+    },
+    finish: async () => {
+      console.info("[mock-bridge] finish (would close window)");
+      return null;
+    },
+    quit_app: async () => {
+      console.info("[mock-bridge] quit_app (would close window)");
+      return null;
+    },
+  };
+
+  const stubApi = makeStubApi(overrides);
+  (window as unknown as Record<string, unknown>).pywebview = { api: stubApi };
+}
+
 function installFinishSignupPreviewBridge(): void {
   const state = readPreviewState();
   console.info(`[mock-bridge] FinishSignup preview — account_state=${state}`);
@@ -178,6 +226,8 @@ if (MOCK_ON && typeof window !== "undefined") {
   const preview = readPreviewScreen();
   if (preview === "finish-signup") {
     installFinishSignupPreviewBridge();
+  } else if (preview === "indicator") {
+    installIndicatorPreviewBridge();
   } else if (preview && preview.startsWith("hud-")) {
     installHudPreviewBridge();
   } else if (
