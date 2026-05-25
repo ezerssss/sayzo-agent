@@ -61,6 +61,7 @@ class FakeNotifier:
         self._latch = False
         self._on_pressed: Optional[Callable[[], None]] = None
         self._on_expire: Optional[Callable[[], None]] = None
+        self._on_secondary: Optional[Callable[[], None]] = None
 
     def notify(self, title: str, body: str) -> None:
         self.notify_calls.append((title, body))
@@ -74,6 +75,8 @@ class FakeNotifier:
         on_pressed: Callable[[], None],
         expire_after_secs: float,
         on_expire: Optional[Callable[[], None]] = None,
+        secondary_button_label: Optional[str] = None,
+        on_secondary_pressed: Optional[Callable[[], None]] = None,
     ) -> bool:
         self.actionable_calls.append(
             dict(
@@ -81,6 +84,7 @@ class FakeNotifier:
                 body=body,
                 button_label=button_label,
                 expire_after_secs=expire_after_secs,
+                secondary_button_label=secondary_button_label,
             )
         )
         if not self.dispatch_returns:
@@ -88,6 +92,7 @@ class FakeNotifier:
         self._latch = False
         self._on_pressed = on_pressed
         self._on_expire = on_expire
+        self._on_secondary = on_secondary_pressed
         return True
 
     def has_authorisation_sync(self) -> Optional[bool]:
@@ -107,6 +112,12 @@ class FakeNotifier:
             return
         self._latch = True
         self._on_expire()
+
+    def simulate_snooze(self) -> None:
+        if self._latch or self._on_secondary is None:
+            return
+        self._latch = True
+        self._on_secondary()
 
 
 class FakeAuthClient:
@@ -861,3 +872,250 @@ async def test_first_fire_on_start_skipped_if_mic_active(
     await sched._maybe_first_fire()
     assert notifier.actionable_calls == []
     assert sched._stats.last_fired_on_day is None
+
+
+# ---------------------------------------------------------------------------
+# Snooze button (v3.8.x)
+# ---------------------------------------------------------------------------
+#
+# The daily-drill toast carries a "Snooze 1h" secondary button. Clicking it
+# defers the drill within the same day (re-fire after snooze_duration_secs)
+# instead of losing it. One snooze per drill; if the user is busy at the
+# re-fire moment we keep retrying until snooze_max_defer_secs, then fall back
+# to the EOD tray. We deliberately did NOT tighten the activity gate — see
+# the v3.6.7 pivot (over-conservative gating = the toast never fires at all).
+
+
+@pytest.mark.asyncio
+async def test_drill_toast_offers_snooze_button(stats_path, monkeypatch) -> None:
+    """The original fire carries the 'Snooze 1h' secondary button."""
+    _patch_fetch(monkeypatch, _ok_response())
+    sched, notifier, _ = _make_scheduler(stats_path=stats_path)
+    await sched._evaluate_and_maybe_fire(ignore_gates=False)
+    assert len(notifier.actionable_calls) == 1
+    assert notifier.actionable_calls[0]["secondary_button_label"] == "Snooze 1h"
+
+
+@pytest.mark.asyncio
+async def test_snooze_records_outcome_and_sets_pending_snooze_until(
+    stats_path, monkeypatch,
+) -> None:
+    """Snooze click → outcome 'snooze', re-fire deadline = now+1h.
+
+    last_fire_at must NOT move — it still reflects the original toast so
+    first-fire-on-start stays cooldown-blocked and the tick loop owns the
+    re-fire.
+    """
+    _patch_fetch(monkeypatch, _ok_response())
+    now = datetime(2026, 5, 4, 11, 5)
+    sched, notifier, _ = _make_scheduler(stats_path=stats_path, now=now)
+    await sched._evaluate_and_maybe_fire(ignore_gates=False)
+    notifier.simulate_snooze()
+    bucket = sched._model.stats.buckets["0-11"]
+    assert bucket.snoozes == 1
+    assert bucket.taps == 0
+    assert bucket.expires == 0
+    assert sched._stats.pending_snooze_until == (now + timedelta(hours=1)).isoformat()
+    assert sched._stats.last_fire_at == now.isoformat()
+
+
+@pytest.mark.asyncio
+async def test_snooze_does_not_refire_before_duration(
+    stats_path, monkeypatch,
+) -> None:
+    """Within the 1h snooze window the scheduler stays quiet."""
+    _patch_fetch(monkeypatch, _ok_response())
+    t0 = datetime(2026, 5, 4, 11, 5)
+    sched, notifier, _ = _make_scheduler(stats_path=stats_path, now=t0)
+    clock = {"now": t0}
+    sched._now_fn = lambda: clock["now"]  # type: ignore[assignment]
+    await sched._evaluate_and_maybe_fire(ignore_gates=False)
+    notifier.simulate_snooze()
+    clock["now"] = t0 + timedelta(minutes=30)  # still inside the window
+    res = await sched._evaluate_and_maybe_fire(ignore_gates=False)
+    assert res.status == "skipped_snoozed"
+    assert len(notifier.actionable_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_snooze_refires_after_duration_when_idle(
+    stats_path, monkeypatch,
+) -> None:
+    """Past the 1h window with the user present, the drill re-fires once.
+
+    The re-fire is the single allowed snooze → its toast offers no
+    secondary button (can't chain into 'never fires').
+    """
+    _patch_fetch(monkeypatch, _ok_response())
+    t0 = datetime(2026, 5, 4, 11, 5)
+    sched, notifier, _ = _make_scheduler(stats_path=stats_path, now=t0)
+    clock = {"now": t0}
+    sched._now_fn = lambda: clock["now"]  # type: ignore[assignment]
+    await sched._evaluate_and_maybe_fire(ignore_gates=False)
+    notifier.simulate_snooze()
+    assert len(notifier.actionable_calls) == 1
+    clock["now"] = t0 + timedelta(hours=1, seconds=1)
+    res = await sched._evaluate_and_maybe_fire(ignore_gates=False)
+    assert res.status == "fired"
+    assert len(notifier.actionable_calls) == 2
+    assert notifier.actionable_calls[1]["secondary_button_label"] is None
+    assert sched._stats.pending_snooze_until is None
+
+
+@pytest.mark.asyncio
+async def test_snooze_refire_deferred_when_armed(stats_path, monkeypatch) -> None:
+    """If the user is in a meeting at the re-fire moment, defer (don't drop)."""
+    _patch_fetch(monkeypatch, _ok_response())
+    t0 = datetime(2026, 5, 4, 11, 5)
+    sched, notifier, _ = _make_scheduler(stats_path=stats_path, now=t0)
+    clock = {"now": t0}
+    armed = {"v": _DISARMED}
+    sched._now_fn = lambda: clock["now"]  # type: ignore[assignment]
+    sched._arm_state_fn = lambda: armed["v"]  # type: ignore[assignment]
+    await sched._evaluate_and_maybe_fire(ignore_gates=False)
+    notifier.simulate_snooze()
+    clock["now"] = t0 + timedelta(hours=1, seconds=1)  # past deadline …
+    armed["v"] = _ARMED  # … but now in a meeting
+    res = await sched._evaluate_and_maybe_fire(ignore_gates=False)
+    assert res.status == "skipped_armed"
+    assert len(notifier.actionable_calls) == 1
+    # Still pending — the next idle tick will re-fire.
+    assert sched._stats.pending_snooze_until is not None
+
+
+@pytest.mark.asyncio
+async def test_snooze_refire_drops_to_eod_after_max_defer(
+    stats_path, monkeypatch,
+) -> None:
+    """Busy past snooze_max_defer_secs → give up to the quiet EOD tray."""
+    _patch_fetch(monkeypatch, _ok_response())
+    t0 = datetime(2026, 5, 4, 11, 5)
+    tray = FakeTrayState()
+    sched, notifier, _ = _make_scheduler(stats_path=stats_path, now=t0)
+    sched._tray_state = tray  # type: ignore[assignment]
+    clock = {"now": t0}
+    sched._now_fn = lambda: clock["now"]  # type: ignore[assignment]
+    await sched._evaluate_and_maybe_fire(ignore_gates=False)
+    notifier.simulate_snooze()
+    # 1h window + 4h max defer + slack.
+    clock["now"] = t0 + timedelta(hours=6)
+    res = await sched._evaluate_and_maybe_fire(ignore_gates=False)
+    assert res.status == "skipped_snooze_gave_up"
+    assert sched._stats.pending_snooze_until is None
+    assert tray.label == "Today's drill — 60s"
+    assert len(notifier.actionable_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_snooze_bypasses_cooldown_at_refire(stats_path, monkeypatch) -> None:
+    """The original fire's 18h cooldown must NOT block the 1h re-fire."""
+    _patch_fetch(monkeypatch, _ok_response())
+    t0 = datetime(2026, 5, 4, 11, 5)
+    sched, notifier, _ = _make_scheduler(stats_path=stats_path, now=t0)
+    clock = {"now": t0}
+    sched._now_fn = lambda: clock["now"]  # type: ignore[assignment]
+    await sched._evaluate_and_maybe_fire(ignore_gates=False)
+    assert sched._stats.last_fire_at == t0.isoformat()
+    notifier.simulate_snooze()
+    assert sched._stats.last_fire_at == t0.isoformat()  # unchanged by snooze
+    clock["now"] = t0 + timedelta(hours=1, seconds=1)  # deep inside 18h cooldown
+    res = await sched._evaluate_and_maybe_fire(ignore_gates=False)
+    assert res.status == "fired"
+    # The re-fire advanced the cooldown clock.
+    assert sched._stats.last_fire_at == (t0 + timedelta(hours=1, seconds=1)).isoformat()
+
+
+@pytest.mark.asyncio
+async def test_snooze_persists_across_scheduler_restart(
+    stats_path, monkeypatch,
+) -> None:
+    """A pending snooze survives an agent restart — it lives in stats.json."""
+    _patch_fetch(monkeypatch, _ok_response())
+    t0 = datetime(2026, 5, 4, 11, 5)
+    sched1, notifier1, _ = _make_scheduler(stats_path=stats_path, now=t0)
+    clock1 = {"now": t0}
+    sched1._now_fn = lambda: clock1["now"]  # type: ignore[assignment]
+    await sched1._evaluate_and_maybe_fire(ignore_gates=False)
+    notifier1.simulate_snooze()
+    assert sched1._stats.pending_snooze_until is not None
+
+    # Fresh scheduler reads the same stats file; advance past the deadline.
+    t1 = t0 + timedelta(hours=1, seconds=1)
+    sched2, notifier2, _ = _make_scheduler(stats_path=stats_path, now=t1)
+    assert sched2._stats.pending_snooze_until == (t0 + timedelta(hours=1)).isoformat()
+    res = await sched2._evaluate_and_maybe_fire(ignore_gates=False)
+    assert res.status == "fired"
+    assert len(notifier2.actionable_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_manual_fire_while_snooze_pending_clears_it(
+    stats_path, monkeypatch,
+) -> None:
+    """fire_now (ignore_gates) while a snooze is armed must consume the
+    pending deadline, or the tick loop would re-fire a duplicate later."""
+    _patch_fetch(monkeypatch, _ok_response())
+    t0 = datetime(2026, 5, 4, 11, 5)
+    sched, notifier, _ = _make_scheduler(stats_path=stats_path, now=t0)
+    clock = {"now": t0}
+    sched._now_fn = lambda: clock["now"]  # type: ignore[assignment]
+    await sched._evaluate_and_maybe_fire(ignore_gates=False)
+    notifier.simulate_snooze()
+    assert sched._stats.pending_snooze_until is not None
+    # Manual trigger 30 min later (still inside the snooze window).
+    clock["now"] = t0 + timedelta(minutes=30)
+    res = await sched.fire_now(ignore_gates=True)
+    assert res.status == "fired"
+    # Deadline consumed → no duplicate re-fire waiting.
+    assert sched._stats.pending_snooze_until is None
+
+
+@pytest.mark.asyncio
+async def test_snooze_refire_transient_error_keeps_pending(
+    stats_path, monkeypatch,
+) -> None:
+    """A transient server error at the re-fire moment must NOT consume the
+    snooze — the next tick retries (bounded by snooze_max_defer_secs)."""
+    t0 = datetime(2026, 5, 4, 11, 5)
+    # First a good response so the original fire + snooze succeed.
+    _patch_fetch(monkeypatch, _ok_response())
+    sched, notifier, _ = _make_scheduler(stats_path=stats_path, now=t0)
+    clock = {"now": t0}
+    sched._now_fn = lambda: clock["now"]  # type: ignore[assignment]
+    await sched._evaluate_and_maybe_fire(ignore_gates=False)
+    notifier.simulate_snooze()
+    # Re-fire time arrives, but the server now returns a transient error.
+    _patch_fetch(monkeypatch, TodaySessionResponse(status="transient_error"))
+    clock["now"] = t0 + timedelta(hours=1, seconds=1)
+    res = await sched._evaluate_and_maybe_fire(ignore_gates=False)
+    assert res.status == "skipped_transient_error"
+    # Snooze still armed → next tick retries.
+    assert sched._stats.pending_snooze_until is not None
+
+
+@pytest.mark.asyncio
+async def test_first_fire_skipped_when_snooze_pending(
+    stats_path, monkeypatch,
+) -> None:
+    """First-fire-on-start defers to the tick loop when a snooze is pending,
+    rather than racing it via the ignore_gates path."""
+    _patch_fetch(monkeypatch, _ok_response())
+    cfg = _cfg(boot_warmup_secs=0.05)
+    now = datetime(2026, 5, 4, 14, 0)
+    sched, notifier, _ = _make_scheduler(stats_path=stats_path, cfg=cfg, now=now)
+    # Pending snooze due shortly; last_fire_at left None so cooldown alone
+    # would NOT block first-fire — proving the snooze guard is what stops it.
+    sched._stats.pending_snooze_until = (now + timedelta(minutes=30)).isoformat()
+    sched._stats.last_fire_at = None
+    await sched._maybe_first_fire()
+    assert notifier.actionable_calls == []
+
+
+def test_snooze_stale_pending_dropped_on_start(stats_path, monkeypatch) -> None:
+    """A snooze whose window fully lapsed (agent off overnight) is cleared."""
+    _patch_fetch(monkeypatch, _ok_response())
+    now = datetime(2026, 5, 5, 11, 5)
+    sched, _, _ = _make_scheduler(stats_path=stats_path, now=now)
+    sched._stats.pending_snooze_until = (now - timedelta(hours=30)).isoformat()
+    sched._maybe_clear_stale_snooze()
+    assert sched._stats.pending_snooze_until is None

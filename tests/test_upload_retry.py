@@ -120,6 +120,9 @@ class MockNotifier:
         button_label: str,
         on_pressed: Any,
         expire_after_secs: float | None = None,
+        on_expire: Any = None,
+        secondary_button_label: str | None = None,
+        on_secondary_pressed: Any = None,
     ) -> bool:
         self.actionable_calls.append(
             {
@@ -128,6 +131,7 @@ class MockNotifier:
                 "button_label": button_label,
                 "on_pressed": on_pressed,
                 "expire_after_secs": expire_after_secs,
+                "secondary_button_label": secondary_button_label,
             }
         )
         return True

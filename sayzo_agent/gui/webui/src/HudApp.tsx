@@ -52,6 +52,7 @@ interface ActionableState {
   body: string;
   button_label: string;
   expire_after_secs: number;
+  secondary_button_label?: string;
 }
 
 const MAX_VISIBLE_TOASTS = 3;
@@ -261,6 +262,7 @@ export function HudApp() {
             body: cmd.body,
             button_label: cmd.button_label,
             expire_after_secs: cmd.expire_after_secs,
+            secondary_button_label: cmd.secondary_button_label,
           });
           break;
         case "hide_all":
@@ -301,7 +303,7 @@ export function HudApp() {
   }, []);
 
   const handleActionable = useCallback(
-    (request_id: string, outcome: "pressed" | "expired") => {
+    (request_id: string, outcome: "pressed" | "expired" | "snoozed") => {
       setActionable(null);
       void hudBridge.sendEvent({
         event: "actionable_response",
@@ -461,6 +463,7 @@ export function HudApp() {
             title: "Daily speaking drill",
             body: "Two minutes today — practice the filler-word habit you've been working on.",
             button_label: "Open drill",
+            secondary_button_label: "Snooze 1h",
             expire_after_secs: 30,
           }),
       },
@@ -542,6 +545,7 @@ export function HudApp() {
           title={actionable.title}
           body={actionable.body}
           buttonLabel={actionable.button_label}
+          secondaryButtonLabel={actionable.secondary_button_label}
           expireAfterSecs={actionable.expire_after_secs}
           onOutcome={(o) => handleActionable(actionable.request_id, o)}
         />

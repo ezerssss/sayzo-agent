@@ -21,11 +21,21 @@ Outcome semantics (decided by user planning round):
 * ``expire`` — no click within ``dismiss_window_secs``. Weight ``+0``.
   We deliberately collapsed dismiss-vs-expire here because OS APIs can't
   reliably tell us whether the user actively dismissed or just ignored.
+* ``snooze`` — user clicked "Snooze 1h" (v3.8.x). The strongest *signal*
+  we have that the user saw the toast and deliberately chose to defer
+  (vs ``expire``, which conflates "saw it, ignored it" with "wasn't at
+  the screen"). Weight ``+0.5`` — between a tap and an expire. The
+  scheduler re-fires once after ``snooze_duration_secs``; that re-fire
+  records its own terminal ``tap`` / ``soft_tap`` / ``expire``, so one
+  snoozed-then-engaged drill contributes two history rows.
 
 The Thompson-sampling hour pick uses ``Beta(taps + soft_taps + α,
 expires + α)`` per candidate hour; an untried hour gets ``Beta(α, α)``
 which is symmetric around 0.5 and therefore gets sampled before
-tried-and-failed hours converge on a low engagement rate.
+tried-and-failed hours converge on a low engagement rate. (Thompson
+sampling has been telemetry-only since v3.6.7 — the activity+cooldown
+gate drives timing now — so ``snooze`` is folded into ``smoothed_score``
+for a future engagement-by-hour UI but does not influence firing.)
 """
 from __future__ import annotations
 
@@ -44,7 +54,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
-NotificationOutcome = Literal["tap", "soft_tap", "expire"]
+NotificationOutcome = Literal["tap", "soft_tap", "expire", "snooze"]
 
 _SCHEMA_VERSION = 1
 
@@ -61,6 +71,7 @@ class BucketStats:
     taps: int = 0
     soft_taps: int = 0
     expires: int = 0
+    snoozes: int = 0
     last_fired_at: Optional[str] = None  # ISO 8601 local
 
     def as_dict(self) -> dict[str, Any]:
@@ -69,6 +80,7 @@ class BucketStats:
             "taps": self.taps,
             "soft_taps": self.soft_taps,
             "expires": self.expires,
+            "snoozes": self.snoozes,
             "last_fired_at": self.last_fired_at,
         }
 
@@ -79,6 +91,7 @@ class BucketStats:
             taps=int(d.get("taps", 0)),
             soft_taps=int(d.get("soft_taps", 0)),
             expires=int(d.get("expires", 0)),
+            snoozes=int(d.get("snoozes", 0)),
             last_fired_at=d.get("last_fired_at") or None,
         )
 
@@ -117,6 +130,17 @@ class NotificationStats:
     last_fired_on_day: Optional[str] = None  # YYYY-MM-DD local (legacy, kept for telemetry)
     eod_fallback_shown_on: Optional[str] = None
     os_disabled_prompt_shown: bool = False
+    # Snooze re-fire state (v3.8.x). When the user clicks "Snooze 1h" the
+    # scheduler stamps here the wall-clock time the toast should re-appear
+    # (ISO 8601 local) and persists it so the snooze survives an agent
+    # restart. The tick loop consults ``pending_snooze_until`` to re-fire,
+    # bypassing the cooldown gate (the user explicitly asked to be
+    # re-pinged). Cleared on re-fire, on give-up after
+    # ``snooze_max_defer_secs``, and stale-on-start. The re-fire toast
+    # carries no snooze button, so a drill is deferrable at most once —
+    # there's no count or session id worth persisting (the snooze outcome
+    # is already in ``history`` with its session). ``None`` ⇒ no snooze.
+    pending_snooze_until: Optional[str] = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -127,6 +151,7 @@ class NotificationStats:
             "last_fired_on_day": self.last_fired_on_day,
             "eod_fallback_shown_on": self.eod_fallback_shown_on,
             "os_disabled_prompt_shown": self.os_disabled_prompt_shown,
+            "pending_snooze_until": self.pending_snooze_until,
         }
 
     @classmethod
@@ -153,7 +178,7 @@ class NotificationStats:
             if not isinstance(entry, dict):
                 continue
             outcome = entry.get("outcome")
-            if outcome not in ("tap", "soft_tap", "expire"):
+            if outcome not in ("tap", "soft_tap", "expire", "snooze"):
                 continue
             history.append(
                 HistoryEntry(
@@ -175,6 +200,7 @@ class NotificationStats:
             last_fired_on_day=d.get("last_fired_on_day") or None,
             eod_fallback_shown_on=d.get("eod_fallback_shown_on") or None,
             os_disabled_prompt_shown=bool(d.get("os_disabled_prompt_shown", False)),
+            pending_snooze_until=d.get("pending_snooze_until") or None,
         )
 
 
@@ -256,17 +282,19 @@ class BucketModel:
     def smoothed_score(self, dow: int, hour: int, *, as_of: datetime) -> float:
         """Recency-decayed engagement score in [0, 1].
 
-        Score = (taps*1.0 + soft_taps*0.3 + expires*0.0) * decay
-                / (fires + alpha)
+        Score = (taps*1.0 + soft_taps*0.3 + snoozes*0.5 + expires*0.0)
+                * decay / (fires + alpha)
 
         Decay is per-bucket, applied to the most-recent-fire timestamp.
-        Returns ``0.0`` for an absent bucket.
+        Returns ``0.0`` for an absent bucket. ``snooze`` weighs ``0.5`` —
+        the user saw the toast and deferred (moderate positive) rather
+        than ignoring it outright. Telemetry-only since v3.6.7.
         """
         b = self.stats.buckets.get(_bucket_key(dow, hour))
         if b is None:
             return 0.0
         decay = self._decay_factor(b, as_of=as_of)
-        weighted = b.taps * 1.0 + b.soft_taps * 0.3 + b.expires * 0.0
+        weighted = b.taps * 1.0 + b.soft_taps * 0.3 + b.snoozes * 0.5 + b.expires * 0.0
         return (weighted * decay) / (b.fires + self._cfg.prior_alpha)
 
     def _decay_factor(self, b: BucketStats, *, as_of: datetime) -> float:
@@ -381,6 +409,8 @@ class BucketModel:
             b.soft_taps += 1
         elif outcome == "expire":
             b.expires += 1
+        elif outcome == "snooze":
+            b.snoozes += 1
         # last_fired_at already set by record_fire; refresh anyway in case
         # an outcome arrives without a preceding record_fire (test paths).
         if not b.last_fired_at:

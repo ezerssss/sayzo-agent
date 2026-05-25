@@ -137,6 +137,8 @@ class _FakeLauncher:
         on_pressed: Callable[[], None],
         expire_after_secs: float,
         on_expire: Optional[Callable[[], None]] = None,
+        secondary_button_label: Optional[str] = None,
+        on_secondary_pressed: Optional[Callable[[], None]] = None,
     ) -> bool:
         self.calls.append((
             "show_actionable",
@@ -145,10 +147,13 @@ class _FakeLauncher:
                 "body": body,
                 "button_label": button_label,
                 "expire_after_secs": expire_after_secs,
+                "secondary_button_label": secondary_button_label,
             },
         ))
         if self._actionable_outcome == "pressed":
             on_pressed()
+        elif self._actionable_outcome == "snoozed" and on_secondary_pressed is not None:
+            on_secondary_pressed()
         elif self._actionable_outcome == "expired" and on_expire is not None:
             on_expire()
         return True
@@ -238,6 +243,48 @@ def test_hud_notifier_actionable_expire():
     )
     assert expired.is_set()
     assert pressed == []
+
+
+def test_hud_notifier_actionable_secondary_button_forwards():
+    """v3.8.x: the optional 'Snooze 1h' secondary button + its callback
+    forward through HudNotifier → launcher, and a 'snoozed' outcome fires
+    on_secondary_pressed (not on_pressed / on_expire)."""
+    fake = _FakeLauncher()
+    fake.set_actionable_outcome("snoozed")
+    snoozed = threading.Event()
+    pressed: list[bool] = []
+    expired: list[bool] = []
+    HudNotifier(fake).notify_actionable(
+        "Daily drill",
+        "Body",
+        button_label="Open drill",
+        on_pressed=lambda: pressed.append(True),
+        expire_after_secs=2.0,
+        on_expire=lambda: expired.append(True),
+        secondary_button_label="Snooze 1h",
+        on_secondary_pressed=lambda: snoozed.set(),
+    )
+    assert snoozed.is_set()
+    assert pressed == []
+    assert expired == []
+    name, kwargs = fake.calls[0]
+    assert name == "show_actionable"
+    assert kwargs["secondary_button_label"] == "Snooze 1h"
+
+
+def test_hud_notifier_actionable_no_secondary_button_by_default():
+    """Single-button actionables still forward with secondary=None."""
+    fake = _FakeLauncher()
+    fake.set_actionable_outcome("pressed")
+    HudNotifier(fake).notify_actionable(
+        "Daily drill",
+        "Body",
+        button_label="Open drill",
+        on_pressed=lambda: None,
+        expire_after_secs=2.0,
+    )
+    _, kwargs = fake.calls[0]
+    assert kwargs["secondary_button_label"] is None
 
 
 def test_hud_notifier_has_authorisation_when_alive():

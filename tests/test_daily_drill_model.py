@@ -351,6 +351,31 @@ def test_save_atomic_is_atomic_replace(tmp_path: Path) -> None:
     assert not (tmp_path / "stats.json.tmp").exists()
 
 
+def test_snooze_outcome_persists_through_load_save_roundtrip(tmp_path: Path) -> None:
+    """Guards the snooze quartet (Literal, BucketStats.snoozes, from_dict
+    whitelist, record_outcome branch) + the pending_snooze_until field
+    against a partial revert: a snoozed drill must survive a save→load
+    cycle intact."""
+    cfg = _cfg()
+    m = BucketModel(NotificationStats(), cfg)
+    fired_at = _dt(hour=10)
+    m.record_fire(fired_at)
+    m.record_outcome(fired_at, "snooze", latency_ms=None, session_id="sess_x")
+    m.stats.pending_snooze_until = "2026-05-04T11:00:00"
+
+    path = tmp_path / "stats.json"
+    m.save_atomic(path)
+    loaded = BucketModel.load(path, cfg)
+
+    b = loaded.stats.buckets["0-10"]
+    assert b.snoozes == 1
+    assert b.fires == 1
+    assert len(loaded.stats.history) == 1
+    assert loaded.stats.history[0].outcome == "snooze"
+    assert loaded.stats.history[0].session_id == "sess_x"
+    assert loaded.stats.pending_snooze_until == "2026-05-04T11:00:00"
+
+
 def test_load_skips_history_entries_with_unknown_outcome(tmp_path: Path) -> None:
     """Forward-compat: a future build might add new outcome types. Don't
     crash on read; just drop the unknown rows."""

@@ -75,6 +75,10 @@ export interface ShowActionableCmd {
   body: string;
   button_label: string;
   expire_after_secs: number;
+  // Optional "Snooze 1h"-style secondary button (v3.8.x). Absent on
+  // single-button actionables; when present, ActionableToast renders a
+  // second ghost button that emits outcome: "snoozed".
+  secondary_button_label?: string;
 }
 
 export interface HideAllCmd {
@@ -100,7 +104,11 @@ export type HudCommand =
 export type HudEvent =
   | { event: "hud_ready" }
   | { event: "card_response"; request_id: string; answer: "yes" | "no" | "timeout" }
-  | { event: "actionable_response"; request_id: string; outcome: "pressed" | "expired" }
+  | {
+      event: "actionable_response";
+      request_id: string;
+      outcome: "pressed" | "expired" | "snoozed";
+    }
   | { event: "pill_stop_clicked" }
   | { event: "pill_collapsed" }
   | { event: "pill_expanded" }

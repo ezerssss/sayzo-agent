@@ -43,7 +43,7 @@ import threading
 import time
 import webbrowser
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Awaitable, Callable, Literal, Optional
 
@@ -92,6 +92,11 @@ FireResultStatus = Literal[
     "skipped_auth_error",
     "skipped_transient_error",
     "skipped_dispatch_failed",
+    # v3.8.x snooze: a re-fire is pending but not yet due (still waiting
+    # out the snooze window), and the give-up status when the user was
+    # busy past snooze_max_defer_secs so we fell back to the EOD tray.
+    "skipped_snoozed",
+    "skipped_snooze_gave_up",
 ]
 
 
@@ -202,6 +207,7 @@ class DailyDrillScheduler:
         )
         self._has_auth_cached = self._notifier.has_authorisation_sync()
         log.info("[daily_drill] OS notification authorisation: %s", self._has_auth_cached)
+        self._maybe_clear_stale_snooze()
         self._started_at_mono = time.monotonic()
         self._stop.clear()
         self._task = asyncio.create_task(self._tick_loop(), name="daily_drill")
@@ -266,6 +272,19 @@ class DailyDrillScheduler:
         if self._is_in_cooldown(now):
             log.info(
                 "[daily_drill] first-fire on start: within cooldown; skipping"
+            )
+            return
+        # Defer to the tick loop when a snooze re-fire is pending. Today the
+        # cooldown check above already covers this (a non-stale snooze keeps
+        # last_fire_at recent, well inside cooldown_secs) — but that's a
+        # magnitude coincidence (snooze_max_defer_secs < cooldown_secs). This
+        # explicit guard keeps first-fire from racing the tick loop's re-fire
+        # even if those knobs are retuned. (Stale snoozes were already cleared
+        # by _maybe_clear_stale_snooze in start().)
+        if self._stats.pending_snooze_until:
+            log.info(
+                "[daily_drill] first-fire on start: snooze re-fire pending; "
+                "leaving it to the tick loop"
             )
             return
 
@@ -366,12 +385,55 @@ class DailyDrillScheduler:
             self._reset_daily_state(today)
             self._last_seen_day = today
 
+        # Snooze re-fire (v3.8.x). If the user clicked "Snooze 1h" earlier,
+        # a re-fire deadline is stamped in stats. Until it passes we stay
+        # quiet; once it passes we bypass the cooldown gate below (the user
+        # explicitly asked to be re-pinged) but still honor every activity
+        # / meeting gate. If they're busy at the deadline we keep retrying
+        # each tick; past snooze_max_defer_secs beyond it we give up to the
+        # quiet EOD tray so a back-to-back-meetings afternoon can't defer
+        # forever. ignore_gates (manual fire-now) skips all of this and
+        # fires immediately — but first-fire-on-start is naturally blocked
+        # by the original fire's cooldown, so it won't double-fire.
+        snooze_bypass_cooldown = False
+        if not ignore_gates and self._stats.pending_snooze_until:
+            snooze_due = self._parse_snooze_until()
+            if snooze_due is None:
+                self._clear_pending_snooze()
+                self._save_stats()
+            elif now < snooze_due:
+                return FireResult(status="skipped_snoozed")
+            elif (now - snooze_due).total_seconds() > self._cfg.snooze_max_defer_secs:
+                log.info(
+                    "[daily_drill] snooze re-fire abandoned after %.0fs "
+                    "unreached (user away or busy past the window); falling "
+                    "back to EOD tray",
+                    (now - snooze_due).total_seconds(),
+                )
+                self._clear_pending_snooze()
+                # Only surface the tray label when we still hold the
+                # response to open on click. After a restart mid-snooze
+                # _current_today is None; a label that no-ops on click is
+                # worse than no label (today's normal fire still covers it).
+                if self._current_today is not None:
+                    self._set_tray_eod_label_if_needed(today)
+                self._save_stats()
+                return FireResult(status="skipped_snooze_gave_up")
+            else:
+                snooze_bypass_cooldown = True
+
         # v3.6.7: cooldown replaces `last_fired_on_day == today`. A single
         # timestamp comparison handles every schedule (daytime, night
         # shift, irregular) without time-of-day knowledge. ignore_gates
         # bypasses this for the test-trigger CLI; first-fire-on-start
-        # honors it via its own _is_in_cooldown call.
-        if not ignore_gates and self._is_in_cooldown(now):
+        # honors it via its own _is_in_cooldown call. snooze_bypass_cooldown
+        # lets a due snooze re-fire through despite the original fire's
+        # cooldown still being active.
+        if (
+            not ignore_gates
+            and not snooze_bypass_cooldown
+            and self._is_in_cooldown(now)
+        ):
             return FireResult(status="skipped_already_fired")
 
         if not self._master_enabled and not ignore_gates:
@@ -440,7 +502,70 @@ class DailyDrillScheduler:
             # so a future UI could surface "your peak engagement hours"
             # without re-instrumenting.
 
-        return await self._fire_drill(now, today)
+        result = await self._fire_drill(
+            now, today, is_snooze_refire=snooze_bypass_cooldown,
+        )
+        # Any fire that actually reaches the user consumes a pending snooze —
+        # both the snooze-bypass re-fire AND a manual fire_now / first-fire
+        # (ignore_gates) that dispatched while a snooze was still armed.
+        # Without this the leftover deadline would re-fire a duplicate toast
+        # at the original re-fire time. A transient failure (no dispatch)
+        # leaves the deadline set so the next tick retries — bounded by
+        # snooze_max_defer_secs.
+        if (
+            self._stats.pending_snooze_until is not None
+            and result.status in ("fired", "skipped_dispatch_failed")
+        ):
+            self._stats.pending_snooze_until = None
+            self._save_stats()
+        return result
+
+    # ------------------------------------------------------------------
+    # Snooze helpers (v3.8.x)
+    # ------------------------------------------------------------------
+
+    def _parse_snooze_until(self) -> Optional[datetime]:
+        """Parse the pending re-fire timestamp; None if unset / corrupt."""
+        raw = self._stats.pending_snooze_until
+        if not raw:
+            return None
+        # `or None` in from_dict only filters falsy values, so a hand-corrupted
+        # stats file could leave a truthy non-string here — fromisoformat
+        # raises TypeError (not ValueError) on that. Catch both so a bad
+        # on-disk value degrades to "no snooze" instead of crashing start().
+        try:
+            return datetime.fromisoformat(raw)
+        except (ValueError, TypeError):
+            log.warning(
+                "[daily_drill] unparseable pending_snooze_until=%r; clearing", raw
+            )
+            return None
+
+    def _clear_pending_snooze(self) -> None:
+        """Drop the snooze re-fire deadline (caller is responsible for save)."""
+        self._stats.pending_snooze_until = None
+
+    def _maybe_clear_stale_snooze(self) -> None:
+        """On start, discard a snooze whose re-fire window has fully lapsed.
+
+        If the agent was off long enough that the re-fire deadline plus the
+        max-defer grace has passed, the snooze is dead — clear it so we
+        don't surface a stale, possibly day-old drill toast on next tick.
+        """
+        if not self._stats.pending_snooze_until:
+            return
+        due = self._parse_snooze_until()
+        if due is None:
+            self._clear_pending_snooze()
+            self._save_stats()
+            return
+        if (self._now_fn() - due).total_seconds() > self._cfg.snooze_max_defer_secs:
+            log.info(
+                "[daily_drill] clearing stale pending snooze (was due %s)",
+                self._stats.pending_snooze_until,
+            )
+            self._clear_pending_snooze()
+            self._save_stats()
 
     def _is_in_cooldown(self, now: datetime) -> bool:
         """True if a fire happened within the last cooldown_secs.
@@ -461,7 +586,9 @@ class DailyDrillScheduler:
         secs_since = (now - last).total_seconds()
         return secs_since < self._cfg.cooldown_secs
 
-    async def _fire_drill(self, now: datetime, today: str) -> FireResult:
+    async def _fire_drill(
+        self, now: datetime, today: str, *, is_snooze_refire: bool = False,
+    ) -> FireResult:
         with self._lock:
             if self._fetch_in_flight:
                 return FireResult(status="skipped_in_progress")
@@ -521,6 +648,16 @@ class DailyDrillScheduler:
         with self._lock:
             self._pending = pending
 
+        # Offer the "Snooze 1h" secondary button on the original fire only.
+        # The re-fire (this is the one snooze the user already took) carries
+        # no snooze button, so a drill can't be chained into "never fires"
+        # (the v3.6.7 lesson).
+        offer_snooze = not is_snooze_refire
+        secondary_label = self._cfg.snooze_secondary_label if offer_snooze else None
+        on_secondary = (
+            (lambda: self._on_snoozed_callback(pending)) if offer_snooze else None
+        )
+
         dispatched = self._notifier.notify_actionable(
             title=title,
             body=body,
@@ -528,6 +665,8 @@ class DailyDrillScheduler:
             on_pressed=lambda: self._on_pressed_callback(pending),
             expire_after_secs=self._cfg.dismiss_window_secs,
             on_expire=lambda: self._on_expire_callback(pending),
+            secondary_button_label=secondary_label,
+            on_secondary_pressed=on_secondary,
         )
         if not dispatched:
             # Backend can't render — fall back to the tray surface for
@@ -594,6 +733,9 @@ class DailyDrillScheduler:
             latency_ms=latency_ms,
             session_id=pending.session_id,
         )
+        # Terminal outcome — the drill is done; drop any snooze state so a
+        # leftover deadline can't re-fire after the user already engaged.
+        self._clear_pending_snooze()
         with self._lock:
             self._pending = None
         self._save_stats()
@@ -612,11 +754,43 @@ class DailyDrillScheduler:
             latency_ms=None,
             session_id=pending.session_id,
         )
+        # Terminal outcome — clear snooze state (see _on_pressed_callback).
+        self._clear_pending_snooze()
         with self._lock:
             self._pending = None
         self._save_stats()
         log.info(
             "[daily_drill] recorded outcome=expire session=%s", pending.session_id
+        )
+
+    def _on_snoozed_callback(self, pending: _PendingFire) -> None:
+        """Notifier on_secondary_pressed → record `snooze` + stamp re-fire.
+
+        The user clicked "Snooze 1h". Record the deferral as its own
+        outcome (the strongest "saw it, chose to wait" signal we have),
+        then stamp the wall-clock re-fire time into stats so the tick loop
+        re-fires after ``snooze_duration_secs``. ``last_fire_at`` is
+        deliberately NOT touched — it still reflects the original toast, so
+        first-fire-on-start stays blocked by the cooldown while the tick
+        loop owns the re-fire.
+        """
+        now = self._now_fn()
+        self._model.record_outcome(
+            pending.fired_at_dt,
+            "snooze",
+            latency_ms=None,
+            session_id=pending.session_id,
+        )
+        self._stats.pending_snooze_until = (
+            now + timedelta(seconds=self._cfg.snooze_duration_secs)
+        ).isoformat()
+        with self._lock:
+            self._pending = None
+        self._save_stats()
+        log.info(
+            "[daily_drill] snooze: re-fire scheduled for %s session=%s",
+            self._stats.pending_snooze_until,
+            pending.session_id,
         )
 
     # ------------------------------------------------------------------
@@ -705,7 +879,16 @@ class DailyDrillScheduler:
             log.warning("[daily_drill] save_stats failed", exc_info=True)
 
     def _reset_daily_state(self, today: str) -> None:
-        """Cross-midnight reset: clear today's pending fire + tray label."""
+        """Cross-midnight reset: clear today's pending fire + tray label.
+
+        Note: pending *snooze* state is deliberately NOT cleared here.
+        This runs on the first evaluation after construction too (when
+        ``_last_seen_day`` is still None), so clearing here would nuke a
+        snooze just loaded from disk on restart. Stale snoozes are instead
+        dropped by ``_maybe_clear_stale_snooze`` on start, by the give-up
+        branch once past ``snooze_max_defer_secs``, and naturally gated by
+        the idle check when the user is away.
+        """
         with self._lock:
             self._pending = None
             self._current_today = None

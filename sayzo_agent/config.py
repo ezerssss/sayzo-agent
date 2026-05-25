@@ -806,6 +806,27 @@ class NotificationConfig(BaseSettings):
     dismiss_window_secs: float = 300.0       # 5 min
     soft_tap_window_secs: float = 14400.0    # 4 h
 
+    # Snooze (v3.8.x). The daily-drill toast carries a "Snooze 1h"
+    # secondary button so a user who's mid-task when it fires can defer
+    # within the same day instead of losing the drill. (We deliberately
+    # did NOT tighten the activity gate further — see the v3.6.7 pivot:
+    # over-conservative gating means the toast never fires at all.) The
+    # re-fire toast carries no snooze button, so a drill is deferrable at
+    # most once — perpetual deferral would just be "never fires" with
+    # extra steps.
+    #
+    # * ``snooze_duration_secs`` — how far out the re-fire lands.
+    # * ``snooze_max_defer_secs`` — if the user is in a meeting (armed /
+    #   mic-active) when the snooze re-fire is due, we keep retrying each
+    #   tick rather than dropping it. Past this many seconds beyond the
+    #   snooze deadline we give up and fall back to the quiet EOD tray
+    #   label, so a back-to-back-meetings afternoon can't defer forever.
+    # * ``snooze_secondary_label`` — visible button copy; in config so a
+    #   future "Snooze 30m" experiment needs no code change.
+    snooze_duration_secs: float = 3600.0     # 1 h
+    snooze_max_defer_secs: float = 14400.0   # 4 h
+    snooze_secondary_label: str = "Snooze 1h"
+
     # Bucket scoring: smoothed_score =
     #   (taps*1.0 + soft_taps*0.3 + expires*0.0) * decay / (fires + alpha)
     # alpha=3 smooths a single bad fire so it can't permanently kill a slot.

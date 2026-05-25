@@ -299,7 +299,16 @@ class HudLauncher:
             entry = self._pending_actionables.pop(req_id, None) if req_id else None
             if entry is None:
                 return
-            cb = entry["on_pressed"] if outcome == "pressed" else entry["on_expire"]
+            # outcome ∈ {"pressed", "expired", "snoozed"}. "snoozed" routes
+            # to the optional secondary callback; an unknown / missing
+            # outcome falls through to on_expire (safe default — treat as
+            # "user didn't take the action").
+            if outcome == "pressed":
+                cb = entry["on_pressed"]
+            elif outcome == "snoozed":
+                cb = entry.get("on_secondary")
+            else:
+                cb = entry["on_expire"]
             if cb is None:
                 return
             try:
@@ -542,6 +551,8 @@ class HudLauncher:
         on_pressed: Callable[[], None],
         expire_after_secs: float,
         on_expire: Optional[Callable[[], None]] = None,
+        secondary_button_label: Optional[str] = None,
+        on_secondary_pressed: Optional[Callable[[], None]] = None,
     ) -> bool:
         if self._given_up:
             log.warning(
@@ -550,21 +561,27 @@ class HudLauncher:
             return False
         request_id = f"actionable-{uuid.uuid4().hex}"
         log.info(
-            "[notify] actionable scheduled: title=%r button=%r expire_after=%ss",
-            title, button_label, expire_after_secs,
+            "[notify] actionable scheduled: title=%r button=%r secondary=%r expire_after=%ss",
+            title, button_label, secondary_button_label, expire_after_secs,
         )
         self._pending_actionables[request_id] = {
             "on_pressed": on_pressed,
             "on_expire": on_expire,
+            "on_secondary": on_secondary_pressed,
         }
-        ok = self._send_threadsafe({
+        cmd: dict[str, Any] = {
             "cmd": Cmd.SHOW_ACTIONABLE,
             "request_id": request_id,
             "title": title,
             "body": body,
             "button_label": button_label,
             "expire_after_secs": float(expire_after_secs),
-        })
+        }
+        # Only carry the secondary button when present so single-button
+        # actionables stay byte-identical to the pre-v3.8.x command shape.
+        if secondary_button_label is not None:
+            cmd["secondary_button_label"] = secondary_button_label
+        ok = self._send_threadsafe(cmd)
         if not ok:
             self._pending_actionables.pop(request_id, None)
         return ok

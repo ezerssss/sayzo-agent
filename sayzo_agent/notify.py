@@ -62,6 +62,8 @@ class Notifier(Protocol):
         on_pressed: Callable[[], None],
         expire_after_secs: float,
         on_expire: Optional[Callable[[], None]] = None,
+        secondary_button_label: Optional[str] = None,
+        on_secondary_pressed: Optional[Callable[[], None]] = None,
     ) -> bool: ...
 
     def has_authorisation_sync(self) -> Optional[bool]: ...
@@ -100,9 +102,15 @@ class NoopNotifier:
         on_pressed: Callable[[], None],
         expire_after_secs: float,
         on_expire: Optional[Callable[[], None]] = None,
+        secondary_button_label: Optional[str] = None,
+        on_secondary_pressed: Optional[Callable[[], None]] = None,
     ) -> bool:
         log.debug(
-            "[notify] (noop) actionable %s — %s [%s]", title, body, button_label,
+            "[notify] (noop) actionable %s — %s [%s]%s",
+            title,
+            body,
+            button_label,
+            f" / [{secondary_button_label}]" if secondary_button_label else "",
         )
         # Test paths can drive the expire branch by registering on_expire.
         if on_expire is not None:
@@ -181,6 +189,8 @@ class HudNotifier:
         on_pressed: Callable[[], None],
         expire_after_secs: float,
         on_expire: Optional[Callable[[], None]] = None,
+        secondary_button_label: Optional[str] = None,
+        on_secondary_pressed: Optional[Callable[[], None]] = None,
     ) -> bool:
         return self._launcher.show_actionable(
             title,
@@ -189,6 +199,8 @@ class HudNotifier:
             on_pressed=on_pressed,
             expire_after_secs=expire_after_secs,
             on_expire=on_expire,
+            secondary_button_label=secondary_button_label,
+            on_secondary_pressed=on_secondary_pressed,
         )
 
     def has_authorisation_sync(self) -> Optional[bool]:
