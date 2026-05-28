@@ -41,11 +41,12 @@ from typing import TYPE_CHECKING, Callable
 import httpx
 
 from .auth.exceptions import AuthenticationRequired
-from .sink import read_record_from_dir, write_record_atomic
+from .sink import local_clock_label, read_record_from_dir, write_record_atomic
 from .upload import parse_json_body
 
 if TYPE_CHECKING:
     from .config import Config
+    from .models import ConversationRecord
     from .notify import Notifier
 
 log = logging.getLogger(__name__)
@@ -85,6 +86,29 @@ _INSIGHT_TOAST_TTL_SECS = 120.0
 # defeats the "while it's fresh" pitch.
 _INSIGHT_DEFER_MAX_SECS = 3600.0
 _DEFER_POLL_SECS = 10.0
+
+
+# Freshness buckets shown in the insight card's chip. Computed at fire time
+# from ``record.ended_at`` so a deferred fire (user in another meeting when
+# the insight became ready) doesn't claim "Just now" for a 50-minute-old
+# capture. Bucket boundaries are loose — the chip is glanceable copy, not a
+# stopwatch — and they're capped at hours because the defer staleness cap
+# is 1 h so >1 h labels are vanishingly rare in practice.
+def _freshness_label(ended_at: datetime | None, now: datetime | None = None) -> str:
+    if ended_at is None:
+        return "Just now"
+    try:
+        ref = now or datetime.now(timezone.utc)
+        elapsed = (ref - ended_at).total_seconds()
+    except Exception:
+        return "Just now"
+    if elapsed < 90:
+        return "Just now"
+    minutes = int(elapsed // 60)
+    if minutes < 60:
+        return f"{minutes} min ago"
+    hours = minutes // 60
+    return "1 hr ago" if hours == 1 else f"{hours} hr ago"
 
 
 # Terminal statuses — stop polling regardless of whether we cached anything.
@@ -381,7 +405,16 @@ class CapturePoller:
     def _make_insight_fire(
         self, rec_dir: Path, deep_link: str, insight: dict,
     ) -> Callable[[], None]:
-        source_label = self._source_label(rec_dir)
+        # Read the record once for both source_label and ended_at —
+        # pre-refactor this method called _source_label which read the
+        # record again, doubling the I/O when the path also persisted
+        # the insight earlier in the call chain.
+        try:
+            record = read_record_from_dir(rec_dir)
+        except Exception:
+            record = None
+        source_label = self._source_label(record)
+        ended_at = record.ended_at if record is not None else None
 
         def _open() -> None:
             try:
@@ -390,11 +423,18 @@ class CapturePoller:
                 log.debug("[poller] webbrowser.open failed for %r", deep_link, exc_info=True)
 
         def fire() -> None:
+            # Freshness is computed HERE, inside the closure body, not at
+            # factory-build time — the closure runs after the defer-wait
+            # in _fire_or_defer, which can add up to 1 h on top of the
+            # ~28 min poll schedule. Computing at fire time keeps the
+            # chip honest under deferred fires.
+            freshness = _freshness_label(ended_at)
             try:
                 self._notifier.notify_insight(  # type: ignore[union-attr]
                     headline=insight["headline"],
                     body=insight["body"],
                     source_label=source_label,
+                    freshness_label=freshness,
                     quote=insight.get("quote"),
                     insight_type=insight.get("type"),
                     button_label="See full feedback",
@@ -435,20 +475,49 @@ class CapturePoller:
 
         return fire
 
-    def _source_label(self, rec_dir: Path) -> str:
-        """Short "from your ___" anchor, derived from the local record title.
+    @staticmethod
+    def _source_label(record: "ConversationRecord | None") -> str:
+        """Short "from your ___" anchor for the insight card's chip.
 
-        Strips the " · timestamp" suffix off placeholder titles ("Zoom call ·
-        2026-…" → "Zoom call") and uses a real server title verbatim ("Q4
-        planning sync"). Falls back to a generic label.
+        Always derives from agent-side metadata, NEVER from ``record.title``:
+        the chip is the "this is from a meeting you just had" recognition
+        cue, and time + source is a stronger hit than the server's topical
+        title ("Q4 planning sync") because freshness + source bind to a
+        lived moment without requiring the user to read + match. The
+        topical title still drives Settings → Captures + the deep-link
+        hero card — those are about subject recognition; this isn't.
+
+        Bonus: the chip's wording is now deterministic regardless of
+        whether the server's title pass succeeded.
+
+        Fallback chain:
+          * ``metadata.arm_app_display`` + " call"   ("Microsoft Teams call")
+          * ``metadata.arm_app_key.title()`` + " call"   ("Discord call")
+          * "conversation"   (hotkey arms with no app attribution)
+
+        Combined with the cached ``metadata.local_clock_label`` ("2:30 pm")
+        the chip reads: "from your 2:30 pm Zoom call" /
+        "from your 2:30 pm conversation".
         """
-        try:
-            record = read_record_from_dir(rec_dir)
-            title = (record.title or "").strip()
-        except Exception:
-            title = ""
-        short = title.split(" · ")[0].strip() if title else ""
-        return short or "recent meeting"
+        if record is None:
+            return "conversation"
+        meta = record.metadata or {}
+        clock = (meta.get("local_clock_label") or "").strip()
+        if not clock and record.started_at is not None:
+            # Legacy records (pre-cache) — recompute now, accepting the
+            # small TZ-drift risk for the user-traveled case. New records
+            # always carry the cached label so this is the cold-start path
+            # for one-time backfill.
+            clock = local_clock_label(record.started_at)
+        display = (meta.get("arm_app_display") or "").strip()
+        key = (meta.get("arm_app_key") or "").strip()
+        if display:
+            source = f"{display} call"
+        elif key:
+            source = f"{key.title()} call"
+        else:
+            source = "conversation"
+        return f"{clock} {source}" if clock else source
 
     def _disable_feedback(self) -> None:
         """Off-switch behind the card's "Stop showing these" button.

@@ -98,6 +98,11 @@ export interface ShowInsightCmd {
   // "From your {source}" context line — agent-supplied from the local
   // record.json title, no server dependency.
   source_label: string;
+  // Freshness chip text ("Just now" / "5 min ago" / "1 hr ago") — computed
+  // by the agent at fire time from record.ended_at, so deferred fires
+  // (user in another meeting when the insight became ready) don't claim
+  // "Just now" for a capture that's actually nearly an hour old.
+  freshness_label: string;
   // Verbatim quote from the user's own speech. Absent for insight types
   // that aren't about a specific utterance (strength / structure / pacing).
   quote?: string;

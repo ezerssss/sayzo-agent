@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Sparkles, X } from "lucide-react";
+import { Clock, X } from "lucide-react";
 import { HudCard } from "./HudCard";
 
 interface Props {
@@ -9,6 +9,8 @@ interface Props {
   body: string;
   /** "From your {source}" context anchor — agent-supplied from the capture title. */
   sourceLabel: string;
+  /** Chip text — "Just now" / "5 min ago" / "1 hr ago". Computed agent-side at fire time. */
+  freshnessLabel: string;
   /** Verbatim quote from the user's own speech. Absent for non-utterance insight types. */
   quote?: string;
   /** Primary button — "See full feedback" (opens the deep-link). */
@@ -29,6 +31,7 @@ export function InsightCard({
   headline,
   body,
   sourceLabel,
+  freshnessLabel,
   quote,
   buttonLabel,
   secondaryButtonLabel,
@@ -89,13 +92,25 @@ export function InsightCard({
         <X size={13} strokeWidth={2.5} />
       </button>
 
-      {/* Source anchor — tells the user where this came from at a glance. */}
-      <div className="mt-2 flex items-center gap-1.5 pr-6 text-[11px] font-medium uppercase tracking-wide text-ink-muted">
-        <Sparkles size={12} className="shrink-0 text-accent" />
-        <span className="truncate">From your {sourceLabel}</span>
+      {/* Source anchor — chip + sentence reads as a thread-reply
+          breadcrumb (timestamp + source), not a category tag. The bold
+          source label is the visual anchor ("ah, that's the call I just
+          had"); the accent-tinted freshness chip ties the row to the
+          primary CTA's color so the card reads as one composition.
+          Wraps to two lines for long server titles (no truncate —
+          losing the most-anchoring word defeats the point). */}
+      <div className="mt-2 flex flex-wrap items-center gap-x-1.5 gap-y-1 pr-6 text-[12px] leading-snug text-ink-muted">
+        <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-accent/10 px-1.5 py-0.5 text-[10.5px] font-semibold text-accent">
+          <Clock size={10} strokeWidth={2.5} />
+          {freshnessLabel}
+        </span>
+        <span>
+          from your{" "}
+          <span className="font-semibold text-ink">{sourceLabel}</span>
+        </span>
       </div>
 
-      <div className="mt-1.5">
+      <div className="mt-2">
         <div className="text-sm font-semibold leading-tight text-ink">
           {headline}
         </div>

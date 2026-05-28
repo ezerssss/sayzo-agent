@@ -71,6 +71,15 @@ class SessionBuffers:
     # placeholder title shown in Settings → Captures until polling fetches
     # the server-generated one.
     arm_app_key: Optional[str] = None
+    # User-facing display name from the matched DetectorSpec (e.g. "Microsoft
+    # Teams" for arm_app_key="teams_desktop", "Google Meet" for "gmeet").
+    # When present, this is the preferred label for both the placeholder
+    # title and the post-capture insight card's source anchor — `app_key`
+    # is a stable lowercase ID with no human-friendly casing, so deriving
+    # display strings from it produces "Gmeet" / "Teams_Desktop" / "Whatsapp".
+    # None for hotkey arms and for legacy sessions opened before this field
+    # existed.
+    arm_app_display: Optional[str] = None
 
     def mic_total_voiced(self) -> float:
         return sum(s.duration for s in self.mic_segments)

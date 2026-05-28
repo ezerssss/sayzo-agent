@@ -809,6 +809,7 @@ class Agent:
                 sr,
                 metadata,
                 rec_id=proc_id,
+                arm_app_display=buffers.arm_app_display,
             ),
         )
         rec_dir = self.cfg.captures_dir / record.id

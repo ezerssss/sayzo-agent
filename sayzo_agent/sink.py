@@ -114,18 +114,50 @@ def encode_opus_stereo(
     container.close()
 
 
-def _placeholder_title(arm_app_key: Optional[str], started_at: datetime) -> str:
+def _placeholder_title(
+    arm_app_key: Optional[str],
+    arm_app_display: Optional[str],
+    started_at: datetime,
+) -> str:
     """Build the local placeholder title shown in Settings → Captures.
 
     Deterministic so the pane has something readable as soon as the capture
     lands on disk. ``CapturePoller`` later overwrites it with the real
     server-generated title once ``GET /api/captures/{id}`` reports the
     capture is past the transcribed/analyzed milestones.
+
+    Prefers ``arm_app_display`` (the user-facing name from DetectorSpec, e.g.
+    "Microsoft Teams" / "Google Meet") over ``arm_app_key.title()`` (which
+    produces gross strings like "Teams_Desktop" / "Gmeet" / "8X8"). Falls
+    back to the lowercase key for legacy / custom detector specs that didn't
+    set a display name.
     """
     stamp = started_at.strftime("%Y-%m-%d %H:%M")
-    if arm_app_key:
-        return f"{arm_app_key.title()} call · {stamp}"
+    name = (arm_app_display or "").strip() or (
+        arm_app_key.title() if arm_app_key else ""
+    )
+    if name:
+        return f"{name} call · {stamp}"
     return f"Conversation · {stamp}"
+
+
+# Wall-clock label like "2:30 pm" — converts the stored UTC timestamp to
+# the user's local TZ at CAPTURE time (not display time). Lives in this
+# module so ``CaptureSink.write`` can persist the result in
+# ``record.metadata["local_clock_label"]`` and downstream consumers
+# (``capture_poller._source_label``) just read the cached string. Locking
+# the TZ at write time avoids the bug where a user who travels between
+# session close and insight fire would otherwise see the wrong wall-clock
+# time on the post-capture card (``astimezone()`` reads the OS TZ at call
+# time, not at session close). ``%I`` produces "01"–"12"; ``.lstrip("0")``
+# trims the hour's leading zero. ``%I`` is guaranteed never to emit "00",
+# so the lstrip can't swallow the whole hour.
+def local_clock_label(ts: datetime) -> str:
+    try:
+        local = ts.astimezone() if ts.tzinfo is not None else ts
+        return local.strftime("%I:%M %p").lstrip("0").lower()
+    except Exception:
+        return ""
 
 
 def serialize_record(record: ConversationRecord) -> dict:
@@ -215,12 +247,18 @@ class CaptureSink:
         sample_rate: int = 16000,
         metadata: dict | None = None,
         rec_id: str | None = None,
+        *,
+        arm_app_display: Optional[str] = None,
     ) -> ConversationRecord:
         """Persist a kept session: encode the stereo Opus blob + write
         ``record.json`` with the local placeholder title.
 
         The capture poller will later overwrite ``title`` / ``summary`` once
-        the server has the real ones.
+        the server has the real ones, but ``metadata.arm_app_key`` /
+        ``arm_app_display`` / ``local_clock_label`` remain — the insight
+        card's source-anchor chip derives from those, not from ``title``,
+        so the chip's wording stays deterministic regardless of whether
+        the server's title pass succeeded.
         """
         rec_id = rec_id or uuid.uuid4().hex[:12]
         rec_dir = self.captures_dir / rec_id
@@ -235,14 +273,27 @@ class CaptureSink:
             application=self.opus_application,
         )
 
-        title = _placeholder_title(arm_app_key, started_at)
+        title = _placeholder_title(arm_app_key, arm_app_display, started_at)
+        # Persist the local wall-clock label + arm-app identity at write
+        # time. Locking these to the capture moment (not the fire moment)
+        # makes the post-capture insight chip's "[time] X call" anchor
+        # robust against: (1) TZ drift if the user travels between
+        # capture and fire, (2) server-side title-pass flakiness — the
+        # chip no longer reads ``record.title`` so it can't be empty or
+        # weird when the server fails to summarize.
+        meta = dict(metadata) if metadata else {}
+        meta.setdefault("local_clock_label", local_clock_label(started_at))
+        if arm_app_key:
+            meta.setdefault("arm_app_key", arm_app_key)
+        if arm_app_display:
+            meta.setdefault("arm_app_display", arm_app_display)
         record = ConversationRecord(
             id=rec_id,
             started_at=started_at,
             ended_at=ended_at,
             title=title,
             summary="",
-            metadata=metadata or {},
+            metadata=meta,
         )
         json_path = rec_dir / "record.json"
         with json_path.open("w", encoding="utf-8") as f:

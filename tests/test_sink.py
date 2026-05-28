@@ -1,12 +1,14 @@
 """Round-trip serialization test for ConversationRecord."""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sayzo_agent.models import ConversationRecord
 from sayzo_agent.retry import STATUS_PENDING, empty_upload_state
 from sayzo_agent.sink import (
+    CaptureSink,
     deserialize_record,
+    local_clock_label,
     serialize_record,
     serialize_record_for_upload,
 )
@@ -114,3 +116,132 @@ def test_serialize_record_for_upload_strips_local_only_fields():
     assert "transcript" not in payload
     assert "audio_path" not in payload
     assert "relevant_span" not in payload
+
+
+def test_local_clock_label_formats_12hour_lowercase():
+    # Naive datetime path — strftime + strip + lower.
+    # 14:30 → "2:30 pm"; 09:05 → "9:05 am"; 00:15 → "12:15 am" (12-hour wraps).
+    assert local_clock_label(datetime(2026, 5, 28, 14, 30)) == "2:30 pm"
+    assert local_clock_label(datetime(2026, 5, 28, 9, 5)) == "9:05 am"
+    assert local_clock_label(datetime(2026, 5, 28, 0, 15)) == "12:15 am"
+
+
+def test_capture_sink_write_caches_local_clock_label(tmp_path, monkeypatch):
+    """CaptureSink.write must persist the local-clock label into metadata
+    so the post-capture insight chip uses the TZ from CAPTURE time, not
+    from the (potentially-changed) OS TZ at fire time.
+
+    Stubs encode_opus_stereo because we don't need real audio I/O — only
+    that record.json carries metadata.local_clock_label.
+    """
+    captures_dir = tmp_path / "captures"
+    captures_dir.mkdir()
+
+    import sayzo_agent.sink as sink_mod
+    monkeypatch.setattr(sink_mod, "encode_opus_stereo",
+                        lambda *a, **k: None)
+
+    sink = CaptureSink(captures_dir)
+    started = datetime(2026, 5, 28, 14, 30, tzinfo=timezone.utc)
+    ended = datetime(2026, 5, 28, 14, 45, tzinfo=timezone.utc)
+    record = sink.write(
+        arm_app_key="zoom",
+        started_at=started,
+        ended_at=ended,
+        mic_pcm16=b"", sys_pcm16=b"",
+        metadata={"close_reason": "joint_silence"},
+        rec_id="rec_clock",
+        arm_app_display="Zoom",
+    )
+    assert "local_clock_label" in record.metadata
+    # Don't pin the wall-clock string — it depends on the test runner's
+    # TZ (CI runs UTC; dev machines vary). Assert shape: a non-empty
+    # string ending in "am" or "pm" so we catch a regression that drops
+    # the lowercase or the am/pm token.
+    label = record.metadata["local_clock_label"]
+    assert isinstance(label, str) and label
+    assert label.endswith(" am") or label.endswith(" pm")
+    # Round-trips through record.json.
+    from sayzo_agent.sink import read_record_from_dir
+    rec_back = read_record_from_dir(captures_dir / "rec_clock")
+    assert rec_back.metadata["local_clock_label"] == label
+
+
+def test_capture_sink_write_respects_existing_local_clock_label(tmp_path, monkeypatch):
+    """When metadata already carries a local_clock_label (e.g. callers
+    pre-computed it), CaptureSink.write must NOT overwrite it."""
+    captures_dir = tmp_path / "captures"
+    captures_dir.mkdir()
+    import sayzo_agent.sink as sink_mod
+    monkeypatch.setattr(sink_mod, "encode_opus_stereo",
+                        lambda *a, **k: None)
+
+    sink = CaptureSink(captures_dir)
+    started = datetime(2026, 5, 28, 14, 30, tzinfo=timezone.utc)
+    ended = datetime(2026, 5, 28, 14, 45, tzinfo=timezone.utc)
+    record = sink.write(
+        arm_app_key=None,
+        started_at=started,
+        ended_at=ended,
+        mic_pcm16=b"", sys_pcm16=b"",
+        metadata={"local_clock_label": "9:00 am"},
+        rec_id="rec_preset",
+    )
+    assert record.metadata["local_clock_label"] == "9:00 am"
+
+
+def test_capture_sink_write_persists_arm_app_identity(tmp_path, monkeypatch):
+    """The post-capture insight chip derives source-anchor from agent-side
+    arm metadata (arm_app_key + arm_app_display), NOT from record.title.
+    Sink must persist both at write time so the chip's wording is
+    deterministic regardless of whether the server's later title-pass
+    succeeds."""
+    captures_dir = tmp_path / "captures"
+    captures_dir.mkdir()
+    import sayzo_agent.sink as sink_mod
+    monkeypatch.setattr(sink_mod, "encode_opus_stereo",
+                        lambda *a, **k: None)
+
+    sink = CaptureSink(captures_dir)
+    started = datetime(2026, 5, 28, 14, 30, tzinfo=timezone.utc)
+    ended = datetime(2026, 5, 28, 14, 45, tzinfo=timezone.utc)
+    record = sink.write(
+        arm_app_key="teams_desktop",
+        started_at=started,
+        ended_at=ended,
+        mic_pcm16=b"", sys_pcm16=b"",
+        metadata={},
+        rec_id="rec_teams",
+        arm_app_display="Microsoft Teams",
+    )
+    assert record.metadata["arm_app_key"] == "teams_desktop"
+    assert record.metadata["arm_app_display"] == "Microsoft Teams"
+    # Placeholder title now uses the display_name too — so Settings → Captures
+    # shows "Microsoft Teams call · ..." instead of "Teams_Desktop call · ...".
+    assert record.title.startswith("Microsoft Teams call · ")
+
+
+def test_capture_sink_write_hotkey_arm_omits_app_metadata(tmp_path, monkeypatch):
+    """Hotkey arms have no app attribution — neither arm_app_key nor
+    arm_app_display should be persisted (None / missing keys), so
+    _source_label falls back to the "conversation" hotkey path."""
+    captures_dir = tmp_path / "captures"
+    captures_dir.mkdir()
+    import sayzo_agent.sink as sink_mod
+    monkeypatch.setattr(sink_mod, "encode_opus_stereo",
+                        lambda *a, **k: None)
+
+    sink = CaptureSink(captures_dir)
+    started = datetime(2026, 5, 28, 14, 30, tzinfo=timezone.utc)
+    ended = datetime(2026, 5, 28, 14, 45, tzinfo=timezone.utc)
+    record = sink.write(
+        arm_app_key=None,
+        started_at=started,
+        ended_at=ended,
+        mic_pcm16=b"", sys_pcm16=b"",
+        metadata={},
+        rec_id="rec_hotkey",
+    )
+    assert "arm_app_key" not in record.metadata
+    assert "arm_app_display" not in record.metadata
+    assert record.title.startswith("Conversation · ")

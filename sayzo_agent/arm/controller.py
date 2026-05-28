@@ -630,7 +630,11 @@ class ArmController:
             self.vad_mic.reset()
             self.vad_sys.reset()
             self.detector.reset_per_source_streams()
-            self.detector.open_session_on_arm(arm_now, arm_app_key=reason.app_key)
+            self.detector.open_session_on_arm(
+                arm_now,
+                arm_app_key=reason.app_key,
+                arm_app_display=reason.display_name,
+            )
         except Exception:
             log.exception("[arm] reset / open_session_on_arm failed (non-fatal)")
 

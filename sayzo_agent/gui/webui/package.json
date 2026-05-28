@@ -22,6 +22,8 @@
     "dev:hud-toast": "vite --mode mock --open /#preview=hud-toast",
     "predev:hud-actionable": "python ../../../scripts/sync_brand_assets.py",
     "dev:hud-actionable": "vite --mode mock --open /#preview=hud-actionable",
+    "predev:hud-insight": "python ../../../scripts/sync_brand_assets.py",
+    "dev:hud-insight": "vite --mode mock --open /#preview=hud-insight",
     "prebuild": "python ../../../scripts/sync_brand_assets.py",
     "build": "vite build",
     "typecheck": "tsc --noEmit",

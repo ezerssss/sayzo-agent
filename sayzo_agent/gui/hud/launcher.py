@@ -602,6 +602,7 @@ class HudLauncher:
         headline: str,
         body: str,
         source_label: str,
+        freshness_label: str,
         button_label: str,
         on_pressed: Callable[[], None],
         expire_after_secs: float,
@@ -617,6 +618,8 @@ class HudLauncher:
         shared ``_pending_actionables`` map, dispatched on
         ``insight_response``. ``on_pressed`` opens the capture deep-link;
         ``on_secondary_pressed`` is the "Stop showing these" off-switch.
+        ``freshness_label`` populates the chip ("Just now" / "5 min ago" /
+        "1 hr ago") — computed at fire time so deferred fires don't lie.
         """
         if self._given_up:
             log.warning(
@@ -626,8 +629,8 @@ class HudLauncher:
             return False
         request_id = f"insight-{uuid.uuid4().hex}"
         log.info(
-            "[notify] insight scheduled: headline=%r type=%r has_quote=%s expire_after=%ss",
-            headline, insight_type, bool(quote), expire_after_secs,
+            "[notify] insight scheduled: headline=%r type=%r has_quote=%s freshness=%r expire_after=%ss",
+            headline, insight_type, bool(quote), freshness_label, expire_after_secs,
         )
         self._pending_actionables[request_id] = {
             "on_pressed": on_pressed,
@@ -640,6 +643,7 @@ class HudLauncher:
             "headline": headline,
             "body": body,
             "source_label": source_label,
+            "freshness_label": freshness_label,
             "button_label": button_label,
             "expire_after_secs": float(expire_after_secs),
         }

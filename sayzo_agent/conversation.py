@@ -154,7 +154,11 @@ class ConversationDetector:
     # ---- session lifecycle -------------------------------------------------
 
     def open_session_on_arm(
-        self, now: float, *, arm_app_key: Optional[str] = None
+        self,
+        now: float,
+        *,
+        arm_app_key: Optional[str] = None,
+        arm_app_display: Optional[str] = None,
     ) -> None:
         """Open a session immediately at arm time, with empty buffers.
 
@@ -167,6 +171,10 @@ class ConversationDetector:
 
         ``arm_app_key`` is stashed on the session buffer so app.py can
         build a placeholder title that names the arm app when known.
+        ``arm_app_display`` is the user-facing version of the same (from
+        the matched ``DetectorSpec.display_name``); the sink prefers it
+        for both placeholder + insight-card source-anchor labels because
+        ``app_key`` is a stable lowercase ID with no human-friendly casing.
 
         Idempotent for repeated calls while OPEN — does nothing.
         """
@@ -175,6 +183,7 @@ class ConversationDetector:
         self._open_session(
             now, trigger=None, trigger_start_ts=0.0, t0_mono=now,
             arm_app_key=arm_app_key,
+            arm_app_display=arm_app_display,
         )
 
     def _open_session(
@@ -184,12 +193,14 @@ class ConversationDetector:
         trigger_start_ts: float,
         t0_mono: Optional[float] = None,
         arm_app_key: Optional[str] = None,
+        arm_app_display: Optional[str] = None,
     ) -> None:
         self.state = SessionState.OPEN
         self._buffers = SessionBuffers(
             started_at=datetime.now(timezone.utc),
             started_monotonic=now,
             arm_app_key=arm_app_key,
+            arm_app_display=arm_app_display,
         )
         self._session_start_mono = now
         self._last_voiced_mono["mic"] = now if trigger == "mic" else 0.0

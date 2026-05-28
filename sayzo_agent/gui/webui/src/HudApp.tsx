@@ -61,6 +61,7 @@ interface InsightState {
   headline: string;
   body: string;
   source_label: string;
+  freshness_label: string;
   quote?: string;
   insight_type?: string;
   button_label: string;
@@ -84,6 +85,8 @@ function previewLabelFor(kind: string): string {
       return "fire actionable";
     case "hud-insight":
       return "fire insight";
+    case "hud-insight-deferred":
+      return "fire insight (deferred)";
     default:
       return kind;
   }
@@ -287,6 +290,7 @@ export function HudApp() {
             headline: cmd.headline,
             body: cmd.body,
             source_label: cmd.source_label,
+            freshness_label: cmd.freshness_label,
             quote: cmd.quote,
             insight_type: cmd.insight_type,
             button_label: cmd.button_label,
@@ -516,11 +520,39 @@ export function HudApp() {
           hudBridge.dispatch({
             cmd: "show_insight",
             request_id: `insight-${Date.now()}`,
-            source_label: "Zoom call",
+            // Matches what ``capture_poller._source_label`` produces in
+            // production (12-hour wall clock + arm-app key). Iterate the
+            // card against the SAME string users see — a shorter "Zoom
+            // call" hid the wrap behavior the real label triggers.
+            source_label: "2:30 pm Zoom call",
+            // ``_freshness_label`` computes this at fire time from
+            // record.ended_at. Demo it as "Just now" — preview the
+            // common case; deferred fires read e.g. "12 min ago".
+            freshness_label: "Just now",
             headline: "A clearer way to give your update",
             quote: "I think maybe we could possibly look into it?",
             body: "Try stating it directly: “I recommend we look into it.”",
             insight_type: "rephrase",
+            button_label: "See full feedback",
+            secondary_button_label: "Stop showing these",
+            expire_after_secs: 120,
+          }),
+      },
+      {
+        key: "hud-insight-deferred",
+        run: () =>
+          hudBridge.dispatch({
+            cmd: "show_insight",
+            request_id: `insight-${Date.now()}`,
+            source_label: "9:15 am call",
+            // Preview what the chip looks like for a deferred fire —
+            // the user was in another meeting for 23 min when this
+            // capture's insight became ready.
+            freshness_label: "23 min ago",
+            headline: "Open with the point, then the context",
+            quote: "Um, well, there were a few things going on this morning that I wanted to flag, but anyway, the deploy is blocked.",
+            body: "Try leading: “The deploy is blocked — here's what happened this morning.”",
+            insight_type: "structure",
             button_label: "See full feedback",
             secondary_button_label: "Stop showing these",
             expire_after_secs: 120,
@@ -617,6 +649,7 @@ export function HudApp() {
           headline={insight.headline}
           body={insight.body}
           sourceLabel={insight.source_label}
+          freshnessLabel={insight.freshness_label}
           quote={insight.quote}
           buttonLabel={insight.button_label}
           secondaryButtonLabel={insight.secondary_button_label}
