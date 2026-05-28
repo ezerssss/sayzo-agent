@@ -110,6 +110,16 @@ class Agent:
             auth_client=auth_client,
             captures_dir=config.captures_dir,
             executor=self._executor,
+            notifier=self.notifier,
+            config=config,
+            # Defer a post-capture insight when the user is in ANOTHER meeting
+            # at fire time. ``self.arm`` is constructed further down, so read
+            # it lazily — this callable only runs during a poll, well after
+            # __init__ completes.
+            armed_check=lambda: bool(
+                getattr(self, "arm", None) is not None
+                and self.arm.armed_event.is_set()
+            ),
         )
         self.retry_mgr = UploadRetryManager(
             captures_dir=config.captures_dir,
@@ -121,6 +131,9 @@ class Agent:
             webapp_base_url=config.auth.effective_server_url or None,
             on_upload_success=self.poller.poll,
             notify_capture_saved=config.notify_capture_saved,
+            # Live read so a Settings toggle / in-card opt-out applies without a
+            # restart (the IPC reload mutates this same ``config`` object).
+            feedback_enabled=lambda: config.notify_capture_feedback,
         )
         self._stop = asyncio.Event()
         self._paused = asyncio.Event()  # clear = running, set = paused

@@ -1993,6 +1993,20 @@ def service(force_setup: bool, from_autostart: bool, open_settings: bool) -> Non
                         "[ipc] reload_notification_config: scheduler reload raised",
                         exc_info=True,
                     )
+            # Copy the master + post-capture-feedback flags onto the live
+            # agent cfg so the CapturePoller (which reads them at fire time,
+            # minutes after upload) sees a Settings → Notifications toggle
+            # without a restart. Re-reading from disk preserves env-var
+            # precedence (SAYZO_NOTIFY_CAPTURE_FEEDBACK / SAYZO_NOTIFICATIONS_ENABLED
+            # still win).
+            try:
+                agent.cfg.notify_capture_feedback = fresh.notify_capture_feedback
+                agent.cfg.notifications_enabled = fresh.notifications_enabled
+            except Exception:
+                log.warning(
+                    "[ipc] reload_notification_config: cfg apply raised",
+                    exc_info=True,
+                )
             return {"reloaded": True}
 
         def _ipc_reload_hud_config() -> dict:

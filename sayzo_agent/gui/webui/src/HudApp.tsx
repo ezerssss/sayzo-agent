@@ -7,6 +7,7 @@ import { DotIndicator } from "./hud/DotIndicator";
 import { ConsentCard } from "./hud/ConsentCard";
 import { InfoToast } from "./hud/InfoToast";
 import { ActionableToast } from "./hud/ActionableToast";
+import { InsightCard } from "./hud/InsightCard";
 import { HudCard } from "./hud/HudCard";
 
 // Duration of the CSS opacity fade (see `index.css::.hud-fade`). When
@@ -55,6 +56,18 @@ interface ActionableState {
   secondary_button_label?: string;
 }
 
+interface InsightState {
+  request_id: string;
+  headline: string;
+  body: string;
+  source_label: string;
+  quote?: string;
+  insight_type?: string;
+  button_label: string;
+  expire_after_secs: number;
+  secondary_button_label?: string;
+}
+
 const MAX_VISIBLE_TOASTS = 3;
 
 function previewLabelFor(kind: string): string {
@@ -69,6 +82,8 @@ function previewLabelFor(kind: string): string {
       return "fire info toast";
     case "hud-actionable":
       return "fire actionable";
+    case "hud-insight":
+      return "fire insight";
     default:
       return kind;
   }
@@ -79,6 +94,7 @@ export function HudApp() {
   const [cards, setCards] = useState<CardState[]>([]);
   const [toasts, setToasts] = useState<ToastState[]>([]);
   const [actionable, setActionable] = useState<ActionableState | null>(null);
+  const [insight, setInsight] = useState<InsightState | null>(null);
   const [demoMode, setDemoMode] = useState(false);
   // Combined mic + system audio level (max of the two). `undefined`
   // means no real audio is streaming and the Waveform self-animates;
@@ -265,11 +281,25 @@ export function HudApp() {
             secondary_button_label: cmd.secondary_button_label,
           });
           break;
+        case "show_insight":
+          setInsight({
+            request_id: cmd.request_id,
+            headline: cmd.headline,
+            body: cmd.body,
+            source_label: cmd.source_label,
+            quote: cmd.quote,
+            insight_type: cmd.insight_type,
+            button_label: cmd.button_label,
+            expire_after_secs: cmd.expire_after_secs,
+            secondary_button_label: cmd.secondary_button_label,
+          });
+          break;
         case "hide_all":
           setPill(null);
           setCards([]);
           setToasts([]);
           setActionable(null);
+          setInsight(null);
           break;
         case "demo_mode":
           setDemoMode(cmd.on);
@@ -314,6 +344,18 @@ export function HudApp() {
     [],
   );
 
+  const handleInsight = useCallback(
+    (request_id: string, outcome: "pressed" | "expired" | "snoozed") => {
+      setInsight(null);
+      void hudBridge.sendEvent({
+        event: "insight_response",
+        request_id,
+        outcome,
+      });
+    },
+    [],
+  );
+
   const handlePillStop = useCallback(() => {
     // Optimistic local hide — matches what production does anyway:
     // ArmController._on_pill_stop_clicked triggers _disarm_internal,
@@ -351,8 +393,9 @@ export function HudApp() {
       cards.length > 0 ||
       toasts.length > 0 ||
       !!actionable ||
+      !!insight ||
       demoMode,
-    [pill, cards.length, toasts.length, actionable, demoMode],
+    [pill, cards.length, toasts.length, actionable, insight, demoMode],
   );
 
   // Window visibility orchestration. Per-element CSS keyframes
@@ -468,6 +511,22 @@ export function HudApp() {
           }),
       },
       {
+        key: "hud-insight",
+        run: () =>
+          hudBridge.dispatch({
+            cmd: "show_insight",
+            request_id: `insight-${Date.now()}`,
+            source_label: "Zoom call",
+            headline: "A clearer way to give your update",
+            quote: "I think maybe we could possibly look into it?",
+            body: "Try stating it directly: “I recommend we look into it.”",
+            insight_type: "rephrase",
+            button_label: "See full feedback",
+            secondary_button_label: "Stop showing these",
+            expire_after_secs: 120,
+          }),
+      },
+      {
         key: "hud-hide",
         run: () => hudBridge.dispatch({ cmd: "hide_all" }),
       },
@@ -548,6 +607,21 @@ export function HudApp() {
           secondaryButtonLabel={actionable.secondary_button_label}
           expireAfterSecs={actionable.expire_after_secs}
           onOutcome={(o) => handleActionable(actionable.request_id, o)}
+        />
+      )}
+
+      {/* Post-capture coaching insight. */}
+      {insight && (
+        <InsightCard
+          key={insight.request_id}
+          headline={insight.headline}
+          body={insight.body}
+          sourceLabel={insight.source_label}
+          quote={insight.quote}
+          buttonLabel={insight.button_label}
+          secondaryButtonLabel={insight.secondary_button_label}
+          expireAfterSecs={insight.expire_after_secs}
+          onOutcome={(o) => handleInsight(insight.request_id, o)}
         />
       )}
 

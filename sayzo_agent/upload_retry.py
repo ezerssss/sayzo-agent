@@ -115,8 +115,9 @@ class UploadRetryManager:
         auth_client: Any | None = None,
         clock: Callable[[], datetime] | None = None,
         webapp_base_url: str | None = None,
-        on_upload_success: Callable[[Path, str], Awaitable[None]] | None = None,
+        on_upload_success: Callable[[Path, str, bool], Awaitable[None]] | None = None,
         notify_capture_saved: bool = True,
+        feedback_enabled: Callable[[], bool] | None = None,
     ) -> None:
         self._captures_dir = captures_dir
         self._upload_client = upload_client
@@ -131,10 +132,19 @@ class UploadRetryManager:
         # NoopUploadClient path; the success toast is skipped cleanly.
         self._webapp_base_url = webapp_base_url
         # Optional hook spawned fire-and-forget after a successful upload —
-        # must accept (rec_dir, server_capture_id) and swallow its own
-        # errors. See ``CapturePoller.poll``.
+        # must accept (rec_dir, server_capture_id, owns_toast) and swallow its
+        # own errors. See ``CapturePoller.poll``. ``owns_toast`` tells the
+        # poller whether IT owns the single per-capture toast (the post-capture
+        # insight card) — true only for a live capture with the feedback
+        # feature on, so the decision stays complementary to the saved-toast
+        # below and we never double-toast.
         self._on_upload_success = on_upload_success
         self._notify_capture_saved = notify_capture_saved
+        # Live read of ``Config.notify_capture_feedback``. When it returns
+        # True, the post-capture insight card (fired later by the poller)
+        # REPLACES the immediate "Capture saved" toast — see the gate below.
+        # None ⇒ feature off (preserves pre-v3.10 behavior + keeps tests simple).
+        self._feedback_enabled = feedback_enabled
 
         self._pause_state = PauseState()
         self._pause_lock = asyncio.Lock()
@@ -340,6 +350,15 @@ class UploadRetryManager:
             ),
         )
 
+        # Post-capture feedback decides who owns the single per-capture toast.
+        # Read the flag live (a Settings toggle / in-card "Stop showing these"
+        # applies to the next capture). ``owns_toast`` = live capture + feature
+        # on → the poller fires the insight card (or its fallback) and the
+        # immediate saved toast below is suppressed. The two decisions are
+        # complementary so a capture never gets two toasts.
+        feedback_on = bool(self._feedback_enabled and self._feedback_enabled())
+        owns_toast = bool(live and feedback_on)
+
         # Fire-and-forget post-upload hook (see CapturePoller.poll).
         if (
             outcome == UploadOutcome.SUCCESS
@@ -347,7 +366,7 @@ class UploadRetryManager:
             and self._on_upload_success is not None
         ):
             task = asyncio.create_task(
-                self._on_upload_success(rec_dir, server_capture_id)
+                self._on_upload_success(rec_dir, server_capture_id, owns_toast)
             )
             self._success_tasks.add(task)
             task.add_done_callback(self._success_tasks.discard)
@@ -363,11 +382,15 @@ class UploadRetryManager:
             # Live-path only. Sweep successes (auto + user-triggered Try Again)
             # stay silent to avoid a toast burst when a backlog drains; the
             # Captures pane row flipping state is the user-visible signal there.
+            # Suppressed when ``feedback_on`` — the poller's post-capture
+            # insight card becomes the single per-capture toast (it deep-links
+            # too), with a fallback saved toast when no insight is produced.
             if (
                 live
                 and server_capture_id
                 and self._webapp_base_url
                 and self._notify_capture_saved
+                and not feedback_on
             ):
                 url = (
                     self._webapp_base_url.rstrip("/")

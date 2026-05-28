@@ -22,7 +22,7 @@ from sayzo_agent.auth.exceptions import AuthenticationRequired
 from sayzo_agent.capture_poller import CapturePoller
 from sayzo_agent.models import ConversationRecord
 from sayzo_agent.retry import empty_upload_state
-from sayzo_agent.sink import serialize_record
+from sayzo_agent.sink import read_record_from_dir, serialize_record
 
 
 # ---------------------------------------------------------------------------
@@ -195,3 +195,235 @@ async def test_poller_writes_only_when_value_changes(env):
     mtime_after = (rec_dir / "record.json").stat().st_mtime_ns
     # The file may not be rewritten when nothing changed.
     assert mtime_after == mtime_before
+
+
+# ---------------------------------------------------------------------------
+# Post-capture coaching insight (owns_toast path, v3.10+)
+# ---------------------------------------------------------------------------
+
+
+class FakeNotifier:
+    """Captures the post-capture toast calls the poller makes."""
+
+    def __init__(self) -> None:
+        self.insight_calls: list[dict] = []
+        self.actionable_calls: list[dict] = []
+        self.toast_calls: list[tuple[str, str]] = []
+
+    def notify(self, title: str, body: str) -> None:
+        self.toast_calls.append((title, body))
+
+    def notify_actionable(self, title, body, *, button_label, on_pressed,
+                          expire_after_secs, on_expire=None,
+                          secondary_button_label=None, on_secondary_pressed=None):
+        self.actionable_calls.append({
+            "title": title, "body": body, "button_label": button_label,
+        })
+        return True
+
+    def notify_insight(self, *, headline, body, source_label, button_label,
+                       on_pressed, expire_after_secs, quote=None,
+                       insight_type=None, on_expire=None,
+                       secondary_button_label=None, on_secondary_pressed=None):
+        self.insight_calls.append({
+            "headline": headline, "body": body, "source_label": source_label,
+            "quote": quote, "insight_type": insight_type,
+            "button_label": button_label,
+            "secondary_button_label": secondary_button_label,
+            "on_secondary_pressed": on_secondary_pressed,
+        })
+        return True
+
+
+def _fake_cfg(tmp_path, *, feedback=True, master=True, server="https://sayzo.app"):
+    return SimpleNamespace(
+        notify_capture_feedback=feedback,
+        notifications_enabled=master,
+        data_dir=tmp_path,
+        auth=SimpleNamespace(effective_server_url=server),
+    )
+
+
+def _toast_poller(env, cfg, notifier, *, armed_check=None, schedule=(0.001,) * 6):
+    return CapturePoller(
+        auth_client=env.auth,
+        captures_dir=env.captures_dir,
+        executor=env.executor,
+        schedule=schedule,
+        notifier=notifier,
+        config=cfg,
+        armed_check=armed_check,
+    )
+
+
+_INSIGHT_BODY = {
+    "type": "rephrase",
+    "headline": "A clearer way to give your update",
+    "quote": "I think maybe we could possibly look into it?",
+    "body": "Try stating it directly: “I recommend we look into it.”",
+    "why": "Direct phrasing signals confidence.",
+}
+
+
+async def test_owns_toast_polls_past_transcribed_to_analyzed_and_fires_insight(env, tmp_path):
+    """The insight only exists at ``analyzed``. The owns_toast poll must NOT
+    stop at the title (transcribed) like the legacy path — it keeps going to
+    analyzed, fires the InsightCard, and persists the insight to record.json."""
+    rec_dir = _write_capture(env.captures_dir, "rec_insight")
+    env.auth.queue({"status": "queued"})
+    env.auth.queue({"status": "transcribed", "title": "Q4 planning sync"})
+    env.auth.queue({"status": "analyzed", "title": "Q4 planning sync",
+                    "coaching_insight": _INSIGHT_BODY})
+    notifier = FakeNotifier()
+    poller = _toast_poller(env, _fake_cfg(tmp_path), notifier)
+
+    await poller.poll(rec_dir, "srv_insight", True)
+
+    # Polled all the way to analyzed (3 GETs) — did not stop at transcribed.
+    assert len(env.auth.calls) == 3
+    assert len(notifier.insight_calls) == 1
+    call = notifier.insight_calls[0]
+    assert call["headline"] == "A clearer way to give your update"
+    assert call["quote"] == "I think maybe we could possibly look into it?"
+    assert call["source_label"] == "Q4 planning sync"  # from the cached title
+    assert call["button_label"] == "See full feedback"
+    assert call["secondary_button_label"] == "Stop showing these"
+    assert notifier.actionable_calls == []  # no fallback
+    # Persisted to record.json for durability / the Captures pane.
+    rec = read_record_from_dir(rec_dir)
+    assert rec.metadata["coaching_insight"]["headline"] == _INSIGHT_BODY["headline"]
+    assert rec.metadata["coaching_insight"]["quote"] == _INSIGHT_BODY["quote"]
+
+
+async def test_owns_toast_analyzed_without_insight_fires_fallback(env, tmp_path):
+    """When the server reaches analyzed with coaching_insight=null, the poller
+    falls back to the plain "Capture saved" toast so upload confirmation isn't
+    lost under the replace-don't-stack model."""
+    rec_dir = _write_capture(env.captures_dir, "rec_noinsight")
+    env.auth.queue({"status": "analyzed", "title": "Q4 sync", "coaching_insight": None})
+    notifier = FakeNotifier()
+    poller = _toast_poller(env, _fake_cfg(tmp_path), notifier)
+
+    await poller.poll(rec_dir, "srv_noinsight", True)
+
+    assert notifier.insight_calls == []
+    assert len(notifier.actionable_calls) == 1
+    assert notifier.actionable_calls[0]["title"] == "Capture saved to Sayzo"
+
+
+async def test_owns_toast_terminal_failure_fires_fallback(env, tmp_path):
+    """A terminal failure (transcription_failed) ends the poll and fires the
+    fallback saved toast — no insight will ever come."""
+    rec_dir = _write_capture(env.captures_dir, "rec_failed")
+    env.auth.queue({"status": "queued"})
+    env.auth.queue({"status": "transcription_failed"})
+    notifier = FakeNotifier()
+    poller = _toast_poller(env, _fake_cfg(tmp_path), notifier)
+
+    await poller.poll(rec_dir, "srv_failed", True)
+
+    assert notifier.insight_calls == []
+    assert len(notifier.actionable_calls) == 1
+
+
+async def test_owns_toast_feature_off_mid_poll_suppresses_everything(env, tmp_path):
+    """If notify_capture_feedback flipped off during the poll, fire nothing —
+    the immediate saved toast was already suppressed at upload time."""
+    rec_dir = _write_capture(env.captures_dir, "rec_off")
+    env.auth.queue({"status": "analyzed", "coaching_insight": _INSIGHT_BODY})
+    notifier = FakeNotifier()
+    poller = _toast_poller(env, _fake_cfg(tmp_path, feedback=False), notifier)
+
+    await poller.poll(rec_dir, "srv_off", True)
+
+    assert notifier.insight_calls == []
+    assert notifier.actionable_calls == []
+
+
+async def test_owns_toast_master_off_suppresses_everything(env, tmp_path):
+    """Master notifications_enabled=False gates the insight path too."""
+    rec_dir = _write_capture(env.captures_dir, "rec_master_off")
+    env.auth.queue({"status": "analyzed", "coaching_insight": _INSIGHT_BODY})
+    notifier = FakeNotifier()
+    poller = _toast_poller(env, _fake_cfg(tmp_path, master=False), notifier)
+
+    await poller.poll(rec_dir, "srv_master_off", True)
+
+    assert notifier.insight_calls == []
+    assert notifier.actionable_calls == []
+
+
+async def test_owns_toast_defers_while_armed_then_fires_on_disarm(env, tmp_path, monkeypatch):
+    """If the user is in ANOTHER meeting when the insight is ready, hold the
+    toast and fire once they disarm."""
+    monkeypatch.setattr("sayzo_agent.capture_poller._DEFER_POLL_SECS", 0.001)
+    rec_dir = _write_capture(env.captures_dir, "rec_defer")
+    env.auth.queue({"status": "analyzed", "coaching_insight": _INSIGHT_BODY})
+    notifier = FakeNotifier()
+    state = {"n": 0}
+
+    def armed_check() -> bool:
+        state["n"] += 1
+        return state["n"] <= 3  # armed for the first 3 checks, then disarmed
+
+    poller = _toast_poller(env, _fake_cfg(tmp_path), notifier, armed_check=armed_check)
+    await poller.poll(rec_dir, "srv_defer", True)
+
+    assert len(notifier.insight_calls) == 1
+    assert state["n"] >= 4  # we actually waited (polled armed state) before firing
+
+
+async def test_owns_toast_dropped_when_armed_past_staleness_cap(env, tmp_path, monkeypatch):
+    """Back-to-back meetings: if still armed past the staleness cap, drop the
+    insight rather than firing it stale hours later."""
+    monkeypatch.setattr("sayzo_agent.capture_poller._DEFER_POLL_SECS", 0.001)
+    monkeypatch.setattr("sayzo_agent.capture_poller._INSIGHT_DEFER_MAX_SECS", 0.005)
+    rec_dir = _write_capture(env.captures_dir, "rec_stale")
+    env.auth.queue({"status": "analyzed", "coaching_insight": _INSIGHT_BODY})
+    notifier = FakeNotifier()
+    poller = _toast_poller(env, _fake_cfg(tmp_path), notifier, armed_check=lambda: True)
+
+    await poller.poll(rec_dir, "srv_stale", True)
+
+    assert notifier.insight_calls == []  # dropped as stale
+    assert notifier.actionable_calls == []
+
+
+async def test_stop_showing_button_disables_flag_and_persists(env, tmp_path):
+    """The card's "Stop showing these" callback flips notify_capture_feedback
+    off in-process AND persists it to user_settings.json (runs in the live
+    agent process, so no IPC needed)."""
+    import json as _json
+
+    rec_dir = _write_capture(env.captures_dir, "rec_stop")
+    env.auth.queue({"status": "analyzed", "coaching_insight": _INSIGHT_BODY})
+    notifier = FakeNotifier()
+    cfg = _fake_cfg(tmp_path)
+    poller = _toast_poller(env, cfg, notifier)
+
+    await poller.poll(rec_dir, "srv_stop", True)
+    assert len(notifier.insight_calls) == 1
+
+    # Invoke the off-switch the user would click on the card.
+    notifier.insight_calls[0]["on_secondary_pressed"]()
+
+    assert cfg.notify_capture_feedback is False
+    saved = _json.loads((tmp_path / "user_settings.json").read_text(encoding="utf-8"))
+    assert saved["notify_capture_feedback"] is False
+    # A small confirmation toast fired.
+    assert any("no more insights" in t.lower() for t, _ in notifier.toast_calls)
+
+
+async def test_non_owning_poll_does_not_fire_any_toast(env, tmp_path):
+    """A sweep re-upload (owns_toast=False) caches title/summary but fires no
+    toast even if the server has an insight ready."""
+    rec_dir = _write_capture(env.captures_dir, "rec_sweep")
+    env.auth.queue({"status": "analyzed", "title": "Q4 sync",
+                    "coaching_insight": _INSIGHT_BODY})
+    notifier = FakeNotifier()
+    poller = _toast_poller(env, _fake_cfg(tmp_path), notifier)
+
+    await poller.poll(rec_dir, "srv_sweep", False)
+
+    assert notifier.insight_calls == []
+    assert notifier.actionable_calls == []

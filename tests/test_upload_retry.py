@@ -272,12 +272,15 @@ async def test_upload_success_invokes_on_upload_success_hook(env, tmp_path):
     """On UploadOutcome.SUCCESS with a server_capture_id, the manager must
     spawn the on_upload_success hook (CapturePoller.poll in production) so
     the poller can fetch the server-generated title/summary later. The
-    hook receives (rec_dir, server_capture_id) and runs fire-and-forget."""
+    hook receives (rec_dir, server_capture_id, owns_toast) and runs
+    fire-and-forget."""
     captures_dir = tmp_path / "captures_hook"
     captures_dir.mkdir()
     seen: list[tuple[Path, str]] = []
 
-    async def _on_success(rec_dir: Path, server_capture_id: str) -> None:
+    async def _on_success(
+        rec_dir: Path, server_capture_id: str, owns_toast: bool = False
+    ) -> None:
         seen.append((rec_dir, server_capture_id))
 
     mgr = UploadRetryManager(
@@ -306,7 +309,9 @@ async def test_upload_success_without_server_capture_id_skips_hook(env, tmp_path
     captures_dir.mkdir()
     seen: list[tuple[Path, str]] = []
 
-    async def _on_success(rec_dir: Path, server_capture_id: str) -> None:
+    async def _on_success(
+        rec_dir: Path, server_capture_id: str, owns_toast: bool = False
+    ) -> None:
         seen.append((rec_dir, server_capture_id))
 
     mgr = UploadRetryManager(

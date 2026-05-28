@@ -73,6 +73,11 @@ const SECTIONS: readonly Section[] = [
     title: "Coaching",
     toggles: [
       {
+        key: "capture_feedback",
+        label: "Show a coaching insight after a meeting is analyzed",
+        hint: "Right after Sayzo finishes analyzing a captured meeting, a short card surfaces one specific thing to work on — pulled from what you actually said. Tap “See full feedback” for the rest, or “Stop showing these” on the card to turn it off.",
+      },
+      {
         key: "daily_drill",
         label: "Send me a daily 60-second speaking drill",
       },
@@ -88,6 +93,7 @@ const ALL_FALSE: NotificationFlags = {
   welcome: false,
   post_arm: false,
   capture_saved: false,
+  capture_feedback: false,
   session_wrapped: false,
   checkin: false,
   meeting_ended_watcher: false,

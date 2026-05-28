@@ -81,6 +81,36 @@ export interface ShowActionableCmd {
   secondary_button_label?: string;
 }
 
+// Post-capture coaching insight (v3.10+). A compact card fired by the
+// CapturePoller once the server finishes analyzing a capture. Distinct
+// from ShowActionableCmd because it carries a capture-source anchor and
+// an optional verbatim quote; rendered by InsightCard, not ActionableToast.
+// Outcomes reuse the actionable vocabulary: primary "See full feedback" →
+// "pressed", secondary "Stop showing these" → "snoozed", dismiss/timeout →
+// "expired".
+export interface ShowInsightCmd {
+  cmd: "show_insight";
+  request_id: string;
+  // Plain, self-explanatory one-liner (server-generated).
+  headline: string;
+  // The concrete suggestion / rewrite / observation.
+  body: string;
+  // "From your {source}" context line — agent-supplied from the local
+  // record.json title, no server dependency.
+  source_label: string;
+  // Verbatim quote from the user's own speech. Absent for insight types
+  // that aren't about a specific utterance (strength / structure / pacing).
+  quote?: string;
+  // rephrase | structure | clarity | pacing | strength | other. Carried for
+  // future per-type styling; not load-bearing for rendering today.
+  insight_type?: string;
+  button_label: string;
+  expire_after_secs: number;
+  // "Stop showing these" — the one-click off-switch. Always present in
+  // production; optional so the demo path can omit it.
+  secondary_button_label?: string;
+}
+
 export interface HideAllCmd {
   cmd: "hide_all";
 }
@@ -98,6 +128,7 @@ export type HudCommand =
   | ShowCardCmd
   | ShowToastCmd
   | ShowActionableCmd
+  | ShowInsightCmd
   | HideAllCmd
   | DemoModeCmd;
 
@@ -106,6 +137,11 @@ export type HudEvent =
   | { event: "card_response"; request_id: string; answer: "yes" | "no" | "timeout" }
   | {
       event: "actionable_response";
+      request_id: string;
+      outcome: "pressed" | "expired" | "snoozed";
+    }
+  | {
+      event: "insight_response";
       request_id: string;
       outcome: "pressed" | "expired" | "snoozed";
     }

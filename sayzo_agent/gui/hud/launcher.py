@@ -58,6 +58,7 @@ class Cmd:
     SHOW_CARD = "show_card"
     SHOW_TOAST = "show_toast"
     SHOW_ACTIONABLE = "show_actionable"
+    SHOW_INSIGHT = "show_insight"
     HIDE_ALL = "hide_all"
     DEMO_MODE = "demo_mode"
     QUIT = "quit"
@@ -67,6 +68,7 @@ class Evt:
     HUD_READY = "hud_ready"
     CARD_RESPONSE = "card_response"
     ACTIONABLE_RESPONSE = "actionable_response"
+    INSIGHT_RESPONSE = "insight_response"
     PILL_STOP_CLICKED = "pill_stop_clicked"
     PILL_COLLAPSED = "pill_collapsed"
     PILL_EXPANDED = "pill_expanded"
@@ -293,7 +295,13 @@ class HudLauncher:
             if fut is not None and not fut.done():
                 fut.set_result(answer if answer in ("yes", "no", "timeout") else "timeout")
             return
-        if event == Evt.ACTIONABLE_RESPONSE:
+        if event in (Evt.ACTIONABLE_RESPONSE, Evt.INSIGHT_RESPONSE):
+            # Actionable toasts (daily drill) and insight cards (post-capture
+            # coaching) share the same callback map + dispatch: both carry
+            # on_pressed / on_secondary / on_expire keyed by request_id, and
+            # the request_id prefixes ("actionable-" / "insight-") never
+            # collide. Reusing the map means the give-up path
+            # (_fail_pending_consents) already fires on_expire for both.
             req_id = payload.get("request_id")
             outcome = payload.get("outcome")
             entry = self._pending_actionables.pop(req_id, None) if req_id else None
@@ -579,6 +587,66 @@ class HudLauncher:
         }
         # Only carry the secondary button when present so single-button
         # actionables stay byte-identical to the pre-v3.8.x command shape.
+        if secondary_button_label is not None:
+            cmd["secondary_button_label"] = secondary_button_label
+        ok = self._send_threadsafe(cmd)
+        if not ok:
+            self._pending_actionables.pop(request_id, None)
+        return ok
+
+    # --- insight card (post-capture coaching) -------------------------
+
+    def show_insight(
+        self,
+        *,
+        headline: str,
+        body: str,
+        source_label: str,
+        button_label: str,
+        on_pressed: Callable[[], None],
+        expire_after_secs: float,
+        quote: Optional[str] = None,
+        insight_type: Optional[str] = None,
+        on_expire: Optional[Callable[[], None]] = None,
+        secondary_button_label: Optional[str] = None,
+        on_secondary_pressed: Optional[Callable[[], None]] = None,
+    ) -> bool:
+        """Show the compact post-capture coaching card (v3.10+).
+
+        Mirrors :meth:`show_actionable`'s plumbing — callbacks stored in the
+        shared ``_pending_actionables`` map, dispatched on
+        ``insight_response``. ``on_pressed`` opens the capture deep-link;
+        ``on_secondary_pressed`` is the "Stop showing these" off-switch.
+        """
+        if self._given_up:
+            log.warning(
+                "[notify] notify_insight dropped (HUD given up): headline=%r",
+                headline,
+            )
+            return False
+        request_id = f"insight-{uuid.uuid4().hex}"
+        log.info(
+            "[notify] insight scheduled: headline=%r type=%r has_quote=%s expire_after=%ss",
+            headline, insight_type, bool(quote), expire_after_secs,
+        )
+        self._pending_actionables[request_id] = {
+            "on_pressed": on_pressed,
+            "on_expire": on_expire,
+            "on_secondary": on_secondary_pressed,
+        }
+        cmd: dict[str, Any] = {
+            "cmd": Cmd.SHOW_INSIGHT,
+            "request_id": request_id,
+            "headline": headline,
+            "body": body,
+            "source_label": source_label,
+            "button_label": button_label,
+            "expire_after_secs": float(expire_after_secs),
+        }
+        if quote:
+            cmd["quote"] = quote
+        if insight_type:
+            cmd["insight_type"] = insight_type
         if secondary_button_label is not None:
             cmd["secondary_button_label"] = secondary_button_label
         ok = self._send_threadsafe(cmd)

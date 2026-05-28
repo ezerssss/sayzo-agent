@@ -94,6 +94,14 @@ _NOTIFICATION_KEYS: dict[str, dict] = {
         "store_patch": lambda v: {"notify_capture_saved": v},
         "cfg_attr": ("notify_capture_saved",),
     },
+    # Post-capture coaching insight card (v3.10+). The live poller reads
+    # ``cfg.notify_capture_feedback`` at fire time, so this goes through
+    # RELOAD_NOTIFICATION_CONFIG (see set_notification) to take effect on the
+    # next analyzed capture without a restart.
+    "capture_feedback": {
+        "store_patch": lambda v: {"notify_capture_feedback": v},
+        "cfg_attr": ("notify_capture_feedback",),
+    },
     "session_wrapped": {
         "store_patch": lambda v: {"arm": {"notify_session_wrapped": v}},
         "cfg_attr": ("arm", "notify_session_wrapped"),
@@ -606,6 +614,7 @@ class Bridge:
             "welcome": bool(self._cfg.notify_welcome),
             "post_arm": bool(self._cfg.arm.notify_post_arm),
             "capture_saved": bool(self._cfg.notify_capture_saved),
+            "capture_feedback": bool(self._cfg.notify_capture_feedback),
             "session_wrapped": bool(self._cfg.arm.notify_session_wrapped),
             "checkin": bool(self._cfg.arm.checkin_enabled),
             "meeting_ended_watcher": bool(self._cfg.arm.meeting_ended_watcher_enabled),
@@ -645,15 +654,15 @@ class Bridge:
             )
             return {"saved": False, "error": "couldn't write user_settings.json"}
 
-        # Daily-drill scheduler has a dedicated reload IPC; master flag
-        # routes through the same path so the scheduler picks up the
-        # gate. The other toggles (welcome / capture_saved / arm.*)
-        # are read from ``cfg`` on each event by the running agent;
-        # the settings subprocess holds its own ``cfg`` copy, so those
-        # changes take effect on the next agent process restart. Mid-
-        # session live propagation for the arm flags is preexisting
-        # tech debt (post_arm has the same shape).
-        if key in ("daily_drill", "master"):
+        # RELOAD_NOTIFICATION_CONFIG re-reads config from disk into the live
+        # agent. Three flags need it: daily_drill (scheduler reload), master
+        # (gates both the scheduler and the insight path), and capture_feedback
+        # (the CapturePoller reads ``cfg.notify_capture_feedback`` at fire
+        # time). The other toggles (welcome / capture_saved / arm.*) are read
+        # from ``cfg`` per-event by the agent; since the settings subprocess
+        # holds its own ``cfg`` copy, those changes take effect on the next
+        # agent restart — preexisting tech debt (post_arm has the same shape).
+        if key in ("daily_drill", "master", "capture_feedback"):
             try:
                 self._ipc.call_quiet(Methods.RELOAD_NOTIFICATION_CONFIG)
             except Exception:

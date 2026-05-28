@@ -46,6 +46,7 @@ export type NotificationFlags = {
   welcome: boolean;
   post_arm: boolean;
   capture_saved: boolean;
+  capture_feedback: boolean;
   session_wrapped: boolean;
   checkin: boolean;
   meeting_ended_watcher: boolean;

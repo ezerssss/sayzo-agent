@@ -878,6 +878,16 @@ class Config(BaseSettings):
     # ``ArmConfig.notify_post_arm`` for the arm-time sub-toggle.
     notify_welcome: bool = True
     notify_capture_saved: bool = True
+    # Post-capture coaching insight card (v3.10+). When True, once the server
+    # finishes analyzing a capture the agent shows ONE specific, grounded
+    # coaching insight as a compact HUD card (see capture_poller.py). Default
+    # ON — it's the engagement payoff. The card carries a one-click "Stop
+    # showing these" button that flips this to False; also toggleable in
+    # Settings → Notifications. When ON it REPLACES the immediate "Capture
+    # saved" toast (the insight card deep-links too); the saved toast only
+    # fires as a fallback when no insight is produced. SAYZO_NOTIFY_CAPTURE_FEEDBACK=0
+    # to disable. Master ``notifications_enabled`` still wins.
+    notify_capture_feedback: bool = True
 
     capture: CaptureConfig = Field(default_factory=CaptureConfig)
     vad: VADConfig = Field(default_factory=VADConfig)
@@ -958,6 +968,7 @@ def load_config() -> Config:
         "notifications_enabled",
         "notify_welcome",
         "notify_capture_saved",
+        "notify_capture_feedback",
     ):
         if key in user and key not in env_top_keys:
             init_kwargs[key] = user[key]
