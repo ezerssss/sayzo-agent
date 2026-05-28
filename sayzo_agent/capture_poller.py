@@ -53,13 +53,25 @@ log = logging.getLogger(__name__)
 
 
 # Seconds-between-checks for ``GET /api/captures/{id}``. Dense early ticks
-# catch the common case fast (server estimate: p50 ≈ 2-3 min to ``analyzed``)
-# so the insight toast lands while the meeting is fresh; the ~5-min backoff
-# tail covers the slow tail (p95 ≈ 4-6 min, but bursty concurrency / long
-# captures / a server deploy gap can push past ~8 min). Total reach ≈ 28 min
-# (10+30+60+120+240+300×4). RE-TUNE this tail once the server ships
-# ``analyzedAt`` and we have real percentiles. Non-owning polls stop on the
-# first cached title, so the tail only applies to ``owns_toast`` captures.
+# catch title/summary fast (lands 5-30 s after upload — keeps Settings →
+# Captures readable promptly); the multi-minute tail covers the much
+# slower ``analyzed`` step. Server estimates (updated 2026-05-28 after
+# the deep-analysis model swapped from gpt-4o-mini to gpt-5 reasoning to
+# fix generic-insight outputs): p50 ≈ 5-8 min, p95 ≈ 10-15 min, worst case
+# ≈ 20+ min. Total schedule reach ≈ 28 min (10+30+60+120+240+300×4) —
+# above the server's "push give-up to ~20 min" floor with ~8 min headroom
+# past their stated worst case. Past ~15 min the server team calls a
+# capture "probably stuck" (deploy gap / OpenAI outage / genuine failure),
+# so don't extend the cap speculatively. Ticks 3-4 (100s, 220s) are now
+# structurally before any plausible ``analyzed`` under gpt-5 — kept as
+# redundant title/summary catches rather than restructured (1-2 extra GETs
+# per capture is cheap). Defer-cap interaction: ``_INSIGHT_DEFER_MAX_SECS``
+# (1 h) is measured from insight-ready, so end-to-end wait can hit ~80 min
+# before drop under gpt-5; ``_freshness_label`` renders honestly off
+# ``record.ended_at``. RE-TUNE this block when the server ships
+# ``analyzedAt`` and we have real percentiles (the gpt-5 numbers above are
+# also structural estimates). Non-owning polls stop on the first cached
+# title, so the tail only applies to ``owns_toast`` captures.
 DEFAULT_POLL_SCHEDULE: tuple[float, ...] = (
     10.0, 30.0, 60.0, 120.0, 240.0, 300.0, 300.0, 300.0, 300.0,
 )
