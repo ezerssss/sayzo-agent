@@ -29,6 +29,10 @@ interface PillState {
   startTs: number;
   hotkey: string;
   collapsed: boolean;
+  // Per-show paint_id forwarded from the launcher (see launcher.py
+  // show_pill). StatePill emits it on mount so the launcher can log
+  // delta_ms — same diagnostic surface as the card components.
+  paintId?: string;
 }
 
 interface CardState {
@@ -231,6 +235,7 @@ export function HudApp() {
             startTs: cmd.start_ts,
             hotkey: cmd.hotkey,
             collapsed: false,
+            paintId: cmd.paint_id,
           });
           break;
         case "hide_pill":
@@ -261,6 +266,17 @@ export function HudApp() {
               timeout_secs: cmd.timeout_secs,
             },
           ]);
+          break;
+        case "hide_card":
+          // Python-initiated dismiss — fired by ask_consent's
+          // cancel-prior path (a new consent supersedes an in-flight
+          // one) and by the Python-side timeout (so the card doesn't
+          // linger past the Python future's give-up point). Filter the
+          // matching id out of the FIFO queue without emitting a
+          // card_response — the Python future has already been
+          // resolved by the launcher side, so any response we sent
+          // would race with the new caller's reply.
+          setCards((cs) => cs.filter((c) => c.request_id !== cmd.request_id));
           break;
         case "show_toast":
           setToasts((ts) => {
@@ -409,28 +425,76 @@ export function HudApp() {
   // everything goes away we let the shell fade out before telling
   // Python to move the OS window offscreen, so the user sees a soft
   // dismissal rather than a snap.
-  const [windowShown, setWindowShown] = useState(false);
-
+  //
+  // Deps cover (a) `hasContent` for the canonical show/hide and
+  // (b) `activeCard?.request_id` for the supersede sub-case: when
+  // a hide_card + show_card pair arrives back-to-back from Python
+  // (consent cancel-prior path), React batches both setCards calls
+  // and `hasContent` stays `true` across the swap — so the effect
+  // wouldn't re-fire on `hasContent` alone, and the layered window
+  // could stick on the prior card's pixmap (window.py:319-326).
+  // Adding activeCard.request_id to deps makes the swap an
+  // observable transition that re-runs the double-rAF + paint
+  // trick. Python-side `_set_window_visible(True)` is idempotent
+  // for the visible flag itself but always re-runs the show
+  // sequence (1-px setGeometry + update()), so the layered window
+  // gets a fresh compose for the new card.
+  //
+  // Early versions tracked a `windowShown` state in deps to avoid
+  // redundant OS calls, but that hit the classic setState-in-effect-
+  // with-state-in-deps anti-pattern: `setWindowShown(true)` would
+  // queue a re-render, the effect would re-run, and React would
+  // fire the OLD effect's cleanup (cancelling the pending rAF chain)
+  // BEFORE the rAFs had a chance to resolve — so `callOs(true)`
+  // never landed.
   useEffect(() => {
-    const callOs = (v: boolean) => {
-      void hudBridge.setWindowVisible(v);
-    };
     if (hasContent) {
-      if (!windowShown) {
-        setWindowShown(true);
-        callOs(true);
-      }
-      return;
+      // Double-rAF before flipping the OS window to visible. React's
+      // `useEffect` runs after commit but BEFORE the browser has
+      // actually painted the new content to QtWebEngine's GPU
+      // surface. If we call setWindowVisible(true) synchronously,
+      // Python's paintEvent → UpdateLayeredWindow composes a still-
+      // empty WebEngine surface into the layered host window, and
+      // the layered surface stays stuck on those alpha=0 pixels
+      // (the failure documented at window.py:319-326). The first
+      // rAF lands on the next paint-scheduling tick; the second
+      // lands AFTER that paint has committed to the GPU surface,
+      // so Python's compose sees real card content.
+      //
+      // Cancellable so the supersede path in launcher.py
+      // (cancel-prior on new ask_consent) — which can fire show_card
+      // + hide_card within ~5 ms — doesn't end up calling
+      // setWindowVisible(true) after the hide-fade has already started.
+      let cancelled = false;
+      const raf1 = requestAnimationFrame(() => {
+        if (cancelled) return;
+        requestAnimationFrame(() => {
+          if (cancelled) return;
+          void hudBridge.setWindowVisible(true);
+        });
+      });
+      return () => {
+        cancelled = true;
+        cancelAnimationFrame(raf1);
+      };
     }
     // hasContent went false — let the shell fade-out class run, then
-    // hide the OS window after the fade settles.
-    if (!windowShown) return;
+    // hide the OS window after the fade settles. Also fires once on
+    // initial mount because hasContent starts false; the resulting
+    // setWindowVisible(false) IPC is a no-op (Python early-returns
+    // when visible == self._currently_visible, which is already
+    // False at boot) so the redundant call is harmless.
     const t = window.setTimeout(() => {
-      setWindowShown(false);
-      callOs(false);
+      void hudBridge.setWindowVisible(false);
     }, HUD_FADE_MS);
     return () => window.clearTimeout(t);
-  }, [hasContent, windowShown]);
+    // Deps cover every overlay slot whose request_id can swap
+    // in-place without a `hasContent` flip — the same paint-stall
+    // failure mode applies symmetrically to consent cards, actionable
+    // toasts, and insight cards (any of them can be replaced via
+    // `setX({...new})` carrying a fresh request_id while another
+    // overlay keeps `hasContent=true`).
+  }, [hasContent, activeCard?.request_id, actionable?.request_id, insight?.request_id]);
 
   // Demo controls — dispatch synthetic commands into the bridge so the
   // exact same code path the production launcher uses also drives the
@@ -596,6 +660,7 @@ export function HudApp() {
       {/* Base layer: pill or dot, shown only while armed. */}
       {pill && !pill.collapsed && (
         <StatePill
+          paintId={pill.paintId}
           audioLevel={audioLevel}
           onStop={handlePillStop}
           onCollapse={handlePillCollapse}
@@ -609,6 +674,7 @@ export function HudApp() {
       {toasts.map((t) => (
         <InfoToast
           key={t.id}
+          id={t.id}
           title={t.title}
           body={t.body}
           ttlSecs={t.ttl_secs}
@@ -620,6 +686,7 @@ export function HudApp() {
       {activeCard && (
         <ConsentCard
           key={activeCard.request_id}
+          requestId={activeCard.request_id}
           title={activeCard.title}
           body={activeCard.body}
           yesLabel={activeCard.yes_label}
@@ -633,6 +700,7 @@ export function HudApp() {
       {actionable && (
         <ActionableToast
           key={actionable.request_id}
+          requestId={actionable.request_id}
           title={actionable.title}
           body={actionable.body}
           buttonLabel={actionable.button_label}
@@ -646,6 +714,7 @@ export function HudApp() {
       {insight && (
         <InsightCard
           key={insight.request_id}
+          requestId={insight.request_id}
           headline={insight.headline}
           body={insight.body}
           sourceLabel={insight.source_label}

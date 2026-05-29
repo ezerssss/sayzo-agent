@@ -33,6 +33,11 @@ export interface ShowPillCmd {
   reason_label: string;
   start_ts: number;
   hotkey: string;
+  // Per-show identifier emitted as the request_id on the StatePill
+  // mount-effect's `card_painted` event so the launcher can log
+  // delta_ms. Optional so older agent builds that don't send it
+  // still render the pill (the diagnostic just silently no-ops).
+  paint_id?: string;
 }
 
 export interface HidePillCmd {
@@ -116,6 +121,11 @@ export interface ShowInsightCmd {
   secondary_button_label?: string;
 }
 
+export interface HideCardCmd {
+  cmd: "hide_card";
+  request_id: string;
+}
+
 export interface HideAllCmd {
   cmd: "hide_all";
 }
@@ -134,6 +144,7 @@ export type HudCommand =
   | ShowToastCmd
   | ShowActionableCmd
   | ShowInsightCmd
+  | HideCardCmd
   | HideAllCmd
   | DemoModeCmd;
 
@@ -150,6 +161,14 @@ export type HudEvent =
       request_id: string;
       outcome: "pressed" | "expired" | "snoozed";
     }
+  // Fired by each card / toast / insight component after one rAF in
+  // its mount effect, so the parent agent can log the time delta
+  // between "Python sent show_X" and "browser actually painted X
+  // into the WebEngine GPU surface." Diagnoses the layered-window
+  // paint-stall (window.py:319-326) — if delta_ms looks normal but
+  // the user still doesn't see anything, the failure is in the Qt
+  // → UpdateLayeredWindow compose path, not React.
+  | { event: "card_painted"; request_id: string }
   | { event: "pill_stop_clicked" }
   | { event: "pill_collapsed" }
   | { event: "pill_expanded" }

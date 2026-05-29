@@ -51,6 +51,7 @@ class Notifier(Protocol):
         no_label: str,
         timeout_secs: float,
         default_on_timeout: ConsentResult = "no",
+        supersede: bool = False,
     ) -> ConsentResult: ...
 
     def notify_actionable(
@@ -104,7 +105,12 @@ class NoopNotifier:
         no_label: str,
         timeout_secs: float,
         default_on_timeout: ConsentResult = "timeout",
+        supersede: bool = False,
     ) -> ConsentResult:
+        # ``supersede`` is HUD-side semantics (replace any pending
+        # consent card); under the no-op notifier there's nothing to
+        # supersede. Accepted for Protocol conformance.
+        del supersede
         log.debug(
             "[notify] (noop) consent %s — %s → %s", title, body, default_on_timeout,
         )
@@ -218,6 +224,7 @@ class HudNotifier:
         no_label: str,
         timeout_secs: float,
         default_on_timeout: ConsentResult = "no",
+        supersede: bool = False,
     ) -> ConsentResult:
         return self._launcher.ask_consent(
             title=title,
@@ -226,6 +233,7 @@ class HudNotifier:
             no_label=no_label,
             timeout_secs=timeout_secs,
             default_on_timeout=default_on_timeout,
+            supersede=supersede,
         )
 
     def notify_actionable(

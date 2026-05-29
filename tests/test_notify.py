@@ -114,6 +114,7 @@ class _FakeLauncher:
         no_label: str,
         timeout_secs: float,
         default_on_timeout: str = "no",
+        supersede: bool = False,
     ) -> str:
         self.calls.append((
             "ask_consent",
@@ -124,6 +125,7 @@ class _FakeLauncher:
                 "no_label": no_label,
                 "timeout_secs": timeout_secs,
                 "default_on_timeout": default_on_timeout,
+                "supersede": supersede,
             },
         ))
         return self._consent_answer

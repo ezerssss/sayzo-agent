@@ -1,8 +1,12 @@
-import { useEffect, useRef, useState } from "react";
 import { Clock, X } from "lucide-react";
+import { useCountdownTimer } from "../lib/useCountdownTimer";
+import { usePaintedSignal } from "../lib/usePaintedSignal";
 import { HudCard } from "./HudCard";
 
+type Outcome = "pressed" | "expired" | "snoozed";
+
 interface Props {
+  requestId: string;
   /** Plain, self-explanatory headline (server-generated). */
   headline: string;
   /** The concrete suggestion / rewrite / observation. */
@@ -18,16 +22,18 @@ interface Props {
   /** Secondary "Stop showing these" off-switch. Absent ⇒ single-button card. */
   secondaryButtonLabel?: string;
   expireAfterSecs: number;
-  onOutcome: (outcome: "pressed" | "expired" | "snoozed") => void;
+  onOutcome: (outcome: Outcome) => void;
 }
 
 // Compact post-capture coaching card (v3.10+). Deliberately lighter than a
 // "rich" card: one source line + headline + at most one short quote + one
 // line of advice. The "why it helps" lives behind "See full feedback", not
 // here — the card has to be absorbable at a glance, not be a reading task.
-// Countdown + single-fire latch mirror ActionableToast so the auto-expire /
-// dismiss / press / stop semantics stay identical across HUD cards.
+// Countdown + single-fire latch via useCountdownTimer — same hook
+// ActionableToast uses, so auto-expire / dismiss / press / stop semantics
+// stay identical across HUD cards.
 export function InsightCard({
+  requestId,
   headline,
   body,
   sourceLabel,
@@ -38,45 +44,13 @@ export function InsightCard({
   expireAfterSecs,
   onOutcome,
 }: Props) {
-  const [remaining, setRemaining] = useState(expireAfterSecs);
-  const calledRef = useRef(false);
-
-  useEffect(() => {
-    const startedAt = Date.now();
-    const id = setInterval(() => {
-      const elapsed = (Date.now() - startedAt) / 1000;
-      const left = Math.max(0, expireAfterSecs - elapsed);
-      setRemaining(left);
-      if (left <= 0 && !calledRef.current) {
-        calledRef.current = true;
-        clearInterval(id);
-        onOutcome("expired");
-      }
-    }, 250);
-    return () => clearInterval(id);
-  }, [expireAfterSecs, onOutcome]);
-
-  function handlePress() {
-    if (calledRef.current) return;
-    calledRef.current = true;
-    onOutcome("pressed");
-  }
-
-  function handleDismiss() {
-    // Manual dismiss == natural expiry: the user saw it and moved on.
-    if (calledRef.current) return;
-    calledRef.current = true;
-    onOutcome("expired");
-  }
-
-  function handleStop() {
-    // "Stop showing these" — reuses the "snoozed" wire outcome, which the
-    // launcher routes to the secondary callback (the off-switch). Distinct
-    // from "expired" so the agent knows this was a deliberate opt-out.
-    if (calledRef.current) return;
-    calledRef.current = true;
-    onOutcome("snoozed");
-  }
+  usePaintedSignal(requestId);
+  const { remaining, fireOnce } = useCountdownTimer<Outcome>(
+    expireAfterSecs,
+    "expired",
+    onOutcome,
+    250,
+  );
 
   const progress = Math.max(0, Math.min(1, remaining / expireAfterSecs));
 
@@ -84,7 +58,8 @@ export function InsightCard({
     <HudCard className="px-4 pb-4 pt-1">
       <button
         type="button"
-        onClick={handleDismiss}
+        // Manual dismiss == natural expiry: the user saw it and moved on.
+        onClick={() => fireOnce("expired")}
         title="Dismiss"
         aria-label="Dismiss"
         className="hud-no-drag absolute right-3 top-3 flex h-6 w-6 items-center justify-center rounded-full text-ink-muted transition hover:bg-gray-100 hover:text-ink"
@@ -132,7 +107,11 @@ export function InsightCard({
         {secondaryButtonLabel && (
           <button
             type="button"
-            onClick={handleStop}
+            // "Stop showing these" — reuses the "snoozed" wire outcome,
+            // which the launcher routes to the secondary callback (the
+            // off-switch). Distinct from "expired" so the agent knows
+            // this was a deliberate opt-out.
+            onClick={() => fireOnce("snoozed")}
             className="hud-no-drag rounded-lg border border-gray-200 bg-transparent px-3 py-2 text-[13px] font-semibold text-ink-muted transition hover:bg-gray-100 hover:text-ink"
           >
             {secondaryButtonLabel}
@@ -140,7 +119,7 @@ export function InsightCard({
         )}
         <button
           type="button"
-          onClick={handlePress}
+          onClick={() => fireOnce("pressed")}
           className="hud-no-drag rounded-lg bg-accent px-3 py-2 text-[13px] font-semibold text-white shadow transition hover:bg-accent-hover"
         >
           {buttonLabel}

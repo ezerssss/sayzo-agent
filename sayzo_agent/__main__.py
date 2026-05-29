@@ -677,7 +677,9 @@ def test_meeting_ended_flow() -> None:
         def ask_consent(
             self, title: str, body: str, yes_label: str, no_label: str,
             timeout_secs: float, default_on_timeout: str = "no",
+            supersede: bool = False,
         ) -> str:
+            del supersede  # HUD-side semantic; ignored under the fake notifier.
             self.consent_calls.append({"title": title, "body": body})
             if self.consent_script:
                 return self.consent_script.pop(0)

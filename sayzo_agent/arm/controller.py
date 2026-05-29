@@ -547,10 +547,16 @@ class ArmController:
         # pill hides for the duration of the confirmation toast so
         # the user isn't simultaneously asked "stop?" and told "still
         # capturing".
+        # Hotkey presses opt in to supersede: any pending consent
+        # (e.g. a whitelist auto-suggest) is the older user signal;
+        # the hotkey press is the latest and most explicit. Resolves
+        # the "consent timed out because two stacked toasts" issue
+        # in the v3.11.0 bug report.
         toast_task = asyncio.ensure_future(self._ask_consent_pausing_pill(
             title, body, yes_label, no_label,
             timeout_secs=self.cfg.hotkey_confirm_timeout_secs,
             default_on_timeout="no",
+            supersede=True,
         ))
         try:
             done, pending = await asyncio.wait(
@@ -1620,6 +1626,7 @@ class ArmController:
     async def _ask_consent(
         self, title: str, body: str, yes: str, no: str, timeout_secs: float,
         default_on_timeout: ConsentResult,
+        supersede: bool = False,
     ) -> ConsentResult:
         """Run ``Notifier.ask_consent`` without blocking the event loop.
 
@@ -1627,18 +1634,27 @@ class ArmController:
         We run it in a default executor so our asyncio loop keeps ticking —
         important because other watchers (whitelist, check-in, meeting-ended)
         may need to continue polling while a toast is up.
+
+        ``supersede`` (default False) opt-in dismisses any pending consent
+        card before showing the new one. Only the hotkey path sets True —
+        see :meth:`_race_confirm_with_double_tap`. Other callers
+        (whitelist watcher, pending_close, meeting_ended, check-in)
+        queue behind the active card.
         """
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None,
             lambda: self.notifier.ask_consent(
-                title, body, yes, no, timeout_secs, default_on_timeout=default_on_timeout,
+                title, body, yes, no, timeout_secs,
+                default_on_timeout=default_on_timeout,
+                supersede=supersede,
             ),
         )
 
     async def _ask_consent_pausing_pill(
         self, title: str, body: str, yes: str, no: str, timeout_secs: float,
         default_on_timeout: ConsentResult,
+        supersede: bool = False,
     ) -> ConsentResult:
         """Ask for consent with the persistent pill hidden during the prompt.
 
@@ -1660,6 +1676,7 @@ class ArmController:
             return await self._ask_consent(
                 title, body, yes, no, timeout_secs,
                 default_on_timeout=default_on_timeout,
+                supersede=supersede,
             )
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
@@ -1667,6 +1684,7 @@ class ArmController:
             lambda: self._hud_launcher.ask_consent_pausing_pill(
                 title, body, yes, no, timeout_secs,
                 default_on_timeout=default_on_timeout,
+                supersede=supersede,
             ),
         )
 

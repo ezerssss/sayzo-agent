@@ -86,7 +86,7 @@ async def _main() -> int:
         def notify(self, title: str, body: str) -> None:
             pass
 
-        def ask_consent(self, title, body, yes_label, no_label, timeout, default_on_timeout):
+        def ask_consent(self, title, body, yes_label, no_label, timeout, default_on_timeout, supersede=False):
             return self.script.pop(0) if self.script else default_on_timeout
 
         def __getattr__(self, name):

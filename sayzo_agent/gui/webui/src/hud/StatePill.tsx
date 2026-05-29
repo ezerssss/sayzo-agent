@@ -1,16 +1,23 @@
 import { memo } from "react";
 import { Check, Minimize2 } from "lucide-react";
+import { usePaintedSignal } from "../lib/usePaintedSignal";
 import logoSvgUrl from "../assets/logo.svg";
 import { GripDots } from "./GripDots";
 import { Waveform } from "./Waveform";
 
 interface Props {
+  /** Per-show identifier from launcher's show_pill. Mount-effect emits
+      it on `card_painted` so the launcher can log delta_ms. Absent
+      under the dev-preview path that doesn't go through launcher. */
+  paintId?: string;
   audioLevel?: number;
   onStop: () => void;
   onCollapse: () => void;
 }
 
-function StatePillImpl({ audioLevel, onStop, onCollapse }: Props) {
+function StatePillImpl({ paintId, audioLevel, onStop, onCollapse }: Props) {
+  usePaintedSignal(paintId);
+
   return (
     <div
       // Content-driven width. Whole pill is the drag region via

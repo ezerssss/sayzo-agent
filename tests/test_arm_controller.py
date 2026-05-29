@@ -107,12 +107,14 @@ class FakeNotifier:
         no_label: str,
         timeout_secs: float,
         default_on_timeout: str = "no",
+        supersede: bool = False,
     ) -> str:
         self.consent_calls.append({
             "title": title, "body": body,
             "yes": yes_label, "no": no_label,
             "timeout": timeout_secs,
             "default_on_timeout": default_on_timeout,
+            "supersede": supersede,
         })
         if self.consent_script:
             return self.consent_script.pop(0)
@@ -235,11 +237,13 @@ class _FakeHudLauncher:
         no_label: str,
         timeout_secs: float,
         default_on_timeout: str = "no",
+        supersede: bool = False,
     ) -> str:
         # Delegate to the notifier so the existing FakeNotifier
         # ``consent_script`` mechanism drives this path too.
         return self._notifier.ask_consent(
-            title, body, yes_label, no_label, timeout_secs, default_on_timeout,
+            title, body, yes_label, no_label, timeout_secs,
+            default_on_timeout, supersede=supersede,
         )
 
 

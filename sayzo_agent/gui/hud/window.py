@@ -106,6 +106,15 @@ class _HudHostWidget(QWidget):
         # calls would clobber the anchor with stale geometry values
         # if Qt fires ``moveEvent`` before ``resizeEvent``.
         self._suppress_anchor_update = False
+        # Running count of resizeEvents fired by Qt's platform plugin —
+        # diagnostic for the 1-px shrink-restore trick in
+        # :meth:`_set_window_visible`. The trick calls ``setGeometry``
+        # twice with different widths in immediate succession to force
+        # a paintEvent → UpdateLayeredWindow refresh; whether Qt
+        # delivers two real resize events or coalesces them has been
+        # an unverified assumption since v3.x. Logged on every visible
+        # show so we can finally measure it.
+        self._n_resize_events = 0
         # Bounded retry counter for the macOS overlay-tweak path —
         # NSWindow realization can lag Qt's loadFinished signal by a
         # tick under load. See :meth:`_apply_mac_overlay_tweaks`.
@@ -276,26 +285,42 @@ class _HudHostWidget(QWidget):
     # ------------------------------------------------------------------
 
     def _set_window_visible(self, visible: bool) -> None:
-        if visible == self._currently_visible:
+        # Redundant HIDE calls are a no-op (window already hidden).
+        # Redundant SHOW calls — i.e. setWindowVisible(True) while
+        # already visible — DO run the paint-refresh sequence again
+        # (1-px setGeometry trick + update() + OS-state log) so the
+        # layered-window backing store recomposes for a swapped card
+        # at the same dimensions (supersede + activeCard.request_id
+        # transitions in HudApp.tsx). But the anchor reset on a real
+        # hidden→visible transition (refresh_screen_anchor + snap to
+        # top-right) MUST NOT fire on a redundant SHOW — that would
+        # silently destroy the user's mid-session drag captured by
+        # moveEvent. Pre-v3.11.0 the early-return covered both
+        # branches and the user-drag preservation was implicit; this
+        # method now gates the anchor reset explicitly on
+        # ``was_visible``.
+        if not visible and not self._currently_visible:
             return
+        was_visible = self._currently_visible
         self._currently_visible = visible
         if visible:
-            # Refresh the chosen-screen anchor on every show. The value
-            # captured at HUD-subprocess __init__ is suspect in two
-            # common scenarios — agent auto-starts at boot before
-            # Windows finishes painting the desktop, and the user
-            # reconfigures monitors between captures — so we re-probe
-            # Qt's screen API here. After this, even if the init-time
-            # value was wrong, the very first show lands the window
-            # correctly.
-            self._refresh_screen_anchor()
-            # Snap the live anchor back to the freshly-computed
-            # top-right of the chosen screen. The user-drag override in
-            # ``moveEvent`` only persists within a single visible
-            # session — once the previous batch cleared and we went
-            # hidden, the next cycle starts fresh at top-right.
-            self._anchor_right_x = self._screen_right_edge
-            self._anchor_y = self._screen_top_edge
+            if not was_visible:
+                # Real hidden→visible transition: refresh the chosen-
+                # screen anchor and snap to top-right. The value
+                # captured at HUD-subprocess __init__ is suspect in
+                # two common scenarios — agent auto-starts at boot
+                # before Windows finishes painting the desktop, and
+                # the user reconfigures monitors between captures —
+                # so we re-probe Qt's screen API here. The user-drag
+                # override in ``moveEvent`` only persists within a
+                # single visible session; going hidden and back
+                # resets it intentionally.
+                self._refresh_screen_anchor()
+                self._anchor_right_x = self._screen_right_edge
+                self._anchor_y = self._screen_top_edge
+            # Use whatever anchor is current — preserved across
+            # redundant SHOWs so a card swap doesn't yank the
+            # window away from where the user dragged it.
             x = self._anchor_right_x - self._current_width
             y = self._anchor_y
             # Last-resort safety net: if for some reason the target
@@ -326,15 +351,33 @@ class _HudHostWidget(QWidget):
             # widths (>300 px).
             w = self._current_width
             h = self._current_height
+            resize_count_before = self._n_resize_events
             self._suppress_anchor_update = True
             try:
                 self.setGeometry(int(x), int(y), max(1, w - 1), h)
                 self.setGeometry(int(x), int(y), w, h)
             finally:
                 self._suppress_anchor_update = False
+            # Belt-and-suspenders alongside the 1-px trick above:
+            # explicit ``update()`` posts a paintEvent into Qt's event
+            # queue even if the platform plugin coalesces the two
+            # setGeometry calls into a single (no-net-change) resize.
+            # ``_view.update()`` mirrors that on the QWebEngineView
+            # widget so the WebEngine compositor's own surface gets
+            # composed into the host pixmap before
+            # ``UpdateLayeredWindow`` is called. Neither replaces the
+            # React-side double-rAF gate in HudApp.tsx, which is the
+            # load-bearing fix for the paint-stall race; these just
+            # close the residual window where Qt's compose runs but
+            # finds a stale GPU surface.
+            self.update()
+            if self._view is not None:
+                self._view.update()
+            resize_count_delta = self._n_resize_events - resize_count_before
             log.info(
-                "[hud] window visibility → shown (pos=%d,%d size=%dx%d)",
+                "[hud] window visibility → shown (pos=%d,%d size=%dx%d resize_events=%d)",
                 int(x), int(y), self._current_width, self._current_height,
+                resize_count_delta,
             )
             # macOS: force the NSWindow into the visible Z-stack via
             # ``orderFrontRegardless``. Required when the parent process
@@ -353,6 +396,18 @@ class _HudHostWidget(QWidget):
             # Window is now content-bearing — let it receive clicks so
             # the user can interact with the card / pill / actionable.
             self._set_click_through(False)
+            # On Windows, ask the OS what it actually thinks the window
+            # is doing. Diagnostic for the layered-window paint-stall:
+            # if ``IsWindowVisible`` is True and the rect matches what
+            # we set but the user still reports nothing on screen, the
+            # failure is definitively in the pixmap-content path
+            # (UpdateLayeredWindow composing a stale WebEngine GPU
+            # surface), not the window-state path. Skipped on macOS —
+            # the failure-mode there is different (LSUIElement-parent
+            # WindowServer composition, handled by
+            # ``_force_order_front_mac`` above).
+            if sys.platform == "win32":
+                self._log_win_os_state()
         else:
             # Going hidden: leave geometry in place — the actual visual
             # disappearance is React rendering all-transparent pixels.
@@ -427,6 +482,51 @@ class _HudHostWidget(QWidget):
         if self._currently_visible and not self._suppress_anchor_update:
             self._anchor_right_x = self.x() + self.width()
             self._anchor_y = self.y()
+
+    def resizeEvent(self, event) -> None:  # noqa: ANN001 — Qt signature
+        """Bump the resize-event diagnostic counter, then defer to Qt.
+
+        Lets :meth:`_set_window_visible` report how many real resize
+        events the 1-px ``setGeometry`` shrink-restore trick actually
+        produced. If the count is consistently 0 or 1, Qt's platform
+        plugin is coalescing the trick into a no-op — explains why
+        the paint-stall workaround was unreliable enough to warrant
+        the React-side double-rAF gate.
+        """
+        super().resizeEvent(event)
+        self._n_resize_events += 1
+
+    def _log_win_os_state(self) -> None:
+        """Log Win32's view of the host window state after a show.
+
+        Diagnostic-only — answers the "is the window actually visible
+        according to Windows?" question that Qt's ``isVisible()`` can't
+        (it returns ``True`` even when the window is occluded or stuck
+        on a stale layered surface). Uses lazy import so the macOS
+        startup path doesn't pay the cost.
+        """
+        try:
+            import win32gui  # type: ignore
+        except Exception:
+            log.debug("[hud] win32gui not importable — skipping OS-state log")
+            return
+        try:
+            hwnd = int(self.winId())
+        except Exception:
+            log.warning("[hud] winId() not available for OS-state log", exc_info=True)
+            return
+        try:
+            is_visible = bool(win32gui.IsWindowVisible(hwnd))
+            is_iconic = bool(win32gui.IsIconic(hwnd))
+            rect = win32gui.GetWindowRect(hwnd)
+        except Exception:
+            log.warning("[hud] win32gui OS-state query failed", exc_info=True)
+            return
+        log.info(
+            "[hud] OS state after show: hwnd=%d IsWindowVisible=%s "
+            "IsIconic=%s GetWindowRect=%r",
+            hwnd, is_visible, is_iconic, rect,
+        )
 
     def _start_system_move(self) -> None:
         """Hand off a window drag to the OS at the cursor's current position.

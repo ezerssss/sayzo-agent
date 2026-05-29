@@ -36,7 +36,7 @@ import os
 import sys
 import time
 import uuid
-from concurrent.futures import Future
+from concurrent.futures import Future, InvalidStateError
 from typing import Any, Callable, Literal, Optional
 
 log = logging.getLogger(__name__)
@@ -59,6 +59,7 @@ class Cmd:
     SHOW_TOAST = "show_toast"
     SHOW_ACTIONABLE = "show_actionable"
     SHOW_INSIGHT = "show_insight"
+    HIDE_CARD = "hide_card"
     HIDE_ALL = "hide_all"
     DEMO_MODE = "demo_mode"
     QUIT = "quit"
@@ -69,6 +70,7 @@ class Evt:
     CARD_RESPONSE = "card_response"
     ACTIONABLE_RESPONSE = "actionable_response"
     INSIGHT_RESPONSE = "insight_response"
+    CARD_PAINTED = "card_painted"
     PILL_STOP_CLICKED = "pill_stop_clicked"
     PILL_COLLAPSED = "pill_collapsed"
     PILL_EXPANDED = "pill_expanded"
@@ -103,11 +105,25 @@ class HudLauncher:
     def __init__(self) -> None:
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._lock = asyncio.Lock()
-        # Per-request future maps, keyed by ``request_id``. Resolved by
+        # Per-request future map, keyed by ``request_id``. Resolved by
         # the stdout reader when it sees the matching ``card_response``
-        # or ``actionable_response`` event.
-        self._pending_cards: dict[str, Future] = {}
+        # event. Stores ``(future, default_on_timeout)`` so the
+        # supersede path in :meth:`ask_consent` can resolve the OLD
+        # caller's future with the OLD caller's default — using the
+        # new caller's default would silently return wrong data,
+        # since the two callers can pass different defaults
+        # (e.g. ``"no"`` vs ``"timeout"``).
+        self._pending_cards: dict[str, tuple[Future, str]] = {}
         self._pending_actionables: dict[str, dict[str, Any]] = {}
+        # Schedule time (monotonic) per request_id / toast id, populated
+        # the moment a SHOW_* command goes onto stdin. The React side
+        # emits ``card_painted`` after one rAF in the component's mount
+        # effect; the stdout reader computes ``delta_ms`` between the
+        # two and logs it. Diagnoses the layered-window paint-stall
+        # (window.py:319-326). Entries are popped on every termination
+        # path via :meth:`_clear_pending_show_tracking` so this dict
+        # cannot grow unbounded over long-running sessions.
+        self._pending_show_times: dict[str, float] = {}
         # Callbacks registered by the ArmController for pill events.
         self._on_pill_stop: Optional[Callable[[], None]] = None
         self._on_pill_collapsed: Optional[Callable[[bool], None]] = None
@@ -291,9 +307,29 @@ class HudLauncher:
         if event == Evt.CARD_RESPONSE:
             req_id = payload.get("request_id")
             answer = payload.get("answer")
-            fut = self._pending_cards.pop(req_id, None) if req_id else None
-            if fut is not None and not fut.done():
-                fut.set_result(answer if answer in ("yes", "no", "timeout") else "timeout")
+            entry = self._pending_cards.pop(req_id, None) if req_id else None
+            self._clear_pending_show_tracking(req_id)
+            if entry is not None:
+                fut, _default = entry
+                if not fut.done():
+                    fut.set_result(
+                        answer if answer in ("yes", "no", "timeout") else "timeout"
+                    )
+            return
+        if event == Evt.CARD_PAINTED:
+            req_id = payload.get("request_id")
+            if not isinstance(req_id, str):
+                return
+            started = self._pending_show_times.pop(req_id, None)
+            if started is None:
+                # Late paint after we already cleared (response /
+                # supersede / hide_card landed first). Not an error.
+                return
+            delta_ms = (time.monotonic() - started) * 1000.0
+            log.info(
+                "[notify] card_painted: request_id=%s delta_ms=%.0f",
+                req_id, delta_ms,
+            )
             return
         if event in (Evt.ACTIONABLE_RESPONSE, Evt.INSIGHT_RESPONSE):
             # Actionable toasts (daily drill) and insight cards (post-capture
@@ -305,6 +341,7 @@ class HudLauncher:
             req_id = payload.get("request_id")
             outcome = payload.get("outcome")
             entry = self._pending_actionables.pop(req_id, None) if req_id else None
+            self._clear_pending_show_tracking(req_id)
             if entry is None:
                 return
             # outcome ∈ {"pressed", "expired", "snoozed"}. "snoozed" routes
@@ -377,9 +414,17 @@ class HudLauncher:
 
     def _fail_pending_consents(self) -> None:
         """Resolve every outstanding card/actionable future as timeout."""
-        for fut in list(self._pending_cards.values()):
+        for fut, default in list(self._pending_cards.values()):
             if not fut.done():
-                fut.set_result("timeout")
+                # Use each caller's own registered default — same
+                # rationale as the supersede path in :meth:`ask_consent`.
+                # Guarded against InvalidStateError for the same reason:
+                # the dispatcher thread may resolve the future between
+                # ``done()`` and ``set_result``.
+                try:
+                    fut.set_result(default)
+                except InvalidStateError:
+                    pass
         self._pending_cards.clear()
         for entry in list(self._pending_actionables.values()):
             cb = entry.get("on_expire")
@@ -389,6 +434,19 @@ class HudLauncher:
                 except Exception:
                     pass
         self._pending_actionables.clear()
+        self._pending_show_times.clear()
+
+    def _clear_pending_show_tracking(self, request_id: Optional[str]) -> None:
+        """Pop the schedule-time entry for ``request_id`` if present.
+
+        Called from every termination path — response received, paint
+        delta logged, hide_card sent, supersede — so
+        ``_pending_show_times`` cannot grow unbounded over a long
+        session of cards and toasts.
+        """
+        if not request_id:
+            return
+        self._pending_show_times.pop(request_id, None)
 
     # ------------------------------------------------------------------
     # Public command surface.
@@ -442,6 +500,7 @@ class HudLauncher:
         if self._given_up:
             return False
         toast_id = f"toast-{uuid.uuid4().hex}"
+        self._pending_show_times[toast_id] = time.monotonic()
         log.info("[notify] notify scheduled: title=%r", title)
         ok = self._send_threadsafe({
             "cmd": Cmd.SHOW_TOAST,
@@ -451,6 +510,7 @@ class HudLauncher:
             "ttl_secs": float(ttl_secs),
         })
         if not ok:
+            self._clear_pending_show_tracking(toast_id)
             log.warning("[notify] notify dropped (HUD unavailable): title=%r", title)
         return ok
 
@@ -464,20 +524,60 @@ class HudLauncher:
         no_label: str,
         timeout_secs: float,
         default_on_timeout: ConsentResult = "no",
+        supersede: bool = False,
     ) -> ConsentResult:
         """Show a consent card and block until the user answers or it times out.
 
         Synchronous — must NOT be called from the asyncio loop thread.
         The legacy ``DesktopNotifier.ask_consent`` had the same constraint.
+
+        ``supersede`` controls what happens when another consent is
+        already on screen. ``False`` (default) queues the new card
+        behind the active one in React's FIFO. ``True`` dismisses every
+        pending consent first, resolving each prior future with its
+        OWN registered ``default_on_timeout`` and sending HIDE_CARD to
+        React. Opt-in because some callers (``pending_close`` with
+        ``default='yes'`` = commit_close; ``meeting_ended`` with
+        ``default='yes'`` = wrap up) have side-effecting defaults that
+        would silently fire if any unrelated new consent superseded
+        them. Only the hotkey path opts in — pressing the hotkey is
+        always the user's most recent and most explicit signal.
         """
         if self._given_up:
             log.warning(
                 "[notify] ask_consent dropped (HUD given up): title=%r", title,
             )
             return default_on_timeout
+        if supersede:
+            # Supersede any in-flight consent before showing the new one.
+            # Walks a snapshot via ``list(...)`` so a concurrent
+            # ``card_response`` from the reader thread can't mutate the
+            # dict mid-iteration. ``set_result`` is guarded by
+            # try/except InvalidStateError because the reader thread can
+            # resolve the future between our ``done()`` check and our
+            # ``set_result`` call — without the guard that race
+            # propagates an exception out of ``ask_consent`` and the new
+            # caller never sees its SHOW_CARD fire.
+            for old_request_id, (old_fut, old_default) in list(self._pending_cards.items()):
+                if not old_fut.done():
+                    try:
+                        old_fut.set_result(old_default)
+                    except InvalidStateError:
+                        pass
+                self._pending_cards.pop(old_request_id, None)
+                self._clear_pending_show_tracking(old_request_id)
+                self._send_threadsafe({
+                    "cmd": Cmd.HIDE_CARD,
+                    "request_id": old_request_id,
+                })
+                log.info(
+                    "[notify] ask_consent: superseding prior request_id=%s",
+                    old_request_id,
+                )
         request_id = f"card-{uuid.uuid4().hex}"
         fut: Future = Future()
-        self._pending_cards[request_id] = fut
+        self._pending_cards[request_id] = (fut, default_on_timeout)
+        self._pending_show_times[request_id] = time.monotonic()
         log.info(
             "[notify] ask scheduled: title=%r yes=%r no=%r timeout=%ss",
             title, yes_label, no_label, timeout_secs,
@@ -493,6 +593,7 @@ class HudLauncher:
         })
         if not ok:
             self._pending_cards.pop(request_id, None)
+            self._clear_pending_show_tracking(request_id)
             return default_on_timeout
         try:
             # Add a small grace margin on top of the React-side timeout
@@ -506,6 +607,15 @@ class HudLauncher:
         except Exception:
             log.warning("[notify] ask_consent waiter raised", exc_info=True)
             self._pending_cards.pop(request_id, None)
+            self._clear_pending_show_tracking(request_id)
+            # Tell React to hide the card so it doesn't linger past
+            # the Python-side timeout — pre-v3.11 the card sat on
+            # screen until React's own timeout fired, which made the
+            # next consent stack on top of a stale one.
+            self._send_threadsafe({
+                "cmd": Cmd.HIDE_CARD,
+                "request_id": request_id,
+            })
             return default_on_timeout
 
     def ask_consent_pausing_pill(
@@ -516,6 +626,7 @@ class HudLauncher:
         no_label: str,
         timeout_secs: float,
         default_on_timeout: ConsentResult = "no",
+        supersede: bool = False,
     ) -> ConsentResult:
         """Sync ``ask_consent`` wrapper that hides the pill for the duration.
 
@@ -543,6 +654,7 @@ class HudLauncher:
             return self.ask_consent(
                 title, body, yes_label, no_label,
                 timeout_secs, default_on_timeout,
+                supersede=supersede,
             )
         finally:
             if snapshot is not None and self._last_pill_params is not None:
@@ -577,6 +689,7 @@ class HudLauncher:
             "on_expire": on_expire,
             "on_secondary": on_secondary_pressed,
         }
+        self._pending_show_times[request_id] = time.monotonic()
         cmd: dict[str, Any] = {
             "cmd": Cmd.SHOW_ACTIONABLE,
             "request_id": request_id,
@@ -592,6 +705,7 @@ class HudLauncher:
         ok = self._send_threadsafe(cmd)
         if not ok:
             self._pending_actionables.pop(request_id, None)
+            self._clear_pending_show_tracking(request_id)
         return ok
 
     # --- insight card (post-capture coaching) -------------------------
@@ -637,6 +751,7 @@ class HudLauncher:
             "on_expire": on_expire,
             "on_secondary": on_secondary_pressed,
         }
+        self._pending_show_times[request_id] = time.monotonic()
         cmd: dict[str, Any] = {
             "cmd": Cmd.SHOW_INSIGHT,
             "request_id": request_id,
@@ -656,6 +771,7 @@ class HudLauncher:
         ok = self._send_threadsafe(cmd)
         if not ok:
             self._pending_actionables.pop(request_id, None)
+            self._clear_pending_show_tracking(request_id)
         return ok
 
     # --- persistent pill (arm state indicator) ------------------------
@@ -672,18 +788,40 @@ class HudLauncher:
             return False
         if start_ts is None:
             start_ts = time.time()
+        # Generate a per-show paint_id so the React StatePill component
+        # can emit ``card_painted`` on mount and we can log the
+        # show_pill → first-paint delta_ms. Same diagnostic plumbing
+        # as cards/toasts/insights/actionables — the pill is the
+        # FIRST content shown on a cold disarmed→armed transition,
+        # exactly the case where the layered-window paint-stall is
+        # most likely to fire, so we want symmetric coverage.
+        paint_id = f"pill-{uuid.uuid4().hex}"
         params = {
             "reason": reason,
             "reason_label": reason_label,
             "start_ts": float(start_ts),
             "hotkey": hotkey,
+            "paint_id": paint_id,
         }
         self._last_pill_params = params
-        return self._send_threadsafe({"cmd": Cmd.SHOW_PILL, **params})
+        self._pending_show_times[paint_id] = time.monotonic()
+        ok = self._send_threadsafe({"cmd": Cmd.SHOW_PILL, **params})
+        if not ok:
+            self._clear_pending_show_tracking(paint_id)
+        return ok
 
     def hide_pill(self) -> bool:
         if self._given_up:
             return False
+        # Clear the pill's paint_id from _pending_show_times BEFORE
+        # forgetting _last_pill_params — otherwise if the React side
+        # never emitted card_painted (rapid arm/disarm before the
+        # mount-rAF fires, paint stall, subprocess crash) the entry
+        # leaks until _fail_pending_consents runs on respawn.
+        if self._last_pill_params is not None:
+            paint_id = self._last_pill_params.get("paint_id")
+            if isinstance(paint_id, str):
+                self._clear_pending_show_tracking(paint_id)
         self._last_pill_params = None
         return self._send_threadsafe({"cmd": Cmd.HIDE_PILL})
 

@@ -1,15 +1,17 @@
 import { useEffect, useRef } from "react";
 import { X } from "lucide-react";
+import { usePaintedSignal } from "../lib/usePaintedSignal";
 import { HudCard, HudCardBrandHeader } from "./HudCard";
 
 interface Props {
+  id: string;
   title: string;
   body: string;
   ttlSecs: number;
   onExpire: () => void;
 }
 
-export function InfoToast({ title, body, ttlSecs, onExpire }: Props) {
+export function InfoToast({ id, title, body, ttlSecs, onExpire }: Props) {
   // Single guard so the timer-driven and click-driven dismissal paths
   // can't both fire onExpire (the parent removes the toast on the first
   // call; a second would be a no-op anyway, but the guard keeps logs
@@ -21,9 +23,11 @@ export function InfoToast({ title, body, ttlSecs, onExpire }: Props) {
     onExpire();
   };
 
+  usePaintedSignal(id);
+
   useEffect(() => {
-    const id = setTimeout(dismiss, ttlSecs * 1000);
-    return () => clearTimeout(id);
+    const timerId = setTimeout(dismiss, ttlSecs * 1000);
+    return () => clearTimeout(timerId);
     // dismiss is captured at mount; we deliberately don't re-arm the
     // timer on parent re-renders.
     // eslint-disable-next-line react-hooks/exhaustive-deps
