@@ -412,16 +412,38 @@ class Agent:
             if len(mic_part) > 24:
                 mic_part = mic_part[:23] + "…"
             reason_tag = f" ({label} scope={scope_part} mic={mic_part})"
+        # HUD subprocess health, folded into the heartbeat so a user (or
+        # triage) watching the terminal can tell at a glance whether the
+        # notification layer is alive — without digging for [hud] lines.
+        # This is the segment that would have made the multi-day "no toast"
+        # incident a 30-second diagnosis. Best-effort: NoopNotifier (tests /
+        # SAYZO_NOTIFICATIONS_ENABLED=0) has no launcher → omit the segment.
+        hud_tag = ""
+        _launcher = getattr(self.notifier, "launcher", None)
+        if _launcher is not None:
+            try:
+                hd = _launcher.diagnose()
+                flags = ["GIVEN_UP"] if hd.get("given_up") else []
+                flags.append("alive" if hd.get("alive") else "DOWN")
+                if hd.get("ready"):
+                    flags.append("ready")
+                rc = hd.get("respawn_count") or 0
+                if rc:
+                    flags.append(f"respawns={rc}")
+                hud_tag = " hud=" + ",".join(flags)
+            except Exception:
+                hud_tag = " hud=?"
         if d.state == SessionState.OPEN and d._buffers is not None:
             elapsed = now - d._session_start_mono
             mic_voiced = d._buffers.mic_total_voiced()
             sys_voiced = d._buffers.sys_total_voiced()
             log.info(
                 "[heartbeat] state=%s%s OPEN elapsed=%.1fs mic_voiced=%.1fs sys_voiced=%.1fs "
-                "kept=%d discarded=%d echo_dropped=%d/%.0fs",
+                "kept=%d discarded=%d echo_dropped=%d/%.0fs%s",
                 arm_state, reason_tag,
                 elapsed, mic_voiced, sys_voiced,
                 kept, discarded, echo_n, echo_s,
+                hud_tag,
             )
         elif d.state == SessionState.PENDING_CLOSE and d._buffers is not None:
             elapsed = now - d._session_start_mono
@@ -429,15 +451,15 @@ class Agent:
             silence = now - last_any if last_any > 0 else 0.0
             log.info(
                 "[heartbeat] state=%s%s PENDING_CLOSE elapsed=%.1fs silence=%.1fs "
-                "kept=%d discarded=%d",
+                "kept=%d discarded=%d%s",
                 arm_state, reason_tag, elapsed, silence,
-                kept, discarded,
+                kept, discarded, hud_tag,
             )
         elif arm_state == "DISARMED":
             log.info(
                 "[heartbeat] state=DISARMED waiting for hotkey or meeting detect "
-                "kept=%d discarded=%d echo_dropped=%d/%.0fs",
-                kept, discarded, echo_n, echo_s,
+                "kept=%d discarded=%d echo_dropped=%d/%.0fs%s",
+                kept, discarded, echo_n, echo_s, hud_tag,
             )
         else:
             # ARMED but detector IDLE — should be a brief transient (between
@@ -445,9 +467,9 @@ class Agent:
             # armed flag). With session-on-arm, ARMED implies OPEN.
             log.info(
                 "[heartbeat] state=%s%s IDLE (transient) "
-                "kept=%d discarded=%d echo_dropped=%d/%.0fs",
+                "kept=%d discarded=%d echo_dropped=%d/%.0fs%s",
                 arm_state, reason_tag,
-                kept, discarded, echo_n, echo_s,
+                kept, discarded, echo_n, echo_s, hud_tag,
             )
 
     def _maybe_run_upload_sweep(self, now: float) -> None:

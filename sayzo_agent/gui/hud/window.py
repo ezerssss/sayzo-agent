@@ -393,6 +393,14 @@ class _HudHostWidget(QWidget):
             # its level even when the owning app isn't active.
             if sys.platform == "darwin":
                 self._force_order_front_mac()
+            elif sys.platform == "win32":
+                # Re-claim the front of the top-most band. WS_EX_TOPMOST is
+                # set once at construction (Qt.WindowStaysOnTopHint) but is
+                # NOT re-asserted, so a borderless-fullscreen meeting window
+                # raised later sits ABOVE us and the toast renders behind it
+                # — invisible to the user while IsWindowVisible still reports
+                # True. Win32 analog of _force_order_front_mac above.
+                self._force_topmost_win()
             # Window is now content-bearing — let it receive clicks so
             # the user can interact with the card / pill / actionable.
             self._set_click_through(False)
@@ -527,6 +535,41 @@ class _HudHostWidget(QWidget):
             "IsIconic=%s GetWindowRect=%r",
             hwnd, is_visible, is_iconic, rect,
         )
+        # Occlusion probe — the line that answers "did the user actually
+        # SEE it?" IsWindowVisible above is True even when a later top-most
+        # window (borderless-fullscreen Meet/Zoom) is painted over us, which
+        # is the exact way a toast goes unseen on Windows (and stays
+        # invisible to every other diagnostic). Ask Win32 which top-level
+        # window owns the pixel at our centre; if it isn't us, we were
+        # covered. Runs after _set_click_through(False) cleared
+        # WS_EX_TRANSPARENT, so hit-testing reaches our window when we are
+        # genuinely on top.
+        try:
+            left, top, right, bottom = rect
+            # Sample a point that reliably lands on RENDERED content, NOT the
+            # geometric centre. This is a per-pixel-alpha layered window
+            # (WA_TranslucentBackground + WS_EX_LAYERED), and Windows hit-tests
+            # layered windows by alpha: fully-transparent pixels (alpha=0) are
+            # click-through, so WindowFromPoint there returns whatever is
+            # BEHIND us — a false "occluded". The pill / first toast / card
+            # always anchors at the TOP of the shell, so a point ~24px below
+            # the top edge, horizontally centred, sits on opaque content for
+            # every overlay state.
+            cx = (left + right) // 2
+            cy = min(top + 24, bottom - 1)
+            pt_hwnd = win32gui.WindowFromPoint((cx, cy))
+            # GA_ROOT = 2 → top-level owner of whatever child is at the point
+            # (WindowFromPoint can return our QtWebEngine child HWND).
+            owner = win32gui.GetAncestor(pt_hwnd, 2) if pt_hwnd else 0
+            occluded = bool(owner) and owner != hwnd
+            owner_title = win32gui.GetWindowText(owner) if owner else ""
+            log.info(
+                "[hud] occlusion probe: sample=(%d,%d) owner_hwnd=%s "
+                "owner_title=%r occluded_by_other_window=%s",
+                cx, cy, owner, owner_title, occluded,
+            )
+        except Exception:
+            log.debug("[hud] occlusion probe failed", exc_info=True)
 
     def _start_system_move(self) -> None:
         """Hand off a window drag to the OS at the cursor's current position.
@@ -756,6 +799,41 @@ class _HudHostWidget(QWidget):
             log.info("[hud] WS_EX_TRANSPARENT %s ok", "set" if ignore else "cleared")
         except Exception:
             log.warning("[hud] WS_EX_TRANSPARENT toggle failed", exc_info=True)
+
+    def _force_topmost_win(self) -> None:
+        """Re-assert ``HWND_TOPMOST`` on the host window (Windows).
+
+        Win32 analog of :meth:`_force_order_front_mac`. The window gets
+        ``WS_EX_TOPMOST`` once at construction (``Qt.WindowStaysOnTopHint``),
+        but that is set-once and does NOT re-raise us above OTHER top-most
+        windows activated later — most importantly a borderless-fullscreen
+        meeting window (Chrome/Meet, Zoom). Among top-most windows z-order
+        is "most recently raised wins", so a toast that fires after the user
+        has gone fullscreen renders BEHIND the meeting and is never seen
+        (``IsWindowVisible`` still reports True — occlusion is invisible to
+        that check; see the occlusion probe in :meth:`_log_win_os_state`).
+        Calling ``SetWindowPos(HWND_TOPMOST)`` on every visibility-show
+        re-claims the front of the top-most band. ``SWP_NOACTIVATE`` keeps
+        us from stealing focus from the meeting app (same contract as the
+        rest of the HUD's no-focus-theft design).
+        """
+        try:
+            import ctypes
+        except Exception:
+            return
+        HWND_TOPMOST = -1
+        SWP_NOSIZE = 0x0001
+        SWP_NOMOVE = 0x0002
+        SWP_NOACTIVATE = 0x0010
+        try:
+            hwnd = int(self.winId())
+            ok = ctypes.windll.user32.SetWindowPos(
+                hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            )
+            log.info("[hud] re-asserted HWND_TOPMOST ok=%s", bool(ok))
+        except Exception:
+            log.warning("[hud] HWND_TOPMOST re-assert failed", exc_info=True)
 
     def _force_order_front_mac(self) -> None:
         """Force the HUD's NSWindow into the visible Z-stack.
@@ -1070,9 +1148,11 @@ class HudWindow:
         # Chromium init.
         def _fail_show_if_not_visible() -> None:
             if not widget.isVisible():
-                log.warning(
-                    "[hud] fail-show timer fired: loadFinished never arrived; "
-                    "showing widget anyway so the HUD isn't permanently invisible",
+                log.info(
+                    "[hud] fail-show timer fired: loadFinished hasn't arrived in "
+                    "8s; showing widget anyway as a safety net (benign on slow "
+                    "cold boots — loadFinished, when it lands, re-runs the real "
+                    "callback wiring)",
                 )
                 widget.show()
 

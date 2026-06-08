@@ -12,7 +12,7 @@ from enum import Enum
 
 import httpx
 
-from .auth.exceptions import AuthenticationRequired
+from .auth.exceptions import AuthenticationRequired, AuthTemporarilyUnavailable
 
 
 class UploadOutcome(str, Enum):
@@ -65,6 +65,14 @@ def classify_exception(exc: BaseException) -> tuple[UploadOutcome, str]:
     can't drift the semantics of 402 without breaking billing. Body sniff is
     best-effort for the error message.
     """
+    if isinstance(exc, AuthTemporarilyUnavailable):
+        # Transient network failure during token refresh (cold-boot race) —
+        # NOT a real auth failure. Retry on the transient backoff instead of
+        # firing the user-facing "session expired, sign in again" toast + auth
+        # pause (_handle_auth_required). Must precede the AuthenticationRequired
+        # check below — it's a subclass.
+        return UploadOutcome.TRANSIENT, f"{type(exc).__name__}: {exc}"
+
     if isinstance(exc, AuthenticationRequired):
         return UploadOutcome.AUTH_REQUIRED, str(exc) or "Authentication required"
 

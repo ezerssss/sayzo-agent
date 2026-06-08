@@ -41,7 +41,7 @@ import logging
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from typing import Optional
 
 from .detectors import BROWSER_PROCESS_NAMES, ForegroundInfo, MicHolder
@@ -271,14 +271,22 @@ def get_mic_holders() -> list[MicHolder]:
     """
     try:
         fut = _get_com_executor().submit(_mic_holders_on_com_thread)
-        # 2 s matches the watcher's poll interval; if a single query takes
-        # longer than a full poll, something is badly wrong and we'd rather
-        # skip this round than stack queries. Enumerating multiple
-        # endpoints + their session managers raises the per-poll cost
-        # above the old single-default-endpoint path, but on consumer
-        # machines the active capture-endpoint count is small (2–5) and
-        # the bound has held in manual smoke.
+        # 2 s matches the watcher's poll interval. The result is awaited
+        # SYNCHRONOUSLY on the asyncio loop (controller._snapshot_mic_state),
+        # so a longer bound would stall the loop — and hotkey / consent-toast
+        # handling with it — for that whole duration. If a single query
+        # overruns a full poll, skip this round rather than stack queries.
         return fut.result(timeout=2.0)
+    except (TimeoutError, FuturesTimeoutError):
+        # Routine slow enumeration — NOT a crash, so no traceback (it was
+        # just noise every slow poll). Both classes: on Python 3.10
+        # concurrent.futures.TimeoutError is distinct from the builtin (only
+        # aliased in 3.11+), and requires-python is >=3.10. The watcher
+        # tolerates an empty poll and re-queries on the next tick.
+        log.warning(
+            "[arm.win] mic-holder enumeration slow (>2s) — skipped this poll"
+        )
+        return []
     except Exception:
         log.warning(
             "[arm.win] mic-holder worker call failed — meeting detection "

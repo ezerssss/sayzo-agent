@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING, Literal, Optional
 
 import httpx
 
-from ..auth.exceptions import AuthenticationRequired
+from ..auth.exceptions import AuthenticationRequired, AuthTemporarilyUnavailable
 
 if TYPE_CHECKING:
     from ..auth.client import AuthenticatedClient
@@ -117,6 +117,22 @@ async def fetch_account_status(
     for attempt in range(max_retries):
         try:
             resp = await client.get(_API_PATH)
+        except AuthTemporarilyUnavailable as exc:
+            # Auth server unreachable (e.g. cold-boot network race) — NOT a
+            # real auth failure. Back off + retry like any transient; do NOT
+            # flip the account to auth_required. Must precede the
+            # AuthenticationRequired clause below (it's a subclass).
+            last_error = repr(exc)
+            log.info(
+                "[account.status] /me auth server unreachable (attempt %d/%d): %s",
+                attempt + 1,
+                max_retries,
+                last_error,
+            )
+            if attempt + 1 < max_retries:
+                await _sleep_backoff(base_backoff_secs, attempt, rng)
+                continue
+            return AccountStatusResponse(status="transient_error")
         except AuthenticationRequired:
             log.info(
                 "[account.status] /me: not authenticated (attempt %d)", attempt + 1

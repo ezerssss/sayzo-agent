@@ -548,8 +548,16 @@ class ArmConfig(BaseSettings):
     # disarmed, and the meeting-ended watcher polls while armed.
     poll_interval_secs: float = 2.0
 
-    # Whitelist consent toast timings.
-    consent_toast_timeout_secs: float = 30.0
+    # Whitelist consent toast timings. 60s (was 30s): a borderless-
+    # fullscreen meeting window (Chrome/Meet, Zoom) can occlude the toast
+    # for a while — see the HWND_TOPMOST re-assert in gui/hud/window.py
+    # (_force_topmost_win), the actual fix for "couldn't see the toast".
+    # A longer window gives the user more chance to notice it once it
+    # surfaces. NOTE: a timeout is STILL treated as a decline (suppresses
+    # re-prompts for the rest of the meeting via _Cooldowns.mark_declined);
+    # lengthening the window is the deliberate no-nag tradeoff chosen over
+    # re-prompting.
+    consent_toast_timeout_secs: float = 60.0
 
     # Hotkey confirmation toast timings (both start + stop).
     hotkey_confirm_timeout_secs: float = 10.0

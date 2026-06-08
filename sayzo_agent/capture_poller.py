@@ -40,7 +40,7 @@ from typing import TYPE_CHECKING, Callable
 
 import httpx
 
-from .auth.exceptions import AuthenticationRequired
+from .auth.exceptions import AuthenticationRequired, AuthTemporarilyUnavailable
 from .sink import local_clock_label, read_record_from_dir, write_record_atomic
 from .upload import parse_json_body
 
@@ -189,6 +189,15 @@ class CapturePoller:
             await asyncio.sleep(delay)
             try:
                 body = await self._fetch(server_capture_id)
+            except AuthTemporarilyUnavailable:
+                # Transient network blip (cold-boot race) — keep polling on the
+                # schedule rather than abandoning the title/insight fetch. Must
+                # precede the AuthenticationRequired clause (it's a subclass).
+                log.debug(
+                    "[poller] auth server unreachable for id=%s — will retry",
+                    server_capture_id,
+                )
+                continue
             except AuthenticationRequired:
                 log.debug(
                     "[poller] auth required for id=%s — giving up",

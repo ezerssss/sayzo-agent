@@ -8,7 +8,9 @@ import os
 import sys
 from pathlib import Path
 
-from .exceptions import AuthenticationRequired
+import httpx
+
+from .exceptions import AuthenticationRequired, AuthTemporarilyUnavailable
 from .models import TokenSet
 from .server import AuthServerProtocol
 
@@ -102,6 +104,27 @@ class TokenStore:
                 new_tokens = await self._server.refresh_token(tokens.refresh_token)
                 self.save(new_tokens)
                 return new_tokens.access_token
+            except httpx.TransportError as exc:
+                # Transient transport-layer failure — ConnectTimeout /
+                # ConnectError / ReadTimeout / RemoteProtocolError / ProxyError,
+                # all common at cold boot, behind captive portals, or on flaky
+                # links before the network is fully up. NOT an auth problem:
+                # the refresh token is almost certainly still valid, the server
+                # was just unreachable. httpx.TransportError is the parent of
+                # all of these — the narrower TimeoutException/NetworkError pair
+                # missed protocol/proxy disconnects, which still flipped the
+                # account to auth_required. Raise a retryable error (subclass of
+                # AuthenticationRequired for backward-compat) + a concise
+                # one-line log so the account / daily-drill pollers back off
+                # instead of dumping a full traceback every 60s poll. See
+                # AuthTemporarilyUnavailable.
+                log.warning(
+                    "token refresh deferred — auth server unreachable (%s)",
+                    type(exc).__name__,
+                )
+                raise AuthTemporarilyUnavailable(
+                    "Auth server unreachable; will retry."
+                ) from exc
             except Exception as exc:
                 log.warning("token refresh failed", exc_info=True)
                 raise AuthenticationRequired(

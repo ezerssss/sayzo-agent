@@ -40,7 +40,7 @@ from typing import TYPE_CHECKING, Literal, Optional
 
 import httpx
 
-from ..auth.exceptions import AuthenticationRequired
+from ..auth.exceptions import AuthenticationRequired, AuthTemporarilyUnavailable
 
 if TYPE_CHECKING:
     from ..auth.client import AuthenticatedClient
@@ -123,6 +123,23 @@ async def fetch_today_session(
     for attempt in range(max_retries):
         try:
             resp = await client.get(_API_PATH, timeout=_TODAY_TIMEOUT)
+        except AuthTemporarilyUnavailable as exc:
+            # Auth server unreachable (e.g. cold-boot network race) — NOT a
+            # real auth failure. Back off + retry like any transient; do NOT
+            # flip to auth_required. Must precede the AuthenticationRequired
+            # clause below (it's a subclass). This is what stops the 60s
+            # token-refresh-failed traceback storm seen in the field.
+            last_error = repr(exc)
+            log.info(
+                "[daily_drill.api] /sessions/today auth server unreachable (attempt %d/%d): %s",
+                attempt + 1,
+                max_retries,
+                last_error,
+            )
+            if attempt + 1 < max_retries:
+                await _sleep_backoff(base_backoff_secs, attempt, rng)
+                continue
+            return TodaySessionResponse(status="transient_error")
         except AuthenticationRequired:
             log.info(
                 "[daily_drill.api] /sessions/today: not authenticated (attempt %d)",
@@ -220,6 +237,17 @@ async def fetch_today_session(
                 await _sleep_backoff(base_backoff_secs, attempt, rng)
                 continue
             return TodaySessionResponse(status="transient_error")
+
+        if sc == 404:
+            # 404 = no drill available for this user yet (not onboarded / no
+            # analyzed captures). A NORMAL state, not an error — in the field
+            # it cleared on its own the moment onboarding completed. Log at
+            # debug so the ~60s poll doesn't spam WARNINGs for days (this was
+            # ~900 lines in one field log); skip quietly via unknown_error.
+            log.debug(
+                "[daily_drill.api] /sessions/today 404 — no drill available yet"
+            )
+            return TodaySessionResponse(status="unknown_error")
 
         # Other 4xx — log + give up for the day.
         log.warning(

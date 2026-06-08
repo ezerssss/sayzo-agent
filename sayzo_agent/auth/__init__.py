@@ -2,7 +2,12 @@
 from __future__ import annotations
 
 from .client import AuthenticatedClient
-from .exceptions import AuthenticationFailed, AuthenticationRequired, PKCEUnavailable
+from .exceptions import (
+    AuthenticationFailed,
+    AuthenticationRequired,
+    AuthTemporarilyUnavailable,
+    PKCEUnavailable,
+)
 from .models import TokenSet
 from .store import TokenStore
 
@@ -10,6 +15,7 @@ __all__ = [
     "AuthenticatedClient",
     "AuthenticationFailed",
     "AuthenticationRequired",
+    "AuthTemporarilyUnavailable",
     "PKCEUnavailable",
     "TokenSet",
     "TokenStore",
