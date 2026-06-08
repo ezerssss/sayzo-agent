@@ -134,8 +134,8 @@ export function AboutPane() {
             Sayzo
           </h1>
           <p className="mt-1.5 max-w-sm text-sm leading-relaxed text-ink-muted">
-            Your English coach &mdash; tuned to how you actually speak.
-            Sayzo turns your real meetings into personalized speaking drills.
+            Your English coach, tuned to how you actually speak. Sayzo turns
+            your real conversations into personalized coaching.
           </p>
         </div>
       </section>

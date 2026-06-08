@@ -123,8 +123,8 @@ export function Welcome({ onSignedIn, onCancel }: Props) {
       footer={footer}
     >
       <p className="text-sm leading-relaxed text-ink-muted">
-        Sayzo syncs your captures to the webapp and unlocks personalized
-        speaking drills — signing in is required to use Sayzo.
+        Sayzo syncs your conversations to the webapp and turns them into
+        personalized coaching. Signing in is required to use Sayzo.
       </p>
 
       {uiState === "idle" && (

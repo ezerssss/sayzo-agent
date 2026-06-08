@@ -115,7 +115,7 @@ class TokenStore:
                 # missed protocol/proxy disconnects, which still flipped the
                 # account to auth_required. Raise a retryable error (subclass of
                 # AuthenticationRequired for backward-compat) + a concise
-                # one-line log so the account / daily-drill pollers back off
+                # one-line log so the account / capture pollers back off
                 # instead of dumping a full traceback every 60s poll. See
                 # AuthTemporarilyUnavailable.
                 log.warning(

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sayzo-agent"
-version = "3.12.0"
+version = "3.13.0"
 description = "Armed-only capture agent for Sayzo — records meetings on user consent (hotkey or whitelisted meeting app), uploads raw stereo OGG Opus to the server, polls for the post-transcription title/summary."
 requires-python = ">=3.10"
 dependencies = [
@@ -80,9 +80,6 @@ dependencies = [
     # heuristic happily reported "granted" while the dialog was still showing
     # and even when the OS had silently denied — bug v2.6.0).
     "pyobjc-framework-AVFoundation>=10.0; sys_platform == 'darwin'",
-    # macOS: idle-time query via Quartz CGEventSourceSecondsSinceLastEventType.
-    # Used by sayzo_agent/idle.py for the daily-drill scheduler's idle gate.
-    "pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'",
     # macOS: SMAppService.agent registration so the BTM "running in the
     # background" notification + System Settings -> Login Items entry are
     # attributed to the Sayzo app, not to the Developer-ID team identity.

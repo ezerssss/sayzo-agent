@@ -142,7 +142,7 @@ class UploadRetryManager:
         self._notify_capture_saved = notify_capture_saved
         # Live read of ``Config.notify_capture_feedback``. When it returns
         # True, the post-capture insight card (fired later by the poller)
-        # REPLACES the immediate "Capture saved" toast — see the gate below.
+        # REPLACES the immediate "Conversation saved" toast — see the gate below.
         # None ⇒ feature off (preserves pre-v3.10 behavior + keeps tests simple).
         self._feedback_enabled = feedback_enabled
 
@@ -268,7 +268,7 @@ class UploadRetryManager:
 
         ``live=True`` marks this call as coming from the live arm/capture
         path (a session that just finished). Currently this only gates the
-        "Capture saved to Sayzo" success toast — sweep-triggered successes
+        "Conversation saved to Sayzo" success toast — sweep-triggered successes
         stay silent so that draining a backlog of "couldn't upload" captures
         (automatic sweep or the Settings → Captures Try Again button) doesn't
         fire a burst of toasts the user has no use for after the fact. The
@@ -404,8 +404,8 @@ class UploadRetryManager:
 
                 try:
                     self._notifier.notify_actionable(
-                        "Capture saved to Sayzo",
-                        "Open it to see your transcript and drills.",
+                        "Conversation saved to Sayzo",
+                        "Open it to see your transcript and coaching.",
                         button_label="Open in Sayzo",
                         on_pressed=_open_in_sayzo,
                         expire_after_secs=30.0,

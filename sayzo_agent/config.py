@@ -39,7 +39,7 @@ class CaptureConfig(BaseSettings):
     #   attribution is fragile — Chrome's WebRTC renderer PID, audio-
     #   service helper PIDs spawned post-tap, and some EDR-managed macOS
     #   configurations all break it silently, producing empty captures
-    #   the user only notices when their drills come back empty. The
+    #   the user only notices when their coaching comes back empty. The
     #   pre-2.9 default; demoted to beta after Sheen's Rippling Mac and
     #   other field reports made the failure pattern untenable.
     system_scope: Literal["arm_app", "endpoint"] = "endpoint"
@@ -734,133 +734,6 @@ class UploadConfig(BaseSettings):
     pause_state_filename: str = ".upload_state.json"
 
 
-class NotificationConfig(BaseSettings):
-    """Daily-drill notification scheduler config.
-
-    Controls a per-workday notification that opens that day's pre-generated
-    60-second speaking drill in the user's default browser. Timing is learned
-    per-user via a (day_of_week, hour) acceptance-rate bucket model with
-    Thompson-sampled hour selection.
-
-    Master ``Config.notifications_enabled`` still wins — when False, the
-    daily-drill scheduler doesn't even tick.
-    """
-
-    # Master sub-toggle. Default ON for signed-in users (the scheduler also
-    # gates on TokenStore.has_tokens(), so an unauthenticated user is silent
-    # regardless). Toggle in Settings → Notifications.
-    daily_drill_enabled: bool = True
-
-    # Activity gate (v3.6.7): the user is "present and free to look at a
-    # toast" iff ``min_idle_secs <= idle_secs <= max_idle_secs``. The
-    # LOWER bound ("don't fire mid-keystroke") prevents interrupting an
-    # active typing burst — wait for a brief pause. The UPPER bound
-    # ("they've touched the computer recently") is the night-shift fix:
-    # a sleeping user is idle for many hours, far above the cap, so the
-    # gate skips. Works for every schedule (daytime, night, evening,
-    # irregular) without time-of-day configuration.
-    min_idle_secs: float = 30.0
-    max_idle_secs: float = 600.0   # 10 min
-
-    # Cooldown between fires (v3.6.7). Replaces the v3.6.5 once-per-
-    # calendar-day gate with a simple timestamp comparison so timezone /
-    # calendar / shift boundaries don't matter. 18h means: fire at 23:00
-    # Mon, next eligible fire window opens at 17:00 Tue. ``ignore_gates``
-    # (test-trigger CLI) bypasses this; first-fire-on-start honors it.
-    cooldown_secs: float = 18 * 3600  # 64800.0 = 18 hours
-
-    # Minimum agent uptime before the scheduler is allowed to fire. Split
-    # out from min_idle_secs in v3.6.5 — those are different concepts and
-    # tying them together meant tuning one re-tuned the other.
-    boot_warmup_secs: float = 30.0
-
-    # Cold-start hour (no engagement history yet). Used by the bucket
-    # model's _cold_start_pick for telemetry purposes only — v3.6.7
-    # decoupled gating from time-of-day, so this is no longer used to
-    # block fires. Kept for back-compat with on-disk stats and any future
-    # UI that wants to display "your typical engagement hour."
-    cold_start_hour: int = 11
-
-    # Legacy time-of-day fields (v3.6.7: NO LONGER USED FOR GATING).
-    #
-    # Pre-v3.6.7 the scheduler enforced a 9-AM-to-8-PM "workday window"
-    # to bound when notifications could fire, with a lunch-hour skip.
-    # That model was fundamentally wrong for non-daytime workers (PH BPO
-    # workers on US shifts, evening / night-shift workers, irregular
-    # schedules). v3.6.7 replaced the time window with an activity gate
-    # (min_idle_secs ≤ idle_secs ≤ max_idle_secs) — "is the user at
-    # their computer right now?" — which is schedule-agnostic.
-    #
-    # The fields are preserved for back-compat with persisted user_settings
-    # and for the bucket model's per-(dow,hour) telemetry. They are not
-    # consulted by ``_evaluate_and_maybe_fire``.
-    min_hour: int = 9
-    lunch_start_hour: int = 12
-    lunch_end_hour: int = 13     # exclusive — lunch covers 12 only
-    max_hour: int = 20           # exclusive
-
-    # Pre-v3.6.5 gate boundary: after this hour the scheduler short-
-    # circuited to the EOD tray label instead of trying to fire a toast.
-    # v3.6.5 dropped that early-return so the normal fire path runs all
-    # the way to max_hour, and the EOD fallback (now a real toast) only
-    # triggers after max_hour. This field is retained for forward/back-
-    # compat with persisted user_settings.json — it is currently unused
-    # as a gate.
-    eod_fallback_hour: int = 17
-
-    # Window for distinguishing tap (engaged) from soft_tap (late tap).
-    # No-tap after dismiss_window_secs records as "expire". A late tap
-    # within soft_tap_window_secs still counts as soft engagement.
-    dismiss_window_secs: float = 300.0       # 5 min
-    soft_tap_window_secs: float = 14400.0    # 4 h
-
-    # Snooze (v3.8.x). The daily-drill toast carries a "Snooze 1h"
-    # secondary button so a user who's mid-task when it fires can defer
-    # within the same day instead of losing the drill. (We deliberately
-    # did NOT tighten the activity gate further — see the v3.6.7 pivot:
-    # over-conservative gating means the toast never fires at all.) The
-    # re-fire toast carries no snooze button, so a drill is deferrable at
-    # most once — perpetual deferral would just be "never fires" with
-    # extra steps.
-    #
-    # * ``snooze_duration_secs`` — how far out the re-fire lands.
-    # * ``snooze_max_defer_secs`` — if the user is in a meeting (armed /
-    #   mic-active) when the snooze re-fire is due, we keep retrying each
-    #   tick rather than dropping it. Past this many seconds beyond the
-    #   snooze deadline we give up and fall back to the quiet EOD tray
-    #   label, so a back-to-back-meetings afternoon can't defer forever.
-    # * ``snooze_secondary_label`` — visible button copy; in config so a
-    #   future "Snooze 30m" experiment needs no code change.
-    snooze_duration_secs: float = 3600.0     # 1 h
-    snooze_max_defer_secs: float = 14400.0   # 4 h
-    snooze_secondary_label: str = "Snooze 1h"
-
-    # Bucket scoring: smoothed_score =
-    #   (taps*1.0 + soft_taps*0.3 + expires*0.0) * decay / (fires + alpha)
-    # alpha=3 smooths a single bad fire so it can't permanently kill a slot.
-    prior_alpha: float = 3.0
-
-    # Per-bucket recency decay applied at read time:
-    # decay = recency_decay ** days_since_bucket_last_fired_at.
-    recency_decay: float = 0.95
-
-    # Hours where smoothed_score < this AND fires >= 3 are excluded from
-    # the candidate set. Single bad day shouldn't disqualify a slot.
-    # Score range is [0, 1] in the dismiss-collapsed outcome model
-    # (taps weight +1, soft_taps +0.3, expires 0); 0.05 ≈ 5% engagement
-    # rate after smoothing. Thompson sampling does most exploration work
-    # — this is a hard floor for "obviously dead" slots only.
-    bad_score_threshold: float = 0.05
-
-    # Maximum history-log entries kept on disk. Older entries roll into
-    # bucket aggregates (no signal lost) but lose their per-event timeline.
-    max_history: int = 200
-
-    # Scheduler tick cadence. Each tick re-evaluates all gates; firing
-    # happens once per workday max.
-    tick_secs: float = 60.0
-
-
 class Config(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="SAYZO_",
@@ -891,7 +764,7 @@ class Config(BaseSettings):
     # coaching insight as a compact HUD card (see capture_poller.py). Default
     # ON — it's the engagement payoff. The card carries a one-click "Stop
     # showing these" button that flips this to False; also toggleable in
-    # Settings → Notifications. When ON it REPLACES the immediate "Capture
+    # Settings → Notifications. When ON it REPLACES the immediate "Conversation
     # saved" toast (the insight card deep-links too); the saved toast only
     # fires as a fallback when no insight is produced. SAYZO_NOTIFY_CAPTURE_FEEDBACK=0
     # to disable. Master ``notifications_enabled`` still wins.
@@ -906,7 +779,6 @@ class Config(BaseSettings):
     hud: HudConfig = Field(default_factory=HudConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)
     upload: UploadConfig = Field(default_factory=UploadConfig)
-    notifications: NotificationConfig = Field(default_factory=NotificationConfig)
 
     @property
     def models_dir(self) -> Path:
@@ -927,10 +799,6 @@ class Config(BaseSettings):
     @property
     def pid_path(self) -> Path:
         return self.data_dir / "agent.pid"
-
-    @property
-    def notification_stats_path(self) -> Path:
-        return self.data_dir / "notification-stats.json"
 
     def ensure_dirs(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -990,21 +858,6 @@ def load_config() -> Config:
         user_arm = {k: v for k, v in user["arm"].items() if k.lower() not in env_arm_keys}
         if user_arm:
             init_kwargs["arm"] = {**probe.arm.model_dump(), **user_arm}
-
-    if isinstance(user.get("notifications"), dict):
-        env_notif_keys = {
-            k[len("SAYZO_NOTIFICATIONS__"):].lower()
-            for k in os.environ
-            if k.upper().startswith("SAYZO_NOTIFICATIONS__")
-        }
-        user_notif = {
-            k: v for k, v in user["notifications"].items()
-            if k.lower() not in env_notif_keys
-        }
-        if user_notif:
-            init_kwargs["notifications"] = {
-                **probe.notifications.model_dump(), **user_notif
-            }
 
     if isinstance(user.get("capture"), dict):
         env_capture_keys = {

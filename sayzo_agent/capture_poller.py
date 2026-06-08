@@ -470,7 +470,7 @@ class CapturePoller:
         return fire
 
     def _make_fallback_saved_fire(self, deep_link: str) -> Callable[[], None]:
-        """Fallback "Capture saved" toast when no insight was produced.
+        """Fallback "Conversation saved" toast when no insight was produced.
 
         Same shape as the immediate saved toast ``upload_retry`` fires when the
         feedback feature is OFF — preserves upload confirmation under the
@@ -485,8 +485,8 @@ class CapturePoller:
         def fire() -> None:
             try:
                 self._notifier.notify_actionable(  # type: ignore[union-attr]
-                    "Capture saved to Sayzo",
-                    "Open it to see your transcript and drills.",
+                    "Conversation saved to Sayzo",
+                    "Open it to see your transcript and coaching.",
                     button_label="Open in Sayzo",
                     on_pressed=_open,
                     expire_after_secs=30.0,

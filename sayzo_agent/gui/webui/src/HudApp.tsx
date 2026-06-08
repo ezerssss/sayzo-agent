@@ -20,7 +20,7 @@ const HUD_FADE_MS = 180;
 
 // Top-right HUD root. Owns the state machine: pill visibility / collapsed,
 // queued consent cards (FIFO, one at a time), stacked toasts, the
-// daily-drill actionable. Subscribes to incoming commands from Python
+// capture-saved actionable. Subscribes to incoming commands from Python
 // via window.hudBridge.dispatch; emits responses via hudBridge.sendEvent.
 
 interface PillState {
@@ -535,7 +535,7 @@ export function HudApp() {
             cmd: "show_card",
             request_id: `demo-${Date.now()}`,
             title: "Sayzo is ready to coach you",
-            body: "Looks like you're in Zoom. Want us to capture this call for personalized speaking drills?",
+            body: "Looks like you're in Zoom. Want us to capture this call so we can highlight your coachable moments?",
             yes_label: "Start coaching",
             no_label: "Not now",
             timeout_secs: 15,
@@ -571,10 +571,9 @@ export function HudApp() {
           hudBridge.dispatch({
             cmd: "show_actionable",
             request_id: `actionable-${Date.now()}`,
-            title: "Daily speaking drill",
-            body: "Two minutes today — practice the filler-word habit you've been working on.",
-            button_label: "Open drill",
-            secondary_button_label: "Snooze 1h",
+            title: "Conversation saved to Sayzo",
+            body: "Open it to see your transcript and coaching.",
+            button_label: "Open in Sayzo",
             expire_after_secs: 30,
           }),
       },
@@ -696,7 +695,7 @@ export function HudApp() {
         />
       )}
 
-      {/* Actionable (daily drill). */}
+      {/* Actionable (capture-saved). */}
       {actionable && (
         <ActionableToast
           key={actionable.request_id}

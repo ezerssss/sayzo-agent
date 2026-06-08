@@ -72,10 +72,9 @@ def test_open_settings_not_connected_returns_none(tmp_path: Path) -> None:
     assert client.call_quiet(Methods.OPEN_SETTINGS) is None
 
 
-def test_daily_drill_method_constants_pinned() -> None:
-    """Wire-format constants — typo guards for the daily-drill plumbing."""
+def test_notification_method_constants_pinned() -> None:
+    """Wire-format constants — typo guards for the notification plumbing."""
     assert Methods.RELOAD_NOTIFICATION_CONFIG == "reload_notification_config"
-    assert Methods.TEST_DRILL_NOTIFICATION == "test_drill_notification"
 
 
 def test_reload_notification_config_round_trip(tmp_path: Path) -> None:
@@ -102,34 +101,6 @@ def test_reload_notification_config_round_trip(tmp_path: Path) -> None:
 
     result = asyncio.run(_run())
     assert result == {"reloaded": True}
-    assert len(invocations) == 1
-
-
-def test_test_drill_notification_round_trip(tmp_path: Path) -> None:
-    """The TEST_DRILL_NOTIFICATION method exists and round-trips cleanly."""
-    invocations: list[None] = []
-
-    async def _run() -> dict:
-        server = IPCServer(tmp_path)
-
-        def _handler() -> dict:
-            invocations.append(None)
-            return {"ok": True}
-
-        server.register(Methods.TEST_DRILL_NOTIFICATION, _handler)
-        await server.start()
-        try:
-            client = IPCClient(tmp_path)
-            loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(
-                None, client.call, Methods.TEST_DRILL_NOTIFICATION
-            )
-        finally:
-            await server.stop()
-        return result
-
-    result = asyncio.run(_run())
-    assert result == {"ok": True}
     assert len(invocations) == 1
 
 

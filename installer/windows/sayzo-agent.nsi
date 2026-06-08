@@ -78,7 +78,7 @@ UninstallIcon "..\..\installer\assets\logo.ico"
 ; they're installing before files hit disk. Copy is the approved draft from
 ; installer/copy_draft.md; mirror any future revisions of that file here.
 !define MUI_WELCOMEPAGE_TITLE "Sayzo - the English speaking coach you bring to your meetings."
-!define MUI_WELCOMEPAGE_TEXT "Sayzo captures conversations from your meetings and turns them into personalized English-speaking drills. It only listens when you say so: press a keyboard shortcut, or say yes to a prompt when Sayzo notices you're in a meeting.$\r$\n$\r$\nYour microphone stays off until then."
+!define MUI_WELCOMEPAGE_TEXT "Sayzo captures conversations from your meetings and turns them into personalized English coaching. It only listens when you say so: press a keyboard shortcut, or say yes to a prompt when Sayzo notices you're in a meeting.$\r$\n$\r$\nYour microphone stays off until then."
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_INSTFILES
 

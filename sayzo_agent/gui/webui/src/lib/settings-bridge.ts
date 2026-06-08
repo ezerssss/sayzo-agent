@@ -51,7 +51,6 @@ export type NotificationFlags = {
   checkin: boolean;
   meeting_ended_watcher: boolean;
   confirm_hotkey_stop: boolean;
-  daily_drill: boolean;
 };
 
 export type NotificationKey = keyof NotificationFlags;

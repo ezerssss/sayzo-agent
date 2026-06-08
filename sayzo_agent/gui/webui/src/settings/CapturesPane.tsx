@@ -28,9 +28,9 @@ const EMPTY_COPY: Record<CaptureBucket, string> = {
   in_progress:
     "Nothing in progress right now. When Sayzo records a meeting, you'll see it here while it's being saved.",
   uploaded:
-    "No captures saved to your account yet. Once one finishes uploading, it'll appear here.",
+    "No conversations saved to your account yet. Once one finishes uploading, it'll appear here.",
   failed:
-    "Nothing failed — Sayzo's keeping up.",
+    "Nothing failed. Sayzo's keeping up.",
   skipped:
     "Nothing skipped recently. When Sayzo decides not to keep a recording, you'll see why here.",
 };
@@ -55,7 +55,7 @@ export function CapturesPane() {
     } catch (e) {
       // Don't blow away the existing list on a transient poll error;
       // just surface the message at the top.
-      setError(`Couldn't load your captures: ${String(e)}`);
+      setError(`Couldn't load your conversations: ${String(e)}`);
     }
   }, []);
 
@@ -122,7 +122,7 @@ export function CapturesPane() {
           setError(
             result.error
               ? `Couldn't retry: ${result.error}`
-              : "Couldn't retry that capture right now.",
+              : "Couldn't retry that conversation right now.",
           );
         }
       } catch (e) {
@@ -186,7 +186,7 @@ export function CapturesPane() {
   const handleDelete = useCallback(
     async (capture: CaptureSummary) => {
       const ok = window.confirm(
-        `Delete this capture? This can't be undone.\n\n${capture.title || "Untitled meeting"}`,
+        `Delete this conversation? This can't be undone.\n\n${capture.title || "Untitled meeting"}`,
       );
       if (!ok) return;
       // Optimistic remove so the row disappears immediately even if the
@@ -197,7 +197,7 @@ export function CapturesPane() {
       try {
         await settingsBridge.deleteCapture(capture.id);
       } catch (e) {
-        setError(`Couldn't delete this capture: ${String(e)}`);
+        setError(`Couldn't delete this conversation: ${String(e)}`);
       }
       await refresh();
     },

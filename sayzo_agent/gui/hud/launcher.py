@@ -332,7 +332,7 @@ class HudLauncher:
             )
             return
         if event in (Evt.ACTIONABLE_RESPONSE, Evt.INSIGHT_RESPONSE):
-            # Actionable toasts (daily drill) and insight cards (post-capture
+            # Actionable toasts (capture-saved) and insight cards (post-capture
             # coaching) share the same callback map + dispatch: both carry
             # on_pressed / on_secondary / on_expire keyed by request_id, and
             # the request_id prefixes ("actionable-" / "insight-") never
@@ -660,7 +660,7 @@ class HudLauncher:
             if snapshot is not None and self._last_pill_params is not None:
                 self._send_threadsafe({"cmd": Cmd.SHOW_PILL, **snapshot})
 
-    # --- actionable toast (daily drill) -------------------------------
+    # --- actionable toast (capture-saved) ------------------------------
 
     def show_actionable(
         self,

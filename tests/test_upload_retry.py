@@ -343,7 +343,7 @@ async def test_upload_success_without_server_capture_id_skips_hook(env, tmp_path
 
 async def test_live_upload_fires_capture_saved_toast(env, tmp_path):
     """Live-path try_upload(live=True) on success with a server_capture_id +
-    a webapp_base_url MUST fire the "Capture saved to Sayzo" actionable toast
+    a webapp_base_url MUST fire the "Conversation saved to Sayzo" actionable toast
     with the deep-link button. This is the only path that fires it — sweep
     successes are silent (see the sibling test)."""
     captures_dir = tmp_path / "captures_live_toast"
@@ -363,13 +363,13 @@ async def test_live_upload_fires_capture_saved_toast(env, tmp_path):
     assert outcome == UploadOutcome.SUCCESS
     assert len(env.notifier.actionable_calls) == 1
     call = env.notifier.actionable_calls[0]
-    assert call["title"] == "Capture saved to Sayzo"
+    assert call["title"] == "Conversation saved to Sayzo"
     assert call["button_label"] == "Open in Sayzo"
 
 
 async def test_sweep_upload_does_not_fire_capture_saved_toast(env, tmp_path):
     """Sweep-path try_upload (default live=False) on success MUST NOT fire
-    the "Capture saved to Sayzo" toast. Draining a backlog of "couldn't
+    the "Conversation saved to Sayzo" toast. Draining a backlog of "couldn't
     upload" captures — auto-sweep or the user-triggered Try Again sweep —
     would otherwise spam a burst of toasts; the Captures pane row flipping
     state is the user-visible signal for sweep success instead."""

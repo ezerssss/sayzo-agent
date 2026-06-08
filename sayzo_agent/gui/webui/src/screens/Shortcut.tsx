@@ -43,7 +43,7 @@ export function Shortcut({ step, onNext, onCancel }: Props) {
     <Layout
       step={step}
       title="Last thing — pick your shortcut"
-      subtitle="This is the key you press when you want Sayzo to start or stop a capture. It's the main way you tell Sayzo to record. You can change it anytime from Settings."
+      subtitle="This is the key you press when you want Sayzo to start or stop recording. It's the main way you tell Sayzo to record. You can change it anytime from Settings."
       footer={
         <>
           <Button variant="ghost" onClick={onCancel} disabled={saving}>

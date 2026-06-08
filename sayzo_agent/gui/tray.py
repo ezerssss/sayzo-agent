@@ -119,16 +119,6 @@ class TrayState:
     # still reference it. Unused by the tray menu itself.
     pause_event: threading.Event = field(default_factory=threading.Event)
     _update_offer: UpdateOffer | None = None
-    # Daily-drill EOD fallback. When the scheduler couldn't fire a
-    # notification (mid-meeting all day, or backend unavailable), it
-    # surfaces today's drill via this dynamic tray menu item. The label
-    # is shown only when non-None; clicking sets ``eod_drill_event``
-    # which the bridge polls and dispatches to the scheduler.
-    _eod_drill_label: str | None = None
-    eod_drill_event: threading.Event = field(default_factory=threading.Event)
-    # Daily-drill manual test trigger (Debug submenu). Set by the tray
-    # thread; the bridge polls and calls scheduler.fire_now(ignore_gates).
-    test_drill_event: threading.Event = field(default_factory=threading.Event)
 
     # Last observed /api/me result, pushed here by the boot refresh task.
     # ``None`` ⇒ never checked yet; the tray renders a normal armed /
@@ -194,14 +184,6 @@ class TrayState:
     def get_update_offer(self) -> UpdateOffer | None:
         with self._lock:
             return self._update_offer
-
-    def set_eod_drill_label(self, label: str | None) -> None:
-        with self._lock:
-            self._eod_drill_label = label
-
-    def get_eod_drill_label(self) -> str | None:
-        with self._lock:
-            return self._eod_drill_label
 
     def is_starting(self) -> bool:
         with self._lock:
@@ -543,18 +525,6 @@ class TrayIcon:
         def update_visible(item) -> bool:
             return self.state.get_update_offer() is not None
 
-        def eod_drill_text(item) -> str:
-            return self.state.get_eod_drill_label() or ""
-
-        def eod_drill_visible(item) -> bool:
-            return bool(self.state.get_eod_drill_label())
-
-        def on_eod_drill(icon, item):
-            self.state.eod_drill_event.set()
-
-        def on_test_drill(icon, item):
-            self.state.test_drill_event.set()
-
         def finish_setup_visible(item) -> bool:
             return self.state.is_account_blocked()
 
@@ -564,12 +534,6 @@ class TrayIcon:
             # known issues, just consistent with how settings_event is
             # handled).
             self.state.finish_setup_event.set()
-
-        # The Debug submenu only renders when SAYZO_DEBUG_TRAY=1 is in the
-        # env — keeps the production menu clean. The CLI command
-        # `sayzo-agent test-drill-notification` is the supported path for
-        # most users; the menu item is convenience for hands-on QA.
-        debug_visible = bool(os.environ.get("SAYZO_DEBUG_TRAY"))
 
         # NOTE: no ``default=True`` on the arm toggle — a single left-click
         # on the tray icon should NOT silently arm/disarm. The user reported
@@ -590,17 +554,9 @@ class TrayIcon:
             ),
             pystray.MenuItem(arm_label, on_arm_toggle),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem(
-                eod_drill_text, on_eod_drill, visible=eod_drill_visible,
-            ),
             pystray.MenuItem(update_text, on_open_update, visible=update_visible),
             pystray.MenuItem("Settings...", on_settings),
             pystray.MenuItem("Open captures folder", on_open_captures),
-            pystray.MenuItem(
-                "Test daily drill notification",
-                on_test_drill,
-                visible=lambda item: debug_visible,
-            ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit Sayzo", on_quit),
         )

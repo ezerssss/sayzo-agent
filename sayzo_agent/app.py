@@ -69,7 +69,6 @@ class Agent:
         sys_capture=None,
         notifier: Optional[Notifier] = None,
         auth_client=None,
-        daily_drill_scheduler=None,
     ) -> None:
         self.cfg = config
         self.mic = mic_capture or MicCapture(
@@ -183,12 +182,6 @@ class Agent:
             system_scope_fn=lambda: self.cfg.capture.system_scope,
             show_recording_indicator_fn=lambda: self.cfg.hud.show_recording_indicator,
         )
-
-        # Optional daily-drill scheduler. Constructed by the service entry
-        # point (__main__.service) only when the user is signed-in and the
-        # feature is enabled in config. The agent itself just owns the
-        # start/stop lifecycle hook.
-        self.daily_drill = daily_drill_scheduler
 
     # ---- pipeline ----------------------------------------------------------
 
@@ -839,7 +832,7 @@ class Agent:
         # block doesn't silently reject a brand-new capture. If credits are
         # genuinely exhausted, the server's 402 re-arms the pause for the
         # sweep; if the user already topped up, the upload just goes through.
-        # ``live=True`` also opts this call into the "Capture saved to Sayzo"
+        # ``live=True`` also opts this call into the "Conversation saved to Sayzo"
         # success toast — sweep-path retries (auto + manual Try Again) stay
         # silent to avoid a toast burst when a backlog drains.
         await self.retry_mgr.try_upload(
@@ -864,17 +857,6 @@ class Agent:
         # kicks off the whitelist watcher. Capture streams stay CLOSED
         # until the user arms via hotkey or accepts a consent toast.
         await self.arm.start()
-
-        # Daily-drill notification scheduler — independent of capture path.
-        # Ticks on its own schedule, fires at most one toast per workday.
-        if self.daily_drill is not None:
-            try:
-                await self.daily_drill.start()
-            except Exception:
-                log.warning(
-                    "[agent] daily-drill scheduler failed to start (non-fatal)",
-                    exc_info=True,
-                )
 
         # First-launch welcome toast — fires once per install, flagged by
         # data_dir/welcomed.json so reopening the agent doesn't re-surface
@@ -915,15 +897,6 @@ class Agent:
         finally:
             for t in consumers:
                 t.cancel()
-            # Stop the daily-drill scheduler before the arm controller so
-            # any in-flight fetch_today_session is cancelled cleanly.
-            if self.daily_drill is not None:
-                try:
-                    await self.daily_drill.stop()
-                except Exception:
-                    log.debug(
-                        "[agent] daily-drill stop raised", exc_info=True
-                    )
             # Stop the arm controller — force-closes any open session,
             # stops streams, unregisters hotkey, cancels background watchers.
             await self.arm.stop()

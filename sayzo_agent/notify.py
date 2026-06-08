@@ -10,7 +10,7 @@ surface entirely and renders every notification through a frameless
 pywebview HUD window we own end-to-end (see :mod:`sayzo_agent.gui.hud`).
 
 This module preserves the historical ``Notifier`` Protocol so the
-ArmController, daily-drill scheduler, upload-retry manager, and app
+ArmController, upload-retry manager, capture poller, and app
 orchestrator don't need to change. The two implementations are:
 
 * :class:`HudNotifier` — wraps a :class:`HudLauncher` and forwards
@@ -293,8 +293,8 @@ class HudNotifier:
     def has_authorisation_sync(self) -> Optional[bool]:
         # The HUD is "authorised" by definition — we own the surface.
         # ``None`` is returned only when the launcher has given up after
-        # repeated crashes; callers (daily-drill scheduler) treat ``None``
-        # as "unknown" and skip the silent-drop fallback.
+        # repeated crashes; callers treat ``None`` as "unknown" and skip
+        # the silent-drop fallback.
         try:
             return True if self._launcher.is_alive() else None
         except Exception:

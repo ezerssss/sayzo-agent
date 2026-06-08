@@ -62,9 +62,9 @@ export function ActionableToast({
         {secondaryButtonLabel && (
           <button
             type="button"
-            // The user deferred the drill; the parent re-fires it
-            // later. Distinct outcome so the agent records it as a
-            // "saw it, chose to wait" signal vs. a passive expiry.
+            // The user pressed the secondary action; the parent handles
+            // it. Distinct outcome so the agent can record "saw it, chose
+            // to defer" vs. a passive expiry.
             onClick={() => fireOnce("snoozed")}
             className="hud-no-drag rounded-lg border border-gray-200 bg-transparent px-3 py-2 text-[13px] font-semibold text-ink-muted transition hover:bg-gray-100 hover:text-ink"
           >

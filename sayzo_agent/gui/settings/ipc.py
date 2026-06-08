@@ -79,13 +79,10 @@ class Methods:
     # the primary already running uses this to ask the primary to surface
     # its Settings window before exiting. Same trigger the tray menu uses.
     OPEN_SETTINGS = "open_settings"
-    # Daily-drill scheduler: rebuild config from disk after the user
-    # toggles a sub-setting (Settings → Notifications → Daily drill).
+    # Rebuild notification config from disk after the user toggles a
+    # Settings → Notifications sub-setting (the coaching-insight flag and
+    # the master switch) so the live agent picks it up without a restart.
     RELOAD_NOTIFICATION_CONFIG = "reload_notification_config"
-    # Manual fire trigger — used by `sayzo-agent test-drill-notification`
-    # CLI and the tray Debug submenu. Bypasses the timing gates so the
-    # user can verify the round-trip without waiting for the model to pick.
-    TEST_DRILL_NOTIFICATION = "test_drill_notification"
     # Settings UI's "Quit Sayzo" button — same path as tray Quit menu.
     QUIT_AGENT = "quit_agent"
 

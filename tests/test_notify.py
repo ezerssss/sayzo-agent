@@ -218,9 +218,9 @@ def test_hud_notifier_actionable_press():
     expired = threading.Event()
     notifier = HudNotifier(fake)
     dispatched = notifier.notify_actionable(
-        "Daily drill",
+        "Conversation saved",
         "Body",
-        button_label="Open drill",
+        button_label="Open in Sayzo",
         on_pressed=lambda: pressed.set(),
         expire_after_secs=2.0,
         on_expire=lambda: expired.set(),
@@ -236,9 +236,9 @@ def test_hud_notifier_actionable_expire():
     pressed: list[bool] = []
     expired = threading.Event()
     HudNotifier(fake).notify_actionable(
-        "Daily drill",
+        "Conversation saved",
         "Body",
-        button_label="Open drill",
+        button_label="Open in Sayzo",
         on_pressed=lambda: pressed.append(True),
         expire_after_secs=0.2,
         on_expire=lambda: expired.set(),
@@ -257,9 +257,9 @@ def test_hud_notifier_actionable_secondary_button_forwards():
     pressed: list[bool] = []
     expired: list[bool] = []
     HudNotifier(fake).notify_actionable(
-        "Daily drill",
+        "Conversation saved",
         "Body",
-        button_label="Open drill",
+        button_label="Open in Sayzo",
         on_pressed=lambda: pressed.append(True),
         expire_after_secs=2.0,
         on_expire=lambda: expired.append(True),
@@ -279,9 +279,9 @@ def test_hud_notifier_actionable_no_secondary_button_by_default():
     fake = _FakeLauncher()
     fake.set_actionable_outcome("pressed")
     HudNotifier(fake).notify_actionable(
-        "Daily drill",
+        "Conversation saved",
         "Body",
-        button_label="Open drill",
+        button_label="Open in Sayzo",
         on_pressed=lambda: None,
         expire_after_secs=2.0,
     )
@@ -299,6 +299,6 @@ def test_hud_notifier_has_authorisation_none_when_dead():
     fake = _FakeLauncher()
     fake.set_alive(False)
     # When the launcher has given up (is_alive=False), authorisation is
-    # "unknown" — the daily-drill scheduler treats None as "skip the
-    # silent-drop fallback" since native notifications no longer exist.
+    # "unknown" — callers treat None as "skip the silent-drop fallback"
+    # since native notifications no longer exist.
     assert HudNotifier(fake).has_authorisation_sync() is None

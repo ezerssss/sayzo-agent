@@ -19,7 +19,7 @@ interface Section {
 
 // Grouped sub-toggles. Each section maps to a piece of agent behaviour
 // — capture lifecycle toasts, long-meeting prompts, the hotkey
-// confirmation, and the daily-drill nudge. The master switch above
+// confirmation, and the coaching insight. The master switch above
 // disables every section at once.
 const SECTIONS: readonly Section[] = [
   {
@@ -31,15 +31,15 @@ const SECTIONS: readonly Section[] = [
       },
       {
         key: "post_arm",
-        label: "Show “Sayzo is capturing” reminders when a capture starts",
+        label: "Show “Sayzo is capturing” reminders when recording starts",
       },
       {
         key: "capture_saved",
-        label: "Show “Conversation saved” when a capture finishes",
+        label: "Show “Conversation saved” when a conversation finishes",
       },
       {
         key: "session_wrapped",
-        label: "Tell me when a capture wraps up automatically",
+        label: "Tell me when a conversation wraps up automatically",
         hint: "After you tap “Keep going” and the meeting app eventually goes quiet, Sayzo silently saves what you had. This toast confirms it.",
       },
     ],
@@ -50,7 +50,7 @@ const SECTIONS: readonly Section[] = [
       {
         key: "checkin",
         label: "Ask if I’m still in long meetings",
-        hint: "Pops a “Still in the meeting?” card after 1 hour, then every half hour. Turn off if you prefer captures to run uninterrupted — you can always stop with the hotkey.",
+        hint: "Pops a “Still in the meeting?” card after 1 hour, then every half hour. Turn off if you prefer conversations to run uninterrupted (you can always stop with the hotkey).",
       },
       {
         key: "meeting_ended_watcher",
@@ -65,7 +65,7 @@ const SECTIONS: readonly Section[] = [
       {
         key: "confirm_hotkey_stop",
         label: "Confirm before stopping from the hotkey",
-        hint: "Off means a single hotkey press while armed stops the capture instantly — no safety net for accidental presses.",
+        hint: "Off means a single hotkey press while armed stops the recording instantly, with no safety net for accidental presses.",
       },
     ],
   },
@@ -75,11 +75,7 @@ const SECTIONS: readonly Section[] = [
       {
         key: "capture_feedback",
         label: "Show a coaching insight after a meeting is analyzed",
-        hint: "Right after Sayzo finishes analyzing a captured meeting, a short card surfaces one specific thing to work on — pulled from what you actually said. Tap “See full feedback” for the rest, or “Stop showing these” on the card to turn it off.",
-      },
-      {
-        key: "daily_drill",
-        label: "Send me a daily 60-second speaking drill",
+        hint: "Right after Sayzo finishes analyzing a conversation, a short card surfaces one specific thing to work on, pulled from what you actually said. Tap “See full feedback” for the rest, or “Stop showing these” on the card to turn it off.",
       },
     ],
   },
@@ -98,7 +94,6 @@ const ALL_FALSE: NotificationFlags = {
   checkin: false,
   meeting_ended_watcher: false,
   confirm_hotkey_stop: false,
-  daily_drill: false,
 };
 
 export function NotificationsPane() {
@@ -182,7 +177,7 @@ export function NotificationsPane() {
       </div>
 
       <p className="mt-6 max-w-md text-xs leading-relaxed text-ink-muted">
-        The “Was that the end of your meeting?” prompt always shows — it
+        The “Was that the end of your meeting?” prompt always shows. It
         gives you a chance to keep going before Sayzo wraps a quiet
         session.
       </p>

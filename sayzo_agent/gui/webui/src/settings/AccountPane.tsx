@@ -135,8 +135,8 @@ function SignedInBody({ status, onSignOut }: SignedInBodyProps) {
   return (
     <div>
       <p className="mt-3 max-w-md text-sm leading-relaxed text-ink-muted">
-        Signed in. Your captures sync to your account so you can drill the
-        coaching moments in the Sayzo web app.
+        Signed in. Your conversations sync to your account so you can replay
+        them in the Sayzo web app.
       </p>
 
       <dl className="mt-8 space-y-2">
@@ -243,8 +243,8 @@ function SignedOutBody({
   return (
     <div>
       <p className="mt-3 max-w-md text-sm leading-relaxed text-ink-muted">
-        You're not signed in. Sayzo will keep captures on this machine until
-        you do — so no coaching drills yet.
+        You're not signed in. Sayzo will keep your conversations on this
+        machine until you do, so no coaching yet.
       </p>
       <div className="mt-6">
         <Button variant="primary" onClick={onSignIn}>

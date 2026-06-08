@@ -64,7 +64,7 @@ export function AudioCapture({ step, onNext, onCancel }: Props) {
     <Layout
       step={step}
       title="System audio access"
-      subtitle="Sayzo captures audio from your meetings — like Zoom, Meet, or Teams — so it can transcribe the full conversation, not just your side."
+      subtitle="Sayzo captures audio from your meetings (like Zoom, Meet, or Teams) so it can transcribe the full conversation, not just your side."
       footer={
         <>
           <Button variant="ghost" onClick={onCancel}>
@@ -96,7 +96,7 @@ export function AudioCapture({ step, onNext, onCancel }: Props) {
       {state === "granted" && (
         <div className="flex items-center gap-2 text-sm font-medium text-green-700">
           <CheckCircle2 className="h-4 w-4" />
-          All set! Your drills will now use the whole meeting — not just
+          All set! Sayzo will now coach you on the whole meeting, not just
           your side.
         </div>
       )}

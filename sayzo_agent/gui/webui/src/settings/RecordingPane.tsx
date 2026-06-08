@@ -97,7 +97,7 @@ export function RecordingPane() {
               When you're in a meeting, capture only your meeting app's
               audio (Chrome, Zoom, Slack, etc.) instead of everything
               playing on your computer. Some setups can't isolate by
-              app — leave this off if your meeting captures come out
+              app, so leave this off if your recordings come out
               silent.
             </p>
           </div>

@@ -18,12 +18,12 @@ class AuthTemporarilyUnavailable(AuthenticationRequired):
     ``except AuthenticationRequired`` handler keeps catching it, so a
     transient blip degrades to the prior behaviour (no regression, no
     uncaught exception). Callers that care to distinguish a retryable
-    network failure — the account + daily-drill pollers — catch THIS
+    network failure — the account + capture pollers — catch THIS
     subclass first and map it to ``transient_error`` (back off + retry)
     instead of ``auth_required``. Before this split a cold-boot
     ConnectTimeout was misreported as "session expired" and the 60s poller
-    hammered a full traceback every cycle (see store.py / account/status.py
-    / daily_drill/api.py)."""
+    hammered a full traceback every cycle (see store.py /
+    account/status.py)."""
 
 
 class AuthenticationFailed(Exception):

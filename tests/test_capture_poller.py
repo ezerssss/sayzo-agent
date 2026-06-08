@@ -334,7 +334,7 @@ async def test_owns_toast_polls_past_transcribed_to_analyzed_and_fires_insight(e
 
 async def test_owns_toast_analyzed_without_insight_fires_fallback(env, tmp_path):
     """When the server reaches analyzed with coaching_insight=null, the poller
-    falls back to the plain "Capture saved" toast so upload confirmation isn't
+    falls back to the plain "Conversation saved" toast so upload confirmation isn't
     lost under the replace-don't-stack model."""
     rec_dir = _write_capture(env.captures_dir, "rec_noinsight")
     env.auth.queue({"status": "analyzed", "title": "Q4 sync", "coaching_insight": None})
@@ -345,7 +345,7 @@ async def test_owns_toast_analyzed_without_insight_fires_fallback(env, tmp_path)
 
     assert notifier.insight_calls == []
     assert len(notifier.actionable_calls) == 1
-    assert notifier.actionable_calls[0]["title"] == "Capture saved to Sayzo"
+    assert notifier.actionable_calls[0]["title"] == "Conversation saved to Sayzo"
 
 
 async def test_owns_toast_terminal_failure_fires_fallback(env, tmp_path):

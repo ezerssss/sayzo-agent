@@ -12,7 +12,7 @@ When you're happy with a block, mark it **APPROVED** in a comment next to it, an
 
 > **Sayzo — the English speaking coach you bring to your meetings.**
 >
-> Sayzo captures conversations from your meetings and turns them into personalized English-speaking drills. It only listens when you say so: press a keyboard shortcut, or say yes to a prompt when Sayzo notices you're in a meeting.
+> Sayzo captures conversations from your meetings and turns them into personalized English coaching. It only listens when you say so: press a keyboard shortcut, or say yes to a prompt when Sayzo notices you're in a meeting.
 >
 > Your microphone stays off until then.
 
@@ -57,7 +57,7 @@ One window, one walkthrough. No second tkinter step after it closes — everythi
 
 - Title: **Welcome to Sayzo**
 - Body (**APPROVED**): *"A quick two-minute setup. Nothing records until you say so."*
-- Copy below the button row (**APPROVED**): *"Signing in links this machine to your account so your captures become coaching drills in the Sayzo web app."*
+- Copy below the button row (**APPROVED**): *"Signing in links this machine to your account so your conversations become coaching in the Sayzo web app."*
 - Buttons: **Cancel** / **Sign in**
 - Pending state button label: **Opening browser…**
 
@@ -74,7 +74,7 @@ One window, one walkthrough. No second tkinter step after it closes — everythi
 - Body (**APPROVED**): *"Sayzo uses your mic only when you start a conversation — with your keyboard shortcut, or by accepting a prompt on screen."*
 - Buttons: **Cancel** / **Allow**
 - On Allow: triggers the macOS Microphone TCC dialog by briefly opening a `sounddevice.InputStream` (see `mac_permissions.prompt_microphone`). Advance is user-initiated — pressing Continue after the system dialog resolves.
-- Granted state (**APPROVED**): *"All set! Your conversations are ready to become personalized speaking drills."*
+- Granted state (**APPROVED**): *"All set! Your conversations are ready for personalized coaching."*
 - Denied state (**APPROVED**): *"Looks like macOS blocked the mic. Open System Settings, turn it on for Sayzo, then come back."* — button changes to **Open Settings**.
 - No Skip option: mic access is required to use Sayzo.
 
@@ -84,9 +84,9 @@ One window, one walkthrough. No second tkinter step after it closes — everythi
 - Body (**APPROVED**): *"Sayzo captures audio from your meetings — like Zoom, Meet, or Teams — so it can transcribe the full conversation, not just your side."*
 - Buttons: **Cancel** / **Allow**
 - On Allow: spawns the pre-compiled audio-tap Swift helper, which triggers the Audio Capture TCC dialog via `AudioHardwareCreateProcessTap`.
-- Granted state (**APPROVED**): *"All set! Your drills will now use the whole meeting — not just your side."*
+- Granted state (**APPROVED**): *"All set! Sayzo will now coach you on the whole meeting, not just your side."*
 - Denied state (**APPROVED**): *"Looks like macOS blocked system audio. Open System Settings, turn it on for Sayzo, then come back."*
-- No Skip option: system audio access is required for drills to capture full meeting context.
+- No Skip option: system audio access is required for Sayzo to capture full meeting context.
 
 ### Screen 05 — Accessibility (macOS only)
 
@@ -288,7 +288,7 @@ Fires when the mic or loopback device can't be opened on arm.
 
 ### Account panel (signed-in)
 - Header: **Account**
-- Body (**APPROVED**): *"Signed in. Your captures sync to your account so you can drill the coaching moments in the Sayzo web app."*
+- Body (**APPROVED**): *"Signed in. Your conversations sync to your account so you can replay them in the Sayzo web app."*
 - Row 1: **Server: [server_url]**
 - Row 2: **Signed in since [date]**
 - Button: **Open webapp**
@@ -296,7 +296,7 @@ Fires when the mic or loopback device can't be opened on arm.
 
 ### Account panel (signed-out)
 - Header: **Account**
-- Body (**APPROVED**): *"You're not signed in. Sayzo will keep captures on this machine until you do — so no coaching drills yet."*
+- Body (**APPROVED**): *"You're not signed in. Sayzo will keep your conversations on this machine until you do, so no coaching yet."*
 - Button: **Sign in**
 
 ### Notifications panel

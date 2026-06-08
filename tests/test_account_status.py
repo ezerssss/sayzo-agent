@@ -1,10 +1,9 @@
 """Tests for sayzo_agent.account.status.
 
-Mirrors tests/test_daily_drill_api.py — uses ``httpx.MockTransport`` so
-we exercise the real ``AuthenticatedClient`` code path while controlling
-responses. Verifies the typed dispatch + the server-state mapping (the
-backend uses ``"active"``; the agent maps to ``"ok"`` to match the
-daily-drill convention).
+Uses ``httpx.MockTransport`` so we exercise the real
+``AuthenticatedClient`` code path while controlling responses. Verifies
+the typed dispatch + the server-state mapping (the backend uses
+``"active"``; the agent maps to ``"ok"``).
 """
 from __future__ import annotations
 

@@ -45,7 +45,7 @@ export function Done({ hotkeyDisplay }: Props) {
   return (
     <Layout
       title="You're all set"
-      subtitle={`Press ${hotkeyDisplay} to start a capture, or say yes when Sayzo spots a meeting. That's it — nothing records until you say so.`}
+      subtitle={`Press ${hotkeyDisplay} to start recording, or say yes when Sayzo spots a meeting. That's it — nothing records until you say so.`}
       footer={
         <Button onClick={handleFinish} disabled={finishing}>
           {finishing ? "Closing…" : "Got it"}

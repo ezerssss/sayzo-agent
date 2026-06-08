@@ -20,9 +20,9 @@ The function never raises — every branch maps to a ``status`` field on
 write / gate decision / GUI re-route) and is the single place where
 "allow / block" decisions live.
 
-Mirrors the shape of :mod:`sayzo_agent.daily_drill.api` so the two
-authenticated GETs share patterns (retry math, error mapping,
-``AuthenticationRequired`` handling) and tests can use the same helpers.
+Follows the agent's authenticated-GET-with-typed-response pattern (retry
+math, error mapping, ``AuthenticationRequired`` handling) so tests can use
+the same helpers.
 """
 from __future__ import annotations
 
@@ -235,8 +235,7 @@ def _map_server_state(
     """Map server's ``account_state`` to the agent's ``ResponseStatus``.
 
     The server uses ``"active"`` for the happy path; the agent uses ``"ok"``
-    to be consistent with :mod:`sayzo_agent.daily_drill.api` (where ``ok``
-    means "200 with usable data"). The other values pass through verbatim.
+    to mean "200 with usable data". The other values pass through verbatim.
 
     Tolerates a server that omits ``account_state`` entirely by deriving
     from ``onboarding_complete`` — that way an early backend version that

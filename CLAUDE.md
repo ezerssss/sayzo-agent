@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A local Python agent that captures meetings on the user's machine — **only when the user says so**. Captures feed server-side analysis that drives personalized speaking drills in the Sayzo English-coaching webapp. Upload is a no-op stub (`NoopUploadClient`) until the user signs in.
+A local Python agent that captures meetings on the user's machine — **only when the user says so**. Captures feed server-side analysis that powers personalized coaching on each conversation in the Sayzo English-coaching webapp, where the user can replay a conversation to practice it. Upload is a no-op stub (`NoopUploadClient`) until the user signs in.
 
 The agent is in **armed-only mode** (v1.0+): audio streams are closed while disarmed, and only open after an explicit arm signal. Two arm paths:
 
@@ -60,7 +60,7 @@ Either way, every session that survives the pipeline is saved locally first and 
 
 ### Notifications: custom HUD overlay (v2.10+)
 
-Sayzo no longer uses OS notification APIs. Every user-facing toast — capture pill, consent prompts, info toasts, daily-drill nudges — renders inside a frameless, transparent, always-on-top pywebview window that the agent owns end-to-end. The legacy `desktop-notifier` / `UNUserNotificationCenter` / `NSUserNotification` / `osascript display dialog` paths were removed in v2.10 after years of "no toast appeared" incidents driven by AUMID drift, Focus-mode banner dropping, unsigned-bundle silent denial, and stale TCC entries across signing changes.
+Sayzo no longer uses OS notification APIs. Every user-facing toast — capture pill, consent prompts, info toasts, post-capture coaching cards — renders inside a frameless, transparent, always-on-top pywebview window that the agent owns end-to-end. The legacy `desktop-notifier` / `UNUserNotificationCenter` / `NSUserNotification` / `osascript display dialog` paths were removed in v2.10 after years of "no toast appeared" incidents driven by AUMID drift, Focus-mode banner dropping, unsigned-bundle silent denial, and stale TCC entries across signing changes.
 
 The HUD architecture has four pieces:
 

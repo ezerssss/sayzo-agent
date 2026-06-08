@@ -167,14 +167,14 @@ def _run_launcher() -> int:
             pressed = asyncio.Event()
             expired = asyncio.Event()
             launcher.show_actionable(
-                "Daily speaking drill",
-                "Two minutes today — practice your filler-word habit.",
-                button_label="Open drill",
+                "Conversation saved to Sayzo",
+                "Open it to see your transcript and coaching.",
+                button_label="Open in Sayzo",
                 on_pressed=lambda: loop.call_soon_threadsafe(pressed.set),
                 expire_after_secs=30.0,
                 on_expire=lambda: loop.call_soon_threadsafe(expired.set),
             )
-            print("✓ actionable shown (click 'Open drill' or wait 30 s)")
+            print("✓ actionable shown (click 'Open in Sayzo' or wait 30 s)")
             done, _ = await asyncio.wait(
                 {
                     asyncio.create_task(pressed.wait()),
@@ -317,7 +317,7 @@ def _run_launcher() -> int:
             ("4", "Collapse pill → dot", cmd_collapse),
             ("5", "Expand dot → pill", cmd_expand),
             ("6", "Info toast", cmd_info_toast),
-            ("7", "Actionable toast (daily drill, 30 s)", cmd_actionable),
+            ("7", "Actionable toast (capture-saved, 30 s)", cmd_actionable),
             ("8", "Consent: 'Was that the end of your meeting?'",
                 cmd_pending_close),
             ("9", "Consent: 'Still in the meeting?' (long-meeting check-in)",

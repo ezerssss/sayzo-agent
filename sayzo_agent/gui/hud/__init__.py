@@ -3,8 +3,8 @@
 The HUD is a frameless, transparent, always-on-top pywebview window
 hosted in its own subprocess and driven by JSON commands over stdin /
 stdout from the parent agent. It owns every user-facing notification
-surface: persistent capture pill, consent prompts, info toasts, daily
-drill nudge. Native OS notification APIs (WinRT, UNUserNotificationCenter,
+surface: persistent capture pill, consent prompts, info toasts, coaching
+cards. Native OS notification APIs (WinRT, UNUserNotificationCenter,
 NSUserNotification, osascript modal) are no longer used.
 
 Public entry points:

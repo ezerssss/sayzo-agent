@@ -101,8 +101,7 @@ export function Microphone({ step, onNext, onCancel }: Props) {
       {state === "granted" && (
         <div className="flex items-center gap-2 text-sm font-medium text-green-700">
           <CheckCircle2 className="h-4 w-4" />
-          All set! Your conversations are ready to become personalized
-          speaking drills.
+          All set! Your conversations are ready for personalized coaching.
         </div>
       )}
       {state === "denied" && (
