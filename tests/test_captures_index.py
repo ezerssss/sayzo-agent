@@ -97,6 +97,35 @@ def test_derive_status_missing_metadata_defaults_to_pending():
 
 
 # ---------------------------------------------------------------------------
+# server_capture_id surfacing (drives the Captures "View feedback" button)
+# ---------------------------------------------------------------------------
+
+
+def test_summary_surfaces_server_capture_id(tmp_path: Path) -> None:
+    now = datetime.now(timezone.utc)
+    _write_record(
+        tmp_path, "a" * 12, started_at=now,
+        metadata={"upload": dict(
+            empty_upload_state(), status=STATUS_UPLOADED, server_capture_id="srv-XYZ",
+        )},
+    )
+    [s] = enumerate_captures(tmp_path)
+    assert s.server_capture_id == "srv-XYZ"
+    # Flows through to the React payload via asdict.
+    assert summary_to_dict(s)["server_capture_id"] == "srv-XYZ"
+
+
+def test_summary_server_capture_id_absent_when_not_uploaded(tmp_path: Path) -> None:
+    now = datetime.now(timezone.utc)
+    _write_record(
+        tmp_path, "b" * 12, started_at=now,
+        metadata={"upload": dict(empty_upload_state(), status=STATUS_PENDING)},
+    )
+    [s] = enumerate_captures(tmp_path)
+    assert s.server_capture_id is None
+
+
+# ---------------------------------------------------------------------------
 # bucket_for + friendly_label coverage
 # ---------------------------------------------------------------------------
 

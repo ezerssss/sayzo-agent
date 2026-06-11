@@ -72,6 +72,13 @@ class CaptureSummary:
     has_audio: bool
     is_processing: bool
     dropped_reason: Optional[str] = None
+    # Server-assigned id from the upload response, persisted at
+    # ``metadata.upload.server_capture_id``. Present once an upload succeeds;
+    # ``None`` otherwise. Drives the Captures pane's "View feedback" button
+    # (builds the ``/app/conversations/{server_capture_id}`` deep-link) — see
+    # ``bridge.open_capture_feedback``. NOT the local ``id`` (that's the dir
+    # name; the server may assign a different id).
+    server_capture_id: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +281,7 @@ def _summary_from_record(rec_dir: Path) -> Optional[CaptureSummary]:
         has_audio=has_audio,
         is_processing=False,
         dropped_reason=dropped_reason,
+        server_capture_id=(upload.get("server_capture_id") or None),
     )
 
 

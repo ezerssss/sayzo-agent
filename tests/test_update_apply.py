@@ -431,3 +431,48 @@ def test_clear_apply_attempts_consumes_failure_marker(tmp_path: Path) -> None:
 def test_clear_apply_attempts_safe_when_missing(tmp_path: Path) -> None:
     clear_apply_attempts(tmp_path)
     assert get_failed_apply_version(tmp_path) is None
+
+
+# ---------------------------------------------------------------------------
+# open-settings-after-update marker (Change 5: a silent boot-auto-apply must
+# NOT re-open Settings; a user-initiated apply must). The marker is the only
+# signal the relaunched agent has to tell the two paths apart.
+# ---------------------------------------------------------------------------
+
+
+def test_user_initiated_apply_writes_open_settings_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sayzo_agent.update_apply import take_open_settings_after_update
+
+    _stub_staged(monkeypatch)
+    _stub_helpers(monkeypatch)
+    with pytest.raises(_ExitSentinel):
+        apply_staged_if_newer(tmp_path, "1.0.0", where="quit")
+    # The relaunched agent would find the marker → re-open Settings on About.
+    assert take_open_settings_after_update(tmp_path) is True
+
+
+def test_boot_apply_does_not_write_open_settings_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sayzo_agent.update_apply import take_open_settings_after_update
+
+    _stub_staged(monkeypatch)
+    _stub_helpers(monkeypatch)
+    with pytest.raises(_ExitSentinel):
+        apply_staged_if_newer(tmp_path, "1.0.0", where="boot")
+    # Silent boot-auto-apply leaves no marker → new agent stays toast-only.
+    assert take_open_settings_after_update(tmp_path) is False
+
+
+def test_take_open_settings_marker_is_one_shot(tmp_path: Path) -> None:
+    from sayzo_agent.update_apply import (
+        set_open_settings_after_update,
+        take_open_settings_after_update,
+    )
+
+    set_open_settings_after_update(tmp_path)
+    assert take_open_settings_after_update(tmp_path) is True
+    # Consumed — a second read returns False so a stale marker self-clears.
+    assert take_open_settings_after_update(tmp_path) is False

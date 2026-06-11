@@ -153,6 +153,7 @@ declare global {
     finish(): Promise<null>;
     quit_app(): Promise<null>;
     restart_app(): Promise<null>;
+    open_web_app(): Promise<null>;
 
     // Web-onboarding gate.
     recheck_account_status(): Promise<AccountStatusPayload>;
@@ -315,6 +316,11 @@ export const bridge = {
   async markPermissionsOnboarded() {
     await whenReady();
     return window.pywebview.api.mark_permissions_onboarded();
+  },
+
+  async openWebApp() {
+    await whenReady();
+    return window.pywebview.api.open_web_app();
   },
 
   async finish() {

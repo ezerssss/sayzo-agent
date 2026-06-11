@@ -1583,8 +1583,37 @@ def service(force_setup: bool, from_autostart: bool, open_settings: bool) -> Non
     # closed) stay silent. The flag is on tray_state so _tray_bridge picks
     # it up via its existing settings-event polling — no new wiring.
     from .launch_source import looks_user_launched
+    from .update_apply import take_open_settings_after_update
 
-    if open_settings:
+    # Did we just apply a *user-initiated* update (About "Install update" /
+    # tray "Install…" / HUD "Install now")? The old agent left this marker
+    # before handing off to the installer; consume it every boot so a stale
+    # one (e.g. a failed helper spawn) self-clears.
+    _user_update = take_open_settings_after_update(cfg.data_dir)
+    # ``_pending_upgrade_toast`` (set above) is non-None iff this boot is the
+    # first after a version bump — i.e. a staged update was just applied.
+    _post_upgrade = _pending_upgrade_toast is not None
+
+    if _user_update and not should_show_gui:
+        # ``not should_show_gui`` guard: an update relaunch never passes
+        # --force-setup and lands with setup already complete, so this is
+        # belt-and-braces against ever popping Settings on top of a setup
+        # window (matches the looks_user_launched branch's guard below).
+        log.warning(
+            "service: user-initiated update applied — re-opening Settings on About"
+        )
+        tray_state.settings_pane = "About"
+        tray_state.settings_event.set()
+    elif _post_upgrade:
+        # Silent boot-time auto-apply: the downstream "Sayzo updated" toast is
+        # the only surface — do NOT pop Settings. This deliberately overrides
+        # the Windows ``--open-settings`` flag (the NSIS relaunch passes it for
+        # BOTH auto and user applies) and the macOS ``looks_user_launched()``
+        # true-positive on the ``open --args service`` relaunch.
+        log.warning(
+            "service: auto-update relaunch — suppressing Settings auto-open (toast only)"
+        )
+    elif open_settings:
         log.warning(
             "service: --open-settings flag — auto-opening Settings"
         )
@@ -1758,6 +1787,17 @@ def service(force_setup: bool, from_autostart: bool, open_settings: bool) -> Non
             )
 
         agent.arm.account_gate_fn = _account_gate_fn
+
+        # The auth-required upload toast's "Sign in" button routes here (fired
+        # from the HUD reader thread). Re-open Settings on the Account pane so
+        # the user can run the desktop sign-in that actually clears the auth
+        # block — a web login wouldn't refresh the agent's OAuth token. Setting
+        # the pane field + event is the same thread-safe handoff the tray uses.
+        def _on_sign_in_requested() -> None:
+            tray_state.settings_pane = "Account"
+            tray_state.settings_event.set()
+
+        agent.retry_mgr.set_sign_in_callback(_on_sign_in_requested)
 
         # Tray is now backed by a real ArmController. Stop showing the
         # bootstrap "Starting…" copy and let menu clicks dispatch.
@@ -2022,15 +2062,21 @@ def service(force_setup: bool, from_autostart: bool, open_settings: bool) -> Non
                     )
                     self._proc = None
 
-            async def show(self) -> None:
-                """Make the Settings window visible.
+            async def show(self, pane: str | None = None) -> None:
+                """Make the Settings window visible, optionally on ``pane``.
 
                 Respawns the subprocess first if it died (manual kill, OOM,
                 crash) so a one-time failure doesn't permanently break the
-                tray menu's Settings click.
+                tray menu's Settings click. ``pane`` (e.g. ``"Account"`` /
+                ``"About"``) routes through the ``show:<pane>`` stdin command
+                so the already-mounted React app navigates at runtime — see
+                ``gui/settings/window.py::_stdin_command_loop``.
                 """
                 async with self._lock:
-                    await self._send(b"show\n")
+                    if pane:
+                        await self._send(f"show:{pane}\n".encode())
+                    else:
+                        await self._send(b"show\n")
 
             async def _send(self, payload: bytes) -> None:
                 if self._proc is None or self._proc.returncode is not None:
@@ -2166,7 +2212,12 @@ def service(force_setup: bool, from_autostart: bool, open_settings: bool) -> Non
                 # avoids Tcl thread-affinity surprises on Windows.
                 if tray_state.settings_event.is_set():
                     tray_state.settings_event.clear()
-                    asyncio.create_task(settings_launcher.show())
+                    # Read + clear the optional target pane published right
+                    # before the event was set (the Event's set/is_set pair
+                    # provides the memory barrier). ``None`` → last-viewed pane.
+                    _pane = tray_state.settings_pane
+                    tray_state.settings_pane = None
+                    asyncio.create_task(settings_launcher.show(pane=_pane))
                 if tray_state.finish_setup_event.is_set():
                     tray_state.finish_setup_event.clear()
                     cached = tray_state.get_cached_account()

@@ -17,6 +17,7 @@ takes to render a hidden window — effectively instant.
 """
 from __future__ import annotations
 
+import json
 import logging
 import sys
 import threading
@@ -213,18 +214,31 @@ class SettingsWindow:
     def _stdin_command_loop(self, window: "webview.Window") -> None:
         """Read newline-delimited commands from stdin and drive the window.
 
-        Recognised commands: ``show``, ``hide``, ``quit``. EOF (parent
-        agent died or closed our stdin pipe) is treated as ``quit`` so
-        we don't orphan the subprocess.
+        Recognised commands: ``show``, ``show:<pane>``, ``hide``, ``quit``.
+        ``show:<pane>`` shows the window and then navigates the already-mounted
+        React app to ``<pane>`` (e.g. ``Account`` / ``About``) at runtime — the
+        pre-warmed window was loaded without a ``#pane=`` fragment, so its
+        first-mount pane read can't be retargeted. EOF (parent agent died or
+        closed our stdin pipe) is treated as ``quit`` so we don't orphan the
+        subprocess.
         """
         try:
             for line in sys.stdin:
-                cmd = line.strip().lower()
-                if not cmd:
+                raw = line.strip()
+                if not raw:
                     continue
+                cmd = raw.lower()
                 if cmd == "show":
                     self._wait_for_bridge_ready("show")
                     self._dispatch_show(window)
+                elif cmd.startswith("show:"):
+                    # Preserve the pane's original case — the parent passes it
+                    # as-is (React's normalizePane matches case-insensitively,
+                    # but we don't want to lowercase it here regardless).
+                    pane = raw[len("show:"):].strip()
+                    self._wait_for_bridge_ready("show")
+                    self._dispatch_show(window)
+                    self._dispatch_navigate(window, pane)
                 elif cmd == "hide":
                     self._wait_for_bridge_ready("hide")
                     self._dispatch_hide(window)
@@ -281,6 +295,25 @@ class SettingsWindow:
                 activate_app()
             except Exception:
                 log.warning("[settings] dock-show / activate failed", exc_info=True)
+
+    @staticmethod
+    def _dispatch_navigate(window: "webview.Window", pane: str) -> None:
+        """Tell the React app to switch panes at runtime.
+
+        Called right after ``_dispatch_show`` (so it runs after the
+        ``_wait_for_bridge_ready`` settle — the bridge must be live or the
+        JS no-ops). ``window.__sayzoNavigate`` is registered by
+        ``SettingsApp.tsx``; the ``&&`` guard makes a missing hook a clean
+        no-op. ``json.dumps`` safely encodes the pane name as a JS literal.
+        """
+        if not pane:
+            return
+        try:
+            window.evaluate_js(
+                f"window.__sayzoNavigate && window.__sayzoNavigate({json.dumps(pane)})"
+            )
+        except Exception:
+            log.warning("[settings] navigate to %r failed", pane, exc_info=True)
 
     @staticmethod
     def _dispatch_hide(window: "webview.Window") -> None:

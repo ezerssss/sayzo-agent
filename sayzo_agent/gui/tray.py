@@ -114,6 +114,14 @@ class TrayState:
     _lock: threading.Lock = field(default_factory=threading.Lock)
     arm_toggle_event: threading.Event = field(default_factory=threading.Event)
     settings_event: threading.Event = field(default_factory=threading.Event)
+    # Optional pane to land on when ``settings_event`` is next consumed
+    # (e.g. ``"Account"`` for the sign-in toast, ``"About"`` after a
+    # user-initiated update). The asyncio-loop tick reads + clears this
+    # alongside the event and passes it to ``settings_launcher.show(pane=…)``;
+    # ``None`` means "open on the last-viewed pane" (the pre-warmed window's
+    # default behavior). Set just before ``settings_event.set()`` so the
+    # Event's memory barrier publishes it to the reader.
+    settings_pane: str | None = None
     quit_event: threading.Event = field(default_factory=threading.Event)
     # Legacy pause-event — kept for back-compat with CLI entrypoints that
     # still reference it. Unused by the tray menu itself.

@@ -183,6 +183,14 @@ export function CapturesPane() {
     }
   }, []);
 
+  const handleViewFeedback = useCallback(async (id: string) => {
+    try {
+      await settingsBridge.openCaptureFeedback(id);
+    } catch (e) {
+      setError(`Couldn't open your feedback: ${String(e)}`);
+    }
+  }, []);
+
   const handleDelete = useCallback(
     async (capture: CaptureSummary) => {
       const ok = window.confirm(
@@ -235,7 +243,17 @@ export function CapturesPane() {
         {captures == null ? (
           <p className="text-sm text-ink-muted">Loading…</p>
         ) : visible.length === 0 ? (
-          <p className="text-sm text-ink-muted">{EMPTY_COPY[active]}</p>
+          <div>
+            <p className="text-sm text-ink-muted">{EMPTY_COPY[active]}</p>
+            <div className="mt-4">
+              <Button
+                variant="secondary"
+                onClick={() => void settingsBridge.openWebApp()}
+              >
+                Open Sayzo
+              </Button>
+            </div>
+          </div>
         ) : (
           <ul className="divide-y divide-ink-border">
             {visible.map((c) => (
@@ -243,6 +261,7 @@ export function CapturesPane() {
                 key={c.id}
                 capture={c}
                 isRetrying={retrying.has(c.id)}
+                onViewFeedback={() => void handleViewFeedback(c.id)}
                 onRetry={() => void handleRetry(c.id)}
                 onOpen={() => void handleOpen(c.id)}
                 onDelete={() => void handleDelete(c)}
@@ -258,6 +277,7 @@ export function CapturesPane() {
 interface CaptureRowProps {
   capture: CaptureSummary;
   isRetrying: boolean;
+  onViewFeedback: () => void;
   onRetry: () => void;
   onOpen: () => void;
   onDelete: () => void;
@@ -266,6 +286,7 @@ interface CaptureRowProps {
 function CaptureRow({
   capture,
   isRetrying,
+  onViewFeedback,
   onRetry,
   onOpen,
   onDelete,
@@ -275,6 +296,9 @@ function CaptureRow({
   // Action buttons depend on what the row can actually do. The retry button
   // stays mounted while in-flight (as a disabled "Trying…") so the user gets
   // continuous feedback that their click was registered.
+  // "View feedback" only shows once the server has a conversation to link to
+  // (server_capture_id present), so the deep-link never 404s.
+  const showViewFeedback = !!capture.server_capture_id;
   const showRetry =
     isRetrying ||
     capture.bucket === "failed" ||
@@ -301,6 +325,11 @@ function CaptureRow({
       <div className="flex shrink-0 flex-col items-end gap-2">
         <Badge tone={capture.badge_tone}>{capture.badge_label}</Badge>
         <div className="flex items-center gap-1">
+          {showViewFeedback && (
+            <Button variant="secondary" onClick={onViewFeedback}>
+              View feedback
+            </Button>
+          )}
           {showRetry && (
             <Button
               variant="secondary"

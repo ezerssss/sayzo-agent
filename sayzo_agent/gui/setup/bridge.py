@@ -348,6 +348,18 @@ class Bridge:
             log.warning("open_log_folder failed", exc_info=True)
             return {"opened": False}
 
+    def open_web_app(self) -> None:
+        """Open the Sayzo web platform home in the user's browser.
+
+        Surfaced from the onboarding Done screen so a new user can land on
+        the platform right after install.
+        """
+        url = self._cfg.auth.effective_server_url or "https://sayzo.app"
+        try:
+            webbrowser.open(url)
+        except Exception:
+            log.warning("open_web_app failed", exc_info=True)
+
     def open_mic_settings(self) -> None:
         if sys.platform == "darwin":
             from sayzo_agent.gui.setup import mac_permissions

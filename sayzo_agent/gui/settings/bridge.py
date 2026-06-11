@@ -456,6 +456,45 @@ class Bridge:
             return {"opened": False, "error": str(exc)}
         return {"opened": True}
 
+    def open_capture_feedback(self, capture_id: str) -> dict[str, Any]:
+        """Open this capture's conversation page on the Sayzo web platform.
+
+        Builds ``{effective_server_url}/app/conversations/{server_capture_id}``
+        — the SERVER id from ``metadata.upload.server_capture_id`` (NOT the
+        local ``capture_id`` dir name; the server may assign a different id, and
+        the local id would 404). Re-reads the record server-side rather than
+        trusting a value from the UI, so a missing/not-yet-uploaded id is
+        reported honestly. The React button is gated on ``server_capture_id``
+        being present, so ``not_uploaded`` is a belt-and-braces guard.
+        """
+        from sayzo_agent.captures_index import is_valid_id
+        from sayzo_agent.upload_retry import read_record_from_dir
+
+        if not isinstance(capture_id, str) or not is_valid_id(capture_id):
+            return {"opened": False, "error": "invalid_id"}
+        rec_dir = self._cfg.captures_dir / capture_id
+        if not (rec_dir / "record.json").exists():
+            return {"opened": False, "error": "missing"}
+        try:
+            record = read_record_from_dir(rec_dir)
+        except Exception:
+            log.warning("[settings.bridge] open_capture_feedback read failed", exc_info=True)
+            return {"opened": False, "error": "unreadable"}
+        server_id = ((record.metadata or {}).get("upload") or {}).get("server_capture_id")
+        if not server_id:
+            return {"opened": False, "error": "not_uploaded"}
+        base = (self._cfg.auth.effective_server_url or WEBAPP_FALLBACK_URL).rstrip("/")
+        self.open_url(f"{base}/app/conversations/{server_id}")
+        return {"opened": True}
+
+    def open_web_app(self) -> None:
+        """Open the Sayzo web platform home in the user's browser.
+
+        Reused by the Settings sidebar, the signed-out Account pane, and the
+        Captures empty states — a one-click way back to the platform.
+        """
+        self.open_url(self._cfg.auth.effective_server_url or WEBAPP_FALLBACK_URL)
+
     # ------------------------------------------------------------------
     # JS-callable methods — Account
     # ------------------------------------------------------------------

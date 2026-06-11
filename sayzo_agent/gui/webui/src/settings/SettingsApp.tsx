@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { settingsBridge } from "../lib/settings-bridge";
 import { Alert } from "../components/ui/Alert";
+import { Button } from "../components/ui/Button";
 import { AccountPane } from "./AccountPane";
 import { AboutPane } from "./AboutPane";
 import { CapturesPane } from "./CapturesPane";
@@ -74,6 +75,24 @@ export function SettingsApp() {
     })();
     return () => {
       cancelled = true;
+    };
+  }, []);
+
+  // Runtime pane navigation. The agent's settings_launcher sends a
+  // `show:<pane>` stdin command (sign-in toast → Account, post-user-update →
+  // About); gui/settings/window.py shows the window then calls
+  // window.__sayzoNavigate(pane) via evaluate_js. The pre-warmed window
+  // mounted without a #pane= fragment, so the first-mount read (above) can't
+  // be retargeted — this hook is the runtime equivalent. setActive is a
+  // stable setter and normalizePane is module-level, so [] deps is correct.
+  useEffect(() => {
+    const w = window as Window & { __sayzoNavigate?: (p: string) => void };
+    w.__sayzoNavigate = (p: string) => {
+      const n = normalizePane(p);
+      if (n) setActive(n);
+    };
+    return () => {
+      delete w.__sayzoNavigate;
     };
   }, []);
 
@@ -175,7 +194,14 @@ function Sidebar({ active, onSelect, inProgressCount }: SidebarProps) {
           />
         ))}
       </ul>
-      <div className="mt-auto border-t border-ink-border px-4 py-4">
+      <div className="mt-auto space-y-2 border-t border-ink-border px-4 py-4">
+        <Button
+          variant="ghost"
+          className="w-full justify-center"
+          onClick={() => void settingsBridge.openWebApp()}
+        >
+          Open Sayzo
+        </Button>
         <QuitSayzoButton />
       </div>
     </nav>

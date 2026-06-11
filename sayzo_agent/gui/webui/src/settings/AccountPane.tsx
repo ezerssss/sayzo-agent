@@ -246,9 +246,15 @@ function SignedOutBody({
         You're not signed in. Sayzo will keep your conversations on this
         machine until you do, so no coaching yet.
       </p>
-      <div className="mt-6">
+      <div className="mt-6 flex flex-wrap gap-3">
         <Button variant="primary" onClick={onSignIn}>
           Sign in
+        </Button>
+        <Button
+          variant="secondary"
+          onClick={() => void settingsBridge.openWebApp()}
+        >
+          Open Sayzo
         </Button>
       </div>
     </div>

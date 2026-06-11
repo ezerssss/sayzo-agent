@@ -205,6 +205,9 @@ export type CaptureSummary = {
   has_audio: boolean;
   is_processing: boolean;
   dropped_reason: string | null;
+  // Server-assigned id (from the upload response); present once uploaded.
+  // Gates the "View feedback" button — only rows that have one can deep-link.
+  server_capture_id: string | null;
 };
 
 export type CaptureDeleteResult = {
@@ -299,6 +302,10 @@ declare global {
     delete_capture(capture_id: string): Promise<CaptureDeleteResult>;
     retry_capture_upload(capture_id: string): Promise<CaptureRetryResult>;
     open_capture_folder(capture_id: string): Promise<CaptureOpenResult>;
+    open_capture_feedback(capture_id: string): Promise<CaptureOpenResult>;
+
+    // Platform navigation.
+    open_web_app(): Promise<null>;
   }
 }
 
@@ -511,6 +518,24 @@ export const settingsBridge = {
     }
     await whenReady();
     return window.pywebview.api.open_capture_folder(captureId);
+  },
+
+  async openCaptureFeedback(captureId: string): Promise<CaptureOpenResult> {
+    if (mockCapturesState) {
+      console.info("[mock] open_capture_feedback", captureId);
+      return Promise.resolve({ opened: true });
+    }
+    await whenReady();
+    return window.pywebview.api.open_capture_feedback(captureId);
+  },
+
+  async openWebApp(): Promise<null> {
+    if (mockCapturesState) {
+      console.info("[mock] open_web_app");
+      return Promise.resolve(null);
+    }
+    await whenReady();
+    return window.pywebview.api.open_web_app();
   },
 
   async finish() {

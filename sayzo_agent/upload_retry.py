@@ -173,6 +173,21 @@ class UploadRetryManager:
         # task with no other ref can be GC'd mid-await; stash here and
         # self-clean on completion. See asyncio.create_task docs.
         self._success_tasks: set[asyncio.Task] = set()
+        # Optional "Sign in" button handler for the auth-required toast.
+        # Wired post-construction by __main__ (it needs the tray) — opens
+        # Settings → Account so the user runs the desktop sign-in that
+        # actually clears the auth block (a web login wouldn't refresh the
+        # agent's OAuth token). None ⇒ fall back to a plain button-less toast.
+        self._on_sign_in_requested: Callable[[], None] | None = None
+
+    def set_sign_in_callback(self, cb: Callable[[], None] | None) -> None:
+        """Wire (or clear) the auth-required toast's "Sign in" button handler.
+
+        Set by ``__main__::_build_pipeline_state`` after the tray exists. The
+        callback fires from the HUD reader thread, so it must be cheap +
+        thread-safe (the wired closure just sets a ``TrayState`` field + event).
+        """
+        self._on_sign_in_requested = cb
 
     # ------------------------------------------------------------------
     # Pause state persistence
@@ -489,7 +504,15 @@ class UploadRetryManager:
             ),
             suffix="Open Settings → Account to sign in again.",
         )
-        await self._fire_notification("Sayzo: sign-in required", body)
+        cb = self._on_sign_in_requested
+        if cb is not None:
+            # Actionable toast: the "Sign in" button opens Settings → Account
+            # (the desktop sign-in that actually clears this block). Falls back
+            # to the plain toast below if the button can't be wired (e.g. the
+            # NoopNotifier / ``sayzo-agent run`` path leaves the callback None).
+            await self._fire_signin_actionable("Sayzo: sign-in required", body, cb)
+        else:
+            await self._fire_notification("Sayzo: sign-in required", body)
 
     async def _check_auth_recovery(self) -> None:
         """If we're auth-blocked, probe the auth client to see if tokens are
@@ -524,6 +547,29 @@ class UploadRetryManager:
             )
         except Exception:
             log.warning("[upload] notification failed", exc_info=True)
+
+    async def _fire_signin_actionable(
+        self, title: str, body: str, on_pressed: Callable[[], None]
+    ) -> None:
+        """Fire the auth-required toast with a "Sign in" button.
+
+        Routed through the executor like ``_fire_notification`` so the stdin
+        write to the HUD subprocess never blocks the loop. ``on_pressed`` is
+        invoked later from the HUD reader thread when the button is clicked.
+        """
+        def _fire() -> None:
+            self._notifier.notify_actionable(
+                title,
+                body,
+                button_label="Sign in",
+                on_pressed=on_pressed,
+                expire_after_secs=60.0,
+            )
+
+        try:
+            await asyncio.get_running_loop().run_in_executor(self._executor, _fire)
+        except Exception:
+            log.warning("[upload] sign-in toast failed", exc_info=True)
 
     # ------------------------------------------------------------------
     # Per-record state update helper (routed through the executor)

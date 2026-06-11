@@ -213,6 +213,8 @@ export function buildMockCaptures(): CaptureSummary[] {
       has_audio: spec.has_audio ?? true,
       is_processing: spec.is_processing ?? false,
       dropped_reason: spec.dropped_reason ?? null,
+      // Uploaded rows have a server id (so the demo shows "View feedback").
+      server_capture_id: spec.bucket === "uploaded" ? hexId(idx + 1) : null,
     };
   });
 }

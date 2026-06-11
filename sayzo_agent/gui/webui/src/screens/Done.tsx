@@ -61,6 +61,14 @@ export function Done({ hotkeyDisplay }: Props) {
           Sayzo lives in your menu bar — click it any time to start, stop,
           or open Settings.
         </p>
+        <div className="pt-1">
+          <Button
+            variant="secondary"
+            onClick={() => void bridge.openWebApp()}
+          >
+            Open Sayzo
+          </Button>
+        </div>
       </div>
     </Layout>
   );
