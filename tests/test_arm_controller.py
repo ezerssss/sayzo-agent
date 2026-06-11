@@ -229,6 +229,11 @@ class _FakeHudLauncher:
     def set_pill_stop_callback(self, _cb: Any) -> None:
         pass
 
+    def reset_given_up(self) -> None:
+        # v3.14: the arm path calls this to recover a given-up HUD; no-op
+        # for the stub (it never enters the give-up state).
+        pass
+
     def ask_consent_pausing_pill(
         self,
         title: str,

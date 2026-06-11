@@ -8,20 +8,28 @@ agent shutdown. Exposes a synchronous API that mirrors the legacy
 ``set_pill_collapsed``).
 
 Threading model: the launcher's public methods are safe to call from any
-thread. Writes to the subprocess's stdin are serialized through a
-``threading.Lock``; the stdout reader runs on a dedicated daemon thread
-and resolves per-request futures. ``ask_consent`` blocks the caller's
-thread on a ``concurrent.futures.Future``; the caller must not be on the
-asyncio loop that will need to schedule other work — same constraint as
-the legacy ``DesktopNotifier.ask_consent``.
+thread. The stdin write coroutine and the stdout reader both run as
+asyncio tasks on the launcher's loop (``_send_threadsafe`` marshals
+writes onto it via ``run_coroutine_threadsafe``); the reader resolves
+per-request futures. ``ask_consent`` blocks the caller's thread on a
+``concurrent.futures.Future``; the caller must not be on the asyncio
+loop that will need to schedule other work — same constraint as the
+legacy ``DesktopNotifier.ask_consent``.
 
-Failure modes (see ``so-turns-out-granola-memoized-riddle.md`` for the
-full design):
+Failure modes:
 
-* Stdin pipe broken or subprocess crashed → respawn with 5 s / 15 s /
-  60 s backoff. After 3 crashes in 60 s, give up for the rest of the
-  session — every public method becomes a no-op that returns
-  ``default_on_timeout``.
+* Stdin pipe broken or subprocess crashed → respawn with
+  ``_RESPAWN_DELAYS`` (5 s / 15 s / 60 s) backoff, scheduled through the
+  single ``_ensure_respawn_scheduled`` entry point. After
+  ``_MAX_RESPAWNS`` crashes inside ``_RESPAWN_WINDOW_SECS`` (120 s),
+  give up for the rest of the session — every public method becomes a
+  no-op that returns ``default_on_timeout``, and the registered health
+  callback fires so the tray can surface it. An explicit user arm calls
+  ``reset_given_up`` to leave that state.
+* Subprocess alive but hung (Qt loop deadlock / GPU hang) → the
+  heartbeat loop (``heartbeat_secs``, 0 disables) kills it after
+  ``_MISSED_PONGS_BEFORE_KILL`` unanswered pings, converting the hang
+  into a normal crash → respawn.
 * Subprocess never sends ``hud_ready`` → first ``ask_consent`` returns
   ``default_on_timeout`` (we don't block forever). The pill / toast
   commands queue inside the subprocess and play once the window loads,
@@ -63,6 +71,10 @@ class Cmd:
     HIDE_ALL = "hide_all"
     DEMO_MODE = "demo_mode"
     QUIT = "quit"
+    # Liveness ping. Handled entirely at the Qt level in window.py's
+    # stdin loop — it never reaches React, so it is deliberately NOT
+    # part of the HudCommand union in hud-bridge.ts.
+    PING = "ping"
 
 
 class Evt:
@@ -75,11 +87,27 @@ class Evt:
     PILL_COLLAPSED = "pill_collapsed"
     PILL_EXPANDED = "pill_expanded"
     LOG = "log"
+    PONG = "pong"
 
 
 _RESPAWN_DELAYS = (5.0, 15.0, 60.0)
 _RESPAWN_WINDOW_SECS = 120.0
 _MAX_RESPAWNS = len(_RESPAWN_DELAYS)
+
+# Bounded window quit() gives a `show_toast_before_quit` toast to reach
+# its first paint (card_painted) before tearing the subprocess down,
+# plus a linger so the user can actually read it. Only the
+# install-update quit path arms this (see __main__._fire_pre_apply_toast);
+# every other quit pays zero extra latency. Module-level so tests can
+# monkeypatch them down to ~0.05 s.
+_QUIT_PAINT_GRACE_SECS = 1.5
+_QUIT_PAINT_LINGER_SECS = 1.0
+
+# Heartbeat: after this many pings in a row with no pong, the subprocess
+# is treated as alive-but-hung (Qt loop deadlock, GPU hang) and killed so
+# the normal respawn ladder takes over. Detection latency is therefore
+# (_MISSED_PONGS_BEFORE_KILL + 1) * heartbeat_secs worst-case.
+_MISSED_PONGS_BEFORE_KILL = 2
 
 
 def _hud_subprocess_argv() -> list[str]:
@@ -102,9 +130,17 @@ def _hud_subprocess_env() -> dict[str, str]:
 class HudLauncher:
     """Manage the HUD subprocess + dispatch its event stream."""
 
-    def __init__(self) -> None:
+    def __init__(self, heartbeat_secs: float = 30.0) -> None:
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._lock = asyncio.Lock()
+        # Liveness ping cadence. 0 disables (same convention as
+        # Config.heartbeat_secs). Production passes
+        # cfg.hud.heartbeat_secs; the default keeps preview_hud.py /
+        # diagnose-notifications constructors working unchanged.
+        self._heartbeat_secs = max(0.0, float(heartbeat_secs))
+        self._heartbeat_task: Optional[asyncio.Task] = None
+        self._outstanding_pings = 0
+        self._ping_seq = 0
         # Per-request future map, keyed by ``request_id``. Resolved by
         # the stdout reader when it sees the matching ``card_response``
         # event. Stores ``(future, default_on_timeout)`` so the
@@ -138,6 +174,19 @@ class HudLauncher:
         self._respawn_count = 0
         self._respawn_window_started: float = 0.0
         self._given_up = False
+        # Single in-flight respawn task — every respawn is scheduled
+        # through _ensure_respawn_scheduled so the backoff ladder can't
+        # be bypassed or doubled (pre-v3.14 _send_async spawned inline,
+        # racing the ladder into duplicate HUD processes).
+        self._respawn_task: Optional[asyncio.Task] = None
+        # Health reporting for the give-up state (tray surface). Fired
+        # with False when the ladder gives up, True when a later
+        # hud_ready proves recovery after reset_given_up().
+        self._health_cb: Optional[Callable[[bool], None]] = None
+        self._reported_degraded = False
+        # Toast id armed by show_toast_before_quit; quit() polls for its
+        # card_painted before teardown (install-update path only).
+        self._quit_grace_toast_id: Optional[str] = None
         # Readiness — flipped when the subprocess writes ``hud_ready``.
         self._ready_event = asyncio.Event()
         self._reader_task: Optional[asyncio.Task] = None
@@ -162,8 +211,31 @@ class HudLauncher:
                 log.warning("[hud] launcher: in giving-up state — skipping start")
                 return
             await self._spawn_locked()
+        if self._heartbeat_secs > 0 and (
+            self._heartbeat_task is None or self._heartbeat_task.done()
+        ):
+            self._heartbeat_task = asyncio.create_task(
+                self._heartbeat_loop(), name="hud-heartbeat",
+            )
 
     async def _spawn_locked(self) -> None:
+        if self._proc is not None and self._proc.returncode is None:
+            # A concurrent path already brought a live subprocess up
+            # (e.g. reset_given_up's start() racing a pending respawn).
+            log.info("[hud] _spawn_locked: live subprocess exists — skipping")
+            return
+        # Reap the previous reader before overwriting its reference —
+        # without this, an orphaned reader task could still dispatch
+        # late events from a dead pipe while the new reader runs.
+        old_reader = self._reader_task
+        if old_reader is not None and not old_reader.done():
+            old_reader.cancel()
+            try:
+                await old_reader
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
         argv = _hud_subprocess_argv() + ["--idle"]
         log.info("[hud] spawning subprocess: %s", argv)
         try:
@@ -180,6 +252,7 @@ class HudLauncher:
             self._proc = None
             return
         self._ready_event.clear()
+        self._outstanding_pings = 0
         self._reader_task = asyncio.create_task(
             self._stdout_reader_loop(self._proc),
             name="hud-stdout-reader",
@@ -232,7 +305,24 @@ class HudLauncher:
             log.warning("[hud] quit_sync failed", exc_info=True)
 
     async def quit(self, timeout_secs: float = 3.0) -> None:
-        """Send ``quit`` and wait for the subprocess to exit."""
+        """Send ``quit`` and wait for the subprocess to exit.
+
+        Confirms the process is actually reaped before returning, even
+        on the terminate → kill escalation path. The caller that follows
+        us on the install-update quit (``apply_staged_at_quit_if_flagged``
+        → silent NSIS) relies on this: a killed-but-not-yet-reaped HUD
+        still holds the exe / DLL image handles, and the installer's
+        ``File /r`` racing that teardown is exactly the "Error opening
+        file for writing" / WerFault dialog users reported when
+        clicking Update.
+        """
+        await self._wait_for_quit_grace_toast()
+        for task in (self._heartbeat_task, self._respawn_task):
+            # A pending respawn firing after quit would resurrect the
+            # HUD into a shutting-down agent; the heartbeat would ping
+            # a pipe we're about to close.
+            if task is not None and not task.done():
+                task.cancel()
         async with self._lock:
             proc = self._proc
             self._proc = None
@@ -262,7 +352,38 @@ class HudLauncher:
                 try:
                     proc.kill()
                 except ProcessLookupError:
-                    pass
+                    return
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    log.warning("[hud] kill not reaped in 2s — proceeding")
+
+    async def _wait_for_quit_grace_toast(self) -> None:
+        """Give a ``show_toast_before_quit`` toast a bounded paint window.
+
+        One-shot: consumes the marker armed by
+        :meth:`show_toast_before_quit`. Polls for the toast's
+        ``card_painted`` (its entry leaving ``_pending_show_times`` —
+        the reader task keeps running while we await) for up to
+        ``_QUIT_PAINT_GRACE_SECS``; once painted, lingers
+        ``_QUIT_PAINT_LINGER_SECS`` so the user can actually read it.
+        No-op (zero added latency) on every quit that didn't arm the
+        marker — i.e. everything except the install-update path.
+        """
+        toast_id = self._quit_grace_toast_id
+        self._quit_grace_toast_id = None
+        if toast_id is None:
+            return
+        deadline = time.monotonic() + _QUIT_PAINT_GRACE_SECS
+        while time.monotonic() < deadline:
+            if toast_id not in self._pending_show_times:
+                await asyncio.sleep(_QUIT_PAINT_LINGER_SECS)
+                return
+            await asyncio.sleep(0.05)
+        log.info(
+            "[hud] quit: grace toast never painted within %.1fs — proceeding",
+            _QUIT_PAINT_GRACE_SECS,
+        )
 
     # ------------------------------------------------------------------
     # Stdout reader.
@@ -272,6 +393,7 @@ class HudLauncher:
         self, proc: asyncio.subprocess.Process,
     ) -> None:
         assert proc.stdout is not None
+        cancelled = False
         try:
             while True:
                 raw = await proc.stdout.readline()
@@ -286,15 +408,85 @@ class HudLauncher:
                     log.warning("[hud] reader: malformed JSON: %r", line[:200])
                     continue
                 self._dispatch_event(payload)
+        except asyncio.CancelledError:
+            # _spawn_locked is replacing this reader (or quit() is
+            # tearing down) — not a crash; don't schedule a respawn.
+            cancelled = True
+            raise
         except Exception:
             log.warning("[hud] stdout reader crashed", exc_info=True)
         finally:
-            rc = proc.returncode
-            log.info("[hud] subprocess exited rc=%s", rc)
-            # If we're still the active proc (i.e. quit() didn't clear
-            # us first), attempt respawn.
-            if self._proc is proc and not self._given_up:
-                asyncio.create_task(self._respawn_after_crash())
+            if not cancelled:
+                rc = proc.returncode
+                log.info("[hud] subprocess exited rc=%s", rc)
+                # If we're still the active proc (i.e. quit() didn't
+                # clear us first), attempt respawn.
+                if self._proc is proc and not self._given_up:
+                    self._ensure_respawn_scheduled()
+
+    def _ensure_respawn_scheduled(self) -> None:
+        """Schedule a respawn unless one is already pending.
+
+        The ONLY entry point to the respawn ladder — both the reader's
+        crash detection and _send_async's dead-subprocess branch route
+        through here, so the 5/15/60s backoff can't be bypassed and two
+        callers can't double-spawn. Must be called from the loop thread
+        (both call sites are).
+        """
+        if self._given_up:
+            return
+        task = self._respawn_task
+        if task is not None and not task.done():
+            return
+        self._respawn_task = asyncio.create_task(
+            self._respawn_after_crash(), name="hud-respawn",
+        )
+
+    async def _heartbeat_loop(self) -> None:
+        """Detect an alive-but-hung HUD (Qt loop deadlock, GPU hang).
+
+        Sends a ``ping`` every ``heartbeat_secs``; the child replies
+        ``pong`` from its GUI thread (proving the Qt event loop is
+        alive — renderer death is covered separately by the
+        renderProcessTerminated handler in window.py). After
+        ``_MISSED_PONGS_BEFORE_KILL`` consecutive unanswered pings the
+        subprocess is killed, which surfaces as a normal crash to the
+        reader → respawn ladder. Paused while the subprocess is down
+        (the ladder owns that state) and during cold boot (no
+        ``hud_ready`` yet — the child-side ready watchdog owns that
+        window).
+        """
+        try:
+            while True:
+                await asyncio.sleep(self._heartbeat_secs)
+                if self._given_up:
+                    return
+                proc = self._proc
+                if proc is None or proc.returncode is not None:
+                    continue
+                if not self._ready_event.is_set():
+                    continue
+                if self._outstanding_pings >= _MISSED_PONGS_BEFORE_KILL:
+                    log.error(
+                        "[hud] heartbeat: %d consecutive missed pongs — "
+                        "killing hung subprocess for respawn",
+                        self._outstanding_pings,
+                    )
+                    self._outstanding_pings = 0
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    continue
+                self._outstanding_pings += 1
+                self._ping_seq += 1
+                self._send_threadsafe(
+                    {"cmd": Cmd.PING, "id": f"ping-{self._ping_seq}"}
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.warning("[hud] heartbeat loop crashed", exc_info=True)
 
     def _dispatch_event(self, payload: Any) -> None:
         if not isinstance(payload, dict):
@@ -302,7 +494,35 @@ class HudLauncher:
         event = payload.get("event")
         if event == Evt.HUD_READY:
             self._ready_event.set()
+            self._outstanding_pings = 0
             log.info("[hud] subprocess emitted hud_ready")
+            if self._reported_degraded:
+                # A ready HUD after a give-up + reset_given_up cycle —
+                # tell the tray the degraded banner can come down.
+                self._reported_degraded = False
+                self._fire_health(True)
+            if self._last_pill_params is not None:
+                # The HUD process (or its renderer — a reload re-emits
+                # hud_ready too) restarted while a session pill was
+                # active: replay it so the recording indicator doesn't
+                # silently vanish mid-meeting. show_pill mints a fresh
+                # paint_id; drop the stale one first so
+                # _pending_show_times can't accumulate an orphan entry
+                # per respawn.
+                params = self._last_pill_params
+                old_paint_id = params.get("paint_id")
+                if isinstance(old_paint_id, str):
+                    self._clear_pending_show_tracking(old_paint_id)
+                log.info("[hud] hud_ready with active pill — replaying show_pill")
+                self.show_pill(
+                    reason=params["reason"],
+                    reason_label=params["reason_label"],
+                    start_ts=params["start_ts"],
+                    hotkey=params.get("hotkey", ""),
+                )
+            return
+        if event == Evt.PONG:
+            self._outstanding_pings = 0
             return
         if event == Evt.CARD_RESPONSE:
             req_id = payload.get("request_id")
@@ -399,6 +619,8 @@ class HudLauncher:
                 self._respawn_count, _RESPAWN_WINDOW_SECS,
             )
             self._fail_pending_consents()
+            self._reported_degraded = True
+            self._fire_health(False)
             return
         delay = _RESPAWN_DELAYS[self._respawn_count]
         self._respawn_count += 1
@@ -449,6 +671,48 @@ class HudLauncher:
         self._pending_show_times.pop(request_id, None)
 
     # ------------------------------------------------------------------
+    # Health reporting + recovery from the give-up state.
+    # ------------------------------------------------------------------
+
+    def set_health_callback(self, cb: Optional[Callable[[bool], None]]) -> None:
+        """Register a callback fired on degraded (False) / recovered (True).
+
+        Used by the tray to surface a "Notifications unavailable" line
+        when the respawn ladder gives up, and clear it when a later
+        ``reset_given_up`` brings the HUD back. Fired on the loop thread.
+        """
+        self._health_cb = cb
+
+    def _fire_health(self, ok: bool) -> None:
+        cb = self._health_cb
+        if cb is None:
+            return
+        try:
+            cb(ok)
+        except Exception:
+            log.warning("[hud] health callback raised (ok=%s)", ok, exc_info=True)
+
+    def reset_given_up(self) -> None:
+        """Clear the give-up state and respawn, in response to user action.
+
+        Called from the arm path (any explicit arm is a fresh, most-
+        recent user signal that they expect Sayzo to work). No-op when
+        not given up. Thread-safe — marshals ``start()`` onto the loop.
+        """
+        if not self._given_up:
+            return
+        log.warning("[hud] give-up reset by user action — respawning")
+        self._given_up = False
+        self._respawn_count = 0
+        self._respawn_window_started = 0.0
+        loop = self._loop
+        if loop is not None and loop.is_running():
+            try:
+                asyncio.run_coroutine_threadsafe(self.start(), loop)
+            except Exception:
+                log.warning("[hud] reset_given_up: start() schedule failed", exc_info=True)
+
+    # ------------------------------------------------------------------
     # Public command surface.
     # ------------------------------------------------------------------
 
@@ -480,9 +744,19 @@ class HudLauncher:
             return
         async with self._lock:
             if self._proc is None or self._proc.returncode is not None:
-                if self._given_up:
-                    return
-                await self._spawn_locked()
+                # Don't spawn inline — that bypassed the backoff ladder
+                # and could double-spawn against a pending
+                # _respawn_after_crash (pre-v3.14 bug). Drop the payload
+                # (logged), make sure the ladder is running, and let
+                # state replay (pill via hud_ready, consents via their
+                # waiter timeouts) cover what was dropped.
+                if not self._given_up:
+                    log.info(
+                        "[hud] _send: subprocess down — dropping payload, "
+                        "respawn scheduled",
+                    )
+                    self._ensure_respawn_scheduled()
+                return
             proc = self._proc
             if proc is None or proc.stdin is None:
                 return
@@ -496,9 +770,18 @@ class HudLauncher:
 
     # --- info toast (fire-and-forget) ---------------------------------
 
-    def show_toast(self, title: str, body: str, ttl_secs: float = 4.0) -> bool:
+    def _show_toast_impl(
+        self, title: str, body: str, ttl_secs: float,
+    ) -> Optional[str]:
+        """Send a SHOW_TOAST and return its toast_id, or None if dropped.
+
+        Shared by :meth:`show_toast` (bool contract) and
+        :meth:`show_toast_before_quit` (needs the id to await its
+        paint). The ``[notify]`` log lines are emitted here so both
+        callers produce byte-identical triage output.
+        """
         if self._given_up:
-            return False
+            return None
         toast_id = f"toast-{uuid.uuid4().hex}"
         self._pending_show_times[toast_id] = time.monotonic()
         log.info("[notify] notify scheduled: title=%r", title)
@@ -512,7 +795,28 @@ class HudLauncher:
         if not ok:
             self._clear_pending_show_tracking(toast_id)
             log.warning("[notify] notify dropped (HUD unavailable): title=%r", title)
-        return ok
+            return None
+        return toast_id
+
+    def show_toast(self, title: str, body: str, ttl_secs: float = 4.0) -> bool:
+        return self._show_toast_impl(title, body, ttl_secs) is not None
+
+    def show_toast_before_quit(
+        self, title: str, body: str, ttl_secs: float = 4.0,
+    ) -> bool:
+        """Show a toast and arm :meth:`quit` to wait for it to paint.
+
+        The install-update path uses this for the "Sayzo is updating"
+        toast: without the grace window in ``quit`` the agent tears the
+        HUD down before the toast's first frame composites, so the user
+        sees everything vanish (the "agent just disappeared" perception)
+        instead of a reassurance that an update is in progress.
+        """
+        toast_id = self._show_toast_impl(title, body, ttl_secs)
+        if toast_id is None:
+            return False
+        self._quit_grace_toast_id = toast_id
+        return True
 
     # --- consent card (blocking yes/no) -------------------------------
 
@@ -891,6 +1195,8 @@ class HudLauncher:
             "respawn_count": self._respawn_count,
             "pending_cards": len(self._pending_cards),
             "pending_actionables": len(self._pending_actionables),
+            "heartbeat_secs": self._heartbeat_secs,
+            "outstanding_pings": self._outstanding_pings,
             "proc_pid": self._proc.pid if self._proc is not None else None,
             "returncode": self._proc.returncode if self._proc is not None else None,
         }

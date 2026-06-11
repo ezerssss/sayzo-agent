@@ -1630,12 +1630,24 @@ def service(force_setup: bool, from_autostart: bool, open_settings: bool) -> Non
         from .notify import HudNotifier, NoopNotifier
 
         hud_launcher = (
-            HudLauncher() if cfg.notifications_enabled else None
+            HudLauncher(heartbeat_secs=cfg.hud.heartbeat_secs)
+            if cfg.notifications_enabled else None
         )
         notifier = (
             HudNotifier(hud_launcher)
             if hud_launcher is not None else NoopNotifier()
         )
+        # Surface a "Notifications unavailable" tray line when the HUD
+        # respawn ladder gives up, and clear it when a later arm recovers it
+        # (see HudLauncher.reset_given_up, called from the arm path).
+        if hud_launcher is not None:
+            def _on_hud_health(ok: bool) -> None:
+                try:
+                    if tray_state.set_hud_degraded(not ok):
+                        tray.update()
+                except Exception:
+                    log.debug("[hud] health->tray update raised", exc_info=True)
+            hud_launcher.set_health_callback(_on_hud_health)
 
         # Share the notifier + pre-quit hook with the tray so both the
         # IPC QUIT_AGENT path and the tray Quit menu can surface a
@@ -2079,7 +2091,15 @@ def service(force_setup: bool, from_autostart: bool, open_settings: bool) -> Non
                         try:
                             proc.kill()
                         except ProcessLookupError:
-                            pass
+                            return
+                        # Confirm the kill is reaped before returning — a
+                        # killed-but-not-yet-reaped Settings process still
+                        # holds the exe/DLL image handles, which the silent
+                        # update installer's File /r would then race.
+                        try:
+                            await asyncio.wait_for(proc.wait(), timeout=2.0)
+                        except asyncio.TimeoutError:
+                            log.warning("[settings] kill not reaped in 2 s — proceeding")
 
         settings_launcher = _SettingsLauncher()
         await settings_launcher.start()

@@ -662,6 +662,13 @@ class HudConfig(BaseSettings):
     # gives new users the live trust signal during their first arm.
     show_recording_indicator: bool = True
 
+    # Parent→HUD liveness ping cadence (seconds). The launcher pings the
+    # HUD subprocess this often; if it stops answering (Qt loop deadlock,
+    # GPU hang) the subprocess is killed and respawned. 0 disables —
+    # same convention as Config.heartbeat_secs. Override via
+    # SAYZO_HUD__HEARTBEAT_SECS.
+    heartbeat_secs: float = 30.0
+
 
 class AuthConfig(BaseSettings):
     auth_url: str = "https://sayzo.app/api/auth"

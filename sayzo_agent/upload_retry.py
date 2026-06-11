@@ -44,6 +44,17 @@ log = logging.getLogger(__name__)
 
 PAUSE_STATE_SCHEMA_VERSION = 1
 
+# Freshness window (seconds) for the post-capture insight card (v3.14).
+# A capture whose immediate LIVE upload failed and got picked up by the
+# sweep moments later is still FRESH and deserves the card — the
+# sweep-suppression only exists to keep a BACKLOG DRAIN (many hours-old
+# captures uploading at once) from spamming cards. So the card fires for a
+# live capture OR a capture that ended within this window; older backlog
+# captures stay silent as before. Matches the insight feature's 1 h
+# staleness horizon (CapturePoller._INSIGHT_DEFER_MAX_SECS). See
+# [[project_mac_no_insight_card]].
+INSIGHT_FRESHNESS_GATE_SECS = 3600.0
+
 
 def _per_record_block_body(
     record: "ConversationRecord | None",
@@ -352,12 +363,28 @@ class UploadRetryManager:
 
         # Post-capture feedback decides who owns the single per-capture toast.
         # Read the flag live (a Settings toggle / in-card "Stop showing these"
-        # applies to the next capture). ``owns_toast`` = live capture + feature
-        # on → the poller fires the insight card (or its fallback) and the
-        # immediate saved toast below is suppressed. The two decisions are
-        # complementary so a capture never gets two toasts.
+        # applies to the next capture). ``owns_toast`` → the poller fires the
+        # insight card (or its fallback) and the immediate saved toast below is
+        # suppressed. The two decisions are complementary so a capture never
+        # gets two toasts.
+        #
+        # v3.14 freshness refinement: owns_toast is True for a live capture OR
+        # a still-FRESH one (ended < INSIGHT_FRESHNESS_GATE_SECS ago). This is
+        # what makes the card fire on captures whose live upload failed and got
+        # swept seconds later — the common macOS case (see
+        # [[project_mac_no_insight_card]]) — while a genuine backlog drain of
+        # hours-old captures stays silent. Was ``live and feedback_on``.
         feedback_on = bool(self._feedback_enabled and self._feedback_enabled())
-        owns_toast = bool(live and feedback_on)
+        capture_fresh = False
+        if record.ended_at is not None:
+            try:
+                age = (self._now() - record.ended_at).total_seconds()
+                capture_fresh = 0 <= age < INSIGHT_FRESHNESS_GATE_SECS
+            except Exception:
+                # Naive/aware mismatch or a bad clock — fall back to the
+                # live-only behavior rather than risk a stale card.
+                capture_fresh = False
+        owns_toast = bool(feedback_on and (live or capture_fresh))
 
         # Fire-and-forget post-upload hook (see CapturePoller.poll).
         if (

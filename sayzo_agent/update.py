@@ -13,6 +13,7 @@ never break the capture pipeline.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from dataclasses import dataclass
 from typing import Optional
@@ -22,6 +23,16 @@ import httpx
 log = logging.getLogger(__name__)
 
 DEFAULT_MANIFEST_URL = "https://sayzo.app/releases/latest.json"
+
+
+def _manifest_url() -> str:
+    """Manifest URL, overridable via ``SAYZO_UPDATE_MANIFEST_URL``.
+
+    The override lets the auto-update flow be exercised end-to-end against a
+    locally hosted ``latest.json`` (e.g. ``python -m http.server``) without
+    touching the production host.
+    """
+    return os.environ.get("SAYZO_UPDATE_MANIFEST_URL") or DEFAULT_MANIFEST_URL
 
 
 @dataclass(frozen=True)
@@ -87,7 +98,7 @@ async def check(
     current_version: str,
     *,
     client: Optional[httpx.AsyncClient] = None,
-    url: str = DEFAULT_MANIFEST_URL,
+    url: Optional[str] = None,
 ) -> Optional[UpdateInfo]:
     """Return an :class:`UpdateInfo` if a newer build exists for this platform.
 
@@ -100,11 +111,12 @@ async def check(
     if pkey is None:
         return None
 
+    resolved_url = url or _manifest_url()
     owned = client is None
     if owned:
         client = httpx.AsyncClient()
     try:
-        data = await fetch_manifest(client, url)
+        data = await fetch_manifest(client, resolved_url)
     finally:
         if owned:
             await client.aclose()

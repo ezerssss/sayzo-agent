@@ -198,9 +198,27 @@ class HudBridge(QObject):
         ):
             self.ready_event.set()
 
+        self._write_line(payload_json)
+
+    def emit_event(self, payload: dict) -> None:
+        """Write a Python-originated event to stdout (e.g. the heartbeat
+        ``pong``). Same serialized stdout path as :meth:`hud_event` so
+        the parent reader sees one well-formed line; the lock prevents
+        interleaving with a concurrent JS-originated event.
+        """
+        import json
+
+        try:
+            line = json.dumps(payload)
+        except (TypeError, ValueError):
+            log.warning("[hud-bridge] emit_event: non-serialisable payload")
+            return
+        self._write_line(line)
+
+    def _write_line(self, line: str) -> None:
         with self._stdout_lock:
             try:
-                sys.stdout.write(payload_json)
+                sys.stdout.write(line)
                 sys.stdout.write("\n")
                 sys.stdout.flush()
             except (BrokenPipeError, ValueError):

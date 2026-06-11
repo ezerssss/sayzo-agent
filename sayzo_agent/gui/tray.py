@@ -125,6 +125,11 @@ class TrayState:
     # disarmed UI in that case (the arm-time gate is forgiving on
     # missing-cache too — see decide_arm_gate).
     _cached_account: CachedAccountStatus | None = None
+    # True when the HUD respawn ladder has given up (notifications silent
+    # for the session until the next arm calls HudLauncher.reset_given_up).
+    # Set via the launcher's health callback wired in _build_pipeline_state;
+    # surfaces a disabled "Notifications unavailable" menu line.
+    _hud_degraded: bool = False
     # Tray-thread → asyncio-loop signal: user clicked the "Finish setup at
     # sayzo.app →" item, agent should open the cached onboarding_url.
     finish_setup_event: threading.Event = field(default_factory=threading.Event)
@@ -184,6 +189,19 @@ class TrayState:
     def get_update_offer(self) -> UpdateOffer | None:
         with self._lock:
             return self._update_offer
+
+    def set_hud_degraded(self, degraded: bool) -> bool:
+        """Set the HUD-degraded flag. Returns True if it changed (so the
+        caller knows whether a tray repaint is worth it)."""
+        with self._lock:
+            if self._hud_degraded == degraded:
+                return False
+            self._hud_degraded = degraded
+            return True
+
+    def is_hud_degraded(self) -> bool:
+        with self._lock:
+            return self._hud_degraded
 
     def is_starting(self) -> bool:
         with self._lock:
@@ -528,6 +546,17 @@ class TrayIcon:
         def finish_setup_visible(item) -> bool:
             return self.state.is_account_blocked()
 
+        def hud_degraded_text(item) -> str:
+            return "Notifications unavailable — will retry on next arm"
+
+        def hud_degraded_visible(item) -> bool:
+            return self.state.is_hud_degraded()
+
+        def on_hud_degraded(icon, item) -> None:
+            # Disabled status line — no action. Defined as a no-op so
+            # pystray treats it as a real (greyed) item across backends.
+            return None
+
         def on_finish_setup(icon, item):
             # Open the cached onboarding URL on the asyncio loop side via
             # the bridge — keeps webbrowser.open off the tray thread (no
@@ -553,6 +582,12 @@ class TrayIcon:
                 visible=finish_setup_visible,
             ),
             pystray.MenuItem(arm_label, on_arm_toggle),
+            # Disabled status line — only visible while the HUD respawn ladder
+            # has given up, so the user isn't left wondering why toasts stopped.
+            pystray.MenuItem(
+                hud_degraded_text, on_hud_degraded,
+                enabled=False, visible=hud_degraded_visible,
+            ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(update_text, on_open_update, visible=update_visible),
             pystray.MenuItem("Settings...", on_settings),

@@ -214,20 +214,38 @@ Section "Install"
     ; overwritten, and the user ends up with a registry/uninstaller that
     ; says vN+1 while the running exe still reports vN.
     ;
-    ; Then explicitly Delete the exes as a probe: if a handle is still open
-    ; past the first sleep, Delete sets the error flag, and we retry with
-    ; a longer sleep before falling through to File /r. This makes the
-    ; partial-replace failure mode self-recovering instead of silently
-    ; corrupting the install.
-    Sleep 2000
+    ; v3.14.0: bounded delete-probe POLL (up to ~15 s) replaces the fixed
+    ; Sleep 2000 / Sleep 3000 above. Each tick tries to Delete both exes;
+    ; the first tick that succeeds (no error flag) means every handle is
+    ; released and we proceed to File /r. The agent now sweeps its own child
+    ; tree before exiting (update_apply_win._sweep_children), so the first
+    ; probe usually succeeds immediately; the poll only earns its keep on a
+    ; busy box where teardown lags. If the exes are STILL locked after the
+    ; whole poll, fall back to taskkill /F by image name — WITHOUT /T. The
+    ; no-tree-walk kill takes down any leftover sayzo-agent(-service).exe
+    ; (e.g. a wedged HUD/Settings child) but never walks the process tree, so
+    ; the installer — a kernel child of the dying agent in silent mode —
+    ; survives (preserving the v3.0.2 lesson above). Interactive installs hit
+    ; this same block but, having already /T-killed above, succeed on tick 1.
+    StrCpy $2 0
+  exe_probe_loop:
     ClearErrors
     Delete "$INSTDIR\${PRODUCT_EXE}"
     Delete "$INSTDIR\${SERVICE_EXE}"
-    IfErrors 0 +4
-        DetailPrint "Sayzo executables still locked - waiting 3 more seconds..."
-        Sleep 3000
-        Delete "$INSTDIR\${PRODUCT_EXE}"
-        Delete "$INSTDIR\${SERVICE_EXE}"
+    IfErrors 0 exe_probe_done
+    IntOp $2 $2 + 1
+    IntCmp $2 30 exe_probe_force
+    Sleep 500
+    Goto exe_probe_loop
+  exe_probe_force:
+    DetailPrint "Sayzo executables still locked after ~15s - force-killing by name (no tree walk)..."
+    nsExec::ExecToLog 'taskkill /IM ${SERVICE_EXE} /F'
+    nsExec::ExecToLog 'taskkill /IM ${PRODUCT_EXE} /F'
+    Sleep 1000
+    ClearErrors
+    Delete "$INSTDIR\${PRODUCT_EXE}"
+    Delete "$INSTDIR\${SERVICE_EXE}"
+  exe_probe_done:
 
     ; Wipe _internal/ before extracting. NSIS File /r writes new files but
     ; does NOT remove files absent from the source dir; without this, stale

@@ -600,6 +600,12 @@ class ArmController:
         if self.state == ArmState.ARMED:
             return
 
+        # An explicit arm is the user's most recent, most explicit signal
+        # that they expect Sayzo to work — so recover the HUD if its respawn
+        # ladder had given up. No-op when the HUD is healthy.
+        if self._hud_launcher is not None:
+            self._hud_launcher.reset_given_up()
+
         # Web-onboarding gate. Synchronous read of the cached /api/me
         # state — block here BEFORE any state mutation or stream open so
         # a gated arm leaves the controller cleanly in DISARMED. The

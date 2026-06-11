@@ -10,12 +10,15 @@ the response carries a ``coaching_insight`` object (or null).
 caches ``title`` / ``summary`` into local ``record.json`` as soon as the server
 reports a post-transcription status.
 
-Two modes, selected by ``owns_toast`` (set by ``UploadRetryManager`` to
-``live and notify_capture_feedback`` at upload time):
+Two modes, selected by ``owns_toast`` (set by ``UploadRetryManager`` —
+feature on AND (live capture OR the capture is still fresh, i.e. ended
+within ``INSIGHT_FRESHNESS_GATE_SECS``); the freshness clause is what lets
+a capture whose live upload failed and got swept moments later still show
+the card — see ``upload_retry`` + [[project_mac_no_insight_card]]):
 
-* ``owns_toast=False`` (sweep re-uploads, or the post-capture feedback feature
-  disabled): legacy behavior — cache title/summary, then stop on the first
-  cached title or a terminal status. No toast.
+* ``owns_toast=False`` (stale backlog re-uploads, or the post-capture feedback
+  feature disabled): legacy behavior — cache title/summary, then stop on the
+  first cached title or a terminal status. No toast.
 * ``owns_toast=True``: keep polling until ``status == "analyzed"`` (the only
   point the server populates/trusts ``coaching_insight`` — server-confirmed),
   a terminal failure, or the schedule is exhausted. Then fire ONE compact

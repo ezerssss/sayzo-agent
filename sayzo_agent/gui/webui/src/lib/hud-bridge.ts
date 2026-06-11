@@ -279,6 +279,42 @@ async function buildQtTransport(
   });
 }
 
+// Bounded retry around the QWebChannel handshake. A single 10 s timeout
+// then a permanent no-op was too brittle: a transient handshake stall (GPU
+// init hitch on slow/old Macs) wedged the HUD for the whole session. Retry
+// up to `attempts` times with a fresh handshake each, then give up — at
+// which point the child-side ready watchdog (window.py, exit code 4) fires
+// because `hud_ready` never landed, and the parent respawns the subprocess.
+// JS can't signal Python here itself: with no transport, `hud_event` has
+// nothing to ride.
+async function buildQtTransportWithRetry(
+  transport: QtWebChannelTransport,
+  attempts = 3,
+): Promise<HudTransport> {
+  let lastErr: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await buildQtTransport(transport);
+    } catch (e) {
+      lastErr = e;
+      console.warn(
+        `[hud-bridge] QWebChannel handshake attempt ${i + 1}/${attempts} failed`,
+        e,
+      );
+      if (i < attempts - 1) {
+        await new Promise((r) => window.setTimeout(r, 1000));
+      }
+    }
+  }
+  console.error(
+    `[hud-bridge] FATAL: no transport after ${attempts} attempts — HUD inert until parent respawn`,
+    lastErr,
+  );
+  throw lastErr instanceof Error
+    ? lastErr
+    : new Error("QWebChannel handshake retries exhausted");
+}
+
 function buildMockTransport(stub: QtBridgeObject): HudTransport {
   return {
     setWindowVisible: (v) => Promise.resolve(stub.set_window_visible(v)),
@@ -308,7 +344,7 @@ function awaitHudTransport(): Promise<HudTransport> {
   }
   const transport = window.qt?.webChannelTransport;
   if (transport) {
-    return buildQtTransport(transport).catch((e) => {
+    return buildQtTransportWithRetry(transport).catch((e) => {
       console.warn("[hud-bridge] QWebChannel setup failed", e);
       return buildNoopTransport("QWebChannel setup error");
     });
@@ -323,7 +359,7 @@ function awaitHudTransport(): Promise<HudTransport> {
       const t = window.qt?.webChannelTransport;
       if (t) {
         resolve(
-          buildQtTransport(t).catch((e) => {
+          buildQtTransportWithRetry(t).catch((e) => {
             console.warn("[hud-bridge] QWebChannel setup failed (post-tick)", e);
             return buildNoopTransport("QWebChannel setup error");
           }),

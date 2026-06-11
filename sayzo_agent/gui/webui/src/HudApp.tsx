@@ -418,6 +418,13 @@ export function HudApp() {
     [pill, cards.length, toasts.length, actionable, insight, demoMode],
   );
 
+  // Newest toast id — used in the visibility deps below so a fresh info
+  // toast arriving while the pill already holds `hasContent=true` still
+  // re-runs the show sequence (which re-asserts topmost on Windows). Without
+  // this an info toast fired mid-meeting renders behind a fullscreen Meet.
+  const newestToastId =
+    toasts.length > 0 ? toasts[toasts.length - 1].id : undefined;
+
   // Window visibility orchestration. Per-element CSS keyframes
   // (`hud-element-enter` in index.css) drive the IN animation for
   // each pill / card / toast as it mounts. The shell-level fade
@@ -491,10 +498,16 @@ export function HudApp() {
     // Deps cover every overlay slot whose request_id can swap
     // in-place without a `hasContent` flip — the same paint-stall
     // failure mode applies symmetrically to consent cards, actionable
-    // toasts, and insight cards (any of them can be replaced via
-    // `setX({...new})` carrying a fresh request_id while another
-    // overlay keeps `hasContent=true`).
-  }, [hasContent, activeCard?.request_id, actionable?.request_id, insight?.request_id]);
+    // toasts, insight cards, AND info toasts (a new toast can arrive
+    // while a pill keeps `hasContent=true`; without re-running the show
+    // sequence its Windows topmost re-assert never fires).
+  }, [
+    hasContent,
+    activeCard?.request_id,
+    actionable?.request_id,
+    insight?.request_id,
+    newestToastId,
+  ]);
 
   // Demo controls — dispatch synthetic commands into the bridge so the
   // exact same code path the production launcher uses also drives the

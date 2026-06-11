@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import signal
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlencode
@@ -28,6 +30,7 @@ from PySide6.QtWidgets import QApplication, QVBoxLayout, QWidget
 from sayzo_agent.config import Config
 from sayzo_agent.gui.common.assets import webui_index_path
 from sayzo_agent.gui.hud.bridge import HudBridge
+from sayzo_agent.gui.hud.js_escape import build_dispatch_js
 
 log = logging.getLogger(__name__)
 
@@ -42,6 +45,23 @@ INITIAL_HUD_HEIGHT = 100
 
 # Distance from the screen edge to the HUD's anchor corner.
 HUD_EDGE_INSET = 8
+
+# A second QtWebEngine renderer death within this window is treated as a
+# persistent failure: instead of reloading again we exit so the parent
+# launcher's respawn ladder takes over with a fresh process.
+_RENDER_DEATH_WINDOW_SECS = 30.0
+
+# If the React app never emits ``hud_ready`` within this long after
+# ``loadFinished`` (transport handshake wedged, JS bundle broken), the
+# subprocess exits so the parent respawns it rather than leaving a
+# frozen-but-alive ghost window. Normal boots set ready in <2 s.
+_READY_WATCHDOG_SECS = 60.0
+
+# Child exit codes that signal the parent launcher to respawn (any
+# non-zero exit trips the reader-loop EOF → ladder; these are documented
+# so agent.log triage can tell apart the recovery reasons).
+_EXIT_RENDERER_DOUBLE_DEATH = 3
+_EXIT_READY_WATCHDOG = 4
 
 
 def _hud_url(index: Path, *, demo: bool) -> str:
@@ -60,6 +80,12 @@ class _HudHostWidget(QWidget):
     # The reader runs on a daemon thread and emits this signal so the
     # JS dispatch happens on the GUI thread (QWebEngineView is GUI-thread-only).
     _command_received = Signal(str)
+    # Emitted by the stdin reader thread when a ``ping`` command arrives;
+    # the connected slot runs on the GUI thread and replies ``pong``, so
+    # a successful pong proves the Qt event loop (not just the process)
+    # is alive. Renderer-only death is covered separately by
+    # renderProcessTerminated.
+    _ping_received = Signal(str)
 
     def __init__(self, cfg: Config, *, demo: bool) -> None:
         super().__init__()
@@ -119,6 +145,14 @@ class _HudHostWidget(QWidget):
         # NSWindow realization can lag Qt's loadFinished signal by a
         # tick under load. See :meth:`_apply_mac_overlay_tweaks`.
         self._overlay_tweak_attempts = 0
+        # Renderer-death recovery bookkeeping (see
+        # :meth:`_on_render_process_terminated`).
+        self._last_render_death = 0.0
+        # Win32 EVENT_SYSTEM_FOREGROUND hook handle + its ctypes
+        # callback. The callback MUST stay referenced on self or it is
+        # garbage-collected and the C side calls into freed memory.
+        self._win_event_hook = None
+        self._win_event_proc = None
 
         # Frameless, top-most, no taskbar/Alt-Tab, no focus theft.
         self.setWindowFlags(
@@ -165,6 +199,12 @@ class _HudHostWidget(QWidget):
         # an opaque white background underneath the React content,
         # defeating the WA_TranslucentBackground host.
         self._view.page().setBackgroundColor(QColor(0, 0, 0, 0))
+        # Recover from a QtWebEngine renderer (GPU/render-process) crash:
+        # without this the host QWidget stays alive but blank forever and
+        # the parent only sees process-exit, not a dead renderer.
+        self._view.page().renderProcessTerminated.connect(
+            self._on_render_process_terminated
+        )
         layout.addWidget(self._view)
 
         # Bridge + WebChannel. We expose the bridge as ``hudPyBridge``
@@ -177,6 +217,9 @@ class _HudHostWidget(QWidget):
         # Hook up load + command pipeline.
         self._view.loadFinished.connect(self._on_load_finished)
         self._command_received.connect(self._dispatch_command_on_gui_thread)
+        # Queued connection (reader thread → GUI thread) so the pong is
+        # written from the Qt loop, proving it's alive.
+        self._ping_received.connect(self._on_ping)
 
         # Listen for display-config changes so a docked-laptop /
         # plugged-in-monitor / resolution-change mid-session re-anchors
@@ -271,6 +314,20 @@ class _HudHostWidget(QWidget):
         self._loaded_event.set()
         # Drain any commands that landed before the page was ready.
         self._flush_pending_commands()
+        # Win32: re-assert topmost whenever the foreground window changes
+        # (a meeting going borderless-fullscreen would otherwise occlude
+        # us). Installed from the Qt main thread, which pumps Windows
+        # messages — the documented requirement for OUTOFCONTEXT hooks.
+        if sys.platform == "win32":
+            self._install_foreground_hook_win()
+        # Arm the ready watchdog: if React never handshakes (transport
+        # wedged / broken bundle), exit so the parent respawns rather
+        # than leaving a frozen window. Skipped in demo/preview (which
+        # may have no parent to respawn it).
+        if not self._demo:
+            QTimer.singleShot(
+                int(_READY_WATCHDOG_SECS * 1000), self._check_ready_watchdog
+            )
 
     # ------------------------------------------------------------------
     # Visibility — driven entirely by React's per-pixel alpha. When
@@ -1028,6 +1085,118 @@ class _HudHostWidget(QWidget):
         self._force_order_front_mac()
 
     # ------------------------------------------------------------------
+    # Liveness + recovery.
+    # ------------------------------------------------------------------
+
+    def _on_ping(self, ping_id: str) -> None:
+        """Reply ``pong`` to the parent's heartbeat (runs on the GUI thread)."""
+        try:
+            self._bridge.emit_event({"event": "pong", "id": ping_id})
+        except Exception:
+            log.warning("[hud] pong reply failed", exc_info=True)
+
+    def _on_render_process_terminated(self, status, exit_code) -> None:  # noqa: ANN001
+        """Recover from a QtWebEngine renderer (GPU/render-process) crash.
+
+        First death in a 30 s window: reload the page (deferred to the
+        next event-loop tick — reloading inside the signal handler is
+        undefined). Re-loading re-fires ``loadFinished`` → re-wires the
+        bridge and React re-emits ``hud_ready``, at which point the
+        parent replays the active pill. A second death within the window
+        means reload isn't helping, so exit and let the parent's respawn
+        ladder bring up a fresh process.
+        """
+        now = time.monotonic()
+        log.error(
+            "[hud] renderProcessTerminated: status=%s exitCode=%s", status, exit_code
+        )
+        if now - self._last_render_death < _RENDER_DEATH_WINDOW_SECS:
+            log.error(
+                "[hud] renderer died twice within %.0fs — exiting %d for parent respawn",
+                _RENDER_DEATH_WINDOW_SECS, _EXIT_RENDERER_DOUBLE_DEATH,
+            )
+            os._exit(_EXIT_RENDERER_DOUBLE_DEATH)
+        self._last_render_death = now
+        log.warning("[hud] reloading web view after renderer death")
+        QTimer.singleShot(0, self._view.reload)
+
+    def _check_ready_watchdog(self) -> None:
+        """Exit if React never emitted ``hud_ready`` (handshake wedged)."""
+        if self._bridge.ready_event.is_set():
+            return
+        log.error(
+            "[hud] React never emitted hud_ready within %.0fs of loadFinished — "
+            "exiting %d for parent respawn",
+            _READY_WATCHDOG_SECS, _EXIT_READY_WATCHDOG,
+        )
+        os._exit(_EXIT_READY_WATCHDOG)
+
+    def _install_foreground_hook_win(self) -> None:
+        """SetWinEventHook(EVENT_SYSTEM_FOREGROUND) → re-assert topmost.
+
+        WS_EX_TOPMOST is set once at construction and does NOT re-raise
+        us above OTHER top-most windows activated later (a borderless-
+        fullscreen Meet/Zoom raised after a toast appears). Reacting to
+        every foreground change keeps the HUD on top without polling.
+        See learn.microsoft.com SetWinEventHook.
+        """
+        try:
+            import ctypes
+            from ctypes import wintypes
+        except Exception:
+            return
+        if self._win_event_hook is not None:
+            return
+        EVENT_SYSTEM_FOREGROUND = 0x0003
+        WINEVENT_OUTOFCONTEXT = 0x0000
+        WinEventProcType = ctypes.WINFUNCTYPE(
+            None,
+            wintypes.HANDLE,  # hWinEventHook
+            wintypes.DWORD,   # event
+            wintypes.HWND,    # hwnd
+            wintypes.LONG,    # idObject
+            wintypes.LONG,    # idChild
+            wintypes.DWORD,   # dwEventThread
+            wintypes.DWORD,   # dwmsEventTime
+        )
+
+        def _cb(hHook, event, hwnd, idObject, idChild, thread, ts):  # noqa: ANN001
+            try:
+                if not self._currently_visible:
+                    return
+                if int(hwnd) == int(self.winId()):
+                    return
+                self._force_topmost_win()
+            except Exception:
+                pass
+
+        try:
+            self._win_event_proc = WinEventProcType(_cb)  # keep ref alive
+            self._win_event_hook = ctypes.windll.user32.SetWinEventHook(
+                EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
+                0, self._win_event_proc, 0, 0, WINEVENT_OUTOFCONTEXT,
+            )
+            log.info(
+                "[hud] foreground WinEvent hook installed ok=%s",
+                bool(self._win_event_hook),
+            )
+        except Exception:
+            log.warning("[hud] SetWinEventHook failed", exc_info=True)
+            self._win_event_hook = None
+            self._win_event_proc = None
+
+    def _uninstall_foreground_hook_win(self) -> None:
+        if self._win_event_hook is None:
+            return
+        try:
+            import ctypes
+            ctypes.windll.user32.UnhookWinEvent(self._win_event_hook)
+        except Exception:
+            pass
+        self._win_event_hook = None
+        self._win_event_proc = None
+
+    # ------------------------------------------------------------------
     # stdin command pipeline. The parent agent's launcher writes
     # newline-delimited JSON commands; we read them on a daemon thread
     # and forward into the React app via window.hudBridge.dispatch().
@@ -1051,6 +1220,13 @@ class _HudHostWidget(QWidget):
                 if cmd == "quit":
                     self._dispatch_quit()
                     return
+                if cmd == "ping":
+                    # Liveness ping — reply pong from the GUI thread,
+                    # never forward to React (proving the Qt loop, not
+                    # the renderer, is alive).
+                    ping_id = payload.get("id", "") if isinstance(payload, dict) else ""
+                    self._ping_received.emit(str(ping_id))
+                    continue
                 # Forward via the Qt signal so the JS dispatch happens
                 # on the GUI thread (QWebEngineView is GUI-thread-only).
                 self._command_received.emit(raw)
@@ -1078,26 +1254,18 @@ class _HudHostWidget(QWidget):
             self._evaluate_js_dispatch(raw)
 
     def _evaluate_js_dispatch(self, raw_json: str) -> None:
-        # Embed via JSON.parse to avoid quote-escape juggling. The
-        # React side's bridge exposes ``window.hudBridge.dispatch(cmd)``.
-        escaped = raw_json.replace("\\", "\\\\").replace("`", "\\`")
-        js = (
-            "(function(){"
-            "try{"
-            f"const payload = JSON.parse(`{escaped}`);"
-            "if (window.hudBridge && typeof window.hudBridge.dispatch === 'function') {"
-            "  window.hudBridge.dispatch(payload);"
-            "}"
-            "}catch(e){console.warn('hud dispatch err', e);}"
-            "})();"
-        )
+        # Embed as a json.dumps'd double-quoted string literal + JSON.parse
+        # on the JS side — see js_escape.build_dispatch_js for why the old
+        # template-literal embedding was an injection vector.
         try:
-            self._view.page().runJavaScript(js)
+            self._view.page().runJavaScript(build_dispatch_js(raw_json))
         except Exception:
             log.warning("[hud] runJavaScript dispatch failed", exc_info=True)
 
     def _dispatch_quit(self) -> None:
         self._quitting = True
+        if sys.platform == "win32":
+            self._uninstall_foreground_hook_win()
         # Schedule app quit on the GUI thread.
         QApplication.instance().quit()
 

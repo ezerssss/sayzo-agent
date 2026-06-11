@@ -367,6 +367,72 @@ async def test_live_upload_fires_capture_saved_toast(env, tmp_path):
     assert call["button_label"] == "Open in Sayzo"
 
 
+async def test_fresh_sweep_capture_owns_insight_toast(env, tmp_path):
+    """v3.14 freshness refinement: a capture whose live upload failed and was
+    swept moments later is still FRESH, so the poller hook receives
+    owns_toast=True (→ it fires the insight card) even on the sweep path
+    (live=False). This is the macOS case from [[project_mac_no_insight_card]]."""
+    captures_dir = tmp_path / "captures_fresh_sweep"
+    captures_dir.mkdir()
+    seen: list[bool] = []
+
+    async def _on_success(rec_dir, server_capture_id, owns_toast=False):
+        seen.append(owns_toast)
+
+    mgr = UploadRetryManager(
+        captures_dir=captures_dir,
+        upload_client=env.upload,
+        notifier=env.notifier,
+        executor=env.executor,
+        config=env.cfg,
+        clock=env.clock,
+        webapp_base_url="https://sayzo.app",
+        on_upload_success=_on_success,
+        feedback_enabled=lambda: True,
+    )
+    # _make_record sets ended_at = started_at + 1 min, so a started_at of
+    # now-11min puts ended_at ~10 min before the clock → well inside the 1 h
+    # freshness gate.
+    started = env.clock() - timedelta(minutes=11)
+    rec_dir, record = _write_capture(captures_dir, "rec_fresh_sweep", started)
+    env.upload.enqueue("success", capture_id="srv_fresh")
+    outcome = await mgr.try_upload(record, rec_dir)  # live defaults False → sweep
+    assert outcome == UploadOutcome.SUCCESS
+    await asyncio.sleep(0)
+    assert seen == [True]
+
+
+async def test_stale_sweep_capture_does_not_own_insight_toast(env, tmp_path):
+    """A genuine backlog drain — a capture that ended hours ago — stays
+    silent: owns_toast=False, so no insight card fires when its sweep finally
+    succeeds. Preserves the no-stale-spam intent the freshness gate refines."""
+    captures_dir = tmp_path / "captures_stale_sweep"
+    captures_dir.mkdir()
+    seen: list[bool] = []
+
+    async def _on_success(rec_dir, server_capture_id, owns_toast=False):
+        seen.append(owns_toast)
+
+    mgr = UploadRetryManager(
+        captures_dir=captures_dir,
+        upload_client=env.upload,
+        notifier=env.notifier,
+        executor=env.executor,
+        config=env.cfg,
+        clock=env.clock,
+        webapp_base_url="https://sayzo.app",
+        on_upload_success=_on_success,
+        feedback_enabled=lambda: True,
+    )
+    started = env.clock() - timedelta(hours=3)  # ended ~3 h ago → stale backlog
+    rec_dir, record = _write_capture(captures_dir, "rec_stale_sweep", started)
+    env.upload.enqueue("success", capture_id="srv_stale")
+    outcome = await mgr.try_upload(record, rec_dir)
+    assert outcome == UploadOutcome.SUCCESS
+    await asyncio.sleep(0)
+    assert seen == [False]
+
+
 async def test_sweep_upload_does_not_fire_capture_saved_toast(env, tmp_path):
     """Sweep-path try_upload (default live=False) on success MUST NOT fire
     the "Conversation saved to Sayzo" toast. Draining a backlog of "couldn't
