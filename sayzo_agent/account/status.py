@@ -70,6 +70,11 @@ class AccountStatusResponse:
     onboarding_url: Optional[str] = None
     email: Optional[str] = None
     user_id: Optional[str] = None
+    # On-demand diagnostics pull (v3.16+). When the server sets this true on a
+    # 200 body, the account-refresh loop fires a one-shot ``agent.log`` upload
+    # (gated on ``Config.share_diagnostics``). Not persisted to the cache — it
+    # is a per-response signal, not account state. See diagnostics.py.
+    collect_logs: Optional[bool] = None
 
     @property
     def is_persistable(self) -> bool:
@@ -100,6 +105,7 @@ async def fetch_account_status(
     max_retries: int = 3,
     base_backoff_secs: float = 2.0,
     rng: Optional[random.Random] = None,
+    extra_headers: Optional[dict] = None,
 ) -> AccountStatusResponse:
     """GET ``/api/me`` with retries on transient failures.
 
@@ -108,15 +114,22 @@ async def fetch_account_status(
     ``base_backoff_secs * 2**attempt + jitter`` with ±10 % jitter, drawn
     from ``rng`` if supplied (defaults to a fresh ``random.Random()``).
 
+    ``extra_headers`` are merged into every request (the agent uses this to
+    piggyback the opt-out diagnostics inventory headers — version / OS /
+    install-id — onto the poll it already makes; see
+    ``diagnostics.diagnostics_headers``). The ``Authorization`` header is
+    always added by ``AuthenticatedClient`` regardless.
+
     Never raises. Failures map to ``status="auth_required"`` /
     ``"transient_error"`` / ``"unknown_error"``.
     """
     rng = rng or random.Random()
     last_error: Optional[str] = None
+    headers = dict(extra_headers or {})
 
     for attempt in range(max_retries):
         try:
-            resp = await client.get(_API_PATH)
+            resp = await client.get(_API_PATH, headers=headers)
         except AuthTemporarilyUnavailable as exc:
             # Auth server unreachable (e.g. cold-boot network race) — NOT a
             # real auth failure. Back off + retry like any transient; do NOT
@@ -212,6 +225,7 @@ def _parse_200(resp: httpx.Response) -> AccountStatusResponse:
     onboarding_url = _str_or_none(payload.get("onboarding_url"))
     email = _str_or_none(payload.get("email"))
     user_id = _str_or_none(payload.get("user_id"))
+    collect_logs = bool(payload.get("collect_logs", False))
 
     status = _map_server_state(server_state, onboarding_complete)
     if status is None:
@@ -226,6 +240,7 @@ def _parse_200(resp: httpx.Response) -> AccountStatusResponse:
         onboarding_url=onboarding_url,
         email=email,
         user_id=user_id,
+        collect_logs=collect_logs,
     )
 
 

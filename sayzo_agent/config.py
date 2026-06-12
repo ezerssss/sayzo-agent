@@ -776,6 +776,15 @@ class Config(BaseSettings):
     # fires as a fallback when no insight is produced. SAYZO_NOTIFY_CAPTURE_FEEDBACK=0
     # to disable. Master ``notifications_enabled`` still wins.
     notify_capture_feedback: bool = True
+    # Remote diagnostics (v3.16+). When True the agent (a) piggybacks app
+    # version + OS + a per-install id onto the existing /api/me poll so we can
+    # see who's on Mac/Windows and what version, and (b) may upload its
+    # PII-free ``agent.log`` on demand (server-flagged) or after a crash. This
+    # single flag gates ALL diagnostics surfaces (see diagnostics.py) — when
+    # False, no inventory headers, no on-demand pull, no crash upload, and no
+    # install-id file is ever written. Opt-out: default ON, disclosed in the
+    # onboarding Done screen + Settings. SAYZO_SHARE_DIAGNOSTICS=0 to disable.
+    share_diagnostics: bool = True
 
     capture: CaptureConfig = Field(default_factory=CaptureConfig)
     vad: VADConfig = Field(default_factory=VADConfig)
@@ -852,6 +861,7 @@ def load_config() -> Config:
         "notify_welcome",
         "notify_capture_saved",
         "notify_capture_feedback",
+        "share_diagnostics",
     ):
         if key in user and key not in env_top_keys:
             init_kwargs[key] = user[key]

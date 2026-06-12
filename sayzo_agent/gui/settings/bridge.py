@@ -323,6 +323,12 @@ class Bridge:
             "data_dir": str(self._cfg.data_dir),
             "web_app_url": webapp,
             "support_url": SUPPORT_URL,
+            # Opt-out diagnostics (v3.16+) — surfaced as a toggle in the About
+            # pane. ``share_diagnostics`` gates the inventory headers + log
+            # upload (see diagnostics.py); ``privacy_url`` deep-links the
+            # disclosure copy shown next to the toggle.
+            "share_diagnostics": bool(self._cfg.share_diagnostics),
+            "privacy_url": webapp.rstrip("/") + "/privacy",
         }
 
     def open_captures_folder(self) -> None:
@@ -700,6 +706,39 @@ class Bridge:
                     exc_info=True,
                 )
 
+        return {"saved": True}
+
+    def set_share_diagnostics(self, value: bool) -> dict[str, Any]:
+        """Persist the opt-out diagnostics toggle (Settings → About).
+
+        Mirrors ``set_notification``: mutate this subprocess's ``cfg`` copy,
+        write ``user_settings.json``, then nudge the live agent over
+        ``RELOAD_NOTIFICATION_CONFIG`` so the change takes effect without a
+        restart — the agent reads ``cfg.share_diagnostics`` live for the
+        inventory headers, on-demand pull, and crash sweep.
+        """
+        coerced = bool(value)
+        try:
+            self._cfg.share_diagnostics = coerced
+        except Exception:
+            log.debug(
+                "[settings.bridge] cfg mutation failed for share_diagnostics",
+                exc_info=True,
+            )
+        try:
+            settings_store.save(self._cfg.data_dir, {"share_diagnostics": coerced})
+        except Exception:
+            log.warning(
+                "[settings.bridge] persist share_diagnostics failed", exc_info=True,
+            )
+            return {"saved": False, "error": "couldn't write user_settings.json"}
+        try:
+            self._ipc.call_quiet(Methods.RELOAD_NOTIFICATION_CONFIG)
+        except Exception:
+            log.debug(
+                "[settings.bridge] reload_notification_config nudge failed",
+                exc_info=True,
+            )
         return {"saved": True}
 
     # ------------------------------------------------------------------

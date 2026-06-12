@@ -35,6 +35,10 @@ export type AboutInfo = {
   data_dir: string;
   web_app_url: string;
   support_url: string;
+  // Opt-out diagnostics (v3.16+). share_diagnostics is the live toggle state;
+  // privacy_url deep-links the disclosure shown next to the About-pane toggle.
+  share_diagnostics: boolean;
+  privacy_url: string;
 };
 
 export type Diagnostics = {
@@ -252,6 +256,9 @@ declare global {
     // About.
     check_for_update(): Promise<{ checking: boolean }>;
     install_update_now(): Promise<{ started: boolean }>;
+    set_share_diagnostics(
+      value: boolean,
+    ): Promise<{ saved: boolean; error?: string }>;
 
     // Notifications.
     get_notifications(): Promise<NotificationFlags>;
@@ -364,6 +371,10 @@ export const settingsBridge = {
   async installUpdateNow() {
     await whenReady();
     return window.pywebview.api.install_update_now();
+  },
+  async setShareDiagnostics(value: boolean) {
+    await whenReady();
+    return window.pywebview.api.set_share_diagnostics(value);
   },
 
   async getNotifications() {

@@ -3,6 +3,7 @@ import { settingsBridge, AboutInfo } from "../lib/settings-bridge";
 import { subscribe, SayzoEvent } from "../lib/events";
 import { useCopyToClipboard } from "../lib/useCopyToClipboard";
 import { Button } from "../components/ui/Button";
+import { Switch } from "../components/ui/Switch";
 import logoUrl from "../assets/logo.png";
 
 type CheckState =
@@ -106,6 +107,19 @@ export function AboutPane() {
       await copy(text);
     } catch {
       // getDiagnostics failed — leave the button as-is.
+    }
+  }
+
+  async function handleShareDiagnostics(value: boolean) {
+    // Optimistic flip; revert if the bridge reports it didn't save.
+    setInfo((cur) => (cur ? { ...cur, share_diagnostics: value } : cur));
+    try {
+      const result = await settingsBridge.setShareDiagnostics(value);
+      if (!result.saved) {
+        setInfo((cur) => (cur ? { ...cur, share_diagnostics: !value } : cur));
+      }
+    } catch {
+      setInfo((cur) => (cur ? { ...cur, share_diagnostics: !value } : cur));
     }
   }
 
@@ -263,6 +277,43 @@ export function AboutPane() {
           </>
         }
       />
+
+      <Divider />
+
+      {/* Diagnostics (opt-out) — default ON, disclosed here + in onboarding.
+          Gates the inventory headers + log upload (see diagnostics.py). The
+          live agent picks the toggle up over IPC without a restart. */}
+      <section className="mt-2">
+        <div className="flex items-start gap-4">
+          <KvLabel>Diagnostics</KvLabel>
+          <div className="flex-1">
+            <label className="flex cursor-pointer items-start justify-between gap-4">
+              <div className="flex-1">
+                <div className="text-sm text-ink">
+                  Share anonymous diagnostics
+                </div>
+                <div className="mt-0.5 text-xs leading-snug text-ink-muted">
+                  Sends your device OS, app version, and error logs to the
+                  Sayzo team so we can find and fix problems faster. Never
+                  includes meeting audio or transcripts.
+                </div>
+              </div>
+              <Switch
+                checked={info.share_diagnostics}
+                onChange={(v) => void handleShareDiagnostics(v)}
+                ariaLabel="Share anonymous diagnostics"
+              />
+            </label>
+            <button
+              type="button"
+              className="mt-2 text-xs text-ink-muted underline underline-offset-2 hover:text-ink"
+              onClick={() => settingsBridge.openUrl(info.privacy_url)}
+            >
+              Privacy policy
+            </button>
+          </div>
+        </div>
+      </section>
 
       <Divider />
 

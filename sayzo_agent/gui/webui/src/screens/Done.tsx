@@ -69,6 +69,16 @@ export function Done({ hotkeyDisplay }: Props) {
             Open Sayzo
           </Button>
         </div>
+
+        {/* Opt-out diagnostics disclosure (v3.16+). Default ON, so the
+            disclosure has to be proactive — non-blocking text here, with the
+            actual toggle + privacy link in Settings → About. Never an em-dash
+            in shipped copy (deferred copy-purge). */}
+        <p className="border-t border-ink-border/60 pt-3 text-xs leading-relaxed text-ink-muted">
+          To help us fix problems, Sayzo shares anonymous diagnostics (your
+          device OS, app version, and error logs, never meeting audio or
+          transcripts). You can turn this off anytime in Settings under About.
+        </p>
       </div>
     </Layout>
   );

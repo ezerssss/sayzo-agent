@@ -53,7 +53,7 @@ def _setup_file_logging(logs_dir) -> None:
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
-def _install_excepthooks() -> None:
+def _install_excepthooks(data_dir=None) -> None:
     """Route unhandled exceptions to the file log before the default handler runs.
 
     Without this, Python's default ``sys.excepthook`` writes the
@@ -75,8 +75,25 @@ def _install_excepthooks() -> None:
 
     Idempotent: callers can invoke this from each CLI subcommand's
     setup without checking — re-installing the same hook is a no-op.
+
+    When ``data_dir`` is provided (the production ``service`` path), the
+    hooks also drop a tiny crash sentinel under it so the next boot can
+    upload ``agent.log`` (gated on ``Config.share_diagnostics``). Dev paths
+    (``run`` / ``hud``) pass ``None`` and skip the sentinel.
     """
     log = logging.getLogger("excepthook")
+
+    def _mark_crash() -> None:
+        # Best-effort breadcrumb so the next service boot uploads agent.log
+        # (gated on Config.share_diagnostics). No-op on the dev run/hud
+        # paths (data_dir is None). Never raises — we're already dying.
+        if data_dir is None:
+            return
+        try:
+            from .diagnostics import write_crash_sentinel
+            write_crash_sentinel(data_dir)
+        except Exception:
+            pass
 
     default_sys_excepthook = sys.excepthook
 
@@ -91,6 +108,7 @@ def _install_excepthooks() -> None:
             )
         except Exception:
             pass  # never let the hook itself raise
+        _mark_crash()
         default_sys_excepthook(exc_type, exc_value, exc_tb)
 
     sys.excepthook = _sys_hook
@@ -110,6 +128,7 @@ def _install_excepthooks() -> None:
                 )
             except Exception:
                 pass
+            _mark_crash()
             default_thread_excepthook(args)
 
         threading.excepthook = _thread_hook
@@ -1336,7 +1355,9 @@ def service(force_setup: bool, from_autostart: bool, open_settings: bool) -> Non
     """Run the agent as a background service (no terminal output, file logging)."""
     cfg = load_config()
     _setup_file_logging(cfg.logs_dir)
-    _install_excepthooks()
+    # Pass data_dir so the excepthook drops a crash sentinel that the boot
+    # sweep uploads next time (production service path only).
+    _install_excepthooks(cfg.data_dir)
     # Redirect comtypes runtime cache off %TEMP% before any pycaw /
     # uiautomation import. CI pre-bakes the common typelibs into the
     # frozen bundle (see scripts/prebake_comtypes.py); this is defense
@@ -1413,12 +1434,20 @@ def service(force_setup: bool, from_autostart: bool, open_settings: bool) -> Non
 
     _prior_version = read_last_seen(cfg.data_dir)
     _pending_upgrade_toast: typing.Optional[tuple[str, str]] = None
+    # True only on the boot that crosses from a pre-3.16.0 version into
+    # 3.16.0+, where opt-out diagnostics turn ON for existing users who never
+    # re-run onboarding. The post-upgrade toast below uses this to disclose
+    # diagnostics proactively — the only proactive surface an upgrader gets,
+    # and load-bearing for the opt-out ethics. ``last_seen_version`` is
+    # rewritten every boot, so the crossing condition is naturally once-only.
+    _diagnostics_disclosure_due = False
     if _prior_version is not None and _update_is_newer(_prior_version, __version__):
         log.warning(
             "[update] post-upgrade detected: prior=v%s now=v%s",
             _prior_version, __version__,
         )
         _pending_upgrade_toast = (_prior_version, __version__)
+        _diagnostics_disclosure_due = _update_is_newer(_prior_version, "3.16.0")
         clear_staged(cfg.data_dir)
         # Apply succeeded — wipe any leftover attempts marker from the
         # version we just upgraded TO so a future apply-fail toast can't
@@ -1737,13 +1766,25 @@ def service(force_setup: bool, from_autostart: bool, open_settings: bool) -> Non
         if _pending_upgrade_toast is not None and cfg.notifications_enabled:
             try:
                 _prior_v, _now_v = _pending_upgrade_toast
-                notifier.notify(
-                    "Sayzo updated",
-                    f"Now running v{_now_v}.",
-                )
+                if _diagnostics_disclosure_due and cfg.share_diagnostics:
+                    # Proactive opt-out disclosure for upgraders (advisor catch):
+                    # they never re-run onboarding, so this is their notice that
+                    # diagnostics turned on. No em-dash in shipped copy.
+                    notifier.notify(
+                        "Sayzo updated",
+                        f"Now on v{_now_v}. To help us fix problems, Sayzo "
+                        "shares anonymous diagnostics (your OS, app version, and "
+                        "error logs, never meeting audio or transcripts). Manage "
+                        "this in Settings under About.",
+                    )
+                else:
+                    notifier.notify(
+                        "Sayzo updated",
+                        f"Now running v{_now_v}.",
+                    )
                 log.info(
-                    "[update] post-upgrade toast fired (v%s -> v%s)",
-                    _prior_v, _now_v,
+                    "[update] post-upgrade toast fired (v%s -> v%s, disclosure=%s)",
+                    _prior_v, _now_v, _diagnostics_disclosure_due,
                 )
             except Exception:
                 log.warning("[update] post-upgrade toast failed", exc_info=True)
@@ -1948,6 +1989,11 @@ def service(force_setup: bool, from_autostart: bool, open_settings: bool) -> Non
             try:
                 agent.cfg.notify_capture_feedback = fresh.notify_capture_feedback
                 agent.cfg.notifications_enabled = fresh.notifications_enabled
+                # share_diagnostics rides the same reload — the diagnostics
+                # headers / crash sweep / on-demand pull all read it live off
+                # agent.cfg, so a Settings toggle takes effect without a
+                # restart.
+                agent.cfg.share_diagnostics = fresh.share_diagnostics
             except Exception:
                 log.warning(
                     "[ipc] reload_notification_config: cfg apply raised",
@@ -2345,6 +2391,56 @@ def service(force_setup: bool, from_autostart: bool, open_settings: bool) -> Non
                 except asyncio.CancelledError:
                     return
 
+        # --- Remote diagnostics (v3.16+) -------------------------------------
+        # Shared in-flight guard so the on-demand pull and the boot crash
+        # sweep never run two concurrent uploads. All reads of share_diagnostics
+        # / auth_client are live off the enclosing scope, so a Settings toggle
+        # (applied via RELOAD_NOTIFICATION_CONFIG) takes effect immediately.
+        _diag_in_flight = {"v": False}
+
+        async def _run_diagnostics_upload(reason: str) -> bool:
+            if _diag_in_flight["v"]:
+                return False
+            # Read share_diagnostics off agent.cfg — that's the object the
+            # RELOAD_NOTIFICATION_CONFIG IPC handler mutates, so a Settings
+            # toggle takes effect here without a restart.
+            if auth_client is None or not agent.cfg.share_diagnostics:
+                return False
+            _diag_in_flight["v"] = True
+            try:
+                from .diagnostics import DiagnosticsUploader
+                return await DiagnosticsUploader(auth_client, cfg).try_upload(reason)
+            finally:
+                _diag_in_flight["v"] = False
+
+        def _spawn_diagnostics(reason: str) -> None:
+            task = asyncio.create_task(_run_diagnostics_upload(reason))
+            agent._background_tasks.add(task)
+            task.add_done_callback(agent._background_tasks.discard)
+
+        async def _crash_report_sweep() -> None:
+            """One-shot at boot: if the previous run left a crash sentinel and
+            the user shares diagnostics, upload agent.log once and clear the
+            sentinel. On opt-out, discard the sentinel without uploading; when
+            signed out, keep it for a later boot."""
+            from .diagnostics import crash_sentinel_path
+            sentinel = crash_sentinel_path(cfg.data_dir)
+            if not sentinel.exists():
+                return
+            if not agent.cfg.share_diagnostics:
+                try:
+                    sentinel.unlink()
+                except OSError:
+                    pass
+                return
+            if auth_client is None:
+                return
+            if await _run_diagnostics_upload("crash"):
+                try:
+                    sentinel.unlink()
+                except OSError:
+                    pass
+
         async def _account_refresh() -> None:
             """Background /api/me refresh. The arm-time gate reads from the
             on-disk cache that this task populates — so a slow first fetch
@@ -2387,6 +2483,15 @@ def service(force_setup: bool, from_autostart: bool, open_settings: bool) -> Non
                         fresh = _read_cache(cfg)
                         if fresh is not None and tray_state.set_cached_account(fresh):
                             tray.update()
+                    # On-demand diagnostics pull: the server flags a specific
+                    # user from the admin dashboard; we ship the log on the
+                    # next poll. Gated on the opt-out toggle.
+                    if response.collect_logs and agent.cfg.share_diagnostics:
+                        log.info(
+                            "[account] server requested diagnostics — "
+                            "firing one-shot log upload"
+                        )
+                        _spawn_diagnostics("on_demand")
                 except Exception:
                     log.warning("[account] refresh raised", exc_info=True)
                 try:
@@ -2397,6 +2502,7 @@ def service(force_setup: bool, from_autostart: bool, open_settings: bool) -> Non
         asyncio.create_task(_tray_bridge())
         asyncio.create_task(_update_check())
         asyncio.create_task(_account_refresh())
+        asyncio.create_task(_crash_report_sweep())
         try:
             await agent.run()
         finally:

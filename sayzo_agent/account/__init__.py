@@ -43,10 +43,17 @@ async def refresh_and_cache(
     deliberately NOT written to the cache — they're transient and should
     never overwrite a positive cache from an earlier successful fetch.
     """
+    # Piggyback the opt-out diagnostics inventory headers (version / OS /
+    # install-id) onto the poll we already make. Returns {} when the user has
+    # opted out, so this is a no-op for them. Lazy import keeps the account
+    # module's import graph free of the upload/httpx chain at load time.
+    from ..diagnostics import diagnostics_headers
+
     response = await fetch_account_status(
         client,
         max_retries=max_retries,
         base_backoff_secs=base_backoff_secs,
+        extra_headers=diagnostics_headers(cfg),
     )
     if response.is_persistable:
         write_cache(
