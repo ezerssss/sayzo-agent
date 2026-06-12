@@ -24,10 +24,12 @@ from .config import CaptureConfig
 log = logging.getLogger(__name__)
 
 
-# noisereduce eagerly imports torch under its torchgate path (~4 s + ~150 MB
-# RSS), even when only the stationary spectral-gate path is used. Defer the
-# load until the first denoise call so the agent's "Starting…" phase doesn't
-# pay it. ``_NR_SENTINEL`` distinguishes "not yet tried" from "tried, failed".
+# noisereduce tries to import torch at module level for its torchgate path
+# (guarded try/except — a no-op since v3.17 removed torch from the bundle,
+# but in a dev venv that still has torch installed it costs ~4 s + ~150 MB
+# RSS). Defer the load until the first denoise call so the agent's
+# "Starting…" phase doesn't pay it. ``_NR_SENTINEL`` distinguishes "not yet
+# tried" from "tried, failed".
 _NR_SENTINEL = object()
 _nr: typing.Any = _NR_SENTINEL
 

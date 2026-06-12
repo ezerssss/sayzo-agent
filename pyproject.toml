@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sayzo-agent"
-version = "3.16.0"
+version = "3.17.0"
 description = "Armed-only capture agent for Sayzo — records meetings on user consent (hotkey or whitelisted meeting app), uploads raw stereo OGG Opus to the server, polls for the post-transcription title/summary."
 requires-python = ">=3.10"
 dependencies = [
@@ -23,12 +23,17 @@ dependencies = [
     "livekit>=1.1",
     "sounddevice>=0.4.6",
     "PyAudioWPatch>=0.2.12; sys_platform == 'win32'",
-    "silero-vad>=5.1",
-    # Direct deps (not transitive of silero-vad) so accidental graph
-    # changes can't drop them. Pinned to 2.x for silero-vad JIT model
-    # compatibility. Imported directly in vad.py + echo_guard.py.
-    "torch>=2.0",
-    "torchaudio>=2.0",
+    # Silero VAD (v3.17+): the model is vendored at
+    # sayzo_agent/data/silero_vad.onnx and runs through onnxruntime
+    # directly (see sayzo_agent/silero_onnx.py). The silero-vad PyPI
+    # package imports torch at module level even on its ONNX path, so
+    # depending on it meant shipping the entire PyTorch runtime
+    # (~320 MB frozen) to run a 2 MB model. onnxruntime MUST stay a
+    # DIRECT dep — it was transitive (via faster-whisper) once before
+    # and silently fell out of the graph in v3.0.0, breaking VAD in the
+    # shipped bundle. `sayzo-agent healthcheck` runs a real inference
+    # against the built artifact in CI to guard exactly that.
+    "onnxruntime>=1.18",
     "av>=12.0",
     "pydantic>=2.6",
     "pydantic-settings>=2.2",
@@ -98,6 +103,10 @@ sayzo-agent = "sayzo_agent.__main__:cli"
 
 [tool.setuptools.packages.find]
 include = ["sayzo_agent*"]
+
+[tool.setuptools.package-data]
+# Vendored Silero VAD v5 ONNX model (MIT, github.com/snakers4/silero-vad).
+sayzo_agent = ["data/*.onnx"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

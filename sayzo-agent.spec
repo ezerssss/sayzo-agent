@@ -56,16 +56,14 @@ datas = []
 # and the Click `--version` flag.
 datas += copy_metadata("sayzo-agent")
 
-# Silero VAD torch JIT model — silero_vad ships it as package data.
-# silero-vad supports both ONNX and JIT backends; we use JIT
-# (see sayzo_agent/vad.py module docstring) so we only need to bundle
-# silero_vad.jit. The .onnx file (and the onnxruntime hidden-import that
-# went with it) were dropped in v3.0.1.
-import silero_vad
-silero_pkg = Path(silero_vad.__file__).parent
-silero_jit = silero_pkg / "data" / "silero_vad.jit"
-if silero_jit.exists():
-    datas.append((str(silero_jit), "silero_vad/data"))
+# Silero VAD v5 ONNX model — vendored package data (v3.17+, see
+# sayzo_agent/silero_onnx.py). Runs through onnxruntime directly; the
+# silero-vad package + torch + torchaudio are no longer dependencies
+# (that combination shipped ~320 MB of PyTorch to run this 2 MB model).
+silero_onnx = Path("sayzo_agent/data/silero_vad.onnx")
+if not silero_onnx.exists():
+    raise SystemExit(f"vendored VAD model missing: {silero_onnx}")
+datas.append((str(silero_onnx), "sayzo_agent/data"))
 
 # macOS: bundle the pre-compiled audio-tap binary (CoreAudio Process Taps helper).
 if sys.platform == "darwin":
@@ -124,10 +122,9 @@ hiddenimports = [
     # Audio / capture
     "sounddevice",
     "_sounddevice_data",
-    # VAD — torch JIT backend (see sayzo_agent/vad.py module docstring
-    # for why we don't use onnx). torch + torchaudio are listed
-    # explicitly further down.
-    "silero_vad",
+    # VAD — onnxruntime session over the vendored model, lazy-imported
+    # inside sayzo_agent/silero_onnx.py so the static scanner misses it.
+    "onnxruntime",
     # Audio encoding
     "av",
     # Config
@@ -140,11 +137,6 @@ hiddenimports = [
     "PIL.ImageDraw",
     # Networking
     "httpx",
-    # torch + torchaudio — required by Silero VAD feed() (torch JIT path).
-    "torch",
-    "torchaudio",
-    # Native toast notifications
-    "desktop_notifier",
     # First-run GUI window
     "webview",
 ]
@@ -163,9 +155,6 @@ if sys.platform == "win32":
     hiddenimports += [
         "pyaudiowpatch",
         "pystray._win32",
-        # desktop-notifier → WinRT backend
-        "winrt",
-        "winsdk",
         # pywebview → EdgeChromium / WinForms backend (uses .NET via pythonnet)
         "webview.platforms.edgechromium",
         "webview.platforms.winforms",
@@ -194,9 +183,6 @@ if sys.platform == "win32":
 if sys.platform == "darwin":
     hiddenimports += [
         "pystray._darwin",
-        # desktop-notifier → UNUserNotificationCenter backend
-        "rubicon",
-        "rubicon.objc",
         # pywebview → Cocoa / WKWebView backend (via pyobjc)
         "webview.platforms.cocoa",
         "Foundation",
@@ -221,6 +207,21 @@ excludes = [
     "pytest",
     "pytest_asyncio",
     "tkinter.test",
+    # torch was removed as a dep in v3.17 (VAD runs on onnxruntime — see
+    # sayzo_agent/silero_onnx.py) but noisereduce does a guarded
+    # `try: import torch` for its optional torchgate path, which
+    # PyInstaller's static scanner treats as a real import. In CI's fresh
+    # venv torch isn't installed so this is a no-op; in a long-lived dev
+    # venv where torch survives as a pip orphan, the soft-import silently
+    # re-adds ~330 MB (plus numba/llvmlite riding the same class of
+    # guarded imports). Excluding keeps local builds equal to CI builds.
+    "torch",
+    "torchaudio",
+    "numba",
+    "llvmlite",
+    "sklearn",
+    "sympy",
+    "networkx",
 ]
 
 # ---------------------------------------------------------------------------
@@ -246,18 +247,16 @@ a = Analysis(
 # ---------------------------------------------------------------------------
 # Strip MSVC C++ runtime DLLs from anywhere in the bundle.
 #
-# Multiple Python packages (numpy, sklearn, llvmlite, winrt, pythonnet) ship
-# their own copies of msvcp140.dll / vcruntime140.dll, each from a different
-# MSVC release. On load order, whichever runs its import first (winrt via
-# desktop-notifier, in our case) anchors the process to its version of
-# MSVCP140.dll. When torch later loads c10.dll — compiled against a newer
-# MSVCP140 — Windows returns the already-loaded older module instead of
-# the newer system copy. c10.dll's DllMain calls a function that doesn't
-# exist in the older DLL → access violation (0xC0000005) → WinError 1114.
+# Multiple Python packages (numpy, pythonnet, onnxruntime) ship their own
+# copies of msvcp140.dll / vcruntime140.dll, each from a different MSVC
+# release. On load order, whichever runs its import first anchors the
+# process to its version of MSVCP140.dll; any later-loaded native module
+# compiled against a newer runtime then hits missing exports → access
+# violation (0xC0000005) → WinError 1114.
 #
-# Observed in the wild: winrt ships 14.29 (from VS 2019). torch's c10.dll
-# wants 14.40+. Load order: winrt first (at import), torch second (via
-# silero_vad → torch), boom.
+# The original in-the-wild pairing was winrt (14.29) vs torch's c10.dll
+# (14.40+) — both gone since v2.10 / v3.17 — but the multi-copy hazard is
+# generic, so the strip stays.
 #
 # Fix: remove every bare copy from the bundle. The NSIS installer
 # bootstraps the VC++ Redistributable onto the target machine (see the
@@ -290,6 +289,98 @@ if sys.platform == "win32":
         f"sayzo-agent.spec: stripped {_before - len(a.binaries)} MSVC runtime "
         f"DLLs (system VC++ Redist supplies them): {_stripped}"
     )
+
+# ---------------------------------------------------------------------------
+# Prune Qt payload the HUD never uses (v3.17).
+#
+# The HUD subprocess imports QtCore / QtGui / QtWidgets / QtWebChannel /
+# QtWebEngineWidgets / QtWebEngineCore only (no QML/Quick Python imports —
+# Qt6Quick.dll etc. still ship because Qt6WebEngineCore.dll links them).
+# Two prune classes, both verified by running the frozen bundle's
+# `healthcheck` + `diagnose-notifications` after a build:
+#
+# 1. Translations: every .qm file (Qt falls back to its built-in English
+#    source strings; all Sayzo-facing copy lives in our React apps) and
+#    every qtwebengine_locales/*.pak except en-US.pak (Chromium-internal
+#    strings — form controls, context menus; QtWebEngine falls back to
+#    en-US for missing locales).
+# 2. Leaf Qt modules PyInstaller's Qt hooks over-collect that nothing in
+#    the WebEngine dependency chain links: 3D, Charts, data-vis, Quick3D,
+#    virtual keyboard, QtPdf, and the QML-import-only QuickControls2 /
+#    QuickDialogs2 family (only reachable through QML `import` statements,
+#    and the HUD has no QML).
+# 3. The PySide6/qml/ plugin tree — QML-engine imports only. The HUD is
+#    QtWebEngineWidgets; Qt6Quick.dll stays (Qt6WebEngineCore.dll links
+#    it) but nothing ever evaluates a QML document.
+# 4. QtWebEngine *.debug.pak / *.debug.bin resources (only loaded by
+#    debug builds of WebEngineCore — we ship release) and the devtools
+#    resource pak (only loaded when remote debugging is enabled; the HUD
+#    never enables it — the setup window's debug devtools is pywebview/
+#    EdgeChromium, not QtWebEngine).
+#
+# Deliberately KEPT: opengl32sw.dll (software-GL fallback — HUD must
+# render on GPU-less / broken-driver / RDP machines), icudtl.dat +
+# qtwebengine_resources*.pak + v8_context_snapshot.bin (mandatory),
+# Qt6ShaderTools (Quick's RHI shader pipeline), all .pyd bindings.
+# ---------------------------------------------------------------------------
+
+_QT_PRUNE_DLL_PREFIXES = (
+    "qt63d", "qt6charts", "qt6datavisualization", "qt6graphs",
+    "qt6quick3d", "qt6virtualkeyboard", "qt6pdf",
+    "qt6quickcontrols2", "qt6quickdialogs2", "qt6quicktemplates2",
+    "qt6quicklayouts", "qt6quickparticles", "qt6quickshapes",
+    "qt6quicktest", "qt6quickeffects", "qt6labs",
+)
+
+
+def _qt_prune(entry):
+    dest = entry[0].replace("\\", "/")
+    low = dest.lower()
+    if "pyside6" not in low:
+        return False
+    if "/translations/" in low or low.startswith("pyside6/translations"):
+        if low.endswith("qtwebengine_locales/en-us.pak"):
+            return False
+        return True
+    if "/qml/" in low or low.startswith("pyside6/qml"):
+        return True
+    if low.endswith((".debug.pak", ".debug.bin")):
+        return True
+    if low.endswith("qtwebengine_devtools_resources.pak"):
+        return True
+    base = low.rsplit("/", 1)[-1]
+    return base.startswith(_QT_PRUNE_DLL_PREFIXES)
+
+
+# Non-Qt hook over-collection (v3.17). Neither is reachable from the
+# import graph (verified via xref + grepping every dep package):
+#   - Pythonwin/ (mfc140u.dll + win32ui.pyd, ~7 MB) — pywin32's MFC GUI
+#     toolkit; the agent uses win32gui/win32process/win32api only.
+#   - PySide6/QtOpenGL.pyd (~9 MB) — Python binding nothing imports;
+#     Qt6OpenGL.dll / Qt6OpenGLWidgets.dll (C-level link deps of the
+#     Quick/WebEngine DLLs) are deliberately KEPT.
+# `sayzo-agent healthcheck` exercises uiautomation + the HUD imports
+# against the built bundle, so an over-aggressive prune here fails CI.
+_EXTRA_PRUNE_PREFIXES = ("pythonwin/",)
+_EXTRA_PRUNE_EXACT = ("pyside6/qtopengl.pyd",)
+
+
+def _bundle_prune(entry):
+    if _qt_prune(entry):
+        return True
+    low = entry[0].replace("\\", "/").lower()
+    return low.startswith(_EXTRA_PRUNE_PREFIXES) or low in _EXTRA_PRUNE_EXACT
+
+
+for _attr in ("binaries", "datas"):
+    _toc = getattr(a, _attr)
+    _dropped = [e[0] for e in _toc if _bundle_prune(e)]
+    setattr(a, _attr, [e for e in _toc if not _bundle_prune(e)])
+    if _dropped:
+        print(
+            f"sayzo-agent.spec: pruned {len(_dropped)} unused {_attr} "
+            f"entries (Qt translations / leaf modules / hook over-collection)"
+        )
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 

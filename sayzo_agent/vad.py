@@ -7,17 +7,15 @@ regions end (with hangover). Segment ``start_ts`` / ``end_ts`` are
 monotonic seconds — the detector subtracts ``session_t0_mono`` to get
 session-relative seconds at write time.
 
-Backend note: we load Silero via the torch JIT path
-(``load_silero_vad(onnx=False)``) — the JIT model is silero-vad's
-default and only requires ``torch`` + ``torchaudio``, both of which
-``feed()`` already imports for tensor work. Using the ONNX backend
-would force a third runtime (``onnxruntime``, ~39 MB) on top of torch
-without changing the inference pathway, and was the source of the
-v3.0.0 regression where dropping ``faster-whisper`` silently took
-``onnxruntime`` with it (faster-whisper was its only transitive
-provider — silero-vad declares onnxruntime as an ``[onnx-cpu]`` extra,
-not a real dep). Don't reintroduce ``onnx=True`` without first making
-``onnxruntime`` a direct dep in pyproject.toml.
+Backend note (v3.17+): inference runs through ``onnxruntime`` against
+the vendored model at ``sayzo_agent/data/silero_vad.onnx`` — see
+``silero_onnx.py`` for the wrapper and the full dependency history.
+The pre-v3.17 torch-JIT backend (``load_silero_vad(onnx=False)``) was
+correct but shipped the entire PyTorch runtime (~320 MB frozen) to run
+a 2 MB model; onnxruntime is a direct dep now (~40 MB) and the
+``sayzo-agent healthcheck`` CI step runs a real inference against the
+built bundle, which closes the v3.0.0 "onnxruntime silently fell out
+of the dep graph" failure mode that originally motivated torch-JIT.
 """
 from __future__ import annotations
 
@@ -32,15 +30,15 @@ from .models import SpeechSegment, Source
 
 log = logging.getLogger(__name__)
 
-# Shared across SileroVAD instances — the torch JIT load is ~150 ms on
-# first call and isn't worth racing two of them in parallel. Holding
-# this around both ``_ensure_loaded`` and any pre-warm call from a
-# background thread guarantees we pay the cost exactly once.
+# Shared across SileroVAD instances — the onnxruntime session build is
+# ~100 ms on first call and isn't worth racing two of them in parallel.
+# Holding this around both ``_ensure_loaded`` and any pre-warm call from
+# a background thread guarantees we pay the cost exactly once.
 _LOAD_LOCK = threading.Lock()
 
 
 class SileroVAD:
-    """Lightweight stateful VAD around the Silero model (torch JIT backend).
+    """Lightweight stateful VAD around the Silero model (ONNX backend).
 
     Silero expects 16 kHz mono float32 in chunks of 512 samples (32 ms).
     We accept arbitrary frame sizes and re-chunk internally.
@@ -62,7 +60,7 @@ class SileroVAD:
         self.min_speech_secs = min_speech_ms / 1000.0
         self.hangover_secs = hangover_ms / 1000.0
 
-        # silero-vad's torch JIT load is ~150 ms on first call. Cheap
+        # The onnxruntime session build is ~100 ms on first call. Cheap
         # enough on its own, but the agent constructs two SileroVAD
         # instances at boot and ``Agent._prewarm_vads`` loads both off
         # the event loop, so this stays lazy — the executor pre-warm
@@ -83,12 +81,12 @@ class SileroVAD:
             return
         # Lock so a background pre-warm thread (Agent._prewarm_vads) and a
         # concurrent first ``feed()`` from the consume loop can't race and
-        # pay the silero-vad load cost twice.
+        # pay the model-load cost twice.
         with _LOAD_LOCK:
             if self._model is not None:
                 return
-            from silero_vad import load_silero_vad
-            self._model = load_silero_vad(onnx=False)
+            from .silero_onnx import SileroOnnxModel
+            self._model = SileroOnnxModel()
 
     def reset(self) -> None:
         """Reset the VAD to a cold-start state.
@@ -116,8 +114,6 @@ class SileroVAD:
         ``end_ts`` are monotonic seconds, anchored to the actual capture
         time of each chunk Silero processed.
         """
-        import torch
-
         self._ensure_loaded()
         # Anchor ``_buf_start_mono`` when the buffer is empty. If there
         # are leftover samples from a previous ``feed()`` call,
@@ -135,10 +131,7 @@ class SileroVAD:
             chunk_end_mono = chunk_start_mono + self._CHUNK_DURATION_SECS
             self._buf_start_mono = chunk_end_mono
 
-            with torch.no_grad():
-                prob = float(
-                    self._model(torch.from_numpy(chunk), self.SAMPLE_RATE).item()
-                )
+            prob = float(self._model(chunk, self.SAMPLE_RATE))
             voiced = prob >= self.threshold
 
             if voiced:

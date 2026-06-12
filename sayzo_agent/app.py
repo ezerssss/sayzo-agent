@@ -320,7 +320,7 @@ class Agent:
         Defers cost away from the hot path so the first ``vad.feed()`` from
         ``_consume`` is a no-op fast path (``_model is not None`` check in
         ``vad.py::_ensure_loaded``). Without this, the first armed session
-        eats an event-loop stall while silero-vad loads × 2 instances,
+        eats an event-loop stall while the Silero model loads × 2 instances,
         and the asyncio loop falls far enough behind the producer
         callbacks (mic at 50 Hz, WASAPI loopback in 500 ms batches) that
         ``mic.queue`` / ``sys.queue`` (both ``maxsize=200`` ≈ 4 s) start
@@ -348,7 +348,8 @@ class Agent:
         except Exception as exc:
             log.critical(
                 "[agent] VAD load failed — agent cannot capture. Likely "
-                "a missing or broken silero-vad / torch install. "
+                "a missing or broken onnxruntime install or a missing "
+                "sayzo_agent/data/silero_vad.onnx. "
                 "Shutting down. (%s: %s)",
                 type(exc).__name__, exc,
                 exc_info=True,
@@ -882,9 +883,10 @@ class Agent:
         # gets dropped at session 1 start (see the 2026-05-14 logs).
         # Once-per-process; runs in a thread-pool executor so it can't
         # block the event loop. Also doubles as the startup health check
-        # for the silero-vad / torch install — `_prewarm_vads` signals
-        # `_stop` on failure so a broken bundle exits loudly instead of
-        # capturing empty sessions forever (see its docstring).
+        # for the onnxruntime install + vendored VAD model —
+        # `_prewarm_vads` signals `_stop` on failure so a broken bundle
+        # exits loudly instead of capturing empty sessions forever (see
+        # its docstring).
         prewarm_task = asyncio.create_task(self._prewarm_vads())
         self._background_tasks.add(prewarm_task)
         prewarm_task.add_done_callback(self._background_tasks.discard)

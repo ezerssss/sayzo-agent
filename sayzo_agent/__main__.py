@@ -376,22 +376,18 @@ def healthcheck() -> None:
     click.echo("Sayzo agent healthcheck")
 
     def _check_silero() -> None:
-        # The exact load path _consume hits on the first armed frame.
-        # If torch / torchaudio / silero-vad's package data are missing
-        # or mismatched, this is what surfaces it.
-        from silero_vad import load_silero_vad
-        load_silero_vad(onnx=False)
-
-    def _check_torch_inference() -> None:
-        # silero-vad's JIT model runs through torch — confirm the JIT
-        # runtime is actually executable, not just importable. Catches
-        # the case where torch is importable but its C++ ops library
-        # didn't ship (VC++ redist mismatch, missing .so on Linux).
-        import torch
+        # The exact load + inference path _consume hits on the first
+        # armed frame. Catches a missing onnxruntime native library, a
+        # missing/mis-bundled sayzo_agent/data/silero_vad.onnx, and the
+        # "imports but can't execute" case — the exact class of break
+        # that bit v3.0.0 when onnxruntime silently fell out of the dep
+        # graph.
         import numpy as np
-        x = torch.from_numpy(np.zeros(512, dtype=np.float32))
-        with torch.no_grad():
-            _ = (x * 2).sum().item()
+        from sayzo_agent.silero_onnx import SileroOnnxModel
+        model = SileroOnnxModel()
+        prob = model(np.zeros(512, dtype=np.float32), 16000)
+        if not (0.0 <= prob <= 1.0):
+            raise RuntimeError(f"silero ONNX returned out-of-range prob {prob}")
 
     def _check_aec() -> None:
         # WebRTC AEC3 via livekit.rtc.apm — ship a synthetic 1 s
@@ -423,10 +419,12 @@ def healthcheck() -> None:
         _try("pyaudiowpatch import", lambda: __import__("pyaudiowpatch"))
         _try("pycaw import", lambda: __import__("pycaw.pycaw"))
         _try("win32gui import", lambda: __import__("win32gui"))
-    _try("torch import", lambda: __import__("torch"))
-    _try("torchaudio import", lambda: __import__("torchaudio"))
-    _try("torch inference", _check_torch_inference)
-    _try("silero-vad load (torch JIT)", _check_silero)
+        # Lazy-loaded by arm/platform_win.py for browser-tab URL reads;
+        # also guards the spec's Pythonwin/win32ui prune — uiautomation
+        # must keep importing without pywin32's MFC payload.
+        _try("uiautomation import", lambda: __import__("uiautomation"))
+    _try("onnxruntime import", lambda: __import__("onnxruntime"))
+    _try("silero VAD load + inference (ONNX)", _check_silero)
     _try("av (PyAV) import", lambda: __import__("av"))
     _try("noisereduce import", lambda: __import__("noisereduce"))
     _try("livekit.rtc.apm import", lambda: __import__("livekit.rtc.apm"))

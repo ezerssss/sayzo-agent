@@ -48,9 +48,9 @@ def _get_silero_model():
     """
     global _SILERO_MODEL
     if _SILERO_MODEL is None:
-        from silero_vad import load_silero_vad
-        # Torch JIT backend; see sayzo_agent/vad.py module docstring.
-        _SILERO_MODEL = load_silero_vad(onnx=False)
+        # ONNX backend (v3.17+); see sayzo_agent/silero_onnx.py.
+        from .silero_onnx import SileroOnnxModel
+        _SILERO_MODEL = SileroOnnxModel()
     return _SILERO_MODEL
 
 
@@ -62,8 +62,6 @@ def default_speech_detector(pcm: np.ndarray) -> float:
     the pipeline's cost for keeping a wrongly-flagged segment is much lower
     than dropping a real user turn.
     """
-    import torch
-
     if pcm is None or len(pcm) < 512:
         return 0.0
     model = _get_silero_model()
@@ -76,9 +74,7 @@ def default_speech_detector(pcm: np.ndarray) -> float:
     n_chunks = len(pcm) // 512
     for i in range(n_chunks):
         chunk = pcm[i * 512:(i + 1) * 512].astype(np.float32, copy=False)
-        with torch.no_grad():
-            p = float(model(torch.from_numpy(chunk), 16000).item())
-        probs.append(p)
+        probs.append(float(model(chunk, 16000)))
     if not probs:
         return 0.0
     return float(np.max(probs))

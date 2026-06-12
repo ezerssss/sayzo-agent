@@ -22,8 +22,8 @@ from sayzo_agent.vad import SileroVAD
 
 
 class _StubSileroModel:
-    """Drop-in for ``silero_vad.load_silero_vad(onnx=False)`` output
-    (a ``torch.jit.RecursiveScriptModule`` in production).
+    """Drop-in for ``silero_onnx.SileroOnnxModel`` (returns a plain float
+    speech probability per 512-sample chunk in production).
 
     Returns scripted probabilities in order. Anything past the script
     end returns 0.0 (unvoiced). Implements ``reset_states`` so VAD's
@@ -35,10 +35,9 @@ class _StubSileroModel:
         self.call_count = 0
 
     def __call__(self, chunk, sample_rate):  # noqa: ANN001
-        import torch
         prob = self._probs[self.call_count] if self.call_count < len(self._probs) else 0.0
         self.call_count += 1
-        return torch.tensor(prob)
+        return prob
 
     def reset_states(self) -> None:
         pass

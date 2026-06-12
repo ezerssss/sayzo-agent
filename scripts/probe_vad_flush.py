@@ -48,7 +48,7 @@ import sys
 
 
 async def _main() -> int:
-    # Local imports so the probe doesn't pay torch/silero import on boot.
+    # Local imports so the probe doesn't pay onnxruntime/silero import on boot.
     from sayzo_agent.arm.controller import ArmController, ArmState
     from sayzo_agent.config import ArmConfig, ConversationConfig, default_detector_specs
     from sayzo_agent.conversation import ConversationDetector

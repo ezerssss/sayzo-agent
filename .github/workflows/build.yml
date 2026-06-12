@@ -55,15 +55,16 @@ jobs:
         run: pyinstaller sayzo-agent.spec
 
       - name: Smoke-test built bundle (healthcheck)
-        # Runs every runtime import + the silero-vad torch JIT load
-        # AGAINST THE PYINSTALLER ARTIFACT (not the build venv) so
-        # missing transitive deps surface here instead of in
-        # production. v3.0.0 shipped without onnxruntime because the
-        # build venv had it as an orphan transitive of faster-whisper
-        # but the bundle didn't — no step ever executed the .exe, so
-        # the regression was invisible until users hit it. Fail-fast
-        # on a healthcheck non-zero exit prevents the same shape of
-        # bug from reaching the installer.
+        # Runs every runtime import + a real Silero VAD inference
+        # (onnxruntime + the vendored .onnx model, v3.17+) AGAINST THE
+        # PYINSTALLER ARTIFACT (not the build venv) so missing
+        # transitive deps surface here instead of in production.
+        # v3.0.0 shipped without onnxruntime because the build venv
+        # had it as an orphan transitive of faster-whisper but the
+        # bundle didn't — no step ever executed the .exe, so the
+        # regression was invisible until users hit it. Fail-fast on a
+        # healthcheck non-zero exit prevents the same shape of bug
+        # from reaching the installer.
         shell: pwsh
         run: |
           $exe = "dist\sayzo-agent\sayzo-agent.exe"
@@ -82,7 +83,10 @@ jobs:
         # Bundled into the installer so target machines get a matched set of
         # msvcp140/vcruntime140 DLLs installed system-wide. We strip those
         # DLLs from the PyInstaller bundle in sayzo-agent.spec because mixing
-        # versions across numpy/sklearn/pythonnet blows up torch's DllMain.
+        # runtime versions across packages (numpy / pythonnet / onnxruntime
+        # each ship their own copy) breaks whichever native module loads
+        # last — see the strip block in the spec for the original
+        # winrt-vs-torch incident.
         shell: pwsh
         run: |
           Invoke-WebRequest -Uri "https://aka.ms/vs/17/release/vc_redist.x64.exe" -OutFile "installer\windows\VC_redist.x64.exe"
@@ -175,10 +179,11 @@ jobs:
 
       - name: Smoke-test built bundle (healthcheck)
         # Sister step to the Windows healthcheck. Runs every runtime
-        # import + the silero-vad torch JIT load AGAINST THE BUILT
-        # .app (not the build venv). Catches "transitive dep silently
-        # disappeared from pyproject.toml" regressions before they
-        # ship — see the Windows step for the v3.0.0 incident.
+        # import + a real Silero VAD inference (onnxruntime + the
+        # vendored .onnx model) AGAINST THE BUILT .app (not the build
+        # venv). Catches "transitive dep silently disappeared from
+        # pyproject.toml" regressions before they ship — see the
+        # Windows step for the v3.0.0 incident.
         #
         # `xattr -cr` clears any extended attributes (e.g. quarantine)
         # that could make Gatekeeper refuse to execute the unsigned
