@@ -553,11 +553,23 @@ class ArmConfig(BaseSettings):
     # for a while — see the HWND_TOPMOST re-assert in gui/hud/window.py
     # (_force_topmost_win), the actual fix for "couldn't see the toast".
     # A longer window gives the user more chance to notice it once it
-    # surfaces. NOTE: a timeout is STILL treated as a decline (suppresses
-    # re-prompts for the rest of the meeting via _Cooldowns.mark_declined);
-    # lengthening the window is the deliberate no-nag tradeoff chosen over
-    # re-prompting.
+    # surfaces.
     consent_toast_timeout_secs: float = 60.0
+
+    # Re-ask after a consent-toast timeout (v3.18+). A timeout is
+    # ambiguous — the user was likely busy joining the call, not saying
+    # no — so unlike an explicit "Not now" (which suppresses for the rest
+    # of the meeting) a timeout schedules ONE re-ask this many seconds
+    # later. The re-ask only fires if the app still holds the mic at that
+    # point (meeting still live); ending the meeting during the wait
+    # drops it and the next meeting starts fresh. A timeout on the
+    # re-ask, or any explicit "Not now", suppresses like a decline.
+    # 120s puts the second ask ~3 min into the meeting (after the 60s
+    # first toast) — intros over, bulk of the meeting still capturable.
+    # max_refires=0 restores the pre-v3.18 one-shot behavior (first
+    # timeout → suppressed for the meeting).
+    consent_timeout_refire_delay_secs: float = 120.0
+    consent_timeout_max_refires: int = 1
 
     # Hotkey confirmation toast timings (both start + stop).
     hotkey_confirm_timeout_secs: float = 10.0

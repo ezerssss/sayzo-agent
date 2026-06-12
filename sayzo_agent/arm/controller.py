@@ -10,7 +10,10 @@ Owns the decision of whether the agent is currently recording. Orchestrates:
   bypasses the confirmation.
 - **Whitelist auto-suggest**: polls for a whitelisted meeting app holding
   the mic while disarmed; fires a consent toast; arms on user "Start
-  coaching". Per-app cooldown after decline / session end.
+  coaching". Explicit "Not now" / session end → per-app suppression until
+  the app releases the mic (rest of the meeting). Toast *timeout* → one
+  re-ask after ``consent_timeout_refire_delay_secs`` if the meeting is
+  still live; a second timeout suppresses like a decline.
 - **PENDING_CLOSE handling**: subscribes to the detector's
   ``on_pending_close`` hook; shows the end-confirmation toast; commits
   close + disarms on "Yes, done" / timeout, reverts on "Not yet".
@@ -94,46 +97,125 @@ class ArmReason:
 
 
 @dataclass
+class _TimeoutSnooze:
+    """Pending re-ask after a consent toast timed out without an answer.
+
+    A timeout is ambiguous (hands busy joining the meeting ≠ "Not now"),
+    so instead of suppressing the whole meeting we allow one re-ask after
+    ``consent_timeout_refire_delay_secs`` — gated on the app still holding
+    the mic at that point, which the watcher's normal matching provides
+    for free. See ``_Cooldowns.mark_timeout``.
+    """
+    # Monotonic time when the re-ask may fire. Until then the app counts
+    # as suppressed; after, it becomes matchable again.
+    refire_at: float
+    # How many consent toasts have timed out for this app this meeting.
+    timeouts: int
+    # Same semantics as _Cooldowns.declined_release_at values: start of the
+    # current "not holding" streak, None while the app still holds the mic.
+    release_streak_start: Optional[float] = None
+
+
+@dataclass
 class _Cooldowns:
     """Per-app suppression state for the whitelist watcher.
 
-    Single mechanism, keyed by ``app_key``: when the user declines a
-    consent toast OR a whitelist-armed session ends, we mark the app as
-    suppressed and clear it once the app releases the mic for
-    ``decline_release_grace_secs`` continuous seconds. Leaving + rejoining
-    a meeting (or closing + reopening a voice-mode session) counts as a
-    new session, so a fresh prompt fires.
+    Two mechanisms, both keyed by ``app_key`` and both cleared once the
+    app releases the mic for ``decline_release_grace_secs`` continuous
+    seconds (leaving + rejoining a meeting counts as a new session, so a
+    fresh prompt fires):
+
+    - **Declined** (explicit "Not now", a whitelist-armed session ending,
+      or the timeout-re-ask budget running out): suppressed for the rest
+      of the meeting.
+    - **Timeout snooze** (consent toast expired with no answer): suppressed
+      only until ``refire_at``, then the watcher may re-ask once. The
+      re-ask budget is ``consent_timeout_max_refires`` per meeting; when a
+      timeout exhausts it, the app flips to declined.
 
     A flat wall-clock cooldown was tried previously for the post-session
     case but caused user-reported bug 2026-04-28: stop a ChatGPT voice
     session, close it, reopen it within 10 min → no toast. Using the
-    release-based mechanism for both paths means the watcher re-prompts
-    as soon as the app actually re-acquires the mic.
+    release-based mechanism means the watcher re-prompts as soon as the
+    app actually re-acquires the mic.
     """
     # Value = monotonic time when the current "not holding" streak started,
     # or None if the app is currently still holding the mic (streak hasn't
     # started yet). Presence of the key = suppressed state.
     declined_release_at: dict[str, Optional[float]] = field(default_factory=dict)
+    # Pending re-asks after a consent-toast timeout. Mutually exclusive
+    # with declined_release_at — mark_declined drops any snooze entry.
+    timeout_snooze: dict[str, _TimeoutSnooze] = field(default_factory=dict)
 
     def active(self, app_key: str) -> bool:
         return app_key in self.declined_release_at
 
-    def suppressed_keys(self) -> frozenset[str]:
-        """Set of currently-suppressed app_keys.
+    def tracked_keys(self) -> frozenset[str]:
+        """Every app_key with live suppression state (either mechanism) —
+        the set the watcher must tick release streaks for."""
+        return frozenset(self.declined_release_at) | frozenset(self.timeout_snooze)
+
+    def suppressed_keys(self, now_mono: float) -> frozenset[str]:
+        """Set of app_keys suppressed at this instant.
 
         Passed to ``match_whitelist(exclude_app_keys=…)`` so the watcher
         skips suppressed specs entirely instead of finding the first match,
         seeing it's suppressed, and giving up — which let a declined
         background gmeet tab mask a foreground chatgpt-com match (user
         report 2026-04-25).
+
+        Declined apps are always suppressed; timeout-snoozed apps only
+        until their ``refire_at`` passes — after that they're matchable
+        again and the next match fires the re-ask.
         """
-        return frozenset(self.declined_release_at.keys())
+        snoozed = frozenset(
+            key for key, entry in self.timeout_snooze.items()
+            if now_mono < entry.refire_at
+        )
+        return frozenset(self.declined_release_at.keys()) | snoozed
+
+    def pending_refire(self, app_key: str) -> bool:
+        """True if a timeout re-ask is pending for this app — i.e. the
+        next consent toast for it is the follow-up, not the first ask."""
+        return app_key in self.timeout_snooze
+
+    def clear_timeout_snooze(self, app_key: str) -> None:
+        self.timeout_snooze.pop(app_key, None)
 
     def mark_declined(self, app_key: str) -> None:
-        """Mark the app as suppressed (decline OR session end). Cleared by
+        """Mark the app as suppressed for the rest of the meeting (explicit
+        decline, session end, or exhausted re-ask budget). Cleared by
         ``tick_session`` once the app releases the mic for long enough."""
+        # Declined supersedes any pending timeout re-ask.
+        self.timeout_snooze.pop(app_key, None)
         # Start with None — no release streak yet (app may still be holding).
         self.declined_release_at[app_key] = None
+
+    def mark_timeout(
+        self,
+        app_key: str,
+        now_mono: float,
+        *,
+        refire_delay_secs: float,
+        max_refires: int,
+    ) -> bool:
+        """Record a consent-toast timeout for the app.
+
+        Returns True if a re-ask was scheduled (``refire_delay_secs`` from
+        now, budget permitting); False if the budget is exhausted and the
+        app was marked declined for the rest of the meeting instead.
+        ``max_refires=0`` disables re-asks entirely (pre-v3.18 behavior:
+        first timeout → declined).
+        """
+        prior = self.timeout_snooze.get(app_key)
+        timeouts = (prior.timeouts if prior else 0) + 1
+        if timeouts > max_refires:
+            self.mark_declined(app_key)
+            return False
+        self.timeout_snooze[app_key] = _TimeoutSnooze(
+            refire_at=now_mono + refire_delay_secs, timeouts=timeouts,
+        )
+        return True
 
     def tick_session(
         self,
@@ -160,6 +242,37 @@ class _Cooldowns:
             return False
         if now_mono - streak_start >= release_grace_secs:
             del self.declined_release_at[app_key]
+            return True
+        return False
+
+    def tick_snooze(
+        self,
+        app_key: str,
+        now_mono: float,
+        *,
+        holding_mic: bool,
+        release_grace_secs: float,
+    ) -> bool:
+        """Per-poll release tracking for timeout snoozes — same streak
+        semantics as ``tick_session``. Dropping the snooze when the app
+        releases the mic is what prevents (a) a re-ask firing after the
+        meeting already ended and (b) an unfired re-ask leaking into the
+        NEXT meeting — the next mic acquisition starts fresh with a full
+        first-ask + re-ask budget.
+
+        Returns True if the snooze was just dropped this call.
+        """
+        entry = self.timeout_snooze.get(app_key)
+        if entry is None:
+            return False
+        if holding_mic:
+            entry.release_streak_start = None
+            return False
+        if entry.release_streak_start is None:
+            entry.release_streak_start = now_mono
+            return False
+        if now_mono - entry.release_streak_start >= release_grace_secs:
+            del self.timeout_snooze[app_key]
             return True
         return False
 
@@ -928,11 +1041,14 @@ class ArmController:
                     log.debug("[arm] whitelist snapshot failed", exc_info=True)
                     continue
                 now_mono = time.monotonic()
-                # Tick the session-based decline tracker for every declined
-                # app. Clearing happens when the app has been off the mic
-                # for decline_release_grace_secs continuous seconds —
-                # "leaving the meeting counts as a new session".
-                for app_key in list(self._cooldowns.declined_release_at.keys()):
+                # Tick release streaks for every app with suppression
+                # state — declined AND timeout-snoozed. Clearing happens
+                # when the app has been off the mic for
+                # decline_release_grace_secs continuous seconds — "leaving
+                # the meeting counts as a new session". For snoozes this is
+                # also what guarantees a re-ask never fires after the
+                # meeting ended and never carries over into the next one.
+                for app_key in self._cooldowns.tracked_keys():
                     holding = _d.arm_app_still_holding_mic(
                         app_key, self.cfg.detectors, mic, fg,
                     )
@@ -947,12 +1063,24 @@ class ArmController:
                             "fresh prompt on next match)",
                             app_key,
                         )
+                    dropped = self._cooldowns.tick_snooze(
+                        app_key, now_mono,
+                        holding_mic=holding,
+                        release_grace_secs=self.cfg.decline_release_grace_secs,
+                    )
+                    if dropped:
+                        log.info(
+                            "[arm] timeout re-ask dropped for %s (mic "
+                            "released — meeting over; fresh prompt on "
+                            "next match)",
+                            app_key,
+                        )
                 # Skip suppressed app_keys directly inside match_whitelist
                 # so a declined gmeet (still "holding" via background tab)
                 # can't shadow a chatgpt-com match in the foreground —
                 # without this filter the watcher would find gmeet first,
                 # see it's suppressed, and silently bail for the whole poll.
-                suppressed = self._cooldowns.suppressed_keys()
+                suppressed = self._cooldowns.suppressed_keys(now_mono)
                 match = _d.match_whitelist(
                     self.cfg.detectors, fg, mic,
                     exclude_app_keys=suppressed,
@@ -1055,21 +1183,47 @@ class ArmController:
                         # gating event logs again.
                         self._gated_log_keys.clear()
 
-                log.info("[arm] firing consent toast for %s", match.app_key)
-                # Show consent toast.
+                # A pending snooze entry means this match is the timeout
+                # re-ask, not the first ask — use follow-up copy so it
+                # reads as a deliberate second nudge, not a glitchy
+                # duplicate of the toast they already saw.
+                is_reask = self._cooldowns.pending_refire(match.app_key)
+                log.info(
+                    "[arm] firing consent toast for %s%s",
+                    match.app_key, " (re-ask after timeout)" if is_reask else "",
+                )
+                if is_reask:
+                    body = (
+                        f"Still in your {match.display_name} meeting? "
+                        "Want us to capture the rest so we can highlight "
+                        "your coachable moments?"
+                    )
+                else:
+                    body = (
+                        f"Looks like you're in {match.display_name}. "
+                        "Want us to capture this so we can highlight "
+                        "your coachable moments?"
+                    )
+                # default_on_timeout="timeout" (not "no"): the default only
+                # applies on transport failure (HUD dead / respawning), and
+                # a toast the user never SAW should get the re-ask path,
+                # not a whole-meeting suppression.
                 result = await self._ask_consent(
                     "Sayzo is ready to coach you",
-                    f"Looks like you're in {match.display_name}. "
-                    "Want us to capture this so we can highlight your coachable moments?",
+                    body,
                     "Start coaching", "Not now",
                     timeout_secs=self.cfg.consent_toast_timeout_secs,
-                    default_on_timeout="no",
+                    default_on_timeout="timeout",
                 )
                 log.info("[arm] consent toast for %s → %s", match.app_key, result)
                 if self.state != ArmState.DISARMED:
-                    # User armed via hotkey while the toast was up. Drop.
+                    # User armed via hotkey while the toast was up. Drop
+                    # (clearing the snooze so the stale re-ask doesn't
+                    # outlive the user's own decision to arm).
+                    self._cooldowns.clear_timeout_snooze(match.app_key)
                     continue
                 if result == "yes":
+                    self._cooldowns.clear_timeout_snooze(match.app_key)
                     target_pids, mic_device = self._resolve_arm_scope_for_match(match)
                     await self._arm_internal(
                         ArmReason(
@@ -1080,10 +1234,35 @@ class ArmController:
                             mic_device=mic_device,
                         )
                     )
+                elif result == "timeout":
+                    # No answer is ambiguous — the user may simply have had
+                    # their hands full joining the meeting. Schedule one
+                    # re-ask (budget permitting); the watcher only fires it
+                    # if the app still holds the mic at that point.
+                    snoozed = self._cooldowns.mark_timeout(
+                        match.app_key, time.monotonic(),
+                        refire_delay_secs=self.cfg.consent_timeout_refire_delay_secs,
+                        max_refires=self.cfg.consent_timeout_max_refires,
+                    )
+                    if snoozed:
+                        log.info(
+                            "[arm] consent timed out for %s — re-asking in "
+                            "%.0fs if the meeting is still live",
+                            match.app_key,
+                            self.cfg.consent_timeout_refire_delay_secs,
+                        )
+                    else:
+                        log.info(
+                            "[arm] consent timed out for %s with no re-asks "
+                            "left — suppressed for the rest of the meeting",
+                            match.app_key,
+                        )
                 else:
-                    # Decline / timeout → session-based suppression. Clears
-                    # once the app releases the mic; the hotkey still works
-                    # as a manual opt-in in the meantime.
+                    # Explicit "Not now" → session-based suppression for
+                    # the whole meeting (mark_declined also drops any
+                    # pending re-ask). Clears once the app releases the
+                    # mic; the hotkey still works as a manual opt-in in
+                    # the meantime.
                     self._cooldowns.mark_declined(match.app_key)
         except asyncio.CancelledError:
             raise

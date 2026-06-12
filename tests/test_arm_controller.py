@@ -1074,6 +1074,161 @@ async def test_whitelist_decline_stays_active_while_app_flaps():
         pass
 
 
+# ---- consent-toast timeout re-ask (v3.18) ----------------------------
+
+
+async def test_whitelist_consent_timeout_schedules_reask_then_arms():
+    """v3.18: a consent-toast timeout is NOT a decline. It schedules one
+    re-ask after consent_timeout_refire_delay_secs; the re-ask uses
+    follow-up copy and a Yes on it arms normally."""
+    notifier = FakeNotifier()
+    notifier.consent_script = ["timeout", "yes"]
+    ctrl, _, *_ = _make_controller(
+        notifier=notifier,
+        mic_holders=[MicHolder("zoom.exe", 1234)],
+        cfg_overrides={"consent_timeout_refire_delay_secs": 0.3},
+    )
+    ctrl._loop = asyncio.get_running_loop()
+    ctrl._whitelist_task = asyncio.create_task(ctrl._run_whitelist_watcher())
+
+    # First toast fires and times out → snoozed, NOT declined.
+    await asyncio.sleep(0.1)
+    assert ctrl.state == ArmState.DISARMED
+    assert len(notifier.consent_calls) == 1
+    assert "zoom" in ctrl._cooldowns.timeout_snooze
+    assert "zoom" not in ctrl._cooldowns.declined_release_at
+    # Transport failure must route to the re-ask path, not auto-decline.
+    assert notifier.consent_calls[0]["default_on_timeout"] == "timeout"
+    assert "Looks like you're in Zoom" in notifier.consent_calls[0]["body"]
+
+    # After the refire delay, the re-ask fires (zoom still holds the mic)
+    # with follow-up copy, and Yes arms.
+    await asyncio.sleep(0.6)
+    assert len(notifier.consent_calls) == 2
+    assert "Still in your Zoom meeting" in notifier.consent_calls[1]["body"]
+    assert ctrl.state == ArmState.ARMED
+    assert "zoom" not in ctrl._cooldowns.timeout_snooze
+
+    ctrl._whitelist_task.cancel()
+    try:
+        await ctrl._whitelist_task
+    except asyncio.CancelledError:
+        pass
+    await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
+
+
+async def test_whitelist_second_timeout_suppresses_for_rest_of_meeting():
+    """Timeout budget is one re-ask per meeting: a second timeout flips
+    the app to declined (no third toast while it keeps holding the mic)."""
+    notifier = FakeNotifier()
+    notifier.consent_script = ["timeout", "timeout"]
+    ctrl, _, *_ = _make_controller(
+        notifier=notifier,
+        mic_holders=[MicHolder("zoom.exe", 1234)],
+        cfg_overrides={"consent_timeout_refire_delay_secs": 0.05},
+    )
+    ctrl._loop = asyncio.get_running_loop()
+    ctrl._whitelist_task = asyncio.create_task(ctrl._run_whitelist_watcher())
+
+    await asyncio.sleep(0.4)
+    assert ctrl.state == ArmState.DISARMED
+    assert len(notifier.consent_calls) == 2
+    assert "zoom" in ctrl._cooldowns.declined_release_at
+    assert "zoom" not in ctrl._cooldowns.timeout_snooze
+
+    # Still no third toast many polls later.
+    await asyncio.sleep(0.2)
+    assert len(notifier.consent_calls) == 2
+
+    ctrl._whitelist_task.cancel()
+    try:
+        await ctrl._whitelist_task
+    except asyncio.CancelledError:
+        pass
+
+
+async def test_whitelist_timeout_reask_dropped_when_meeting_ends():
+    """Meeting ends during the snooze window → the re-ask never fires
+    (matching requires a live mic-holder) and the snooze state clears via
+    the release streak, so the NEXT meeting starts fresh with first-ask
+    copy and a full budget."""
+    notifier = FakeNotifier()
+    notifier.consent_script = ["timeout", "yes"]
+    ctrl, _, *_ = _make_controller(
+        notifier=notifier,
+        mic_holders=[MicHolder("zoom.exe", 1234)],
+        # Refire far beyond the test horizon — it must never fire here.
+        cfg_overrides={"consent_timeout_refire_delay_secs": 10.0},
+    )
+    ctrl._loop = asyncio.get_running_loop()
+    ctrl._whitelist_task = asyncio.create_task(ctrl._run_whitelist_watcher())
+
+    await asyncio.sleep(0.05)
+    assert "zoom" in ctrl._cooldowns.timeout_snooze
+
+    # Zoom releases the mic (meeting over) → snooze drops after the
+    # release grace, with no re-ask ever fired.
+    ctrl._q_mic_holders = lambda: []
+    await asyncio.sleep(0.2)
+    assert "zoom" not in ctrl._cooldowns.timeout_snooze
+    assert "zoom" not in ctrl._cooldowns.declined_release_at
+    assert len(notifier.consent_calls) == 1
+
+    # A new meeting → fresh FIRST ask (not the follow-up copy) → arms.
+    ctrl._q_mic_holders = lambda: [MicHolder("zoom.exe", 5678)]
+    await asyncio.sleep(0.2)
+    assert len(notifier.consent_calls) == 2
+    assert "Looks like you're in Zoom" in notifier.consent_calls[1]["body"]
+    assert ctrl.state == ArmState.ARMED
+
+    ctrl._whitelist_task.cancel()
+    try:
+        await ctrl._whitelist_task
+    except asyncio.CancelledError:
+        pass
+    await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
+
+
+async def test_whitelist_decline_on_reask_suppresses_and_drops_snooze():
+    """Explicit "Not now" on the re-ask → declined for the rest of the
+    meeting, pending snooze gone, no further toasts."""
+    notifier = FakeNotifier()
+    notifier.consent_script = ["timeout", "no"]
+    ctrl, _, *_ = _make_controller(
+        notifier=notifier,
+        mic_holders=[MicHolder("zoom.exe", 1234)],
+        cfg_overrides={"consent_timeout_refire_delay_secs": 0.05},
+    )
+    ctrl._loop = asyncio.get_running_loop()
+    ctrl._whitelist_task = asyncio.create_task(ctrl._run_whitelist_watcher())
+
+    await asyncio.sleep(0.4)
+    assert ctrl.state == ArmState.DISARMED
+    assert len(notifier.consent_calls) == 2
+    assert "zoom" in ctrl._cooldowns.declined_release_at
+    assert "zoom" not in ctrl._cooldowns.timeout_snooze
+
+    ctrl._whitelist_task.cancel()
+    try:
+        await ctrl._whitelist_task
+    except asyncio.CancelledError:
+        pass
+
+
+def test_cooldowns_mark_timeout_zero_budget_declines_immediately():
+    """max_refires=0 restores pre-v3.18 behavior: first timeout →
+    declined, no snooze scheduled."""
+    from sayzo_agent.arm.controller import _Cooldowns
+
+    cd = _Cooldowns()
+    snoozed = cd.mark_timeout(
+        "zoom", 100.0, refire_delay_secs=120.0, max_refires=0,
+    )
+    assert snoozed is False
+    assert "zoom" in cd.declined_release_at
+    assert "zoom" not in cd.timeout_snooze
+
+
 # ---- meeting-ended watcher ------------------------------------------
 
 
