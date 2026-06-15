@@ -869,26 +869,53 @@ class _HudHostWidget(QWidget):
         has gone fullscreen renders BEHIND the meeting and is never seen
         (``IsWindowVisible`` still reports True — occlusion is invisible to
         that check; see the occlusion probe in :meth:`_log_win_os_state`).
-        Calling ``SetWindowPos(HWND_TOPMOST)`` on every visibility-show
-        re-claims the front of the top-most band. ``SWP_NOACTIVATE`` keeps
-        us from stealing focus from the meeting app (same contract as the
-        rest of the HUD's no-focus-theft design).
+
+        Routed through **pywin32** (``win32gui.SetWindowPos``), NOT raw
+        ``ctypes.windll.user32.SetWindowPos``. The raw-ctypes path shipped
+        through v3.18.0 passed ``HWND_TOPMOST = -1`` with no ``argtypes``; on
+        64-bit Python that ``-1`` is zero-extended to ``0x00000000FFFFFFFF``
+        instead of the sign-extended ``(HWND)-1 = 0xFFFFFFFFFFFFFFFF`` sentinel
+        Windows expects, so EVERY call failed with ``GetLastError() == 1400``
+        (``ERROR_INVALID_WINDOW_HANDLE``) and the toast stayed buried behind
+        the meeting — logged blandly as ``ok=False`` with no error code, which
+        is why it went undiagnosed across v3.12–v3.18.0. pywin32 marshals the
+        handle via ``PyHANDLE`` and gets ``(HWND)-1`` right. Confirmed by live
+        probe on the same hwnd: raw ctypes → errno 1400, pywin32 → success.
+
+        ``SWP_NOACTIVATE`` keeps us from stealing focus from the meeting app
+        (same contract as the rest of the HUD's no-focus-theft design). The
+        ``HWND_NOTOPMOST`` → ``HWND_TOPMOST`` toggle forces a real
+        re-insertion at the front of the top-most band: a bare
+        ``HWND_TOPMOST`` on an already-top-most window can be optimized to a
+        no-op that won't jump above another *recently-raised* top-most window
+        (e.g. a Chrome OAuth popup — the exact case the user hit).
         """
         try:
-            import ctypes
+            import pywintypes  # type: ignore[import-not-found]
+            import win32con  # type: ignore[import-not-found]
+            import win32gui  # type: ignore[import-not-found]
         except Exception:
+            log.warning(
+                "[hud] pywin32 unavailable — topmost re-assert skipped",
+                exc_info=True,
+            )
             return
-        HWND_TOPMOST = -1
-        SWP_NOSIZE = 0x0001
-        SWP_NOMOVE = 0x0002
-        SWP_NOACTIVATE = 0x0010
+        flags = (
+            win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE
+        )
         try:
             hwnd = int(self.winId())
-            ok = ctypes.windll.user32.SetWindowPos(
-                hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            win32gui.SetWindowPos(hwnd, win32con.HWND_NOTOPMOST, 0, 0, 0, 0, flags)
+            win32gui.SetWindowPos(hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0, flags)
+            log.info("[hud] re-asserted HWND_TOPMOST ok")
+        except pywintypes.error as e:
+            # Self-diagnosing: name the real Win32 error instead of the blind
+            # ok=False that hid errno 1400 (ERROR_INVALID_WINDOW_HANDLE) for
+            # three releases.
+            log.warning(
+                "[hud] HWND_TOPMOST re-assert failed winerror=%s (%s)",
+                getattr(e, "winerror", "?"), getattr(e, "strerror", e),
             )
-            log.info("[hud] re-asserted HWND_TOPMOST ok=%s", bool(ok))
         except Exception:
             log.warning("[hud] HWND_TOPMOST re-assert failed", exc_info=True)
 
@@ -1171,8 +1198,24 @@ class _HudHostWidget(QWidget):
                 pass
 
         try:
+            user32 = ctypes.windll.user32
+            user32.SetWinEventHook.argtypes = [
+                wintypes.DWORD,    # eventMin
+                wintypes.DWORD,    # eventMax
+                wintypes.HMODULE,  # hmodWinEventProc
+                WinEventProcType,  # pfnWinEventProc
+                wintypes.DWORD,    # idProcess
+                wintypes.DWORD,    # idThread
+                wintypes.DWORD,    # dwFlags
+            ]
+            # HWINEVENTHOOK is a HANDLE (pointer-width). Without an explicit
+            # restype, ctypes defaults to c_int and truncates the 64-bit
+            # handle, so the value stored in self._win_event_hook can't be
+            # unhooked cleanly on quit (same class of bug as the HWND_TOPMOST
+            # marshalling above, just on the return path).
+            user32.SetWinEventHook.restype = wintypes.HANDLE
             self._win_event_proc = WinEventProcType(_cb)  # keep ref alive
-            self._win_event_hook = ctypes.windll.user32.SetWinEventHook(
+            self._win_event_hook = user32.SetWinEventHook(
                 EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
                 0, self._win_event_proc, 0, 0, WINEVENT_OUTOFCONTEXT,
             )
@@ -1190,7 +1233,13 @@ class _HudHostWidget(QWidget):
             return
         try:
             import ctypes
-            ctypes.windll.user32.UnhookWinEvent(self._win_event_hook)
+            from ctypes import wintypes
+            user32 = ctypes.windll.user32
+            # Match the HANDLE restype set on SetWinEventHook so the full
+            # 64-bit hook handle round-trips instead of a truncated c_int.
+            user32.UnhookWinEvent.argtypes = [wintypes.HANDLE]
+            user32.UnhookWinEvent.restype = wintypes.BOOL
+            user32.UnhookWinEvent(self._win_event_hook)
         except Exception:
             pass
         self._win_event_hook = None
