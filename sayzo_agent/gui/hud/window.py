@@ -18,10 +18,9 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Optional
 from urllib.parse import urlencode
 
-from PySide6.QtCore import QObject, QRect, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QRect, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QCursor, QGuiApplication
 from PySide6.QtWebChannel import QWebChannel
 from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -431,7 +430,7 @@ class _HudHostWidget(QWidget):
             if self._view is not None:
                 self._view.update()
             resize_count_delta = self._n_resize_events - resize_count_before
-            log.info(
+            log.debug(
                 "[hud] window visibility → shown (pos=%d,%d size=%dx%d resize_events=%d)",
                 int(x), int(y), self._current_width, self._current_height,
                 resize_count_delta,
@@ -484,7 +483,7 @@ class _HudHostWidget(QWidget):
             # the previous arm cycle.
             self._anchor_right_x = self._screen_right_edge
             self._anchor_y = self._screen_top_edge
-            log.info(
+            log.debug(
                 "[hud] window visibility → hidden (per-pixel alpha will paint transparent)",
             )
             # Window is now content-empty — let clicks pass through to
@@ -523,7 +522,7 @@ class _HudHostWidget(QWidget):
             )
         finally:
             self._suppress_anchor_update = False
-        log.info(
+        log.debug(
             "[hud] window size → %dx%d at (%d,%d) (visible=%s)",
             self._current_width, self._current_height,
             int(x), int(y), self._currently_visible,
@@ -679,7 +678,7 @@ class _HudHostWidget(QWidget):
         geom = screen.availableGeometry()
         right_x = geom.right() - HUD_EDGE_INSET
         top_y = geom.top() + HUD_EDGE_INSET
-        log.info(
+        log.debug(
             "[hud] screen anchor: name=%s availableGeometry=(%d,%d %dx%d) "
             "cursor=(%d,%d) → right_x=%d top_y=%d",
             screen.name(),
@@ -829,7 +828,7 @@ class _HudHostWidget(QWidget):
             return
         try:
             ns_window.setIgnoresMouseEvents_(bool(ignore))
-            log.info("[hud] setIgnoresMouseEvents_(%s) ok", ignore)
+            log.debug("[hud] setIgnoresMouseEvents_(%s) ok", ignore)
         except Exception:
             log.warning("[hud] setIgnoresMouseEvents_ failed", exc_info=True)
 
@@ -952,7 +951,7 @@ class _HudHostWidget(QWidget):
             return
         try:
             ns_window.orderFrontRegardless()
-            log.info("[hud] orderFrontRegardless ok")
+            log.debug("[hud] orderFrontRegardless ok")
         except Exception:
             log.warning("[hud] orderFrontRegardless failed", exc_info=True)
 

@@ -88,7 +88,7 @@ def main() -> int:
     # if PyInstaller fails to pick them up later.
     import comtypes
     gen_dir = next(
-        (p for p in comtypes.__path__ for sub in ["gen"] if (p_ := p)),
+        (p for p in comtypes.__path__ for sub in ["gen"] if p),
         None,
     )
     if gen_dir:

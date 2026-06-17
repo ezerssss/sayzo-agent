@@ -5,11 +5,9 @@ and ``MicState`` inputs. No OS calls, no real pycaw / CoreAudio.
 """
 from __future__ import annotations
 
-import pytest
 
 from sayzo_agent.arm.detectors import (
     ForegroundInfo,
-    MatchResult,
     MicHolder,
     MicState,
     arm_app_still_holding_mic,

@@ -31,10 +31,19 @@ import asyncio
 import logging
 import sys
 import time
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from ._utils import drain_queue as _drain_queue_fn
+from .queue_guard import FrameQueueGuard
+
+if TYPE_CHECKING:
+    # sounddevice is lazy-imported inside the PortAudio methods (see the
+    # module docstring) to avoid loading the C library at boot. This
+    # TYPE_CHECKING import resolves the `sd.InputStream` annotation for
+    # linters/type-checkers without the runtime cost.
+    import sounddevice as sd
 
 # ``sounddevice`` is imported inside the methods that touch PortAudio
 # (``_resolve_device_index`` + ``MicCapture.start``). Loading it eagerly
@@ -122,6 +131,12 @@ class MicCapture:
         self.frame_duration = self.frame_samples / sample_rate
         self.device = device
         self.queue: asyncio.Queue[tuple[float, np.ndarray]] = asyncio.Queue(maxsize=queue_maxsize)
+        # Drop-on-full guard: a full queue means the consumer fell behind
+        # (transient loop stall). Dropping silently with a throttled summary
+        # beats letting put_nowait raise QueueFull into asyncio's default
+        # handler, which dumped a traceback + the full numpy frame for every
+        # dropped frame. See capture/queue_guard.py.
+        self._enqueue = FrameQueueGuard(self.queue, label="mic")
         self._stream: sd.InputStream | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         # Offset between "callback fires" and "first sample in indata was
@@ -179,7 +194,7 @@ class MicCapture:
         if self._resample_fn is not None:
             mono = self._resample_fn(mono)
         try:
-            loop.call_soon_threadsafe(self.queue.put_nowait, (capture_mono_ts, mono))
+            loop.call_soon_threadsafe(self._enqueue.put, (capture_mono_ts, mono))
         except RuntimeError:
             pass
 

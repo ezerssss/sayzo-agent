@@ -244,7 +244,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 1
 
     print(f"Spawned child PID: {child_pid}")
-    print(f"Sleeping 3s for Cocoa initialization...")
+    print("Sleeping 3s for Cocoa initialization...")
     time.sleep(3)
 
     # Check if process is still alive
@@ -291,7 +291,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     print()
     print(f"Sleeping {args.wait}s — watch top-right of screen for HUD demo content.")
-    print(f"Ctrl+C to quit early.")
+    print("Ctrl+C to quit early.")
     try:
         time.sleep(args.wait)
     except KeyboardInterrupt:

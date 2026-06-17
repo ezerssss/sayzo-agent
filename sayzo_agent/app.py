@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -640,9 +639,14 @@ class Agent:
             for r in eg_report.per_segment:
                 lag_ms = int(round(r.lag_samples * 1000.0 / sr))
                 if r.echo_spans:
-                    # Already-dropped segments — one log line per echo span.
+                    # Already-dropped segments — one line per echo span.
+                    # DEBUG: per-segment detail is ~hundreds of lines per
+                    # session (the bulk of echo_guard's log volume). The
+                    # INFO summary above carries the counts, and the dropped
+                    # spans are persisted to record.json::metadata.echo_guard,
+                    # so this is recoverable via SAYZO_LOG_LEVEL=DEBUG.
                     for es, ee in r.echo_spans:
-                        log.info(
+                        log.debug(
                             "[echo_guard]   drop %.2f-%.2fs coh=%.2f "
                             "resid_speech_p=%.2f lag=%dms xcorr=%.2f "
                             "rms_mic=%.3f rms_sys=%.3f reason=%s",
@@ -658,8 +662,9 @@ class Agent:
                     # with AEC decorrelating bleed from sys, echo_guard's
                     # coherence check can stop firing even when bleed is
                     # audible. We need to SEE the scores to know if a
-                    # threshold tweak is warranted.
-                    log.info(
+                    # threshold tweak is warranted. DEBUG — see the drop
+                    # branch above (recoverable via SAYZO_LOG_LEVEL=DEBUG).
+                    log.debug(
                         "[echo_guard]   keep %.2f-%.2fs coh=%.2f "
                         "resid_speech_p=%.2f lag=%dms xcorr=%.2f "
                         "rms_mic=%.3f rms_sys=%.3f reason=%s",
@@ -843,8 +848,40 @@ class Agent:
 
     # ---- lifecycle ---------------------------------------------------------
 
+    @staticmethod
+    def _loop_exception_handler(loop, context) -> None:
+        """Asyncio exception handler — backstop that suppresses the
+        capture-queue ``QueueFull`` flood and delegates everything else.
+
+        A ``QueueFull`` raised by a scheduled ``Queue.put_nowait`` callback
+        means a capture frame was dropped because the consumer fell behind.
+        The producers now guard their own puts (``capture/queue_guard.py``),
+        so this should rarely fire — but if any unguarded ``put_nowait`` path
+        remains, asyncio's *default* handler would log a full traceback
+        **including the numpy frame repr** for every dropped frame (~63k
+        lines / 97% of one production log). Drop those silently here; route
+        every other exception to the default handler so real errors surface.
+        """
+        exc = context.get("exception")
+        if isinstance(exc, asyncio.QueueFull):
+            # Don't route to the default handler (it would repr the callback
+            # args — incl. the numpy frame — once per dropped frame). But log
+            # at DEBUG rather than swallow silently, so this can't hide an
+            # unrelated QueueFull regression: invisible at the production INFO
+            # level, recoverable with SAYZO_LOG_LEVEL=DEBUG.
+            log.debug("[loop] suppressed QueueFull from a put_nowait callback")
+            return
+        loop.default_exception_handler(context)
+
     async def run(self) -> None:
         self.cfg.ensure_dirs()
+
+        # Install the loop exception handler before any capture task starts.
+        # Belt-and-suspenders with the producer-side drop guard so a stray
+        # QueueFull can never flood agent.log with numpy-array tracebacks.
+        asyncio.get_running_loop().set_exception_handler(
+            self._loop_exception_handler
+        )
 
         # Drain any unuploaded captures from prior runs (failed transients,
         # stuck in_flight records, legacy records from before upload-state

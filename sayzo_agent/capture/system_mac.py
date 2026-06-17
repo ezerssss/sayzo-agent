@@ -44,6 +44,7 @@ import numpy as np
 from scipy.signal import resample_poly
 
 from ._utils import drain_queue as _drain_queue_fn
+from .queue_guard import FrameQueueGuard
 
 log = logging.getLogger(__name__)
 
@@ -155,6 +156,10 @@ class SystemCapture:
         self.frame_duration = self.frame_samples / sample_rate
         self.system_scope = system_scope  # "arm_app" | "endpoint"
         self.queue: asyncio.Queue[tuple[float, np.ndarray]] = asyncio.Queue(maxsize=queue_maxsize)
+        # Drop-on-full guard (see capture/queue_guard.py). The reader is an
+        # on-loop async task, so it calls put() directly. Unified with mic +
+        # Windows so all three producers share one throttled drop-log shape.
+        self._enqueue = FrameQueueGuard(self.queue, label="system")
 
         if device is not None:
             log.warning(
@@ -442,10 +447,7 @@ class SystemCapture:
                     frame = resampled[pos : pos + self.frame_samples]
                     frame_mono = batch_first_mono + (pos / self.sample_rate)
                     pos += self.frame_samples
-                    try:
-                        self.queue.put_nowait((frame_mono, frame))
-                    except asyncio.QueueFull:
-                        log.warning("system queue full, dropping frame")
+                    self._enqueue.put((frame_mono, frame))
 
         except asyncio.CancelledError:
             raise

@@ -68,7 +68,6 @@ def main() -> int:
     dur = float(sys.argv[1]) if len(sys.argv) > 1 else 1.0
     overlay_secs = int(round(dur * SR))
     overlay_start = 18  # sec
-    overlay_end_int = 18 + max(1, int(round(dur)))  # for the per-sec table
 
     diag = Path.home() / ".sayzo" / "agent" / "aec-diag" / "ceec9db3797a"
 

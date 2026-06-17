@@ -15,10 +15,9 @@ import asyncio
 import time
 from typing import Any, Optional
 
-import pytest
 
 from sayzo_agent.arm.controller import ArmController, ArmReason, ArmState
-from sayzo_agent.arm.detectors import ForegroundInfo, MicHolder, MicState
+from sayzo_agent.arm.detectors import ForegroundInfo, MicHolder
 from sayzo_agent.config import ArmConfig, ConversationConfig, DetectorSpec, default_detector_specs
 from sayzo_agent.conversation import ConversationDetector, SessionState
 from sayzo_agent.models import SessionCloseReason, SpeechSegment
@@ -170,6 +169,15 @@ def _make_controller(
         is_mic_active=lambda: mic_active,
         get_running_processes=lambda: running or frozenset(),
         get_foreground_info=lambda: foreground or ForegroundInfo(),
+        # Inject empty browser-title / URL queries so _snapshot_foreground
+        # doesn't fall through to the REAL platform queries and read the
+        # test machine's actual Chrome tabs (non-hermetic) — and, on
+        # Windows, pay the ~0.5 s UIAutomation enumeration. Mirrors
+        # test_whitelist_arm_uses_resolver_when_match_has_no_pids. Now that
+        # the watcher snapshots run off-loop (run_in_executor), that real
+        # query would resolve concurrently and race the test's fixed sleep.
+        get_browser_window_titles=lambda: [],
+        get_browser_window_urls=lambda: [],
         system_scope_fn=lambda: system_scope,
     )
     return ctrl, detector, mic, sys_cap, vad_m, vad_s, notifier
@@ -2134,3 +2142,47 @@ async def test_session_wrapped_notify_skipped_when_disabled():
         await ctrl._whitelist_task
     except asyncio.CancelledError:
         pass
+
+
+# ---- off-loop snapshots (v3.20 QueueFull-storm fix) -------------------
+
+
+async def test_async_snapshot_runs_off_event_loop():
+    """A slow platform snapshot must NOT freeze the event loop.
+
+    Regression guard for the QueueFull storm: running the macOS audio-detect
+    subprocess snapshot directly on the loop blocked it ~1.9 s/poll, starving
+    the capture-queue consumer. The watchers now await the snapshot via
+    run_in_executor; this proves a blocking snapshot lets concurrent loop
+    work proceed.
+    """
+    import time as _time
+
+    ctrl, *_ = _make_controller()
+    ctrl._loop = asyncio.get_running_loop()
+
+    def _slow_holders():
+        _time.sleep(0.15)  # blocking, like a real audio-detect call
+        return []
+
+    ctrl._q_mic_holders = _slow_holders  # type: ignore[assignment]
+
+    counter = 0
+
+    async def _spin():
+        nonlocal counter
+        while True:
+            counter += 1
+            await asyncio.sleep(0.005)
+
+    spinner = asyncio.create_task(_spin())
+    await ctrl._async_snapshot_mic_state()
+    spinner.cancel()
+    try:
+        await spinner
+    except asyncio.CancelledError:
+        pass
+
+    # If the snapshot had run on the loop, the spinner would have been frozen
+    # for the whole 0.15 s (~0 ticks). Off-loop, it advances many times.
+    assert counter > 5

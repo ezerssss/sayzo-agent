@@ -86,7 +86,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-import time
 from typing import Optional
 
 from PySide6.QtCore import Qt, QTimer, QUrl

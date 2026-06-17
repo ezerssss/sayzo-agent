@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import logging
 
-import click
 from rich.console import Console
 from rich.panel import Panel
 

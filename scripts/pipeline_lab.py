@@ -63,7 +63,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from sayzo_agent.aec import cancel_echo
 from sayzo_agent.capture.mic import MicCapture
 from sayzo_agent.config import AecConfig, ConversationConfig
-from sayzo_agent.conversation import ConversationDetector, SessionState
+from sayzo_agent.conversation import ConversationDetector
 from sayzo_agent.dsp import (
     _apply_highpass,
     _denoise,

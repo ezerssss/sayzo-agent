@@ -7,13 +7,11 @@ schedule, the status gating, and the no-auth-client no-op fallback.
 """
 from __future__ import annotations
 
-import asyncio
 import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Optional
 
 import httpx
 import pytest

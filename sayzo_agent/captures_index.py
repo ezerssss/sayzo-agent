@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 import re
 import shutil
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -28,7 +28,6 @@ from .retry import (
     STATUS_PENDING,
     STATUS_UPLOADED,
 )
-from .sink import deserialize_record
 from .upload_retry import read_record_from_dir, write_record_atomic
 
 log = logging.getLogger(__name__)

@@ -271,11 +271,13 @@ def get_mic_holders() -> list[MicHolder]:
     """
     try:
         fut = _get_com_executor().submit(_mic_holders_on_com_thread)
-        # 2 s matches the watcher's poll interval. The result is awaited
-        # SYNCHRONOUSLY on the asyncio loop (controller._snapshot_mic_state),
-        # so a longer bound would stall the loop — and hotkey / consent-toast
-        # handling with it — for that whole duration. If a single query
-        # overruns a full poll, skip this round rather than stack queries.
+        # 2 s matches the watcher's poll interval. As of v3.20 the controller
+        # calls this off the event loop (controller._async_snapshot_mic_state
+        # → run_in_executor), so a slow query no longer stalls the asyncio
+        # loop — but the bound still caps how long a worker thread blocks
+        # here, and skipping a round beats stacking queries when one overruns
+        # a full poll. (Pre-v3.20 this ran synchronously ON the loop, which is
+        # what caused the QueueFull storm; don't reintroduce that call site.)
         return fut.result(timeout=2.0)
     except (TimeoutError, FuturesTimeoutError):
         # Routine slow enumeration — NOT a crash, so no traceback (it was

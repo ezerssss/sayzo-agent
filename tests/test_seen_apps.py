@@ -16,8 +16,7 @@ from pathlib import Path
 import pytest
 
 from sayzo_agent.arm import seen_apps
-from sayzo_agent.arm.seen_apps import SeenApp
-from sayzo_agent.config import DetectorSpec, default_detector_specs
+from sayzo_agent.config import DetectorSpec
 
 
 def _whitelist_loom() -> list[DetectorSpec]:

@@ -15,7 +15,6 @@ import httpx
 import pytest
 
 from sayzo_agent.account.status import (
-    AccountStatusResponse,
     fetch_account_status,
 )
 from sayzo_agent.auth.client import AuthenticatedClient

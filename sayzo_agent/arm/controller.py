@@ -1009,7 +1009,7 @@ class ArmController:
             and reason is not None
             and reason.source == "whitelist"
             and reason.app_key
-            and self._arm_app_confirmed_holding(reason.app_key)
+            and await self._arm_app_confirmed_holding(reason.app_key)
         ):
             now0 = time.monotonic()
             # Safety cap: a session the app has held open for a long time with
@@ -1091,10 +1091,22 @@ class ArmController:
                 if self.state != ArmState.DISARMED:
                     continue
                 try:
-                    mic = self._snapshot_mic_state()
-                    fg = self._snapshot_foreground()
+                    # Gather both off-loop so mic-holders and the foreground
+                    # tab are sampled at ~the same instant — match_whitelist
+                    # correlates fg.browser_tab_url against a browser PID in
+                    # mic.holders, so sampling them seconds apart could
+                    # mis-correlate during a tab switch.
+                    mic, fg = await asyncio.gather(
+                        self._async_snapshot_mic_state(),
+                        self._async_snapshot_foreground(),
+                    )
                 except Exception:
                     log.debug("[arm] whitelist snapshot failed", exc_info=True)
+                    continue
+                # Snapshots ran off-loop (run_in_executor) — an arm
+                # (hotkey/other) could have landed while we awaited, so
+                # re-check before acting on a now-stale DISARMED view.
+                if self.state != ArmState.DISARMED or self._stop.is_set():
                     continue
                 now_mono = time.monotonic()
                 # Tick release streaks for every app with suppression
@@ -1175,27 +1187,41 @@ class ArmController:
                             )
                             if throttle_ok:
                                 last_no_match_log_at = now_mono
-                                sig_titles = tuple(
-                                    sorted({
-                                        fg.browser_tab_title or "",
-                                        fg.window_title or "",
-                                        *fg.browser_window_titles,
-                                    } - {""})
-                                )
+                                # INFO line is content-free by design:
+                                # holder/foreground BUNDLE IDS + counts
+                                # only. Window titles + tab URLs are user
+                                # browsing content (Gmail subjects, search
+                                # queries, watch URLs) and MUST NOT land in
+                                # agent.log — it's uploaded by the
+                                # diagnostics feature, which contracts the
+                                # log as PII-free (see diagnostics.py). The
+                                # full detail goes to DEBUG, recoverable
+                                # locally via SAYZO_LOG_LEVEL=DEBUG.
                                 log.info(
                                     "[arm] no whitelist match: holders=%s "
-                                    "fg.bundle=%s fg.is_browser=%s "
-                                    "tab_title=%r win_titles=%r url=%r — "
+                                    "fg.bundle=%s fg.is_browser=%s — "
                                     "active_specs=%d (suppressed=%d)",
                                     list(holder_summary) or "[]",
                                     fg.bundle_id,
                                     fg.is_browser,
-                                    fg.browser_tab_title,
-                                    list(sig_titles),
-                                    fg.browser_tab_url,
                                     len(self.cfg.detectors),
                                     len(suppressed),
                                 )
+                                if log.isEnabledFor(logging.DEBUG):
+                                    sig_titles = tuple(
+                                        sorted({
+                                            fg.browser_tab_title or "",
+                                            fg.window_title or "",
+                                            *fg.browser_window_titles,
+                                        } - {""})
+                                    )
+                                    log.debug(
+                                        "[arm] no whitelist match detail: "
+                                        "tab_title=%r win_titles=%r url=%r",
+                                        fg.browser_tab_title,
+                                        list(sig_titles),
+                                        fg.browser_tab_url,
+                                    )
                     elif last_no_match_signature is not None:
                         last_no_match_signature = None
                     self._record_unmatched_holders(mic, fg)
@@ -1388,13 +1414,23 @@ class ArmController:
                 except asyncio.CancelledError:
                     return
                 try:
-                    mic = self._snapshot_mic_state()
-                    fg = self._snapshot_foreground()
+                    # Only the mic-holder snapshot is needed here:
+                    # arm_app_still_holding_mic ignores its foreground arg
+                    # (the holder check is purely mic.holders), so we skip the
+                    # foreground snapshot entirely rather than pay a second
+                    # off-loop query every 2 s for an unused value. Running
+                    # this on the loop (pre-v3.20) blocked it ~1.9 s on the
+                    # macOS audio-detect subprocess, starving app._consume and
+                    # causing the QueueFull storm + dropped mic audio.
+                    mic = await self._async_snapshot_mic_state()
                 except Exception:
                     log.debug("[arm] meeting-ended snapshot failed", exc_info=True)
                     continue
+                # The await may have spanned a disarm/close, so re-check.
+                if self.state != ArmState.ARMED or self._stop.is_set():
+                    return
                 still = _d.arm_app_still_holding_mic(
-                    reason.app_key, self.cfg.detectors, mic, fg,
+                    reason.app_key, self.cfg.detectors, mic, ForegroundInfo(),
                 )
                 if still:
                     grace = 0.0
@@ -1864,7 +1900,31 @@ class ArmController:
             browser_window_urls=tuple(urls),
         )
 
-    def _arm_app_confirmed_holding(self, app_key: str) -> bool:
+    async def _async_snapshot_mic_state(self) -> MicState:
+        """Off-loop variant of :meth:`_snapshot_mic_state`.
+
+        The mic-holder query shells out to the macOS ``audio-detect``
+        helper via ``subprocess.run(timeout=1.9s)`` (and on Windows hops
+        the COM executor). Running it directly inside a 2 s polling
+        coroutine blocked the event loop ~1.9 s of every 2 s, starving
+        the capture-queue consumer (``app._consume``) — the root cause of
+        the ``asyncio QueueFull`` storm and the dropped mic audio. Hop it
+        onto the default executor so the loop keeps draining frames.
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._snapshot_mic_state)
+
+    async def _async_snapshot_foreground(self) -> ForegroundInfo:
+        """Off-loop variant of :meth:`_snapshot_foreground`.
+
+        Synchronous AX / NSWorkspace reads (and Windows UIAutomation tab
+        reads) can stall on a busy browser; same loop-starvation hazard
+        as :meth:`_async_snapshot_mic_state`, so it runs in the executor.
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._snapshot_foreground)
+
+    async def _arm_app_confirmed_holding(self, app_key: str) -> bool:
         """Fail-safe mic-holder check for the joint-silence defer gate in
         :meth:`_handle_pending_close`.
 
@@ -1885,9 +1945,15 @@ class ArmController:
         close+suppress here. ``arm_app_still_holding_mic`` ignores its
         ``foreground`` arg for the mic-holder check, so we pass an empty
         ``ForegroundInfo`` rather than pay for a second blocking snapshot.
+
+        Runs the snapshot off-loop: this gate fires from the async
+        ``_handle_pending_close`` while a whitelist session is ARMED and still
+        capturing, so a synchronous on-loop snapshot would stall the loop
+        ~1.9 s (macOS audio-detect) right at end-of-meeting — the same
+        consumer-starvation that the watcher fix removes.
         """
         try:
-            mic = self._snapshot_mic_state()
+            mic = await self._async_snapshot_mic_state()
         except Exception:
             log.debug(
                 "[arm] defer-gate mic snapshot failed; keeping session open",

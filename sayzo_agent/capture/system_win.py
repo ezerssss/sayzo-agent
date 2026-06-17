@@ -27,6 +27,7 @@ from math import gcd
 import numpy as np
 
 from ._utils import drain_queue as _drain_queue_fn
+from .queue_guard import FrameQueueGuard
 
 # pyaudiowpatch + scipy.signal are imported inside ``_run`` instead of at
 # module load. Both are only needed once the capture thread spins up (i.e.
@@ -65,6 +66,10 @@ class SystemCapture:
         self.system_scope = system_scope  # "arm_app" | "endpoint"
         self.silence_pump_enabled = silence_pump_enabled
         self.queue: asyncio.Queue[tuple[float, np.ndarray]] = asyncio.Queue(maxsize=queue_maxsize)
+        # Drop-on-full guard (see capture/queue_guard.py) — replaces the old
+        # bare put_nowait that surfaced QueueFull as asyncio "Exception in
+        # callback" spam when the consumer fell behind.
+        self._enqueue = FrameQueueGuard(self.queue, label="system")
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
@@ -285,17 +290,18 @@ class SystemCapture:
                 # time.
                 if self._loop is None:
                     continue
-                # ``call_soon_threadsafe`` doesn't raise QueueFull — the
-                # put_nowait runs on the event loop and any QueueFull
-                # surfaces there as an asyncio "Exception in callback"
-                # log line. We don't try/except here.
+                # Enqueue via the drop-on-full guard (runs the put_nowait on
+                # the loop thread). A full queue means the consumer fell
+                # behind; the guard drops + emits a throttled summary instead
+                # of letting QueueFull surface as asyncio "Exception in
+                # callback" spam (the pre-fix behavior documented here).
                 pos = 0
                 while pos + self.frame_samples <= len(samples):
                     frame = samples[pos : pos + self.frame_samples]
                     frame_mono = batch_first_sample_mono + (pos / self.sample_rate)
                     pos += self.frame_samples
                     self._loop.call_soon_threadsafe(
-                        self.queue.put_nowait, (frame_mono, frame)
+                        self._enqueue.put, (frame_mono, frame)
                     )
 
         except Exception:

@@ -7,9 +7,29 @@ on:
 
 jobs:
   # -----------------------------------------------------------------------
+  # Lint gate — fast static analysis, runs before the build matrix.
+  # Added after a `NameError: name 'log' is not defined` in the OS-shutdown
+  # handler shipped to production: no linter ran anywhere (v3.20.0). Ruff's
+  # pyflakes rules (F821 undefined-name etc.) catch that exact class for
+  # free. Config + rule set live in pyproject.toml [tool.ruff].
+  # -----------------------------------------------------------------------
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ruff
+        run: pip install ruff
+      - name: Ruff check (F821 undefined-name + pyflakes)
+        run: ruff check .
+
+  # -----------------------------------------------------------------------
   # Windows
   # -----------------------------------------------------------------------
   build-windows:
+    needs: lint
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -112,6 +132,7 @@ jobs:
   # macOS
   # -----------------------------------------------------------------------
   build-macos:
+    needs: lint
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4

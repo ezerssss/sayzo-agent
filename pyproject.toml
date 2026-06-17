@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sayzo-agent"
-version = "3.19.0"
+version = "3.20.0"
 description = "Armed-only capture agent for Sayzo — records meetings on user consent (hotkey or whitelisted meeting app), uploads raw stereo OGG Opus to the server, polls for the post-transcription title/summary."
 requires-python = ">=3.10"
 dependencies = [
@@ -96,6 +96,7 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "ruff>=0.15",
 ]
 
 [project.scripts]
@@ -111,3 +112,23 @@ sayzo_agent = ["data/*.onnx"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+# Scoped to the BUG class that shipped a NameError to production: pyflakes
+# (F) catches undefined names (F821 — the exact `log` bug), unused imports
+# / variables (F401 / F841), f-string mistakes, and redefinitions; E9
+# catches syntax / IO errors. Pycodestyle style rules (E/W) and import
+# sorting (I) are deliberately NOT enabled yet — there are ~220 pre-existing
+# cosmetic hits, and gating CI on those now would bury the correctness
+# signal. They can be layered in later without blocking this gate.
+select = ["E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests bind helper locals that are kept alive deliberately (stubs that must
+# not be GC'd, timers, fakes) and read oddly as "unused". Don't gate CI on
+# F841 there — but F821 (undefined-name, the bug this gate exists for) and
+# E9 still apply to tests.
+"tests/**" = ["F841"]

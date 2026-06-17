@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-import pytest
 
 from sayzo_agent.gui.settings.ipc import IPCClient, IPCServer, Methods
 

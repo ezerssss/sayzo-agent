@@ -97,10 +97,8 @@ from __future__ import annotations
 
 import argparse
 import os
-import shutil
 import subprocess
 import sys
-from typing import Optional
 
 
 _LAUNCHSERVICES_ENV_PREFIXES = (
@@ -302,11 +300,11 @@ def main() -> int:
         # Process exists but we can't signal it — still try to query
         pass
 
-    print(f"# macOS process state capture")
+    print("# macOS process state capture")
     print(f"# Target PID: {pid}")
     print(f"# Captured at: {_run_cmd('date')}")
     print(f"# Probe pid: {os.getpid()}  uid: {os.getuid()}  euid: {os.geteuid()}")
-    print(f"# (Note: lsmp + some launchctl details may need sudo for full output.)")
+    print("# (Note: lsmp + some launchctl details may need sudo for full output.)")
 
     print(_section("1. PROCESS TREE (ps -o pid,ppid,pgid,sid,...)"))
     print(capture_process_tree(pid))

@@ -44,7 +44,11 @@ import os
 import sys
 import time
 import uuid
-from concurrent.futures import Future, InvalidStateError
+from concurrent.futures import (
+    Future,
+    InvalidStateError,
+    TimeoutError as FuturesTimeout,
+)
 from typing import Any, Callable, Literal, Optional
 
 log = logging.getLogger(__name__)
@@ -108,6 +112,9 @@ _QUIT_PAINT_LINGER_SECS = 1.0
 # the normal respawn ladder takes over. Detection latency is therefore
 # (_MISSED_PONGS_BEFORE_KILL + 1) * heartbeat_secs worst-case.
 _MISSED_PONGS_BEFORE_KILL = 2
+
+# Throttle window for the "subprocess down — dropping payload" summary log.
+_DOWN_DROP_LOG_INTERVAL_SECS = 5.0
 
 
 def _hud_subprocess_argv() -> list[str]:
@@ -190,6 +197,12 @@ class HudLauncher:
         # Readiness — flipped when the subprocess writes ``hud_ready``.
         self._ready_event = asyncio.Event()
         self._reader_task: Optional[asyncio.Task] = None
+        # Throttle for the "subprocess down — dropping payload" log. A HUD
+        # death mid-session produced a 53-line burst in 5 s (one per dropped
+        # pill-frame during the respawn window); collapse it to a periodic
+        # summary so the signal survives without the flood.
+        self._down_drop_count = 0
+        self._down_drop_last_log: float = 0.0
         # Lock for the synchronous-write path. The stdin pipe itself is
         # only safe to drain from the loop thread.
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -261,11 +274,14 @@ class HudLauncher:
     async def wait_for_ready(self, timeout_secs: float = 15.0) -> bool:
         """Block until the subprocess emits ``hud_ready`` or timeout.
 
-        Returns ``True`` on success, ``False`` on timeout. Callers that
-        need the HUD to be visible before a high-stakes consent prompt
-        should await this with a reasonable timeout. Callers issuing
-        fire-and-forget toasts don't need to wait — the subprocess
-        buffers commands that arrive before the React app mounts.
+        Returns ``True`` on success, ``False`` on timeout. Await this before
+        firing a toast/card right after ``start()`` (e.g. the post-upgrade
+        toast): until the subprocess exists AND has handshaked ``hud_ready``,
+        ``_send`` hits ``_proc is None`` and DROPS the payload. The child
+        only buffers commands that arrive after its process is up but before
+        ``loadFinished`` — it can't catch anything sent before it's spawned,
+        so "fire-and-forget is always safe" was wrong (it dropped the
+        post-update toast on every auto-update).
         """
         if self._given_up:
             return False
@@ -751,10 +767,25 @@ class HudLauncher:
                 # state replay (pill via hud_ready, consents via their
                 # waiter timeouts) cover what was dropped.
                 if not self._given_up:
-                    log.info(
-                        "[hud] _send: subprocess down — dropping payload, "
-                        "respawn scheduled",
-                    )
+                    # Throttle: a HUD death mid-session drops one payload per
+                    # high-frequency pill-frame, which produced a 53-line burst
+                    # in 5 s. Log the FIRST drop of a burst immediately, then a
+                    # running summary every interval. The counter is reset on
+                    # the next successful send (recovery, below), so each new
+                    # down-burst logs its first drop right away.
+                    self._down_drop_count += 1
+                    now = time.monotonic()
+                    if (
+                        self._down_drop_count == 1
+                        or now - self._down_drop_last_log
+                        >= _DOWN_DROP_LOG_INTERVAL_SECS
+                    ):
+                        log.info(
+                            "[hud] _send: subprocess down — dropped %d "
+                            "payload(s), respawn scheduled",
+                            self._down_drop_count,
+                        )
+                        self._down_drop_last_log = now
                     self._ensure_respawn_scheduled()
                 return
             proc = self._proc
@@ -763,6 +794,10 @@ class HudLauncher:
             try:
                 proc.stdin.write(line)
                 await proc.stdin.drain()
+                # Successful send → HUD is up. Reset the down-drop counter so
+                # the next down-burst logs its first drop immediately rather
+                # than folding into a stale count from an earlier incident.
+                self._down_drop_count = 0
             except (BrokenPipeError, ConnectionResetError):
                 log.info("[hud] pipe broken — letting reader handle respawn")
             except Exception:
@@ -908,8 +943,17 @@ class HudLauncher:
             )
             log.info("[notify] ask resolved: title=%r → %s", title, answer)
             return answer
-        except Exception:
-            log.warning("[notify] ask_consent waiter raised", exc_info=True)
+        except Exception as exc:
+            # A consent timeout is EXPECTED (user didn't answer in the
+            # window) — log a one-liner, not a scary stack trace. Only
+            # genuinely unexpected waiter failures get a traceback.
+            if isinstance(exc, FuturesTimeout):
+                log.info(
+                    "[notify] ask_consent timed out (%.0fs) — title=%r → %s",
+                    timeout_secs, title, default_on_timeout,
+                )
+            else:
+                log.warning("[notify] ask_consent waiter raised", exc_info=True)
             self._pending_cards.pop(request_id, None)
             self._clear_pending_show_tracking(request_id)
             # Tell React to hide the card so it doesn't linger past

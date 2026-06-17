@@ -205,12 +205,12 @@ def _probe_browser(short_name: str, skip_applescript: bool) -> None:
     pids = _pids_for_bundle(bundle)
     print(f"\n=== {display}  ({bundle}) ===")
     if not pids:
-        print(f"  not running")
+        print("  not running")
         return
     print(f"  pids: {pids}")
     pid = pids[0]
 
-    print(f"  Method A (AX text-field walk): ", end="", flush=True)
+    print("  Method A (AX text-field walk): ", end="", flush=True)
     try:
         a = method_a_addressbar_walk(pid)
     except Exception as exc:
@@ -219,7 +219,7 @@ def _probe_browser(short_name: str, skip_applescript: bool) -> None:
     else:
         print(repr(a))
 
-    print(f"  Method B (AX WebArea URL):     ", end="", flush=True)
+    print("  Method B (AX WebArea URL):     ", end="", flush=True)
     try:
         b = method_b_webarea_url(pid)
     except Exception as exc:
@@ -229,9 +229,9 @@ def _probe_browser(short_name: str, skip_applescript: bool) -> None:
         print(repr(b))
 
     if skip_applescript:
-        print(f"  Method C (AppleScript):        skipped")
+        print("  Method C (AppleScript):        skipped")
         return
-    print(f"  Method C (AppleScript):        ", end="", flush=True)
+    print("  Method C (AppleScript):        ", end="", flush=True)
     c, err = method_c_applescript(short_name)
     if err:
         print(f"ERROR  {err}")

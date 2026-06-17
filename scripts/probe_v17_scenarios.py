@@ -47,7 +47,7 @@ import sys
 
 
 async def _main() -> int:
-    from sayzo_agent.arm.controller import ArmController, ArmState
+    from sayzo_agent.arm.controller import ArmController
     from sayzo_agent.config import ArmConfig, ConversationConfig, default_detector_specs
     from sayzo_agent.conversation import ConversationDetector
     from sayzo_agent.models import SpeechSegment

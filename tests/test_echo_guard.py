@@ -13,7 +13,6 @@ from scipy.signal import butter, sosfilt
 
 from sayzo_agent.config import EchoGuardConfig
 from sayzo_agent.echo_guard import (
-    EchoGuardReport,
     _merge_spans,
     _subtract_spans,
     classify_buffers,

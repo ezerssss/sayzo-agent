@@ -530,7 +530,7 @@ def _print_one_pass(binary_path: str) -> None:
         owner_pid, owner_bundle, source = find_owning_app(pid, bundle, responsible)
         print(f"    owning app: pid={owner_pid} bundle={owner_bundle!r}  [{source}]")
         if owner_bundle is None:
-            print(f"    → no known owner — skipping")
+            print("    → no known owner — skipping")
             continue
 
         spec = desktop_spec_for_bundle(owner_bundle)
@@ -546,8 +546,8 @@ def _print_one_pass(binary_path: str) -> None:
             print(f"    {browser_name} window titles: {titles}")
             print(f"    {browser_name} AX URLs:       {urls if urls else '(none — AX URL not exposed by this browser)'}")
             if not titles and not urls:
-                print(f"    → browser is capturing but AX returned no titles OR urls")
-                print(f"      (Accessibility permission may not be granted)")
+                print("    → browser is capturing but AX returned no titles OR urls")
+                print("      (Accessibility permission may not be granted)")
                 continue
             spec = match_browser_spec(urls, titles)
             if spec is not None:
@@ -557,9 +557,9 @@ def _print_one_pass(binary_path: str) -> None:
                 print(f"    → browser match: {spec.app_key} ({spec.display_name})")
                 matched_apps.append((spec, f"browser via {browser_name} {via}"))
             else:
-                print(f"    → browser is capturing but no url/title matched any spec")
+                print("    → browser is capturing but no url/title matched any spec")
         else:
-            print(f"    → owner is neither a known browser nor a known meeting app")
+            print("    → owner is neither a known browser nor a known meeting app")
 
     print()
     if matched_apps:

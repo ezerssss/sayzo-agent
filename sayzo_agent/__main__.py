@@ -17,6 +17,13 @@ import click
 from .arm.hotkey import humanize_binding
 from .config import load_config
 
+if typing.TYPE_CHECKING:
+    # Runtime import is local to the functions that construct it (HudLauncher
+    # is heavy); this TYPE_CHECKING import resolves the forward-ref annotation
+    # at module scope (e.g. `hud_launcher: "HudLauncher | None"`) for linters
+    # and type-checkers without paying the import cost at boot.
+    from .gui.hud.launcher import HudLauncher
+
 
 def _setup_logging(level: str, debug: bool) -> None:
     lvl = logging.DEBUG if debug else getattr(logging, level.upper(), logging.INFO)
@@ -35,8 +42,18 @@ class _DropHeartbeat(logging.Filter):
         return "[heartbeat]" not in record.getMessage()
 
 
-def _setup_file_logging(logs_dir) -> None:
-    """Configure rotating file-based logging for the background service."""
+def _setup_file_logging(logs_dir, level: str = "INFO", debug: bool = False) -> None:
+    """Configure rotating file-based logging for the background service.
+
+    ``level`` / ``debug`` mirror :func:`_setup_logging`. The file root
+    is set from the resolved level (not hard-pinned to INFO) so that
+    ``SAYZO_LOG_LEVEL=DEBUG`` / ``SAYZO_DEBUG=1`` brings DEBUG lines
+    back into ``agent.log`` — important now that high-frequency chatter
+    (per-segment echo_guard, HUD geometry) is demoted to DEBUG and is
+    otherwise unrecoverable from the file. Default INFO keeps the normal
+    24/7 service log unchanged.
+    """
+    lvl = logging.DEBUG if debug else getattr(logging, level.upper(), logging.INFO)
     log_file = logs_dir / "agent.log"
     handler = logging.handlers.RotatingFileHandler(
         log_file, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8",
@@ -47,7 +64,7 @@ def _setup_file_logging(logs_dir) -> None:
     ))
     handler.addFilter(_DropHeartbeat())
     root = logging.getLogger()
-    root.setLevel(logging.INFO)
+    root.setLevel(lvl)
     root.addHandler(handler)
     for noisy in ("httpx", "httpcore", "filelock"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
@@ -204,6 +221,13 @@ def _install_agent_side_hud_shutdown_propagation(hud_launcher) -> None:
     from sayzo_agent.gui.common.win_shutdown import (
         install_session_ending_callback,
     )
+
+    # Closure-captured logger. This function is module-level (no `log`
+    # in scope) and the callback fires later on an OS-shutdown thread,
+    # so without this the callback raised `NameError: name 'log' is not
+    # defined` the moment the user shut down — silently defeating the
+    # whole parent→HUD quit propagation on BOTH macOS and Windows.
+    log = logging.getLogger("shutdown")
 
     def _on_os_shutting_down() -> None:
         log.warning("[agent] OS shutdown signal — pushing quit to HUD subprocess")
@@ -650,15 +674,14 @@ def test_meeting_ended_flow() -> None:
     works. Each scenario takes ~1 s with the test-tuned timings; total
     runtime under 5 s.
     """
-    from typing import Any, Optional
+    from typing import Any
 
     from .arm.controller import ArmController, ArmReason, ArmState
     from .arm.detectors import (
-        DetectorSpec, ForegroundInfo, MicHolder, MicState,
+        DetectorSpec, ForegroundInfo, MicHolder,
     )
     from .config import ArmConfig, ConversationConfig, default_detector_specs
     from .conversation import ConversationDetector
-    from .models import SessionCloseReason
 
     # Inline fakes (kept here so this command works in the installed
     # bundle, which doesn't ship tests/).
@@ -993,7 +1016,7 @@ def diagnose_notifications() -> None:
     import json as _json
 
     cfg = load_config()
-    _setup_file_logging(cfg.logs_dir)
+    _setup_file_logging(cfg.logs_dir, cfg.log_level, cfg.debug)
     stream_handler = logging.StreamHandler(sys.stderr)
     stream_handler.setFormatter(
         logging.Formatter("%(asctime)s %(levelname)-5s %(name)s  %(message)s")
@@ -1352,7 +1375,7 @@ def run() -> None:
 def service(force_setup: bool, from_autostart: bool, open_settings: bool) -> None:
     """Run the agent as a background service (no terminal output, file logging)."""
     cfg = load_config()
-    _setup_file_logging(cfg.logs_dir)
+    _setup_file_logging(cfg.logs_dir, cfg.log_level, cfg.debug)
     # Pass data_dir so the excepthook drops a crash sentinel that the boot
     # sweep uploads next time (production service path only).
     _install_excepthooks(cfg.data_dir)
@@ -1582,7 +1605,7 @@ def service(force_setup: bool, from_autostart: bool, open_settings: bool) -> Non
         cfg = load_config()
 
     from .auth.store import TokenStore
-    from .gui.tray import TrayIcon, TrayState, Status, request_full_shutdown
+    from .gui.tray import TrayIcon, TrayState, request_full_shutdown
 
     from .auth.client import make_auth_client
     auth_client = make_auth_client(cfg)
@@ -1679,8 +1702,12 @@ def service(force_setup: bool, from_autostart: bool, open_settings: bool) -> Non
     # .start() is called inside _main where the asyncio loop is live.
     hud_launcher: "HudLauncher | None" = None
 
+    # The Notifier bound to the HUD launcher. nonlocal so _main can fire the
+    # post-upgrade toast AFTER the HUD subprocess is ready (see _main).
+    notifier = None
+
     def _build_pipeline_state() -> None:
-        nonlocal agent, hud_launcher
+        nonlocal agent, hud_launcher, notifier
         from .app import Agent
         from .gui.hud.launcher import HudLauncher
         from .notify import HudNotifier, NoopNotifier
@@ -1756,55 +1783,16 @@ def service(force_setup: bool, from_autostart: bool, open_settings: bool) -> Non
 
         tray_state.on_install_update_clicked = _on_install_update_clicked
 
-        # Fire the post-upgrade toast queued by the boot-time last_version
-        # check above. Best-effort: any notifier failure logs but doesn't
-        # block agent startup. Toast title intentionally omits the prior
-        # version — users don't care what they upgraded FROM, only that
-        # they're now on the latest.
-        if _pending_upgrade_toast is not None and cfg.notifications_enabled:
-            try:
-                _prior_v, _now_v = _pending_upgrade_toast
-                if _diagnostics_disclosure_due and cfg.share_diagnostics:
-                    # Proactive opt-out disclosure for upgraders (advisor catch):
-                    # they never re-run onboarding, so this is their notice that
-                    # diagnostics turned on. No em-dash in shipped copy.
-                    notifier.notify(
-                        "Sayzo updated",
-                        f"Now on v{_now_v}. To help us fix problems, Sayzo "
-                        "shares anonymous diagnostics (your OS, app version, and "
-                        "error logs, never meeting audio or transcripts). Manage "
-                        "this in Settings under About.",
-                    )
-                else:
-                    notifier.notify(
-                        "Sayzo updated",
-                        f"Now running v{_now_v}.",
-                    )
-                log.info(
-                    "[update] post-upgrade toast fired (v%s -> v%s, disclosure=%s)",
-                    _prior_v, _now_v, _diagnostics_disclosure_due,
-                )
-            except Exception:
-                log.warning("[update] post-upgrade toast failed", exc_info=True)
+        # NOTE: the post-upgrade "Sayzo updated" toast is fired in _main AFTER
+        # the HUD subprocess handshakes hud_ready — NOT here. Firing it during
+        # this sync setup (before hud_launcher.start()) meant _send hit
+        # `_proc is None` and dropped the toast on every auto-update (observed
+        # 3x in one production log). _pending_upgrade_toast stays set so _main
+        # picks it up; see _fire_post_upgrade_toast below.
 
-        # Apply-failed toast: surfaces a previous boot's exhausted apply-
-        # attempt cap so the user has an actionable next step instead of
-        # silently looping. Mutually exclusive with the post-upgrade toast
-        # in practice (one means "install worked", the other means "install
-        # didn't"), but we don't enforce that — they read different markers.
-        if _pending_apply_failed_toast is not None and cfg.notifications_enabled:
-            try:
-                notifier.notify(
-                    "Sayzo update failed",
-                    f"Couldn't install v{_pending_apply_failed_toast}. "
-                    "Download the latest from sayzo.app to update manually.",
-                )
-                log.info(
-                    "[update] apply-failed toast fired for v%s",
-                    _pending_apply_failed_toast,
-                )
-            except Exception:
-                log.warning("[update] apply-failed toast failed", exc_info=True)
+        # NOTE: the apply-failed toast is also fired in _main after hud_ready
+        # (same pre-spawn drop race as the post-upgrade toast above).
+        # _pending_apply_failed_toast stays set for _fire_post_upgrade_toast.
 
         agent = Agent(
             cfg,
@@ -1842,6 +1830,47 @@ def service(force_setup: bool, from_autostart: bool, open_settings: bool) -> Non
         # bootstrap "Starting…" copy and let menu clicks dispatch.
         tray_state.mark_ready()
         tray.update()
+
+    def _fire_post_upgrade_toast() -> None:
+        """Fire the queued post-upgrade / apply-failed toast (called from
+        _main AFTER the HUD is ready — see the call site for why). Best-effort:
+        a notifier failure logs but never blocks startup. The two markers are
+        mutually exclusive in practice (update worked vs. update failed)."""
+        if notifier is None:
+            return
+        try:
+            if _pending_upgrade_toast is not None:
+                _prior_v, _now_v = _pending_upgrade_toast
+                if _diagnostics_disclosure_due and cfg.share_diagnostics:
+                    # Proactive opt-out disclosure for upgraders (advisor
+                    # catch): they never re-run onboarding, so this is their
+                    # notice that diagnostics turned on. No em-dash in copy.
+                    notifier.notify(
+                        "Sayzo updated",
+                        f"Now on v{_now_v}. To help us fix problems, Sayzo "
+                        "shares anonymous diagnostics (your OS, app version, "
+                        "and error logs, never meeting audio or transcripts). "
+                        "Manage this in Settings under About.",
+                    )
+                else:
+                    notifier.notify("Sayzo updated", f"Now running v{_now_v}.")
+                log.info(
+                    "[update] post-upgrade toast fired (v%s -> v%s, "
+                    "disclosure=%s)",
+                    _prior_v, _now_v, _diagnostics_disclosure_due,
+                )
+            if _pending_apply_failed_toast is not None:
+                notifier.notify(
+                    "Sayzo update failed",
+                    f"Couldn't install v{_pending_apply_failed_toast}. "
+                    "Download the latest from sayzo.app to update manually.",
+                )
+                log.info(
+                    "[update] apply-failed toast fired for v%s",
+                    _pending_apply_failed_toast,
+                )
+        except Exception:
+            log.warning("[update] post-upgrade toast failed", exc_info=True)
 
     async def _main() -> None:
         loop = asyncio.get_running_loop()
@@ -2202,6 +2231,23 @@ def service(force_setup: bool, from_autostart: bool, open_settings: bool) -> Non
         if hud_launcher is not None:
             await hud_launcher.start()
             _install_agent_side_hud_shutdown_propagation(hud_launcher)
+            # Fire the post-upgrade / apply-failed toast now that the HUD
+            # subprocess exists — but only after it handshakes hud_ready, so
+            # the toast isn't dropped against `_proc is None`. Bounded wait so
+            # a sick HUD can't stall boot. Best-effort: a drop here is no worse
+            # than the old always-dropped behavior, and the update still
+            # applied either way.
+            if (
+                cfg.notifications_enabled
+                and (_pending_upgrade_toast is not None
+                     or _pending_apply_failed_toast is not None)
+            ):
+                try:
+                    await hud_launcher.wait_for_ready(timeout_secs=15.0)
+                except Exception:
+                    log.debug("[update] wait_for_ready before toast raised",
+                              exc_info=True)
+                _fire_post_upgrade_toast()
 
         def _sync_arm_state_to_tray() -> None:
             """Push ArmController.state → TrayState immediately.
@@ -2716,7 +2762,7 @@ def hud(idle: bool, demo: bool) -> None:
     # "I can't see the HUD" reports: the subprocess's own
     # window-position + screen-detection logs land in agent.log
     # alongside the parent's `[hud] spawning subprocess` line.
-    _setup_file_logging(cfg.logs_dir)
+    _setup_file_logging(cfg.logs_dir, cfg.log_level, cfg.debug)
     _install_excepthooks()
     log = logging.getLogger("hud")
 

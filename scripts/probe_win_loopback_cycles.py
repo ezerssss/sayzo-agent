@@ -67,7 +67,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-import struct
 import sys
 import time
 import wave

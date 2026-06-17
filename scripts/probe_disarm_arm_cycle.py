@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import struct
 import sys
 import time
 import wave
@@ -37,11 +36,10 @@ try:
 except Exception:
     pass
 
-import numpy as np
 
 from sayzo_agent.capture.mic import MicCapture
 from sayzo_agent.config import ConversationConfig
-from sayzo_agent.conversation import ConversationDetector, SessionState
+from sayzo_agent.conversation import ConversationDetector
 from sayzo_agent.models import SessionCloseReason
 
 

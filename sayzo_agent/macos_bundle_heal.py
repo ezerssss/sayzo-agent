@@ -93,6 +93,14 @@ def heal_bundle() -> None:
             )
         else:
             log.info("[mac_heal] xattr -cr ok")
+    except subprocess.TimeoutExpired:
+        # Best-effort heal on a busy boot (disk/Gatekeeper contention) —
+        # a one-liner, not a stack trace. The bundle is usually already
+        # clean; a timeout here isn't fatal.
+        log.warning(
+            "[mac_heal] xattr -cr timed out after %ss — skipping (best-effort)",
+            _SUBPROCESS_TIMEOUT_SECS,
+        )
     except Exception:
         log.warning("[mac_heal] xattr -cr failed", exc_info=True)
 

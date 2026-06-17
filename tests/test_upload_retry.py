@@ -32,9 +32,8 @@ from sayzo_agent.retry import (
     UploadOutcome,
     empty_upload_state,
 )
-from sayzo_agent.sink import deserialize_record, serialize_record
+from sayzo_agent.sink import serialize_record
 from sayzo_agent.upload_retry import (
-    PauseState,
     UploadRetryManager,
     read_record_from_dir,
 )
