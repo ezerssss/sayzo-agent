@@ -66,6 +66,36 @@ def test_open_session_on_arm_idempotent_when_open():
     assert d._buffers is first_buffers
 
 
+def test_open_session_idle_true_when_long_open_and_no_speech():
+    """An abandoned session (open a long time, no voiced audio on either
+    channel) reads idle — the signal the abandon cap uses to stop buffering."""
+    d = ConversationDetector(_cfg())
+    d.open_session_on_arm(now=0.0)
+    assert d.open_session_idle(700.0, min_open_secs=600.0, max_voiced_secs=2.0) is True
+
+
+def test_open_session_idle_false_before_min_open():
+    """A young session is not abandoned even with no speech yet (early join)."""
+    d = ConversationDetector(_cfg())
+    d.open_session_on_arm(now=0.0)
+    assert d.open_session_idle(100.0, min_open_secs=600.0, max_voiced_secs=2.0) is False
+
+
+def test_open_session_idle_false_with_system_audio():
+    """A muted user listening to a presentation has system-channel voiced
+    audio, so the session is NOT idle even though the mic is silent."""
+    d = ConversationDetector(_cfg())
+    d.open_session_on_arm(now=0.0)
+    d.on_segment(SpeechSegment("system", 100.0, 110.0), now=110.0)  # 10s sys voiced
+    assert d.open_session_idle(700.0, min_open_secs=600.0, max_voiced_secs=2.0) is False
+
+
+def test_open_session_idle_false_when_no_session():
+    """IDLE (no open session) is never 'idle' for the abandon check."""
+    d = ConversationDetector(_cfg())
+    assert d.open_session_idle(700.0, min_open_secs=600.0, max_voiced_secs=2.0) is False
+
+
 def test_back_to_back_sessions_without_vad_reset():
     """Two sessions in a row with a monotonically-growing VAD clock.
 

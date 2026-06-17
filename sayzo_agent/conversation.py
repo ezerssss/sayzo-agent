@@ -483,6 +483,27 @@ class ConversationDetector:
             )
         self._stream_end_mono = {"mic": None, "system": None}
 
+    def open_session_idle(
+        self, now: float, *, min_open_secs: float, max_voiced_secs: float,
+    ) -> bool:
+        """True if the current session has been open at least ``min_open_secs``
+        but has captured at most ``max_voiced_secs`` of voiced audio across
+        **both** channels — i.e. an abandoned/idle session (a meeting left open
+        and muted in an empty room), not an early join that hasn't started yet.
+
+        The both-channel check matters: a muted user listening to a presentation
+        has system-channel voiced audio and is NOT idle. Pure — reads in-memory
+        segment durations. Segments accumulate over the whole session
+        (``revert_close`` resets only the silence clock, not the buffers), so a
+        session that ever had real speech never reads idle.
+        """
+        if self._buffers is None or self.state == SessionState.IDLE:
+            return False
+        if (now - self._session_start_mono) < min_open_secs:
+            return False
+        voiced = self._buffers.mic_total_voiced() + self._buffers.sys_total_voiced()
+        return voiced <= max_voiced_secs
+
     # ---- output API --------------------------------------------------------
 
     def take_closed_session(self) -> Optional[SessionBuffers]:

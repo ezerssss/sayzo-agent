@@ -621,6 +621,20 @@ class ArmConfig(BaseSettings):
     # without errors; nothing reads it anymore.
     meeting_ended_snooze_secs: float = 600.0
 
+    # Abandoned-session safety cap (v3.19+). A whitelist session is kept OPEN
+    # while the arm-app holds the mic, even through long joint silence (so an
+    # early joiner who's quiet before the meeting starts isn't dropped). But a
+    # session the app has held open for ``early_join_abandon_secs`` with at most
+    # ``early_join_abandon_max_voiced_secs`` of voiced audio across BOTH channels
+    # is an abandoned/forgotten meeting (left open + muted in an empty room),
+    # not an early join — so ``_handle_pending_close`` closes+discards it instead
+    # of deferring forever, to bound buffered-PCM memory. Both-channel check is
+    # deliberate: a muted user listening to a presentation has system-channel
+    # audio and must NOT be treated as idle. The close does NOT suppress the app,
+    # so a meeting that genuinely starts later can still re-prompt.
+    early_join_abandon_secs: float = 600.0
+    early_join_abandon_max_voiced_secs: float = 2.0
+
     # Per-app detection rules. Populated from ``default_detector_specs()``.
     detectors: list[DetectorSpec] = Field(default_factory=default_detector_specs)
 

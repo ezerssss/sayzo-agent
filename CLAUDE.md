@@ -106,6 +106,9 @@ ConversationDetector (silence-bounded sessions)
     ↓ [appends PCM + segments to the already-open session buffer]
 [joint silence 45s → PENDING_CLOSE → end-confirmation toast]
 [toast Yes/timeout → commit_close → sink path; toast No/speech → revert]
+[whitelist arm + arm-app still holds the mic (v3.19+) → silently revert, NO
+ toast/close: the user is still in the meeting (e.g. joined early, nobody
+ talking yet); the meeting-ended watcher owns the close on mic release]
     ↓
 [AEC pre-pass — WebRTC AEC3 via livekit.rtc.apm; subtracts speaker bleed from
  mic at the sample level. Off by default in v3.5.0; SAYZO_AEC__ENABLED=1 to
@@ -156,6 +159,7 @@ Default whitelist ships with 25 apps (14 desktop + 11 web — Meet/Teams-web/Zoo
   - `commit_close(reason)` — finalize: push buffers to `_closed_queue`, go back to IDLE, sink picks it up via `_ticker`.
   - `revert_close(now)` — cancel close: back to OPEN, silence timer reset.
   - VAD segment during PENDING_CLOSE → auto-revert (user resumed speaking is ground truth).
+  - **Whitelist-arm defer (v3.19+)** → if the arm is a whitelist arm and the arm-app still holds the mic (`_arm_app_confirmed_holding` in `arm/controller.py`), `_handle_pending_close` silently `revert_close`s and fires **no** toast — joint silence does not close a session while the meeting is provably still live (early-join "missed the whole standup" fix). For a whitelist arm the authoritative "meeting over" signal is the **meeting-ended watcher** firing on mic *release*, not joint silence. Hotkey/tray arms have no arm-app to track, so they keep the joint-silence close above. This means joint silence alone never closes a whitelist session while the app holds the mic — so a meeting left open + muted (or a browser lingering on the mic after a call) would keep the session OPEN, buffering PCM. The **abandoned-session safety cap** bounds that: a session held open for `ArmConfig.early_join_abandon_secs` (default 600 s) with ≤ `early_join_abandon_max_voiced_secs` (default 2 s) of voiced audio on **both** channels (`ConversationDetector.open_session_idle`) is closed+discarded — `_disarm_internal(..., suppress=False)` so a meeting that genuinely starts later can still re-prompt. A muted user listening to a presentation has system-channel audio, so it's not treated as idle.
   - Legacy unit-test path (no callback registered) → commit immediately, preserving pre-armed-model behavior.
 
 **Gap-fill cap + stale-frame guard (v3.6+).** `on_frame` zero-fills dropped-frame and cold-start gaps to preserve the sample-to-mono-time invariant — load-bearing for AEC, since mic[k] and sys[k] must represent the same wall-clock moment or the ±500 ms cross-correlation search can't find the alignment. The cap is `ConversationConfig.max_gap_fill_secs` (default 30 s in v3.6+, was 2 s pre-v3.6). Above the cap, a pathological gap (literal system suspend, USB reconnect after minutes) re-anchors with a small audible discontinuity rather than injecting tens of seconds of zeros. Stale frames (`capture_mono_ts < session_t0_mono - 0.5 s`) — leftovers from a previous arm cycle that leaked through the producer queue — are detected explicitly at the top of `on_frame` and dropped; pre-v3.6 the re-anchor branch did double duty as the stale-frame guard with a tight 2 s cap, so legitimate WASAPI cold-start delays (1–5 s typical, ~3.5 s seen in the wild) silently hit re-anchor without zero-fill and misaligned mic vs sys by the startup delay. The visible symptom was AEC `peak < 0.05` on every capture and ~0 dB cancellation — fixed in v3.6.0.

@@ -20,7 +20,7 @@ import pytest
 from sayzo_agent.arm.controller import ArmController, ArmReason, ArmState
 from sayzo_agent.arm.detectors import ForegroundInfo, MicHolder, MicState
 from sayzo_agent.config import ArmConfig, ConversationConfig, DetectorSpec, default_detector_specs
-from sayzo_agent.conversation import ConversationDetector
+from sayzo_agent.conversation import ConversationDetector, SessionState
 from sayzo_agent.models import SessionCloseReason, SpeechSegment
 
 
@@ -566,6 +566,263 @@ async def test_pending_close_auto_revert_on_speech_skips_confirmation():
     assert mic.stop_count == 0
 
     await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
+
+
+# ---- pending-close defer gate (whitelist early-join) -----------------
+#
+# Regression guard for the early-join bug: a whitelist arm where the user
+# joined the meeting early (no one talking yet) hit 45 s joint silence, the
+# end-confirmation toast timed out (user wasn't watching), the session
+# closed AND the app was suppressed for the rest of the meeting — so the
+# real meeting that started minutes later was never re-prompted/captured.
+# Fix: while the meeting app still holds the mic, joint silence must NOT
+# close the session (the meeting-ended watcher owns the close on mic
+# release). The gmeet path is the one that actually bit (browser specs go
+# through `_browser_holds_mic`), so the defer test arms gmeet, not a
+# desktop app.
+
+
+def _make_gmeet_controller(
+    notifier: FakeNotifier, holders: list[MicHolder],
+    *, cfg_overrides: Optional[dict] = None,
+) -> tuple[ArmController, ConversationDetector, FakeCapture, FakeCapture]:
+    """Controller wired for a Windows-style Google Meet (browser) whitelist
+    arm. ``holders`` is a mutable list the test reassigns in-place to
+    simulate the meeting app releasing the mic. The gmeet match needs a
+    browser process holding the mic + a meet.google.com foreground tab; the
+    browser-title/URL queries are stubbed empty so the test never picks up
+    the dev machine's real browser tabs (mirrors the manual construction in
+    ``test_whitelist_arm_uses_resolver_when_match_has_no_pids``)."""
+    cfg_kwargs = dict(
+        hotkey="ctrl+alt+s",
+        poll_interval_secs=0.01,
+        hotkey_confirm_timeout_secs=0.1,
+        consent_toast_timeout_secs=0.1,
+        end_toast_timeout_secs=0.1,
+        checkin_toast_timeout_secs=0.1,
+        meeting_ended_toast_timeout_secs=0.1,
+        whitelist_arm_release_grace_secs=0.03,
+        force_close_after_keep_going_secs=0.05,
+        decline_release_grace_secs=0.05,
+        long_meeting_checkin_marks_secs=[3600.0],
+        detectors=default_detector_specs(),
+    )
+    if cfg_overrides:
+        cfg_kwargs.update(cfg_overrides)
+    cfg = ArmConfig(**cfg_kwargs)
+    detector = ConversationDetector(ConversationConfig(joint_silence_close_secs=1.0))
+    mic = FakeCapture()
+    sys_cap = FakeCapture()
+    ctrl = ArmController(
+        cfg, detector,
+        mic_capture=mic, sys_capture=sys_cap,
+        vad_mic=FakeVAD(source="mic"), vad_sys=FakeVAD(source="system"),
+        notifier=notifier,
+        get_mic_holders=lambda: list(holders),
+        is_mic_active=lambda: True,
+        get_running_processes=lambda: frozenset(),
+        get_foreground_info=lambda: ForegroundInfo(
+            process_name="chrome.exe",
+            is_browser=True,
+            browser_tab_url="https://meet.google.com/abc-defg-hij",
+            browser_tab_title="Meet - Standup - Google Chrome",
+        ),
+        get_browser_window_titles=lambda: [],
+        get_browser_window_urls=lambda: [],
+    )
+    return ctrl, detector, mic, sys_cap
+
+
+async def _arm_gmeet(ctrl: ArmController) -> None:
+    """Arm a gmeet whitelist session via the watcher, then cancel the
+    background watchers so only ``_handle_pending_close`` is exercised (the
+    meeting-ended / check-in tasks would otherwise race the joint-silence
+    path under test)."""
+    ctrl._loop = asyncio.get_running_loop()
+    ctrl._whitelist_task = asyncio.create_task(ctrl._run_whitelist_watcher())
+    await asyncio.sleep(0.15)
+    assert ctrl.state == ArmState.ARMED, "expected gmeet whitelist arm"
+    assert ctrl._reason is not None and ctrl._reason.app_key == "gmeet"
+    for t in (ctrl._whitelist_task, ctrl._meeting_ended_task, ctrl._checkin_task):
+        if t is not None:
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+
+
+def _drive_joint_silence(detector: ConversationDetector) -> None:
+    """One short system blip then 2 s of silence (close threshold is 1 s in
+    the test cfg) → OPEN → PENDING_CLOSE → schedules _handle_pending_close.
+    Mirrors the real early-join trigger (a 0.2 s join sound set the anchor)."""
+    detector.on_segment(SpeechSegment("system", 0.0, 0.2), now=100.0)
+    detector.tick(102.0)
+
+
+async def test_whitelist_pending_close_defers_while_browser_holds_mic():
+    """Core regression: gmeet armed, Chrome still holds the mic, joint
+    silence fires → the session must NOT close, NO end-confirmation toast,
+    and crucially the app must NOT be suppressed."""
+    notifier = FakeNotifier()
+    notifier.consent_script = ["yes"]  # arm only; no end-confirmation expected
+    holders = [MicHolder("chrome.exe", 4344)]
+    ctrl, detector, mic, _ = _make_gmeet_controller(notifier, holders)
+    await _arm_gmeet(ctrl)
+
+    _drive_joint_silence(detector)
+    await asyncio.sleep(0.05)
+
+    assert ctrl.state == ArmState.ARMED
+    assert detector.state == SessionState.OPEN  # reverted, still capturing
+    assert mic.stop_count == 0
+    assert not any(
+        c["title"] == "Was that the end of your meeting?"
+        for c in notifier.consent_calls
+    )
+    # The bug was suppression-on-timeout; gmeet must stay re-promptable.
+    assert ctrl._cooldowns.suppressed_keys(time.monotonic()) == frozenset()
+
+    await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
+
+
+async def test_whitelist_pending_close_defers_on_failed_mic_snapshot():
+    """Fail-safe: a COM-timeout returns empty holders (indistinguishable
+    from a real release). The defer gate must keep the session open on an
+    unreadable poll rather than closing+suppressing."""
+    notifier = FakeNotifier()
+    notifier.consent_script = ["yes"]
+    holders = [MicHolder("chrome.exe", 4344)]
+    ctrl, detector, mic, _ = _make_gmeet_controller(notifier, holders)
+    await _arm_gmeet(ctrl)
+
+    # Simulate the enumeration failing for this poll (empty + inactive).
+    ctrl._q_mic_holders = lambda: []
+    ctrl._q_is_mic_active = lambda: False
+
+    _drive_joint_silence(detector)
+    await asyncio.sleep(0.05)
+
+    assert ctrl.state == ArmState.ARMED
+    assert detector.state == SessionState.OPEN
+    assert mic.stop_count == 0
+    assert ctrl._cooldowns.suppressed_keys(time.monotonic()) == frozenset()
+
+    await ctrl._disarm_internal(SessionCloseReason.HOTKEY_END)
+
+
+async def test_whitelist_pending_close_closes_when_app_released():
+    """When the arm-app is genuinely gone (a different, non-browser app is
+    confirmed holding the mic), the defer gate falls through and joint
+    silence closes the session as before — the backstop is preserved."""
+    notifier = FakeNotifier()
+    notifier.consent_script = ["yes", "yes"]  # arm, then end-confirmation Yes
+    holders = [MicHolder("chrome.exe", 4344)]
+    ctrl, detector, mic, _ = _make_gmeet_controller(notifier, holders)
+    await _arm_gmeet(ctrl)
+
+    # gmeet released the mic; some other (non-browser) app holds it now, so
+    # `_browser_holds_mic` is False → arm-app confirmed gone → close proceeds.
+    holders[:] = [MicHolder("someother.exe", 7)]
+
+    _drive_joint_silence(detector)
+    await asyncio.sleep(0.05)
+
+    assert ctrl.state == ArmState.DISARMED
+    assert any(
+        c["title"] == "Was that the end of your meeting?"
+        for c in notifier.consent_calls
+    )
+
+
+async def test_hotkey_pending_close_closes_even_if_browser_holds_mic():
+    """Scope guard: the defer gate is whitelist-only. A hotkey arm closes on
+    joint silence as before even with a browser holding the mic (it has no
+    arm-app to track, and a hotkey close doesn't suppress anything)."""
+    notifier = FakeNotifier()
+    notifier.consent_script = ["yes", "yes"]  # hotkey arm, end-confirmation Yes
+    ctrl, detector, mic, sys_cap, *_ = _make_controller(
+        notifier=notifier,
+        mic_holders=[MicHolder("chrome.exe", 4344)],
+        mic_active=True,
+    )
+
+    await ctrl._on_hotkey_pressed()  # source="hotkey", app_key=None
+    _drive_joint_silence(detector)
+    await asyncio.sleep(0.05)
+
+    assert ctrl.state == ArmState.DISARMED  # gate skipped (not a whitelist arm)
+
+
+async def test_whitelist_deferred_session_still_closed_by_watcher_on_release():
+    """Safety net (integration): a deferred early-join session is still
+    bounded. Joint silence defers while Chrome holds the mic, then when the
+    meeting genuinely ends (Chrome releases the mic) the meeting-ended
+    watcher closes it. Validates the fix's central claim — "the
+    meeting-ended watcher owns the close" — with the watcher actually
+    running (the other defer tests cancel it for isolation)."""
+    notifier = FakeNotifier()
+    notifier.consent_script = ["yes", "yes"]  # arm; then meeting-ended "Wrap up"
+    holders = [MicHolder("chrome.exe", 4344)]
+    ctrl, detector, mic, _ = _make_gmeet_controller(notifier, holders)
+
+    ctrl._loop = asyncio.get_running_loop()
+    ctrl._whitelist_task = asyncio.create_task(ctrl._run_whitelist_watcher())
+    await asyncio.sleep(0.15)
+    assert ctrl.state == ArmState.ARMED
+    assert ctrl._reason is not None and ctrl._reason.app_key == "gmeet"
+    # Stop ONLY the whitelist watcher; keep the meeting-ended watcher running.
+    ctrl._whitelist_task.cancel()
+    try:
+        await ctrl._whitelist_task
+    except asyncio.CancelledError:
+        pass
+
+    # Joint silence while Chrome still holds the mic → defers, stays armed.
+    _drive_joint_silence(detector)
+    await asyncio.sleep(0.05)
+    assert ctrl.state == ArmState.ARMED
+    assert detector.state == SessionState.OPEN
+
+    # Meeting really ends: Chrome releases the mic → meeting-ended watcher
+    # (grace 0.03s) fires and closes the session.
+    holders[:] = []
+    await asyncio.sleep(0.2)
+    assert ctrl.state == ArmState.DISARMED
+    assert any(
+        c["title"] == "Looks like your meeting ended"
+        for c in notifier.consent_calls
+    )
+
+
+async def test_whitelist_abandoned_idle_session_closes_without_suppression():
+    """Abandon cap: a session the app holds open with ~zero speech past
+    early_join_abandon_secs is closed+discarded (bounds buffered memory) —
+    but NOT suppressed, so a meeting that actually starts later can still
+    re-prompt. No end-confirmation toast either (it's an abandon, not a
+    user-facing wrap-up)."""
+    notifier = FakeNotifier()
+    notifier.consent_script = ["yes"]  # arm only
+    holders = [MicHolder("chrome.exe", 4344)]
+    # abandon immediately once idle (no speech) — exercises the cap path.
+    ctrl, detector, mic, _ = _make_gmeet_controller(
+        notifier, holders, cfg_overrides={"early_join_abandon_secs": 0.0},
+    )
+    await _arm_gmeet(ctrl)
+
+    # Joint silence with no speech captured + app still holding the mic →
+    # open_session_idle True (age>=0, ~0 voiced) → abandon.
+    _drive_joint_silence(detector)
+    await asyncio.sleep(0.05)
+
+    assert ctrl.state == ArmState.DISARMED
+    # Closed to bound memory, but the app was NOT marked declined.
+    assert ctrl._cooldowns.suppressed_keys(time.monotonic()) == frozenset()
+    # Abandon is silent — no end-confirmation toast.
+    assert not any(
+        c["title"] == "Was that the end of your meeting?"
+        for c in notifier.consent_calls
+    )
 
 
 # ---- whitelist consent -----------------------------------------------

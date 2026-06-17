@@ -889,6 +889,7 @@ class ArmController:
         close_reason: SessionCloseReason,
         *,
         show_post_toast: bool = False,
+        suppress: bool = True,
     ) -> None:
         """Transition ARMED → DISARMED.
 
@@ -945,8 +946,12 @@ class ArmController:
         # (e.g. ChatGPT voice mode) immediately re-prompts on the new
         # mic acquisition, while staying quiet if the app keeps holding
         # the mic (still in the same Zoom call).
+        # ``suppress=False`` is used by the abandoned-idle-session close
+        # (see ``_handle_pending_close``): we close to bound memory, but the
+        # app never actually released the mic, so a meeting that genuinely
+        # starts later must still be able to re-prompt.
         prev = self._reason
-        if prev is not None and prev.app_key:
+        if suppress and prev is not None and prev.app_key:
             self._cooldowns.mark_declined(prev.app_key)
 
         self.state = ArmState.DISARMED
@@ -983,6 +988,57 @@ class ArmController:
         asyncio.ensure_future(self._handle_pending_close(), loop=self._loop)
 
     async def _handle_pending_close(self) -> None:
+        # Whitelist arms: joint silence alone must NOT close the session while
+        # the meeting app still holds the mic. The user is still in the meeting
+        # (classically: joined early and nobody's talking yet, or a quiet
+        # stretch mid-meeting), just silent. The authoritative "meeting over"
+        # signal for a whitelist arm is the meeting-ended watcher firing when
+        # the arm-app RELEASES the mic — so defer the close (revert to OPEN)
+        # instead of firing the end-confirmation toast and suppressing the app
+        # for the rest of the meeting (the early-join "missed the whole standup"
+        # bug). Hotkey/tray arms have no arm-app to track and keep the
+        # close-on-silence backstop below. The meeting genuinely ending is
+        # owned by the meeting-ended watcher (it fires ~grace seconds after the
+        # arm-app releases the mic); on a clean release the fail-safe defers
+        # rather than racing it. The gate only falls through to the close below
+        # when ``_arm_app_confirmed_holding`` is False — i.e. a *different* app
+        # is confirmed holding the mic so the arm-app is genuinely gone.
+        reason = self._reason
+        if (
+            self.detector.state == SessionState.PENDING_CLOSE
+            and reason is not None
+            and reason.source == "whitelist"
+            and reason.app_key
+            and self._arm_app_confirmed_holding(reason.app_key)
+        ):
+            now0 = time.monotonic()
+            # Safety cap: a session the app has held open for a long time with
+            # ~zero voiced audio on BOTH channels is an abandoned/forgotten
+            # meeting (left open + muted in an empty room), not an early join.
+            # Stop buffering it — close + discard (it fails the cheap gate
+            # anyway) WITHOUT whole-meeting suppression, so a meeting that does
+            # start later can still re-prompt via the watcher.
+            if self.detector.open_session_idle(
+                now0,
+                min_open_secs=self.cfg.early_join_abandon_secs,
+                max_voiced_secs=self.cfg.early_join_abandon_max_voiced_secs,
+            ):
+                log.info(
+                    "[arm] abandoning idle held session — %s holds the mic but "
+                    "no speech for >%.0fs; closing to bound memory",
+                    reason.app_key, self.cfg.early_join_abandon_secs,
+                )
+                await self._disarm_internal(
+                    SessionCloseReason.JOINT_SILENCE, suppress=False,
+                )
+                return
+            self.detector.revert_close(now0)
+            log.info(
+                "[arm] joint-silence close deferred — %s still holds the mic; "
+                "session continues (meeting-ended watcher owns the close)",
+                reason.app_key,
+            )
+            return
         result = await self._ask_consent_pausing_pill(
             "Was that the end of your meeting?",
             "It's been quiet for a bit. Wrap up and save, or keep going?",
@@ -1806,6 +1862,44 @@ class ArmController:
             fg,
             browser_window_titles=tuple(titles),
             browser_window_urls=tuple(urls),
+        )
+
+    def _arm_app_confirmed_holding(self, app_key: str) -> bool:
+        """Fail-safe mic-holder check for the joint-silence defer gate in
+        :meth:`_handle_pending_close`.
+
+        Returns True (KEEP the session open — defer the close) UNLESS we have a
+        confirmed reading that the arm-app is gone: a non-empty holder set that
+        does not include the arm-app. Any empty/unreadable holder set defers —
+        ``platform_win.get_mic_holders`` returns ``[]`` on a >2 s COM timeout
+        (indistinguishable from a real release), and a genuine release is owned
+        by the meeting-ended watcher (it fires ~``whitelist_arm_release_grace_secs``
+        after the arm-app drops the mic) rather than raced by this single-read
+        gate. macOS's active-but-unattributable case (mic active, holders empty)
+        defers for the same reason.
+
+        Deliberately stricter than the watcher's per-poll
+        ``arm_app_still_holding_mic`` check, which is allowed to see ``[]`` and
+        start counting absence because it requires a sustained streak before
+        acting — a one-off COM timeout self-corrects there but would wrongly
+        close+suppress here. ``arm_app_still_holding_mic`` ignores its
+        ``foreground`` arg for the mic-holder check, so we pass an empty
+        ``ForegroundInfo`` rather than pay for a second blocking snapshot.
+        """
+        try:
+            mic = self._snapshot_mic_state()
+        except Exception:
+            log.debug(
+                "[arm] defer-gate mic snapshot failed; keeping session open",
+                exc_info=True,
+            )
+            return True
+        if not mic.holders:
+            # Empty (or COM-timeout []) holder set — not a confirmed release;
+            # a real release is closed by the meeting-ended watcher. Defer.
+            return True
+        return _d.arm_app_still_holding_mic(
+            app_key, self.cfg.detectors, mic, ForegroundInfo(),
         )
 
     async def _ask_consent(
