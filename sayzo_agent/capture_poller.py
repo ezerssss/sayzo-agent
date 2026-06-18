@@ -180,8 +180,9 @@ class CapturePoller:
 
         ``owns_toast=True``: keep polling to ``analyzed`` (or terminal failure
         / schedule exhaustion), then fire the post-capture coaching card or a
-        fallback saved toast. Silent on errors — polling failures leave the
-        local placeholder in place; the webapp shows live state on click.
+        feedback-ready toast when no insight was produced. Silent on errors —
+        polling failures leave the local placeholder in place; the webapp shows
+        live state on click.
         """
         if self._auth_client is None:
             return
@@ -272,7 +273,7 @@ class CapturePoller:
                 )
             return
 
-        # owns_toast: fire the insight card, or a fallback saved toast when no
+        # owns_toast: fire the insight card, or a feedback-ready toast when no
         # insight was produced (analyzed-with-null, terminal failure, or the
         # schedule exhausted before analysis finished).
         await self._fire_post_capture(rec_dir, server_capture_id, insight)
@@ -344,7 +345,7 @@ class CapturePoller:
         ``quote`` / ``type`` / ``why``), or ``None`` when the server returned
         null / a malformed object / missing the required fields. "No insight"
         is a first-class outcome (server contract) — the caller fires a
-        fallback saved toast in that case.
+        feedback-ready toast in that case.
         """
         raw = body.get("coaching_insight")
         if not isinstance(raw, dict):
@@ -396,7 +397,7 @@ class CapturePoller:
         server_capture_id: str,
         insight: dict | None,
     ) -> None:
-        """Fire the insight card (or fallback saved toast), respecting live gates.
+        """Fire the insight card (or no-insight feedback-ready toast), respecting live gates.
 
         Re-checks the master + feedback flags live (the user may have toggled
         during the minutes-long poll) and defers the fire if they're currently
@@ -423,7 +424,7 @@ class CapturePoller:
         if insight:
             fire_fn = self._make_insight_fire(rec_dir, deep_link, insight)
         else:
-            fire_fn = self._make_fallback_saved_fire(deep_link)
+            fire_fn = self._make_no_insight_fire(rec_dir, deep_link)
         await self._fire_or_defer(fire_fn)
 
     def _make_insight_fire(
@@ -472,13 +473,30 @@ class CapturePoller:
 
         return fire
 
-    def _make_fallback_saved_fire(self, deep_link: str) -> Callable[[], None]:
-        """Fallback "Conversation saved" toast when no insight was produced.
+    def _make_no_insight_fire(
+        self, rec_dir: Path, deep_link: str,
+    ) -> Callable[[], None]:
+        """Feedback-ready toast for the no-insight case (analyzed-with-null,
+        terminal failure, or schedule exhaustion).
 
-        Same shape as the immediate saved toast ``upload_retry`` fires when the
-        feedback feature is OFF — preserves upload confirmation under the
-        "replace, don't stack" model.
+        The server produced no single coaching highlight, but the conversation
+        page still has the transcript, replay-to-practice, and per-utterance
+        coaching moments — so this actively invites the user to review it
+        (personalized to the call, mirroring the insight card's source anchor)
+        rather than reading as a passive "saved" confirmation, preserving the
+        click-through we'd otherwise lose when there's no insight card.
+
+        Distinct from the immediate "Conversation saved to Sayzo" toast
+        ``upload_retry`` fires when the feedback feature is OFF: that one is a
+        bare save confirmation for a user who opted out of coaching; this one
+        drives the click-through. The two deliberately diverge in copy + intent.
         """
+        try:
+            record = read_record_from_dir(rec_dir)
+        except Exception:
+            record = None
+        source_label = self._source_label(record)
+
         def _open() -> None:
             try:
                 webbrowser.open(deep_link)
@@ -488,14 +506,14 @@ class CapturePoller:
         def fire() -> None:
             try:
                 self._notifier.notify_actionable(  # type: ignore[union-attr]
-                    "Conversation saved to Sayzo",
-                    "Open it to see your transcript and coaching.",
-                    button_label="Open in Sayzo",
+                    f"Your {source_label} is ready to review",
+                    "Replay it and see your coaching moments.",
+                    button_label="See feedback",
                     on_pressed=_open,
-                    expire_after_secs=30.0,
+                    expire_after_secs=15.0,
                 )
             except Exception:
-                log.debug("[poller] fallback saved-toast failed", exc_info=True)
+                log.debug("[poller] no-insight toast failed", exc_info=True)
 
         return fire
 

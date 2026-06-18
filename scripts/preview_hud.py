@@ -167,14 +167,17 @@ def _run_launcher() -> int:
             pressed = asyncio.Event()
             expired = asyncio.Event()
             launcher.show_actionable(
-                "Conversation saved to Sayzo",
-                "Open it to see your transcript and coaching.",
-                button_label="Open in Sayzo",
+                # Long app name on purpose — exercises title wrapping for the
+                # no-insight "feedback ready" toast (capture_poller produces a
+                # dynamic, personalized title that can be ~2× the old static one).
+                "Your 2:30 pm Microsoft Teams call is ready to review",
+                "Replay it and see your coaching moments.",
+                button_label="See feedback",
                 on_pressed=lambda: loop.call_soon_threadsafe(pressed.set),
                 expire_after_secs=30.0,
                 on_expire=lambda: loop.call_soon_threadsafe(expired.set),
             )
-            print("✓ actionable shown (click 'Open in Sayzo' or wait 30 s)")
+            print("✓ actionable shown (click 'See feedback' or wait 30 s)")
             done, _ = await asyncio.wait(
                 {
                     asyncio.create_task(pressed.wait()),

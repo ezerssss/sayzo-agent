@@ -584,9 +584,12 @@ export function HudApp() {
           hudBridge.dispatch({
             cmd: "show_actionable",
             request_id: `actionable-${Date.now()}`,
-            title: "Conversation saved to Sayzo",
-            body: "Open it to see your transcript and coaching.",
-            button_label: "Open in Sayzo",
+            // Long app name on purpose — exercises title wrapping for the
+            // no-insight "feedback ready" toast (the agent builds a dynamic,
+            // personalized title that can be ~2× the old static one).
+            title: "Your 2:30 pm Microsoft Teams call is ready to review",
+            body: "Replay it and see your coaching moments.",
+            button_label: "See feedback",
             expire_after_secs: 30,
           }),
       },

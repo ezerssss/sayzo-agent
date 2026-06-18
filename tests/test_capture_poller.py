@@ -238,6 +238,7 @@ class FakeNotifier:
                           secondary_button_label=None, on_secondary_pressed=None):
         self.actionable_calls.append({
             "title": title, "body": body, "button_label": button_label,
+            "expire_after_secs": expire_after_secs,
         })
         return True
 
@@ -332,8 +333,9 @@ async def test_owns_toast_polls_past_transcribed_to_analyzed_and_fires_insight(e
 
 async def test_owns_toast_analyzed_without_insight_fires_fallback(env, tmp_path):
     """When the server reaches analyzed with coaching_insight=null, the poller
-    falls back to the plain "Conversation saved" toast so upload confirmation isn't
-    lost under the replace-don't-stack model."""
+    fires the no-insight "feedback ready" toast — personalized to the call and
+    deep-linking to the conversation page — so we keep the click-through we'd
+    otherwise lose without an insight card."""
     rec_dir = _write_capture(env.captures_dir, "rec_noinsight")
     env.auth.queue({"status": "analyzed", "title": "Q4 sync", "coaching_insight": None})
     notifier = FakeNotifier()
@@ -343,12 +345,18 @@ async def test_owns_toast_analyzed_without_insight_fires_fallback(env, tmp_path)
 
     assert notifier.insight_calls == []
     assert len(notifier.actionable_calls) == 1
-    assert notifier.actionable_calls[0]["title"] == "Conversation saved to Sayzo"
+    call = notifier.actionable_calls[0]
+    # Title is personalized from the fixture's arm metadata via _source_label
+    # (arm_app_display="Zoom", local_clock_label="2:30 pm" → "2:30 pm Zoom call").
+    assert call["title"] == "Your 2:30 pm Zoom call is ready to review"
+    assert call["body"] == "Replay it and see your coaching moments."
+    assert call["button_label"] == "See feedback"
+    assert call["expire_after_secs"] == 15.0
 
 
 async def test_owns_toast_terminal_failure_fires_fallback(env, tmp_path):
     """A terminal failure (transcription_failed) ends the poll and fires the
-    fallback saved toast — no insight will ever come."""
+    no-insight "feedback ready" toast — no insight will ever come."""
     rec_dir = _write_capture(env.captures_dir, "rec_failed")
     env.auth.queue({"status": "queued"})
     env.auth.queue({"status": "transcription_failed"})
