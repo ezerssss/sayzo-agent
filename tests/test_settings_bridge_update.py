@@ -121,6 +121,12 @@ def test_install_when_already_staged_skips_download_and_calls_quit(
     assert [e["phase"] for e in phases] == ["applying"]
     assert phases[0]["version"] == "3.0.0"
     ipc.call.assert_called_once_with(Methods.QUIT_AGENT)
+    # The Settings page is the ONE surface that must leave the
+    # open-settings-after-update marker so the relaunched agent re-opens
+    # Settings on About. (apply_staged_if_newer no longer writes it — see
+    # update_apply.py — so this end-to-end guard lives here.)
+    from sayzo_agent.update_apply import take_open_settings_after_update
+    assert take_open_settings_after_update(cfg.data_dir) is True
 
 
 def test_install_when_stale_stage_redownloads(

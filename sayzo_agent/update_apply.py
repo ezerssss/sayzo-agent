@@ -39,15 +39,18 @@ log = logging.getLogger(__name__)
 
 QUIT_APPLY_FLAG_NAME = "quit_with_apply.flag"
 
-# Marker written by ``apply_staged_if_newer`` for any *user-initiated* apply
-# (``where != "boot"``), persisted across the relaunch the platform helper
-# triggers. The freshly-relaunched agent consumes it on boot to decide
-# whether to re-open the Settings window (on About) — a user who clicked
-# "Install update" wants to land back in Settings; a silent boot-time
-# auto-apply must NOT pop Settings. Disambiguates the two paths, which
-# otherwise look identical to the new agent (Windows passes ``--open-settings``
-# for both; macOS's ``open --args service`` trips ``looks_user_launched`` for
-# both). See ``__main__.py::service`` open-settings decision.
+# Marker written ONLY by the Settings → Install update handler
+# (``gui/settings/bridge.py::_install_update_worker``), persisted across the
+# relaunch the platform helper triggers. The freshly-relaunched agent consumes
+# it on boot to decide whether to re-open the Settings window (on About) — a
+# user who clicked "Install update" from the Settings page wants to land back
+# in Settings. Every other install surface (the HUD "Install now" toast, the
+# tray "Install…" item) and the silent boot-time auto-apply leave it unwritten,
+# so they stay toast-only (no Settings pop). This marker is the sole signal
+# that survives the relaunch to distinguish those paths, which otherwise look
+# identical to the new agent (Windows passes ``--open-settings`` for all of
+# them; macOS's ``open --args service`` trips ``looks_user_launched`` for all
+# of them). See ``__main__.py::service`` open-settings decision.
 OPEN_SETTINGS_FLAG_NAME = "open_settings_after_update.flag"
 
 # Cap on how many times we'll re-spawn the platform installer / swap helper
@@ -110,10 +113,13 @@ def _open_settings_flag_path(data_dir: Path) -> Path:
 def set_open_settings_after_update(data_dir: Path) -> None:
     """Mark that the next post-update boot should re-open Settings (on About).
 
-    Written by :func:`apply_staged_if_newer` for user-initiated applies
-    (``where != "boot"``). Best-effort: a failed write just means the new
-    agent treats the update as silent (no Settings pop) — never breaks the
-    apply itself.
+    Written ONLY by the Settings → Install update handler
+    (``gui/settings/bridge.py::_install_update_worker``) — the one surface
+    where the user expects to land back in Settings after the update. The HUD
+    "Install now" toast, the tray "Install…" item, and the boot-time
+    auto-apply intentionally do NOT write it, so they stay toast-only.
+    Best-effort: a failed write just means the new agent treats the update as
+    silent (no Settings pop) — never breaks the apply itself.
     """
     path = _open_settings_flag_path(data_dir)
     try:
@@ -130,9 +136,10 @@ def take_open_settings_after_update(data_dir: Path) -> bool:
     """Consume the open-settings-after-update marker: return True iff it was
     present, deleting it either way.
 
-    Consumed unconditionally on every boot so a stale marker (e.g. from a
-    user-initiated apply whose helper spawn then failed) self-clears on the
-    next boot rather than lingering until some future upgrade.
+    Consumed unconditionally on every boot so a stale marker (e.g. a Settings
+    → Install update whose stage was already current, or whose helper spawn
+    then failed) self-clears on the next boot rather than lingering until some
+    future upgrade.
     """
     path = _open_settings_flag_path(data_dir)
     present = path.exists()
@@ -206,13 +213,13 @@ def apply_staged_if_newer(data_dir: Path, current_version: str, *, where: str) -
         "[update] applying staged v%s at %s (attempt %d/%d, currently running v%s)",
         staged.version, where, attempts, MAX_APPLY_ATTEMPTS, current_version,
     )
-    # User-initiated applies (Settings → Install update, tray "Install…",
-    # HUD "Install now" — all route through where="quit") leave a marker so
-    # the relaunched agent re-opens Settings on About. The boot-time
-    # auto-apply (where="boot") leaves nothing, so it stays silent (toast
-    # only). "quit" is the only non-boot caller; see the flag's docstring.
-    if where != "boot":
-        set_open_settings_after_update(data_dir)
+    # NOTE: this path no longer writes the open-settings-after-update marker.
+    # Re-opening Settings on relaunch is now a property of the *initiating
+    # surface*, not the apply mechanism — only Settings → Install update wants
+    # it, and it writes the marker itself (gui/settings/bridge.py). The HUD
+    # "Install now" toast and the tray "Install…" item deliberately leave it
+    # unwritten so they stay silent (the "Sayzo updated" toast only). See
+    # set_open_settings_after_update + __main__.py::service.
     try:
         if sys.platform == "win32":
             from .update_apply_win import spawn_installer_and_exit

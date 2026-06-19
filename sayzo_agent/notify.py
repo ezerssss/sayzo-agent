@@ -43,6 +43,10 @@ ConsentResult = Literal["yes", "no", "timeout"]
 class Notifier(Protocol):
     def notify(self, title: str, body: str) -> None: ...
 
+    def notify_before_quit(
+        self, title: str, body: str, ttl_secs: float = 2.0,
+    ) -> None: ...
+
     def ask_consent(
         self,
         title: str,
@@ -96,6 +100,14 @@ class NoopNotifier:
 
     def notify(self, title: str, body: str) -> None:
         log.debug("[notify] (noop) %s — %s", title, body)
+
+    def notify_before_quit(
+        self, title: str, body: str, ttl_secs: float = 2.0,
+    ) -> None:
+        # No HUD subprocess to keep alive — the caller's quit proceeds with
+        # no grace window, exactly the pre-fix behavior. Just log.
+        del ttl_secs
+        log.debug("[notify] (noop) before-quit %s — %s", title, body)
 
     def ask_consent(
         self,
@@ -215,6 +227,16 @@ class HudNotifier:
 
     def notify(self, title: str, body: str) -> None:
         self._launcher.show_toast(title, body, ttl_secs=self.DEFAULT_TOAST_TTL_SECS)
+
+    def notify_before_quit(
+        self, title: str, body: str, ttl_secs: float = 2.0,
+    ) -> None:
+        # Arms the launcher's quit-grace window so the agent's teardown
+        # (``HudLauncher.quit``) waits for this toast to paint and finish
+        # its countdown before killing the HUD subprocess. Used by the
+        # "Sayzo is updating" pre-apply toast — without it the HUD is torn
+        # down mid-paint and the toast's bar freezes (looks like a crash).
+        self._launcher.show_toast_before_quit(title, body, ttl_secs=ttl_secs)
 
     def ask_consent(
         self,

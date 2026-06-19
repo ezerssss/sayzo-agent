@@ -99,13 +99,15 @@ _RESPAWN_WINDOW_SECS = 120.0
 _MAX_RESPAWNS = len(_RESPAWN_DELAYS)
 
 # Bounded window quit() gives a `show_toast_before_quit` toast to reach
-# its first paint (card_painted) before tearing the subprocess down,
-# plus a linger so the user can actually read it. Only the
-# install-update quit path arms this (see __main__._fire_pre_apply_toast);
-# every other quit pays zero extra latency. Module-level so tests can
-# monkeypatch them down to ~0.05 s.
+# its first paint (card_painted) before tearing the subprocess down.
+# After paint, quit() lingers for the toast's OWN ttl (stored in
+# `_quit_grace_toast_ttl`) so its countdown bar runs visibly to 0% rather
+# than freezing mid-fill when the HUD dies. The install-update quit path
+# arms this via __main__._fire_pre_apply_toast → notify_before_quit; every
+# other quit pays zero extra latency. `_QUIT_PAINT_GRACE_SECS` is the cap
+# on how long we wait for that FIRST paint. Module-level so tests can
+# monkeypatch it down to ~0.05 s.
 _QUIT_PAINT_GRACE_SECS = 1.5
-_QUIT_PAINT_LINGER_SECS = 1.0
 
 # Heartbeat: after this many pings in a row with no pong, the subprocess
 # is treated as alive-but-hung (Qt loop deadlock, GPU hang) and killed so
@@ -194,6 +196,13 @@ class HudLauncher:
         # Toast id armed by show_toast_before_quit; quit() polls for its
         # card_painted before teardown (install-update path only).
         self._quit_grace_toast_id: Optional[str] = None
+        # The armed toast's ttl; quit() lingers so the countdown bar finishes
+        # rather than freezing when the HUD dies. Lingered relative to when the
+        # toast was SHOWN (_quit_grace_toast_shown_at), not when quit() notices
+        # the paint — preceding teardown (settings_launcher.quit) already
+        # elapsed, so a fresh full-ttl sleep would add dead empty-screen time.
+        self._quit_grace_toast_ttl: float = 0.0
+        self._quit_grace_toast_shown_at: float = 0.0
         # Readiness — flipped when the subprocess writes ``hud_ready``.
         self._ready_event = asyncio.Event()
         self._reader_task: Optional[asyncio.Task] = None
@@ -381,19 +390,32 @@ class HudLauncher:
         :meth:`show_toast_before_quit`. Polls for the toast's
         ``card_painted`` (its entry leaving ``_pending_show_times`` —
         the reader task keeps running while we await) for up to
-        ``_QUIT_PAINT_GRACE_SECS``; once painted, lingers
-        ``_QUIT_PAINT_LINGER_SECS`` so the user can actually read it.
+        ``_QUIT_PAINT_GRACE_SECS``; once painted, lingers for whatever is
+        LEFT of the toast's ttl (``_quit_grace_toast_ttl`` measured from
+        ``_quit_grace_toast_shown_at``) so its countdown bar runs visibly to
+        0% rather than freezing mid-fill — but without re-sleeping time the
+        toast was already on screen during preceding teardown.
         No-op (zero added latency) on every quit that didn't arm the
         marker — i.e. everything except the install-update path.
         """
         toast_id = self._quit_grace_toast_id
+        ttl_secs = self._quit_grace_toast_ttl
+        shown_at = self._quit_grace_toast_shown_at
         self._quit_grace_toast_id = None
+        self._quit_grace_toast_ttl = 0.0
+        self._quit_grace_toast_shown_at = 0.0
         if toast_id is None:
             return
         deadline = time.monotonic() + _QUIT_PAINT_GRACE_SECS
         while time.monotonic() < deadline:
             if toast_id not in self._pending_show_times:
-                await asyncio.sleep(_QUIT_PAINT_LINGER_SECS)
+                # Linger only the REMAINING countdown — the toast has been
+                # visible since shown_at, so cap total on-screen time at ttl
+                # instead of sleeping a fresh full ttl of dead empty-screen
+                # delay after settings teardown already elapsed.
+                remaining = ttl_secs - (time.monotonic() - shown_at)
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
                 return
             await asyncio.sleep(0.05)
         log.info(
@@ -837,20 +859,24 @@ class HudLauncher:
         return self._show_toast_impl(title, body, ttl_secs) is not None
 
     def show_toast_before_quit(
-        self, title: str, body: str, ttl_secs: float = 4.0,
+        self, title: str, body: str, ttl_secs: float = 2.0,
     ) -> bool:
-        """Show a toast and arm :meth:`quit` to wait for it to paint.
+        """Show a toast and arm :meth:`quit` to wait for it to paint + finish.
 
         The install-update path uses this for the "Sayzo is updating"
         toast: without the grace window in ``quit`` the agent tears the
         HUD down before the toast's first frame composites, so the user
         sees everything vanish (the "agent just disappeared" perception)
-        instead of a reassurance that an update is in progress.
+        instead of a reassurance that an update is in progress. ``quit``
+        also lingers for ``ttl_secs`` after paint so the toast's countdown
+        bar runs to 0% rather than freezing mid-fill on teardown.
         """
         toast_id = self._show_toast_impl(title, body, ttl_secs)
         if toast_id is None:
             return False
         self._quit_grace_toast_id = toast_id
+        self._quit_grace_toast_ttl = float(ttl_secs)
+        self._quit_grace_toast_shown_at = time.monotonic()
         return True
 
     # --- consent card (blocking yes/no) -------------------------------

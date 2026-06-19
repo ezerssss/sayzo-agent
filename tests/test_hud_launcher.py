@@ -9,6 +9,7 @@ state methods directly.
 from __future__ import annotations
 
 import asyncio
+import time
 from concurrent.futures import Future
 
 import pytest
@@ -130,9 +131,12 @@ def test_given_up_makes_public_methods_noop():
 def test_show_toast_before_quit_arms_marker():
     launcher = HudLauncher()
     _capture_sends(launcher)
-    assert launcher.show_toast_before_quit("Updating", "soon") is True
+    assert launcher.show_toast_before_quit("Updating", "soon", ttl_secs=2.0) is True
     assert launcher._quit_grace_toast_id is not None
     assert launcher._quit_grace_toast_id in launcher._pending_show_times
+    # The toast's ttl is stashed so quit() lingers exactly that long after
+    # paint (countdown bar runs to 0% instead of freezing on teardown).
+    assert launcher._quit_grace_toast_ttl == 2.0
 
 
 @pytest.mark.asyncio
@@ -146,35 +150,61 @@ async def test_quit_grace_no_marker_returns_immediately():
 @pytest.mark.asyncio
 async def test_quit_grace_bounded_when_never_painted(monkeypatch):
     monkeypatch.setattr(launcher_mod, "_QUIT_PAINT_GRACE_SECS", 0.05)
-    monkeypatch.setattr(launcher_mod, "_QUIT_PAINT_LINGER_SECS", 0.01)
     launcher = HudLauncher()
     _capture_sends(launcher)
-    launcher.show_toast_before_quit("Updating", "soon")
+    launcher.show_toast_before_quit("Updating", "soon", ttl_secs=2.0)
     # Toast id stays in _pending_show_times (never painted) → must give up at
-    # the grace deadline rather than hang.
+    # the grace deadline rather than hang (the ttl linger is never reached
+    # because paint never lands).
     loop = asyncio.get_running_loop()
     start = loop.time()
     await launcher._wait_for_quit_grace_toast()
     assert loop.time() - start < 1.0
-    # One-shot: marker consumed.
+    # One-shot: marker + stashed ttl consumed.
     assert launcher._quit_grace_toast_id is None
+    assert launcher._quit_grace_toast_ttl == 0.0
 
 
 @pytest.mark.asyncio
-async def test_quit_grace_returns_after_paint(monkeypatch):
+async def test_quit_grace_lingers_remaining_ttl_when_fresh(monkeypatch):
+    # Painted with ~full ttl remaining (shown ~now) → linger runs ~ttl so the
+    # countdown bar reaches 0% before teardown.
     monkeypatch.setattr(launcher_mod, "_QUIT_PAINT_GRACE_SECS", 1.0)
-    monkeypatch.setattr(launcher_mod, "_QUIT_PAINT_LINGER_SECS", 0.01)
     launcher = HudLauncher()
     _capture_sends(launcher)
-    launcher.show_toast_before_quit("Updating", "soon")
+    launcher.show_toast_before_quit("Updating", "soon", ttl_secs=0.2)
     toast_id = launcher._quit_grace_toast_id
-    # Simulate the paint ack landing almost immediately.
-    launcher._pending_show_times.pop(toast_id, None)
+    launcher._pending_show_times.pop(toast_id, None)  # paint ack
     loop = asyncio.get_running_loop()
     start = loop.time()
     await launcher._wait_for_quit_grace_toast()
-    # Returned quickly (linger only), well under the 1 s grace.
-    assert loop.time() - start < 0.5
+    elapsed = loop.time() - start
+    # Lower bound proves the linger ran for ~ttl (the regression was linger==0
+    # → froze). Upper bound is generous (asyncio.sleep never returns early;
+    # only a loaded CI runner can overshoot) — sibling-test headroom, not a
+    # tight multiple that flakes under load.
+    assert 0.1 <= elapsed < 1.0
+
+
+@pytest.mark.asyncio
+async def test_quit_grace_caps_linger_at_remaining_ttl(monkeypatch):
+    # If the toast has ALREADY been on screen ~ttl (e.g. settings_launcher.quit
+    # elapsed before hud quit ran), linger only the REMAINING countdown — not a
+    # fresh full ttl of dead empty-screen delay before the update relaunch.
+    monkeypatch.setattr(launcher_mod, "_QUIT_PAINT_GRACE_SECS", 1.0)
+    launcher = HudLauncher()
+    _capture_sends(launcher)
+    launcher.show_toast_before_quit("Updating", "soon", ttl_secs=1.0)
+    toast_id = launcher._quit_grace_toast_id
+    # Pretend the toast was shown 0.95 s ago → only ~0.05 s of countdown left.
+    launcher._quit_grace_toast_shown_at = time.monotonic() - 0.95
+    launcher._pending_show_times.pop(toast_id, None)  # paint ack
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    await launcher._wait_for_quit_grace_toast()
+    elapsed = loop.time() - start
+    # Without the cap this would sleep a fresh 1.0 s.
+    assert elapsed < 0.5
 
 
 # --- respawn unification -----------------------------------------------------

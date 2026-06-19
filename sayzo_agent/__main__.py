@@ -1635,20 +1635,29 @@ def service(force_setup: bool, from_autostart: bool, open_settings: bool) -> Non
     from .launch_source import looks_user_launched
     from .update_apply import take_open_settings_after_update
 
-    # Did we just apply a *user-initiated* update (About "Install update" /
-    # tray "Install…" / HUD "Install now")? The old agent left this marker
-    # before handing off to the installer; consume it every boot so a stale
-    # one (e.g. a failed helper spawn) self-clears.
+    # Did the user click "Install update" from the Settings page (About)?
+    # That's the ONLY surface that leaves this marker — the HUD "Install now"
+    # toast and the tray "Install…" item deliberately don't, so they relaunch
+    # toast-only (no Settings pop). Consume it every boot so a stale one
+    # (e.g. a failed helper spawn) self-clears.
     _user_update = take_open_settings_after_update(cfg.data_dir)
     # ``_pending_upgrade_toast`` (set above) is non-None iff this boot is the
     # first after a version bump — i.e. a staged update was just applied.
     _post_upgrade = _pending_upgrade_toast is not None
 
-    if _user_update and not should_show_gui:
-        # ``not should_show_gui`` guard: an update relaunch never passes
-        # --force-setup and lands with setup already complete, so this is
-        # belt-and-braces against ever popping Settings on top of a setup
-        # window (matches the looks_user_launched branch's guard below).
+    if _user_update and _post_upgrade and not should_show_gui:
+        # Re-open Settings on About ONLY when the Settings-page install
+        # actually applied an update THIS boot (``_post_upgrade``). The marker
+        # alone isn't enough: a Settings install whose quit-time apply no-ops
+        # or fails without relaunching (stage not newer, MAX_APPLY_ATTEMPTS
+        # exhausted, helper spawn raised, or the QUIT_AGENT IPC failed so the
+        # agent never quit) leaves the marker on disk, and honoring it on a
+        # later unrelated boot would pop Settings with no update having
+        # happened. Requiring ``_post_upgrade`` suppresses that orphan pop
+        # while preserving every real Settings install (which always bumps the
+        # version on relaunch → ``_post_upgrade`` true). The marker is consumed
+        # unconditionally above either way, so an orphan self-clears.
+        # ``not should_show_gui``: never pop Settings on top of a setup window.
         log.warning(
             "service: user-initiated update applied — re-opening Settings on About"
         )
@@ -1756,10 +1765,16 @@ def service(force_setup: bool, from_autostart: bool, open_settings: bool) -> Non
                 if (staged is not None
                         and is_newer(__version__, staged.version)
                         and cfg.notifications_enabled):
-                    notifier.notify(
+                    # notify_before_quit (NOT notify) arms the HUD launcher's
+                    # quit-grace window: HudLauncher.quit waits for this toast
+                    # to paint and run its 2 s countdown to completion before
+                    # tearing the subprocess down. With a plain notify the HUD
+                    # was killed mid-paint and the toast bar froze near 100%.
+                    notifier.notify_before_quit(
                         "Sayzo is updating",
                         f"Installing v{staged.version}. "
                         "Sayzo will reappear shortly.",
+                        ttl_secs=2.0,
                     )
             except Exception:
                 log.debug("[update] pre-apply toast failed", exc_info=True)

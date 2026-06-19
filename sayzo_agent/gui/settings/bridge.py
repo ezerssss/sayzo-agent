@@ -1415,9 +1415,19 @@ class Bridge:
             # If the agent is unreachable, the flag still sits on disk for
             # the boot-time apply path to catch on next launch — we surface
             # "queued_for_restart" in that case.
+            #
+            # Also write the open-settings-after-update marker: the Settings
+            # page is the ONLY install surface that should land the user back
+            # in Settings (on About) after the relaunch. The HUD "Install now"
+            # toast and the tray "Install…" item leave it unwritten so they
+            # stay toast-only (no Settings pop). See update_apply.py.
             try:
-                from sayzo_agent.update_apply import set_quit_apply_intent
+                from sayzo_agent.update_apply import (
+                    set_open_settings_after_update,
+                    set_quit_apply_intent,
+                )
                 set_quit_apply_intent(self._cfg.data_dir)
+                set_open_settings_after_update(self._cfg.data_dir)
                 self._ipc.call(Methods.QUIT_AGENT)
             except IPCNotConnected:
                 self._push_update_phase(

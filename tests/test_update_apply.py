@@ -433,13 +433,16 @@ def test_clear_apply_attempts_safe_when_missing(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# open-settings-after-update marker (Change 5: a silent boot-auto-apply must
-# NOT re-open Settings; a user-initiated apply must). The marker is the only
-# signal the relaunched agent has to tell the two paths apart.
+# open-settings-after-update marker. The marker is the only signal the
+# relaunched agent has to decide whether to re-open Settings. It is now
+# written ONLY by the Settings → Install update handler (bridge.py) — the
+# apply mechanism itself (apply_staged_if_newer) never writes it, regardless
+# of ``where``, so the HUD "Install now" toast / tray "Install…" / boot
+# auto-apply all relaunch toast-only.
 # ---------------------------------------------------------------------------
 
 
-def test_user_initiated_apply_writes_open_settings_marker(
+def test_quit_apply_does_not_write_open_settings_marker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from sayzo_agent.update_apply import take_open_settings_after_update
@@ -448,8 +451,10 @@ def test_user_initiated_apply_writes_open_settings_marker(
     _stub_helpers(monkeypatch)
     with pytest.raises(_ExitSentinel):
         apply_staged_if_newer(tmp_path, "1.0.0", where="quit")
-    # The relaunched agent would find the marker → re-open Settings on About.
-    assert take_open_settings_after_update(tmp_path) is True
+    # The apply mechanism no longer writes the marker — the initiating surface
+    # does. The HUD toast / tray route through where="quit" and must stay
+    # toast-only (the Settings page writes the marker for itself in bridge.py).
+    assert take_open_settings_after_update(tmp_path) is False
 
 
 def test_boot_apply_does_not_write_open_settings_marker(

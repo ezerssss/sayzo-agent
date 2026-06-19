@@ -66,6 +66,12 @@ def test_noop_notifier_has_authorisation_returns_none():
     assert NoopNotifier().has_authorisation_sync() is None
 
 
+def test_noop_notifier_notify_before_quit_never_raises():
+    # No HUD subprocess to keep alive under the noop notifier — must be a
+    # silent no-op so the install-update quit path just proceeds.
+    NoopNotifier().notify_before_quit("Sayzo is updating", "Installing…", ttl_secs=2.0)
+
+
 # ----------------------------------------------------------------------
 # HudNotifier — round-trips through a fake launcher.
 # ----------------------------------------------------------------------
@@ -101,6 +107,15 @@ class _FakeLauncher:
     def show_toast(self, title: str, body: str, ttl_secs: float = 4.0) -> bool:
         self.calls.append((
             "show_toast",
+            {"title": title, "body": body, "ttl_secs": ttl_secs},
+        ))
+        return True
+
+    def show_toast_before_quit(
+        self, title: str, body: str, ttl_secs: float = 2.0,
+    ) -> bool:
+        self.calls.append((
+            "show_toast_before_quit",
             {"title": title, "body": body, "ttl_secs": ttl_secs},
         ))
         return True
@@ -176,6 +191,22 @@ def test_hud_notifier_notify_forwards_to_show_toast():
     assert name == "show_toast"
     assert kwargs["title"] == "Conversation saved"
     assert kwargs["body"] == "Demo · 12 min"
+
+
+def test_hud_notifier_notify_before_quit_forwards_to_show_toast_before_quit():
+    # The "Sayzo is updating" pre-apply toast must route through
+    # show_toast_before_quit (arms the launcher's quit-grace window), NOT
+    # plain show_toast — otherwise the HUD is torn down mid-paint and the
+    # toast bar freezes. Regression guard for the toast-hang fix.
+    fake = _FakeLauncher()
+    notifier = HudNotifier(fake)
+    notifier.notify_before_quit("Sayzo is updating", "Installing v9.9.9.", ttl_secs=2.0)
+    assert len(fake.calls) == 1
+    name, kwargs = fake.calls[0]
+    assert name == "show_toast_before_quit"
+    assert kwargs["title"] == "Sayzo is updating"
+    assert kwargs["body"] == "Installing v9.9.9."
+    assert kwargs["ttl_secs"] == 2.0
 
 
 def test_hud_notifier_ask_consent_returns_yes(monkeypatch):
