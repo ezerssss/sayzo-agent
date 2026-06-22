@@ -74,11 +74,12 @@ class SetupWindow:
         patch_clear_user_data_none_guard()
         patch_on_close_swallow_teardown()
 
-        # Windows-only: intercept SystemEvents.SessionEnding so we exit
-        # cleanly via WM_QUIT before pywebview's FormClosed handler runs
-        # against a dying WebView2 child process and surfaces a JIT
-        # dialog that blocks Windows shutdown. See gui/common/win_shutdown.py.
-        # Setup has no idle-vs-quit distinction, so no set_quitting callback.
+        # Windows-only: intercept SystemEvents.SessionEnding so we hard-exit
+        # (os._exit) before pywebview's FormClosed teardown runs against a
+        # dying WebView2 child process — that teardown crashes pythonnet's
+        # exception marshaller and surfaces a WerFault ".NET Framework" dialog.
+        # See gui/common/win_shutdown.py. Setup has no idle-vs-quit
+        # distinction, so no set_quitting callback.
         install_shutdown_protection(window)
 
         # Catch the user-closed-via-X path (the Cancel button is handled by

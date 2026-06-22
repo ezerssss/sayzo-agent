@@ -27,11 +27,13 @@ v2.16.0 section for the full root-cause analysis:
   exception.
 * :func:`_arm_hud_hard_exit_timer` — a ``threading.Timer`` armed inside
   the commitDataRequest handler that calls ``os._exit(0)`` after a
-  short timeout. Mirrors the v2.15.0 pattern in
-  ``gui/common/win_shutdown.py::_arm_hard_exit_timer``. Daemon thread,
-  doesn't block clean shutdown when the event loop drains fast; fires
-  only when Qt is starved (QtWebEngine GPU hang, deadlocked Chromium
-  IPC, runaway JS).
+  short timeout. The HUD keeps a timer because its Qt event loop can be
+  starved (QtWebEngine GPU hang, deadlocked Chromium IPC, runaway JS) and
+  ``app.quit()`` is only *queued*. The Settings/Setup ``win_shutdown.py``
+  SessionEnding path used to share this timer-then-quit pattern but as of
+  v3.20.3 hard-exits **unconditionally** (no timer) — pywebview's teardown
+  is the thing that crashes there, so it must never run. Daemon thread,
+  doesn't block clean shutdown when the event loop drains fast.
 
 All three are cross-platform via Qt's signal abstraction. No
 platform-specific dispatch needed inside this module.
@@ -149,11 +151,12 @@ def _make_about_to_quit_handler(view_provider):
 def _arm_hud_hard_exit_timer() -> None:
     """Schedule ``os._exit(0)`` after the hard-exit timeout.
 
-    Mirrors ``gui/common/win_shutdown.py::_arm_hard_exit_timer``: daemon
-    thread, doesn't block clean shutdown if Qt drains the event loop
-    first; fires only when something hung. The OS reclaims our
+    Daemon thread, doesn't block clean shutdown if Qt drains the event
+    loop first; fires only when something hung. The OS reclaims our
     resources at process exit, so skipping the rest of Qt's teardown
-    is the right tradeoff at SessionEnding time.
+    is the right tradeoff at SessionEnding time. (The Settings/Setup
+    ``win_shutdown.py`` SessionEnding path hard-exits unconditionally
+    rather than arming a timer — see this module's docstring.)
     """
 
     def _fire() -> None:

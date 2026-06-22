@@ -2720,6 +2720,18 @@ def settings(pane: str | None, idle: bool) -> None:
     """
     cfg = load_config()
     _setup_logging("INFO", debug=cfg.debug)
+    # File logging + excepthooks mirror what `service()` / `hud()` do. Without
+    # these the Settings subprocess inherits stderr from a windowed PyInstaller
+    # exe (/dev/null), so every `[settings]` / `[safe_quit]` / `[win_shutdown]`
+    # / `[pywebview_patches]` line and any Python crash traceback vanishes — the
+    # reason the tray-quit shutdown crash was invisible in agent.log for so long
+    # (it was only recoverable from the Windows Event Log). The CLR-level
+    # pythonnet crash itself bypasses sys.excepthook, but the file handler now
+    # captures the surrounding lifecycle so future shutdown issues are
+    # debuggable. Multi-process appends to the single RotatingFileHandler are an
+    # accepted pattern here — the hud subprocess already does the same.
+    _setup_file_logging(cfg.logs_dir, cfg.log_level, cfg.debug)
+    _install_excepthooks()
     log = logging.getLogger("settings")
 
     from .gui.settings.lockfile import SettingsLock

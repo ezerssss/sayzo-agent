@@ -1,11 +1,12 @@
 """Windows-shutdown protection for pywebview windows.
 
-Why this exists (the gap left by ``safe_quit.py``)
---------------------------------------------------
+Why this exists (the gap left by the explicit quit path)
+--------------------------------------------------------
 
-``safe_quit_window`` protects our *explicit* quit path: when the parent
-agent sends ``quit`` over stdin, ``_dispatch_quit`` calls it and the
-message loop exits via ``WM_QUIT`` without firing ``FormClosed``.
+The *explicit* quit path (parent agent sends ``quit`` over stdin →
+``SettingsWindow._dispatch_quit``) handles itself: on Windows it
+hard-exits via ``os._exit(0)`` before any .NET teardown runs, so the
+pywebview FormClosed crash never happens.
 
 But the parent agent isn't the only thing that closes the Settings
 subprocess. Windows shutdown sends ``WM_CLOSE`` directly to every
@@ -31,20 +32,29 @@ Two layers of defence, both Windows-only:
 1. **SessionEnding handler** — subscribe to
    ``Microsoft.Win32.SystemEvents.SessionEnding``, which fires on
    ``WM_QUERYENDSESSION`` (the message Windows sends *before*
-   ``WM_CLOSE`` to ask permission to shut down). In the handler we set
-   the ``_quitting`` flag (so the idle Settings hide-on-close
-   contract lets the close proceed) and call ``safe_quit_window`` —
-   which posts ``WM_QUIT`` via ``BeginInvoke``. The message loop
-   processes ``WM_QUIT`` first, so ``WM_CLOSE``'s ``OnFormClosed``
-   path never runs and the crash never happens.
+   ``WM_CLOSE`` to ask permission to shut down). In the handler we
+   **hard-exit** (``os._exit(0)``) before ``WM_CLOSE`` can drive the
+   ``FormClosed`` teardown at all. Earlier versions instead posted
+   ``WM_QUIT`` via ``safe_quit_window`` and armed a 2 s fallback timer,
+   but the teardown that ``safe_quit_window`` triggers throws a .NET
+   exception that pythonnet crashes while *marshalling* back into Python
+   (``System.NullReferenceException`` in
+   ``TypeManager.AllocateTypeObject`` — a known pythonnet 3.x shutdown
+   race). That crash sits *below* the Python ``try/except`` and the
+   WinForms ``ThreadException`` net, so neither layer can catch it; it
+   surfaces as the WerFault ".NET Framework / stopped working" dialog.
+   The only reliable fix is to not run the teardown — see
+   ``SettingsWindow._dispatch_quit`` for the matching explicit-quit path.
 
-2. **Application.ThreadException safety net** — if anything still
-   slips through (X-button race, OS variant we haven't observed,
-   pywebview internal changes), we register a ``ThreadException``
-   handler that logs the exception and silently swallows it. The
-   JIT-debugging dialog never appears; shutdown isn't blocked. We
-   only swallow inside ``BrowserForm`` / pywebview-internal stack
-   frames so genuine application bugs still surface normally.
+2. **Application.ThreadException safety net** — if any *other* WinForms
+   message-loop exception still slips through (X-button race, OS variant
+   we haven't observed, pywebview internal changes), we register a
+   ``ThreadException`` handler that logs the exception and silently
+   swallows it. We only swallow inside ``BrowserForm`` / pywebview-
+   internal stack frames so genuine application bugs still surface
+   normally. Note this layer cannot catch the pythonnet-marshaller crash
+   above (that's why layer 1 hard-exits) — it covers the cases where a
+   .NET exception *does* reach the message loop cleanly.
 
 We could have monkey-patched pywebview's ``on_close`` to fix the root
 cause (and tried in v2.7.5 — see
@@ -64,7 +74,6 @@ from __future__ import annotations
 import logging
 import os
 import sys
-import threading
 from typing import TYPE_CHECKING, Callable, Optional
 
 if TYPE_CHECKING:
@@ -80,10 +89,12 @@ def install_shutdown_protection(
 ) -> None:
     """Install Windows-shutdown protection on a pywebview window.
 
-    ``set_quitting`` is called from the SessionEnding handler before
-    ``safe_quit_window`` so callers that distinguish quit-vs-hide on
-    the close path (the idle Settings window's ``on_closing``) can
-    flip into quit mode. Pass ``None`` if there's no such flag (the
+    ``set_quitting`` is flipped by the SessionEnding handler before it
+    hard-exits. Because the hard-exit (``os._exit``) pre-empts ``WM_CLOSE``,
+    the idle Settings ``on_closing`` handler never runs on this path, so the
+    flag is belt-and-suspenders here — it's only load-bearing on the
+    explicit-quit / macOS close path (where the window is actually destroyed
+    and ``on_closing`` fires). Pass ``None`` if there's no such flag (the
     Setup window, which has no idle-mode contract).
 
     Best-effort: any failure logs and swallows — these handlers are
@@ -105,8 +116,9 @@ def install_session_ending_callback(callback: Callable[[], None]) -> bool:
     can push a quit to the HUD subprocess via
     ``HudLauncher.quit_sync()``. The pywebview-window-aware variant
     above (``_install_session_ending_handler``) layers extra logic on
-    top of this same subscription, including ``safe_quit_window`` +
-    ``_arm_hard_exit_timer``.
+    top of this same subscription: it flips ``set_quitting`` and then
+    hard-exits the subprocess (``os._exit``) before pywebview's
+    FormClosed teardown can crash pythonnet.
 
     Returns ``True`` if subscribed; ``False`` on non-Windows or if the
     pythonnet bridge to ``Microsoft.Win32.SystemEvents`` can't be
@@ -187,11 +199,14 @@ def _install_session_ending_handler(
     *,
     set_quitting: Optional[Callable[[], None]],
 ) -> None:
-    """Subscribe to SystemEvents.SessionEnding → safe_quit_window.
+    """Subscribe to SystemEvents.SessionEnding → hard-exit.
 
     SystemEvents fires this on ``WM_QUERYENDSESSION``, before Windows
-    starts terminating processes. We have a small window to post
-    ``WM_QUIT`` and let the message loop drain cleanly.
+    starts terminating processes — our chance to get out cleanly before
+    ``WM_CLOSE`` drives pywebview's FormClosed teardown (which throws a
+    .NET exception that crashes pythonnet's exception marshaller). The
+    handler flips ``set_quitting`` and then ``os._exit(0)``s rather than
+    draining the message loop, so the crashing teardown never runs.
 
     Imports are lazy so this module stays cheap to import and doesn't
     trigger pythonnet / .NET assembly load at module-load time. By
@@ -207,20 +222,18 @@ def _install_session_ending_handler(
         )
         return
 
-    from sayzo_agent.gui.common.safe_quit import safe_quit_window
-
     def _on_session_ending(sender, args) -> None:
         # ``args.Reason`` is SessionEndReasons.Logoff or .SystemShutdown.
-        # We treat both identically: exit cleanly before pywebview's
-        # FormClosed handler crashes.
+        # We treat both identically: hard-exit before pywebview's FormClosed
+        # teardown can run.
         reason = "unknown"
         try:
             reason = str(args.Reason)
         except Exception:
             pass
         log.warning(
-            "[win_shutdown] SessionEnding fired (reason=%s) — quitting via "
-            "safe_quit_window before WM_CLOSE arrives",
+            "[win_shutdown] SessionEnding fired (reason=%s) — hard-exiting "
+            "before pywebview's FormClosed teardown can crash pythonnet",
             reason,
         )
         if set_quitting is not None:
@@ -230,16 +243,23 @@ def _install_session_ending_handler(
                 log.warning(
                     "[win_shutdown] set_quitting callback raised", exc_info=True
                 )
-        # Belt-and-suspenders: if the message loop hasn't drained within
-        # the timeout, force-exit so we never block Windows shutdown waiting
-        # on a pywebview internal hang. Windows kills GUI apps after ~5s of
-        # not responding to WM_ENDSESSION; ``_HARD_EXIT_TIMEOUT_SECS`` is
-        # set well inside that budget.
-        _arm_hard_exit_timer()
-        try:
-            safe_quit_window(window)
-        except Exception:
-            log.warning("[win_shutdown] safe_quit_window raised", exc_info=True)
+        # Hard-exit immediately rather than draining the WinForms message loop
+        # via ``safe_quit_window``. The FormClosed teardown (Application.Exit
+        # recursion, clear_user_data, detached WebView2 RCW) throws a .NET
+        # exception that pythonnet then crashes while *marshalling* back into
+        # Python — ``System.NullReferenceException`` in
+        # ``TypeManager.AllocateTypeObject``, an unhandled managed exception
+        # (0xe0434352) that surfaces as the WerFault ".NET Framework / stopped
+        # working" dialog. That crash is BELOW our Python ``on_close`` swallow
+        # and the WinForms ``ThreadException`` net, so neither can catch it. The
+        # old "post WM_QUIT + 2 s hard-exit timer" still ran ``safe_quit_window``
+        # first, leaving a 2 s window for the same crash during OS shutdown.
+        # This is a stateless GUI subprocess (settings persist on-change) and
+        # the OS is reclaiming everything anyway — mirror
+        # ``SettingsWindow._dispatch_quit`` and skip the teardown entirely.
+        # No explicit log flush: handlers flush per record, and a flush could
+        # block on a stuck stream — at SessionEnding the exit must never block.
+        os._exit(0)
 
     try:
         SystemEvents.SessionEnding += SessionEndingEventHandler(_on_session_ending)
@@ -371,35 +391,3 @@ _PYWEBVIEW_TEARDOWN_SIGNATURES = (
 def _looks_like_pywebview_teardown_crash(exc_text: str) -> bool:
     """Heuristic: does this .NET exception look like the pywebview shutdown bug?"""
     return any(sig in exc_text for sig in _PYWEBVIEW_TEARDOWN_SIGNATURES)
-
-
-# Hard timeout for the Settings/Setup subprocess after SessionEnding fires.
-# Windows gives GUI apps ~5 s to respond to WM_ENDSESSION before killing
-# them with WM_CLOSE / TerminateProcess. We pick a value well inside that
-# budget so the message loop has time to drain WM_QUIT first; if it
-# doesn't (pywebview internal hang, deadlocked Dispose, etc.), we exit
-# the process unconditionally. Better to die slightly early than block
-# the user's shutdown waiting on a stuck WebView2 teardown.
-_HARD_EXIT_TIMEOUT_SECS = 2.0
-
-
-def _arm_hard_exit_timer() -> None:
-    """Schedule ``os._exit(0)`` after ``_HARD_EXIT_TIMEOUT_SECS``.
-
-    Daemon thread so it doesn't block clean shutdown. If the message
-    loop drains and the process exits cleanly first, this thread dies
-    with the process. If something hangs, the timer fires and the
-    process exits without any further cleanup — by design, since at
-    SessionEnding time the OS is about to reclaim our resources anyway.
-    """
-    def _fire():
-        log.warning(
-            "[win_shutdown] hard-exit timer fired after %.1fs — forcing "
-            "process exit so Windows shutdown isn't blocked",
-            _HARD_EXIT_TIMEOUT_SECS,
-        )
-        os._exit(0)
-
-    timer = threading.Timer(_HARD_EXIT_TIMEOUT_SECS, _fire)
-    timer.daemon = True
-    timer.start()

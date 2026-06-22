@@ -1,5 +1,25 @@
 """Tear-down helper that exits the WinForms message loop without closing the form.
 
+Status (v3.20.3): no longer on the Windows quit path
+----------------------------------------------------
+
+The Windows tray-quit and SessionEnding paths now **hard-exit**
+(``os._exit(0)``) instead of calling this helper — see
+``SettingsWindow._dispatch_quit`` and ``win_shutdown.py``. Even the
+``Application.ExitThread`` approach below still drives enough of the
+WinForms/WebView2 teardown that, at shutdown, a .NET exception gets
+thrown and pythonnet crashes while *marshalling* it back into the
+finalizing interpreter (``System.NullReferenceException`` in
+``TypeManager.AllocateTypeObject`` — a known pythonnet 3.x shutdown
+race), surfacing as the WerFault ".NET Framework / stopped working"
+dialog. That crash is below the Python ``try/except`` and the WinForms
+``ThreadException`` net, so it can't be caught; the only fix is to not
+run the teardown. ``safe_quit_window`` is therefore now used **only on
+macOS / non-Windows** (where it falls through to ``window.destroy()`` —
+NSWindow close doesn't recurse and there's no .NET). The win32
+``_try_exit_thread`` branch is retained for reference but is not on any
+live path. The original rationale below is kept for history.
+
 Why we don't just call ``window.destroy()`` on shutdown
 -------------------------------------------------------
 

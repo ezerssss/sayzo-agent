@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 import threading
 import time
@@ -117,10 +118,12 @@ class SettingsWindow:
         patch_clear_user_data_none_guard()
         patch_on_close_swallow_teardown()
 
-        # Windows-only: intercept SystemEvents.SessionEnding so we exit
-        # cleanly via WM_QUIT before pywebview's FormClosed handler runs
-        # against a dying WebView2 child process and surfaces a JIT
-        # dialog that blocks Windows shutdown. See gui/common/win_shutdown.py.
+        # Windows-only: intercept SystemEvents.SessionEnding so we hard-exit
+        # (os._exit) before pywebview's FormClosed teardown runs against a
+        # dying WebView2 child process — that teardown crashes pythonnet's
+        # exception marshaller and surfaces a WerFault ".NET Framework" dialog.
+        # See gui/common/win_shutdown.py (the SessionEnding handler) + the
+        # matching tray-quit path in _dispatch_quit below.
         def _mark_quitting() -> None:
             self._quitting = True
 
@@ -331,6 +334,36 @@ class SettingsWindow:
 
     def _dispatch_quit(self, window: "webview.Window") -> None:
         self._quitting = True
-        # safe_quit_window bypasses window.destroy() — see its docstring
-        # for the WinForms FormClosed-recursion rationale.
-        safe_quit_window(window)
+        if sys.platform == "win32":
+            # Hard-exit BEFORE any .NET teardown runs. The WinForms/WebView2
+            # FormClosed teardown (Application.Exit recursion, clear_user_data,
+            # detached WebView2 RCW) throws a .NET exception at shutdown, and
+            # pythonnet then crashes (System.NullReferenceException in
+            # TypeManager.AllocateTypeObject) while *marshalling* that exception
+            # back into Python as the CLR runtime tears down — an unhandled
+            # managed exception (0xe0434352) that surfaces as the WerFault
+            # ".NET Framework / Sayzo has stopped working" dialog when the user
+            # clicks tray Quit. That crash is BELOW the Python try/except
+            # (pywebview_patches.on_close) and WinForms Application.ThreadException
+            # swallow layers — pythonnet dies *converting* the exception before
+            # it ever becomes a Python/message-loop exception — so neither layer
+            # can catch it. Skip the fragile teardown entirely: this is a
+            # stateless GUI subprocess (Settings persist on-change via
+            # settings_store.save, never at quit), so there is nothing to flush,
+            # and Windows reclaims the window + WebView2 child on process exit.
+            # os._exit is safe w.r.t. SettingsLock — it's a kernel lock that
+            # releases on process death (is_running consults the kernel lock,
+            # not the .pid file). macOS is immune (no .NET; NSWindow close does
+            # not recurse), so it keeps the graceful safe_quit_window path below.
+            # Mirrors the macOS agent's own os._exit(0) at quit (__main__.py).
+            # No explicit log flush: logging.StreamHandler/FileHandler flush per
+            # record (emit() calls flush()), so nothing is buffered here, and a
+            # flush could block on a stuck stream — the exit must never block.
+            # Emit a marker first so agent.log shows an intentional tray-Quit
+            # (clean rc=0) vs a crash (mirrors the SessionEnding handler's log).
+            log.info("[settings] quit — hard-exiting (skips WinForms teardown)")
+            os._exit(0)
+        else:
+            # macOS / other: safe_quit_window bypasses window.destroy() — see its
+            # docstring for the WinForms FormClosed-recursion rationale.
+            safe_quit_window(window)

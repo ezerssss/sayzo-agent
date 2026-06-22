@@ -15,28 +15,22 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def _no_real_hard_exit_timer(monkeypatch):
-    """Defang ``_arm_hard_exit_timer`` for the whole module.
+def _no_real_os_exit(monkeypatch):
+    """Defang ``os._exit`` for the whole module.
 
-    Several tests fire ``SessionEnding``, which arms a real ``threading.Timer``
-    that calls ``os._exit(0)`` 2 s later. If a test runs slower than that
-    (or pytest doesn't tear down fast enough between tests), the timer
-    fires mid-suite and kills the pytest process. Mock the Timer class
-    so it stores the call but never actually fires. Tests that need to
-    inspect the timer arming behavior install their own stub on top.
+    The SessionEnding handler now **hard-exits** via ``os._exit(0)`` instead of
+    draining the WinForms message loop (it skips the pywebview FormClosed
+    teardown that crashes pythonnet's exception marshaller). Several tests fire
+    ``SessionEnding``; without this fixture that real ``os._exit(0)`` would kill
+    the pytest process. Replace it with a recorder so the handler completes
+    normally and tests can assert it was called. Tests that want to inspect the
+    exit request the fixture by name to read the recorded codes.
     """
-    import threading as _threading
+    import os as _os
 
-    class _NoopTimer:
-        def __init__(self, interval, function):
-            self.interval = interval
-            self.function = function
-            self.daemon = False
-
-        def start(self):
-            pass
-
-    monkeypatch.setattr(_threading, "Timer", _NoopTimer)
+    calls: list = []
+    monkeypatch.setattr(_os, "_exit", lambda code=0: calls.append(code))
+    return calls
 
 
 @pytest.fixture(autouse=True)
@@ -73,10 +67,15 @@ def _install_stubs(uid: str = "master"):
         SessionEnding-added handler back and fire it manually).
       - thread_exception: System.Windows.Forms.Application.ThreadException
         (same — captures the registered handler).
-      - exit_thread: Application.ExitThread (called via safe_quit_window).
+      - exit_thread / browser_form: the safe_quit_window path stubs. As of
+        v3.20.3 the SessionEnding handler hard-exits (os._exit) instead of
+        calling safe_quit_window, so these are retained to assert that path
+        is NOT taken (test_session_ending_hard_exits asserts BeginInvoke
+        is never called).
       - set_mode: Application.SetUnhandledExceptionMode.
     """
-    # webview stubs for safe_quit_window.
+    # webview stubs: kept so we can assert the safe_quit_window/ExitThread
+    # path is NOT exercised on SessionEnding (it hard-exits instead).
     fake_browser_form = MagicMock()
     fake_browser_form.IsDisposed = False
     fake_winforms_module = types.ModuleType("webview.platforms.winforms")
@@ -190,8 +189,16 @@ def test_windows_installs_both_handlers(monkeypatch):
     )
 
 
-def test_session_ending_calls_safe_quit(monkeypatch):
-    """SessionEnding firing → ExitThread invoked on UI thread (via safe_quit)."""
+def test_session_ending_hard_exits(monkeypatch, _no_real_os_exit):
+    """SessionEnding firing → os._exit(0), NOT safe_quit / BeginInvoke.
+
+    safe_quit_window would post WM_QUIT and let the WinForms FormClosed teardown
+    run, which throws a .NET exception pythonnet crashes while marshalling
+    (System.NullReferenceException in TypeManager.AllocateTypeObject → the
+    WerFault ".NET Framework" dialog). That crash is below the Python/
+    ThreadException swallow layers, so the only fix is to skip the teardown by
+    hard-exiting before any .NET teardown call runs.
+    """
     monkeypatch.setattr(sys, "platform", "win32")
     stubs = _install_stubs()
 
@@ -205,10 +212,10 @@ def test_session_ending_calls_safe_quit(monkeypatch):
     args = types.SimpleNamespace(Reason="SystemShutdown")
     stubs.session_events.fire(sender=None, args=args)
 
-    # safe_quit_window's Windows path posts ExitThread via BrowserForm.BeginInvoke.
-    stubs.browser_form.BeginInvoke.assert_called_once()
-    # destroy() must NOT run — that's the path that would crash if WebView2
-    # is already dying.
+    # Hard-exit fired...
+    assert _no_real_os_exit == [0], "SessionEnding must hard-exit via os._exit(0)"
+    # ...and the crashing teardown path must NOT run.
+    stubs.browser_form.BeginInvoke.assert_not_called()
     window.destroy.assert_not_called()
 
 
@@ -296,50 +303,6 @@ def test_thread_exception_passes_through_real_bugs(monkeypatch, caplog):
         "not swallowed" in rec.getMessage()
         for rec in caplog.records
     ), "expected pass-through log for non-pywebview exception"
-
-
-def test_session_ending_arms_hard_exit_timer(monkeypatch):
-    """SessionEnding must arm the os._exit fallback timer.
-
-    The user-visible contract: Windows shutdown is never blocked waiting on
-    a pywebview internal hang. If safe_quit_window's WM_QUIT post doesn't
-    drain the message loop in time, ``_HARD_EXIT_TIMEOUT_SECS`` later we
-    call os._exit unconditionally so the process gets out of Windows'
-    way. Test by mocking threading.Timer — we don't actually want
-    os._exit to fire during the test suite.
-    """
-    monkeypatch.setattr(sys, "platform", "win32")
-    stubs = _install_stubs()
-
-    import threading as _threading
-
-    timer_args = []
-
-    class _StubTimer:
-        def __init__(self, interval, function):
-            timer_args.append((interval, function))
-            self.daemon = False
-
-        def start(self):
-            timer_args.append("started")
-
-    monkeypatch.setattr(_threading, "Timer", _StubTimer)
-
-    from sayzo_agent.gui.common.win_shutdown import (
-        _HARD_EXIT_TIMEOUT_SECS,
-        install_shutdown_protection,
-    )
-
-    window = MagicMock()
-    window.uid = "master"
-    install_shutdown_protection(window)
-    stubs.session_events.fire(sender=None, args=types.SimpleNamespace(Reason="SystemShutdown"))
-
-    # Timer constructed with the documented delay and start() called.
-    interval, fire_fn = timer_args[0]
-    assert interval == _HARD_EXIT_TIMEOUT_SECS
-    assert timer_args[1] == "started"
-    assert callable(fire_fn)
 
 
 def test_session_ending_subscription_failure_does_not_propagate(monkeypatch):
