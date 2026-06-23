@@ -476,7 +476,7 @@ async def test_hotkey_stop_flushes_vad_pending_segments_into_session():
 
     # The flushed segments landed in the now-closed session's segment
     # lists. Without the flush hook, both lists would be empty and the
-    # gate would fail counterparty on sys_total=0.0s.
+    # closed session would carry no captured speech at all.
     closed = detector.take_closed_session()
     assert closed is not None
     assert len(closed.mic_segments) == 1, "mic flush segment dropped"

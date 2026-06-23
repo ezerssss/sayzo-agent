@@ -19,7 +19,6 @@ def _cfg(**overrides) -> ConversationConfig:
     base = dict(
         joint_silence_close_secs=10.0,
         min_user_total_secs=8.0,
-        min_sys_voiced_secs=1.0,
     )
     base.update(overrides)
     return ConversationConfig(**base)
@@ -324,17 +323,21 @@ def test_gate_passes_late_substantive_user_turn():
     assert closed.mic_turn_count() == 2
 
 
-def test_gate_fails_no_counterparty():
-    """User talks to themselves — must be discarded."""
+def test_gate_passes_mic_only_solo():
+    """User speaks with no counterparty/system audio at all — must be KEPT
+    (v3.21.0+). A solo / one-sided session (presenting, early-joined to a quiet
+    room, or a machine where system-audio loopback captured nothing) passes the
+    gate purely on mic voiced time. There is no counterparty requirement."""
     cfg = _cfg()
     d = ConversationDetector(cfg)
     d.on_segment(SpeechSegment("mic", 0.0, 30.0), now=100.0)
     d.tick(200.0)
     closed = d.take_closed_session()
     assert closed is not None
+    assert closed.sys_total_voiced() == 0.0  # genuinely no other side
     result = evaluate_user_turn_gate(closed, cfg)
-    assert not result.passed
-    assert "counterparty" in result.reason
+    assert result.passed
+    assert "PASS" in result.reason
 
 
 # ----------------------------------------------------------------------

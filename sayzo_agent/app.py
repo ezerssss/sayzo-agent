@@ -693,7 +693,7 @@ class Agent:
             )
             try:
                 self.notifier.notify(
-                    "Capture discarded",
+                    "Capture skipped",
                     "Your speech was too brief to coach you on this one. Try a longer session.",
                 )
             except Exception:

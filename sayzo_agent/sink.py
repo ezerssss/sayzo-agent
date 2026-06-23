@@ -43,7 +43,7 @@ AUDIO_FILENAME = "audio.opus"
 # reason values from older agent versions are rendered via
 # ``captures_index._DROPPED_LABELS`` on read.
 DROPPED_REASON_LABELS: dict[str, str] = {
-    "gate_failed": "Skipped — not enough conversation",
+    "gate_failed": "Skipped — too short",
 }
 
 # Most-recent N dropped stubs to keep on disk. Older are pruned at write time

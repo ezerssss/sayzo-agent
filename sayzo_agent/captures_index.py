@@ -149,7 +149,7 @@ def friendly_label(
 # agent versions and are kept here so the Captures pane renders them
 # correctly; the live agent only writes ``gate_failed``.
 _DROPPED_LABELS: dict[str, str] = {
-    "gate_failed": "Skipped — not enough conversation",
+    "gate_failed": "Skipped — too short",
     "non_english": "Skipped — wasn't English",
     "empty_transcript": "Skipped — nothing was transcribed",
 }
@@ -165,7 +165,7 @@ def _detail_text(
         # Friendly explanation, not the raw reason key.
         reason = dropped.get("reason") or ""
         if reason == "gate_failed":
-            return "This was very short or mostly silence."
+            return "We didn't catch enough of your speech to coach you on this one."
         if reason == "non_english":
             lang = (dropped.get("detected_lang") or "").upper()
             return f"Sayzo only coaches English right now (heard {lang})." if lang else "Sayzo only coaches English right now."

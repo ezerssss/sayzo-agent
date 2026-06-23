@@ -114,6 +114,14 @@ class VADConfig(BaseSettings):
 
 
 class ConversationConfig(BaseSettings):
+    # ``extra="ignore"`` so a removed/renamed field (e.g. the v3.21.0 removal of
+    # `min_sys_voiced_secs`) doesn't turn a leftover ``SAYZO_CONVERSATION__*``
+    # env var into a boot-time pydantic ValidationError. The top-level ``Config``
+    # sets this too, but it does NOT propagate to nested sub-configs — each must
+    # opt in. (Pre-v3.21.0 this was worked around per-field by keeping deprecated
+    # fields around; see ``final_audio_merge_gap_secs`` below.)
+    model_config = SettingsConfigDict(extra="ignore")
+
     joint_silence_close_secs: float = 45.0
     # Single-threshold substantive-user-turn rule (v3.5.2+): a session passes
     # iff the user's cumulative voiced time is at least this many seconds,
@@ -124,8 +132,14 @@ class ConversationConfig(BaseSettings):
     # should pass when it didn't. echo_guard handles "user accidentally let
     # a podcast play into their mic" cases on a separate pass, so a single
     # long VAD segment can't game this threshold.
+    #
+    # This is the ONLY keep/discard gate — there is NO counterparty (other-side)
+    # requirement. A solo / one-sided session, or one where system-audio
+    # loopback captured nothing (sys_total=0), is kept as long as the user's mic
+    # speech clears this bar. The brief v3.x `min_sys_voiced_secs` gate was
+    # removed in v3.21.0 because it discarded those sessions and mislabeled them
+    # "too brief". See `evaluate_user_turn_gate` in conversation.py.
     min_user_total_secs: float = 8.0
-    min_sys_voiced_secs: float = 1.0
     # Pad around each VAD segment (mic or system) when building the final
     # saved audio. Regions outside any padded segment are zero-filled so
     # dead air + static artifacts don't end up in the on-disk capture. Small

@@ -513,38 +513,38 @@ class ConversationDetector:
 
 
 def evaluate_user_turn_gate(buffers: SessionBuffers, cfg: ConversationConfig) -> GateResult:
-    """Cheap pre-upload gate: substantive user speech AND counterparty present.
+    """Cheap pre-upload gate: enough of the user's own speech to coach on.
 
-    Single-threshold rule (v3.5.2+): cumulative mic voiced time across the
-    whole session must be ≥ ``cfg.min_user_total_secs``, however distributed.
-    One long turn, many short turns, doesn't matter.
+    Single-threshold rule: cumulative mic voiced time across the whole session
+    must be ≥ ``cfg.min_user_total_secs``, however distributed — one long turn,
+    many short turns, doesn't matter. ``mic_total`` is measured AFTER echo_guard
+    has stripped speaker bleed, so it reflects the user's real voice.
+
+    There is NO counterparty requirement: a solo / one-sided session (the user
+    talks but the other side never does, OR a machine where system-audio
+    loopback captured nothing — ``sys_total=0``) is KEPT as long as there is
+    enough mic speech. ``sys_total`` is still measured and logged for
+    diagnostics but never affects pass/fail. (The brief counterparty gate was
+    removed in v3.21.0 — it mis-discarded these sessions and mislabeled them
+    "too brief.")
     """
     mic_total = buffers.mic_total_voiced()
     mic_max = buffers.mic_max_turn()
     mic_turns = buffers.mic_turn_count()
-    sys_total = buffers.sys_total_voiced()
+    sys_total = buffers.sys_total_voiced()  # diagnostics only — not a gate
 
     user_ok = mic_total >= cfg.min_user_total_secs
-    sys_ok = sys_total >= cfg.min_sys_voiced_secs
 
-    if not user_ok:
-        reason = (
-            f"FAIL substantive-user-turn (mic_total={mic_total:.1f}s "
-            f"over {mic_turns} turns < {cfg.min_user_total_secs:.0f}s)"
-        )
-    elif not sys_ok:
-        reason = (
-            f"FAIL counterparty (sys_total={sys_total:.1f}s < {cfg.min_sys_voiced_secs:.1f}s — "
-            f"no other side)"
-        )
-    else:
-        reason = (
-            f"PASS substantive-user-turn (mic_total={mic_total:.1f}s "
-            f"over {mic_turns} turns ≥ {cfg.min_user_total_secs:.0f}s)"
-        )
+    verdict = "PASS" if user_ok else "FAIL"
+    comparator = "≥" if user_ok else "<"
+    reason = (
+        f"{verdict} substantive-user-turn (mic_total={mic_total:.1f}s "
+        f"over {mic_turns} turns {comparator} {cfg.min_user_total_secs:.0f}s; "
+        f"sys_total={sys_total:.1f}s)"
+    )
 
     return GateResult(
-        passed=user_ok and sys_ok,
+        passed=user_ok,
         reason=reason,
         mic_total=mic_total,
         mic_max_turn=mic_max,
