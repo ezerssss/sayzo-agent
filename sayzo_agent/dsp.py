@@ -2,8 +2,14 @@
 
 Pipeline per channel:
 
-    mic:    int16 -> float32 -> highpass(80Hz) -> denoise -> peak-norm -> int16
-    system: int16 -> float32 -> highpass(40Hz) ->         -> peak-norm -> int16
+    mic:    int16 -> float32 -> highpass(80Hz) -> denoise -> [peak-norm] -> int16
+    system: int16 -> float32 -> highpass(40Hz) ->         -> [peak-norm] -> int16
+
+The bracketed per-channel peak-normalize runs only when
+``loudness_match_enabled=False``. By default (v3.22+) loudness is handled jointly
+across both channels by ``loudness.match_loudness`` after session trim, so the
+mic and system channels end at the same PERCEIVED loudness (peak-normalize only
+matches peaks, not loudness).
 
 This runs on the heavy-worker ``ThreadPoolExecutor`` so it never blocks the
 asyncio loop. Output is what ends up on disk + uploaded to the server for
@@ -136,6 +142,12 @@ def apply_mic_dsp(pcm16: bytes, sr: int, cfg: CaptureConfig) -> bytes:
     Everything else is controlled by individual flags / cutoffs so the chain
     can be partially disabled (e.g. ``highpass_mic_hz=0`` + ``denoise_enabled=False``
     + ``peak_normalize_dbfs=0`` would be identity modulo quantization round-trip).
+
+    Loudness: when ``loudness_match_enabled`` (v3.22+ default), the per-channel
+    peak-normalize here is SKIPPED — the joint ``loudness.match_loudness`` stage
+    (run after trim, on both channels together) owns final loudness so mic and
+    system end at the same perceived level. When it's off, the per-channel
+    peak-normalize runs as before (exact pre-v3.22 behavior).
     """
     if not cfg.dsp_enabled or not pcm16:
         return pcm16
@@ -143,7 +155,8 @@ def apply_mic_dsp(pcm16: bytes, sr: int, cfg: CaptureConfig) -> bytes:
     x = _apply_highpass(x, cfg.highpass_mic_hz, sr)
     if cfg.denoise_enabled:
         x = _denoise(x, sr, cfg.denoise_strength)
-    x = _peak_normalize(x, cfg.peak_normalize_dbfs, cfg.peak_normalize_max_gain_db)
+    if not cfg.loudness_match_enabled:
+        x = _peak_normalize(x, cfg.peak_normalize_dbfs, cfg.peak_normalize_max_gain_db)
     return _f32_to_i16(x)
 
 
@@ -153,12 +166,17 @@ def apply_sys_dsp(pcm16: bytes, sr: int, cfg: CaptureConfig) -> bytes:
     System audio is typically already a clean digital stream (Zoom, Discord,
     a YouTube video). Aggressive denoising would damage music or low-volume
     speech from the far side, so this chain is intentionally light: just a
-    low-cutoff highpass to kill DC/rumble and a peak normalize for
-    consistent loudness.
+    low-cutoff highpass to kill DC/rumble (loudness is handled jointly — see
+    ``apply_mic_dsp`` and ``loudness.match_loudness``).
+
+    Loudness: when ``loudness_match_enabled`` (v3.22+ default), the per-channel
+    peak-normalize here is SKIPPED in favor of the joint loudness-match stage;
+    when it's off, the per-channel peak-normalize runs as before.
     """
     if not cfg.dsp_enabled or not pcm16:
         return pcm16
     x = _i16_to_f32(pcm16)
     x = _apply_highpass(x, cfg.highpass_sys_hz, sr)
-    x = _peak_normalize(x, cfg.peak_normalize_dbfs, cfg.peak_normalize_max_gain_db)
+    if not cfg.loudness_match_enabled:
+        x = _peak_normalize(x, cfg.peak_normalize_dbfs, cfg.peak_normalize_max_gain_db)
     return _f32_to_i16(x)

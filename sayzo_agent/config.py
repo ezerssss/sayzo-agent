@@ -89,6 +89,53 @@ class CaptureConfig(BaseSettings):
     # to restore pre-v3.6.4 unbounded behavior.
     peak_normalize_max_gain_db: float = 6.0
 
+    # Inter-channel loudness match (v3.22+, see loudness.py). The per-channel
+    # peak-normalize above matches PEAKS, not perceived loudness — two channels
+    # can both hit ``peak_normalize_dbfs`` yet sound at very different volumes
+    # on replay (mic=L vs sys=R). This stage runs AFTER session trim on BOTH
+    # channels together and equalizes their PERCEIVED loudness (ITU-R BS.1770
+    # LUFS via pyloudnorm), so the user's voice and the far side sit at the
+    # same level. When True, dsp.py SKIPS the per-channel peak-normalize and
+    # this joint stage owns loudness; when False, loudness.py is an identity
+    # pass and the per-channel peak-normalize above runs as before — i.e.
+    # ``SAYZO_CAPTURE__LOUDNESS_MATCH_ENABLED=0`` restores the exact
+    # pre-v3.22 behavior, byte-for-byte. Replay-UX only: the server's
+    # transcription pass does its own gain control, so this never affects it.
+    loudness_match_enabled: bool = True
+    # Loudness measure. "lufs" = pyloudnorm BS.1770 (default; K-weighted +
+    # gated, so it ignores the silent stretches while the other side talks).
+    # "rms" = numpy-only gated-RMS proxy (no pyloudnorm dependency); also the
+    # automatic fallback when pyloudnorm fails to import in a frozen build.
+    loudness_method: Literal["lufs", "rms"] = "lufs"
+    # Target loudness (LUFS), ≈ spoken-content norm. Two roles:
+    #   - Two-channel: a FLOOR (lower bound) on the meet-in-the-middle target.
+    #     The match target = clamp(midpoint, floor=this, max=quieter+max_boost).
+    #     So the midpoint is lifted UP to this when it falls below (keeps quiet
+    #     captures from getting quieter / the louder far side from being cut
+    #     down), bounded by the boost cap so the quieter channel's hum isn't
+    #     amplified past it. For loud captures (midpoint above this floor) the
+    #     floor has NO effect — the target stays at the midpoint and clipping is
+    #     handled by ``loudness_peak_ceiling_dbfs``. Both channels still land on
+    #     one target, so they stay matched.
+    #   - Solo (mic-only since v3.21.0, or system-only): the lone channel is
+    #     normalized toward this (boost bounded by max_boost, cut allowed).
+    # Unifying the two roles keeps mic-only and two-sided captures at a
+    # consistent replay loudness. Tune during validation.
+    loudness_target_lufs: float = -18.0
+    # Hard cap on how far the quieter channel may be BOOSTED toward the match
+    # target, in dB. Same rationale as ``peak_normalize_max_gain_db`` above: a
+    # near-silent post-AEC channel must not have its hum/room-tone lifted to
+    # speech level. The cut side (bringing the louder channel down) is uncapped.
+    # When the gap exceeds this cap the match point slides toward the quieter
+    # channel so the two channels still end matched (never silently mismatched).
+    loudness_max_boost_db: float = 6.0
+    # Joint sample-peak ceiling (dBFS). After per-channel gains, if the louder
+    # channel's peak exceeds this, BOTH channels are scaled by the same factor
+    # so nothing clips AND the loudness match is preserved. -3 dBFS matches the
+    # headroom the old per-channel peak-normalize targeted and leaves margin for
+    # inter-sample true peaks that can exceed the sample peak after Opus encode.
+    loudness_peak_ceiling_dbfs: float = -3.0
+
     # Windows-only: opens a silent render stream on the same WASAPI endpoint
     # as the loopback capture, for the lifetime of an armed session. WASAPI
     # loopback documented behavior: when nothing is rendering on the endpoint,
@@ -327,9 +374,9 @@ class AecConfig(BaseSettings):
     #
     # AGC stays hardcoded OFF in aec.py — it pumps mic gain during
     # far-side monologue and boosts ambient noise to speech level,
-    # confusing Deepgram's diarization. Our peak-normalize in dsp.py
-    # is the one-shot loudness pass that handles overall level without
-    # AGC's per-frame mischief.
+    # confusing Deepgram's diarization. Final level is set jointly by
+    # loudness.match_loudness after trim (v3.22+ default); dsp.py
+    # peak-normalize is the LOUDNESS_MATCH_ENABLED=0 fallback.
     noise_suppression: bool = False
     high_pass_filter: bool = True
 

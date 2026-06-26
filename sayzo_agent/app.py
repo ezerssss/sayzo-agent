@@ -22,6 +22,7 @@ from .conversation import (
     evaluate_user_turn_gate,
 )
 from .dsp import apply_mic_dsp, apply_sys_dsp
+from .loudness import match_loudness
 from . import aec, echo_guard
 from .models import SessionBuffers
 from .session_trim import apply_session_trim
@@ -759,6 +760,34 @@ class Agent:
             trim_report.original_secs,
         )
 
+        # 3b. Joint inter-channel loudness match. Runs on the TRIMMED buffers
+        # (so pyloudnorm's gating sees only kept speech — pre/post silence +
+        # echo-zeroed mic spans are gone) and BEFORE encode, so mic=L and sys=R
+        # land at the same PERCEIVED loudness on replay. Applies per-channel
+        # scalar gain only — length-preserving, no shift/resample — so the
+        # identical-index mic<->sys alignment from trim is untouched (CLAUDE.md
+        # design rule 6). No-op when loudness_match_enabled is off (dsp.py then
+        # owns loudness via its per-channel peak-normalize).
+        mic_final, sys_final, loudness_report = await loop.run_in_executor(
+            self._executor,
+            match_loudness,
+            bytes(mic_final),
+            bytes(sys_final),
+            sr,
+            self.cfg.capture,
+        )
+        log.info(
+            "[loudness] %s%s mic=%s sys=%s target=%s gains mic%+.1f sys%+.1f%s",
+            loudness_report.method,
+            " (fallback)" if loudness_report.fallback_used else "",
+            loudness_report.mic_lufs,
+            loudness_report.sys_lufs,
+            loudness_report.common_target_lufs,
+            loudness_report.mic_gain_db,
+            loudness_report.sys_gain_db,
+            " [mic-only]" if loudness_report.mic_only else "",
+        )
+
         # 4. Sink + upload
         # Derive wall-clock started_at / ended_at from the sliced PCM. Two
         # offsets shift `buffers.started_at`:
@@ -780,6 +809,7 @@ class Agent:
             "close_reason": buffers.close_reason.value if buffers.close_reason else None,
             "upload": empty_upload_state(),
             "trim": trim_report.as_metadata(),
+            "loudness": loudness_report.as_metadata(),
         }
         if eg_report is not None:
             metadata["echo_guard"] = {

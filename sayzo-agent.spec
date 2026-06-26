@@ -125,6 +125,9 @@ hiddenimports = [
     # VAD — onnxruntime session over the vendored model, lazy-imported
     # inside sayzo_agent/silero_onnx.py so the static scanner misses it.
     "onnxruntime",
+    # Inter-channel loudness match (BS.1770), lazy-imported inside
+    # sayzo_agent/loudness.py::_get_pyln so the static scanner misses it.
+    "pyloudnorm",
     # Audio encoding
     "av",
     # Config

@@ -169,8 +169,9 @@ def cancel_echo(
     # AGC stays False — it dynamically pumps mic gain across the
     # session, which is right for a phone call but wrong for our
     # pipeline (would boost ambient noise to speech level during
-    # far-side monologue, confusing Deepgram diarize). dsp.py's
-    # one-shot peak-normalize handles overall level instead.
+    # far-side monologue, confusing Deepgram diarize). Final level is
+    # set after session trim by loudness.match_loudness (v3.22+ default);
+    # dsp.py's peak-normalize is the LOUDNESS_MATCH_ENABLED=0 fallback.
     apm = APM(
         echo_cancellation=True,
         noise_suppression=bool(cfg.noise_suppression),

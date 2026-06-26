@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sayzo-agent"
-version = "3.21.0"
+version = "3.22.0"
 description = "Armed-only capture agent for Sayzo — records meetings on user consent (hotkey or whitelisted meeting app), uploads raw stereo OGG Opus to the server, polls for the post-transcription title/summary."
 requires-python = ">=3.10"
 dependencies = [
@@ -14,6 +14,13 @@ dependencies = [
     # Pure numpy/scipy — pulls matplotlib transitively (used only by its
     # optional plotting helpers, which we never import).
     "noisereduce>=3.0",
+    # pyloudnorm: ITU-R BS.1770 integrated-loudness meter for the inter-channel
+    # loudness match at session close (see sayzo_agent/loudness.py). Pure
+    # numpy/scipy — no extra runtime weight. Lazy-imported in
+    # loudness._get_pyln, so it's a hiddenimport in sayzo-agent.spec and the
+    # `sayzo-agent healthcheck` exercises it against the built bundle (same
+    # freeze-graph guard as onnxruntime — see below).
+    "pyloudnorm>=0.1",
     # WebRTC AEC3 via livekit.rtc.apm. The base `livekit` PyPI package
     # bundles the WebRTC AudioProcessingModule (same engine as Chrome/
     # Meet) with prebuilt FFI binaries for Windows + macOS (arm64 +

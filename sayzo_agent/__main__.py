@@ -436,6 +436,31 @@ def healthcheck() -> None:
                 f"AEC output length mismatch: {len(out)} vs {len(mic)}"
             )
 
+    def _check_loudness() -> None:
+        # Inter-channel loudness match (BS.1770 via pyloudnorm). Run a real
+        # match on a synthetic >400 ms mic+sys buffer. Same freeze-graph guard
+        # as _check_aec/_check_silero: pyloudnorm is lazy-imported, so if it
+        # didn't make it into the bundle, match_loudness silently degrades to
+        # the gated-RMS fallback — rep.fallback_used trips this check rather
+        # than shipping that degradation to users.
+        import numpy as np
+        from sayzo_agent.config import CaptureConfig
+        from sayzo_agent.loudness import match_loudness
+        sr = 16000
+        n = sr  # 1 s, comfortably above the 400 ms gating block
+        t = np.arange(n) / sr
+        mic = (0.05 * np.sin(2 * np.pi * 220 * t) * 32767).astype(np.int16).tobytes()
+        sys_pcm = (0.4 * np.sin(2 * np.pi * 440 * t) * 32767).astype(np.int16).tobytes()
+        out_mic, out_sys, rep = match_loudness(mic, sys_pcm, sr, CaptureConfig())
+        if not rep.ran:
+            raise RuntimeError(f"loudness match did not run (reason={rep.skip_reason})")
+        if rep.fallback_used:
+            raise RuntimeError(
+                "pyloudnorm missing from bundle — loudness fell back to gated-RMS"
+            )
+        if len(out_mic) != len(mic) or len(out_sys) != len(sys_pcm):
+            raise RuntimeError("loudness output length mismatch")
+
     _try("numpy import", lambda: __import__("numpy"))
     _try("scipy.signal import", lambda: __import__("scipy.signal"))
     _try("sounddevice import", lambda: __import__("sounddevice"))
@@ -451,8 +476,10 @@ def healthcheck() -> None:
     _try("silero VAD load + inference (ONNX)", _check_silero)
     _try("av (PyAV) import", lambda: __import__("av"))
     _try("noisereduce import", lambda: __import__("noisereduce"))
+    _try("pyloudnorm import", lambda: __import__("pyloudnorm"))
     _try("livekit.rtc.apm import", lambda: __import__("livekit.rtc.apm"))
     _try("AEC end-to-end", _check_aec)
+    _try("loudness match end-to-end (LUFS)", _check_loudness)
     _try("pydantic import", lambda: __import__("pydantic"))
     _try("httpx import", lambda: __import__("httpx"))
     _try("pystray import", lambda: __import__("pystray"))
